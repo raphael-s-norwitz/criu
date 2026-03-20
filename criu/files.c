@@ -551,6 +551,8 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			ops = &timerfd_dump_ops;
 		else if (is_pidfd_link(link))
 			ops = &pidfd_dump_ops;
+		else if (is_async_eventfd(link))
+			ops = &uverbs_async_eventfd_dump_ops;
 #ifdef CONFIG_HAS_LIBBPF
 		else if (is_bpfmap_link(link))
 			ops = &bpfmap_dump_ops;
