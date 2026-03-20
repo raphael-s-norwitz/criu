@@ -7,3 +7,8 @@ message uverbs_file_entry {
 	optional string		ib_dev		= 2;
 	optional uint32		ctxn		= 3;
 };
+
+message uverbs_async_ev_file_entry {
+	required uint32		id		= 1;
+	optional uint32		ctxn		= 2;
+};
