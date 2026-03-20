@@ -2227,6 +2227,18 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 			entry_met = true;
 			continue;
 		}
+		if (fdinfo_field(str, "ctxn")) {
+			UverbsFileEntry *uve = arg;
+
+			if (type != FD_TYPES__UVERBSFD)
+				goto parse_err;
+			ret = sscanf(str, "ctxn: %u", &uve->ctxn);
+			if (ret != 1)
+				goto parse_err;
+			uve->has_ctxn = true;
+			entry_met = true;
+			continue;
+		}
 		if (fdinfo_field(str, "ino") || fdinfo_field(str, "NSpid") || fdinfo_field(str, "Pid")) {
 			struct pidfd_dump_info *pidfd_info = arg;
 
@@ -2263,7 +2275,7 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 	 * An eventpoll/inotify file may have no target fds set thus
 	 * resulting in no tfd: lines in proc. This is normal.
 	 */
-	if (type == FD_TYPES__EVENTPOLL || type == FD_TYPES__INOTIFY)
+	if (type == FD_TYPES__EVENTPOLL || type == FD_TYPES__INOTIFY || type == FD_TYPES__UVERBSFD)
 		goto out;
 
 	pr_err("No records of type %d found in fdinfo file\n", type);

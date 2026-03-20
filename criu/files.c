@@ -50,6 +50,7 @@
 #include "fdstore.h"
 #include "bpfmap.h"
 #include "pidfd.h"
+#include "rdma.h"
 
 #include "protobuf.h"
 #include "util.h"
@@ -466,6 +467,9 @@ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
 	switch (maj) {
 	case MEM_MAJOR:
 		ops = get_mem_dev_ops(p, minor(p->stat.st_rdev));
+		break;
+	case 231: /* FIXME: add MEM_IB_UVERBS to uapi */
+		ops = &uverbs_dump_ops;
 		break;
 	case MISC_MAJOR:
 		ops = get_misc_dev_ops(minor(p->stat.st_rdev));
