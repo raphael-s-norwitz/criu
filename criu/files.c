@@ -1799,6 +1799,9 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
 		ret = collect_one_file_entry(fe, fe->bpf->id, &fe->bpf->base, &bpfmap_cinfo);
 		break;
 #endif
+	case FD_TYPES__UVERBSFD:
+		ret = collect_one_file_entry(fe, fe->uvfd->id, &fe->uvfd->base, &uverbsfd_cinfo);
+		break;
 	}
 
 	return ret;
