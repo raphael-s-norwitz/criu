@@ -21,6 +21,12 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "rdma: "
 
+/* FIXME: Probably not a real max */
+#define MAX_PROCESS_CONTEXTS 4096
+
+/* FIXME: Probably replace with linked list or hasmap/xarray. */
+static u32 ctxn_uverbsfd_id_map[MAX_PROCESS_CONTEXTS];
+
 bool is_async_eventfd(char *link)
 {
 	return is_anon_link_type(link, "[infinibandevent]");
@@ -57,6 +63,111 @@ static int dump_async_eventfile(int lfd, u32 id, const struct fd_parms *p)
 const struct fdtype_ops uverbs_async_eventfd_dump_ops = {
 	.type = FD_TYPES__UVERBSASYNCFD,
 	.dump = dump_async_eventfile,
+};
+
+struct uverbsasyncevfd_file_info {
+	UverbsAsyncEvFileEntry *uvaefe;
+	struct file_desc d;
+};
+
+static int
+ib_uverbs_alloc_async_event_fd_ioctl(int cmd_fd, uint32_t driver_id,
+				     int *async_fd_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[1];
+	} buf;
+
+	memset(&buf, 0, sizeof(buf));
+
+	buf.hdr.object_id = UVERBS_OBJECT_ASYNC_EVENT;
+	buf.hdr.method_id = UVERBS_METHOD_ASYNC_EVENT_ALLOC;
+	buf.hdr.driver_id = driver_id;
+	buf.hdr.reserved1 = 0;
+	buf.hdr.reserved2 = 0;
+	buf.hdr.num_attrs = 1;
+
+	buf.attrs[0].attr_id = UVERBS_ATTR_ASYNC_EVENT_ALLOC_FD_HANDLE;
+	buf.attrs[0].len = 0;
+	buf.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	buf.attrs[0].data = 0;
+	buf.hdr.length = sizeof(buf.hdr) + sizeof(buf.attrs[0]);
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &buf.hdr) != 0)
+		return -errno;
+
+	*async_fd_out = (int)buf.attrs[0].data;
+	return 0;
+}
+
+static int uverbsasyncevfd_open(struct file_desc *d, int *new_fd)
+{
+	struct uverbsasyncevfd_file_info *ui;
+	struct file_desc *cmd_fd_desc;
+	int async_fd = -1, cmd_fd, ret;
+	u32 cmd_fd_id;
+
+	ui = container_of(d, struct uverbsasyncevfd_file_info, d);
+
+	cmd_fd_id = ctxn_uverbsfd_id_map[ui->uvaefe->ctxn];
+	if (!cmd_fd_id) {
+		pr_info("No chr device set for async fd id %#x ctxn %u, retrying\n",
+			ui->uvaefe->id,
+			ui->uvaefe->has_ctxn ? ui->uvaefe->ctxn : 0);
+		return 1;
+	}
+
+	cmd_fd_desc = find_file_desc_raw(FD_TYPES__UVERBSFD, cmd_fd_id);
+	if (!cmd_fd_desc) {
+		pr_info("No cmd_fd found for async ev fd id %#x ctxn %u\n",
+			ui->uvaefe->id,
+			ui->uvaefe->has_ctxn ? ui->uvaefe->ctxn : 0);
+		return -1;
+	}
+
+	cmd_fd = file_master(cmd_fd_desc)->fe->fd;
+
+	/* FIXME: Set correct driver_id */
+	ret = ib_uverbs_alloc_async_event_fd_ioctl(cmd_fd, RDMA_DRIVER_RXE, &async_fd);
+	if (ret) {
+		pr_info("asyncevfd alloc failed %s (%d) - cmd_fd %d id %#x ctxn %u\n",
+			strerror(-ret), ret, cmd_fd, ui->uvaefe->id,
+			ui->uvaefe->has_ctxn ? ui->uvaefe->ctxn : 0);
+		return -1;
+	}
+
+	pr_info("Opened uverbs async ev fd id %#x ctxn %u with cmd_fd %d\n",
+		ui->uvaefe->id, ui->uvaefe->has_ctxn ? ui->uvaefe->ctxn : 0,
+		cmd_fd);
+
+	*new_fd = async_fd;
+	return 0;
+}
+
+static struct file_desc_ops uverbs_async_eventfile_desc_ops = {
+	.type = FD_TYPES__UVERBSASYNCFD,
+	.open = uverbsasyncevfd_open,
+};
+
+static int collect_one_uverbsasyncevfd(void *o, ProtobufCMessage *base,
+				       struct cr_img *i)
+{
+	struct uverbsasyncevfd_file_info *ui = o;
+
+	ui->uvaefe = pb_msg(base, UverbsAsyncEvFileEntry);
+	file_desc_add(&ui->d, ui->uvaefe->id, &uverbs_async_eventfile_desc_ops);
+
+	pr_info("Collected uverbsasyncevfd ctxn %d\n", ui->uvaefe->ctxn);
+
+	return 0;
+}
+
+struct collect_image_info uverbsasyncevfd_cinfo = {
+	.fd_type = CR_FD_UVERBSAE_FILE,
+	.pb_type = PB_UVERBS_ASYNC_EV_FILE,
+	.priv_size = sizeof(struct uverbsasyncevfd_file_info),
+	.collect = collect_one_uverbsasyncevfd,
 };
 
 static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
@@ -141,6 +252,8 @@ static int uverbsfd_open(struct file_desc *d, int *new_fd)
 	ret = ib_uverbs_get_context_ioctl(fd, RDMA_DRIVER_RXE);
 	if (ret)
 		goto out_get_context;
+
+	ctxn_uverbsfd_id_map[ui->uvfe->ctxn] = ui->uvfe->id;
 
 	*new_fd = fd;
 	return 0;

@@ -1802,6 +1802,9 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
 	case FD_TYPES__UVERBSFD:
 		ret = collect_one_file_entry(fe, fe->uvfd->id, &fe->uvfd->base, &uverbsfd_cinfo);
 		break;
+	case FD_TYPES__UVERBSASYNCFD:
+		ret = collect_one_file_entry(fe, fe->uvaefd->id, &fe->uvaefd->base, &uverbsasyncevfd_cinfo);
+		break;
 	}
 
 	return ret;
