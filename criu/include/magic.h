@@ -102,6 +102,7 @@
 #define APPARMOR_MAGIC	     0x59423047 /* Nikolskoye */
 #define PIDFD_MAGIC	     0x54435556 /* Ufa */
 #define UVERBS_FILE_MAGIC    0x56463721 /* Elektrostal */
+#define UVERBSAE_FILE_MAGIC  0x56463775 /* Mytishchi */
 
 #define IFADDR_MAGIC	RAW_IMAGE_MAGIC
 #define ROUTE_MAGIC	RAW_IMAGE_MAGIC
