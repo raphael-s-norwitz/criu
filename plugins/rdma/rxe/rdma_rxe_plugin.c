@@ -29,11 +29,16 @@
  */
 
 #include "criu-log.h"
-#include "plugin.h"
+#include "criu-plugin.h"
+
+#include "images/rdma_criu.pb-c.h"
+
+#include <rdma/ib_user_ioctl_verbs.h>
 
 #include <dirent.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -168,5 +173,46 @@ static void rdma_rxe_plugin_fini(int stage, int ret)
 		ret, rxe_active ? "active" : "inactive", rxe_dev_count);
 }
 
+/*
+ * Per-context claim hook (CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT).
+ *
+ * Invoked at dump time for every uverbs context the target process
+ * holds, and again at restore time as a "does the destination's
+ * plugin set still cover this image?" check. Returns the plugin's
+ * RdmaCriuDriver value (RCD_RXE) iff:
+ *
+ *   - the plugin is active on this host (rxe_active is set, i.e.
+ *     init() found at least one rxe ibdev present);
+ *   - AND the context's kernel driver is RDMA_DRIVER_RXE.
+ *
+ * Either condition failing -> return RCD_UNKNOWN to decline the
+ * context. Negative returns are reserved for "I would normally
+ * claim this but a probe failed" (none of which apply to rxe; rxe
+ * has no host-side gate beyond the driver being loaded). The
+ * plugin set arbitration in criu/rdma.c::rdma_arbitrate_plugin_claim()
+ * enforces exactly-one-claim across all loaded RDMA plugins.
+ */
+static int rdma_rxe_plugin_claim_uverbs_context(const char *ibdev,
+						uint32_t kernel_driver_id)
+{
+	if (!rxe_active) {
+		pr_debug("claim(%s, kdrv=%u): plugin inactive, declining\n",
+			 ibdev, kernel_driver_id);
+		return RDMA_CRIU_DRIVER__RCD_UNKNOWN;
+	}
+	if (kernel_driver_id != RDMA_DRIVER_RXE) {
+		pr_debug("claim(%s, kdrv=%u): kernel driver is not "
+			 "RDMA_DRIVER_RXE (%u), declining\n",
+			 ibdev, kernel_driver_id, (uint32_t)RDMA_DRIVER_RXE);
+		return RDMA_CRIU_DRIVER__RCD_UNKNOWN;
+	}
+
+	pr_info("claim(%s, kdrv=%u): claiming as RCD_RXE\n", ibdev,
+		kernel_driver_id);
+	return RDMA_CRIU_DRIVER__RCD_RXE;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
+			rdma_rxe_plugin_claim_uverbs_context)

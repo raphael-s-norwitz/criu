@@ -2,6 +2,8 @@
 
 syntax = "proto2";
 
+import "rdma_criu.proto";
+
 message uverbs_file_entry {
 	required uint32		id		= 1;
 	optional string		ib_dev		= 2;
@@ -21,6 +23,20 @@ message uverbs_file_entry {
 	 * headers (kernel UAPI enum can grow).
 	 */
 	optional uint32		driver_id	= 5;
+	/*
+	 * Which CRIU plugin claimed responsibility for this context at
+	 * dump time. Selected by the per-plugin claim() hook
+	 * (CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT) under exactly-one-
+	 * winner arbitration: zero claims -> hard fail at dump, multiple
+	 * claims -> hard fail at dump (operator's plugin set is
+	 * inconsistent). Restore dispatches per-plugin restore work off
+	 * this field. Distinct from driver_id because one kernel driver
+	 * can be served by multiple CRIU plugins (mlx5_core today: the
+	 * mlx5_sriov_vfmig host-driven path; later, possibly an IB-
+	 * resource fw-assisted replay strategy). UNKNOWN is reserved for
+	 * "no plugin claims, restore must fail".
+	 */
+	optional rdma_criu_driver criu_driver	= 6;
 };
 
 message uverbs_async_ev_file_entry {

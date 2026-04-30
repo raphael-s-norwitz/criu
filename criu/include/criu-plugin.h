@@ -68,6 +68,31 @@ enum {
 
 	CR_PLUGIN_HOOK__UPDATE_INETSK = 15,
 
+	/*
+	 * RDMA per-context plugin claim. Invoked at dump time by
+	 * criu/rdma.c for every uverbs cdev about to be checkpointed,
+	 * once per loaded RDMA-class plugin. The plugin returns the
+	 * RdmaCriuDriver value identifying itself if (and only if) it
+	 * intends to own dump+restore for this context, or the sentinel
+	 * value RCD_UNKNOWN (0) if it doesn't claim it. The arbitration
+	 * helper in criu/rdma.c enforces "exactly one plugin claims";
+	 * zero or multiple claims is a hard dump failure.
+	 *
+	 * Distinct from the existing per-fd hooks (DUMP_EXT_FILE etc.)
+	 * because it runs *per uverbs context*, doesn't have an fd id
+	 * yet at call time, and is read-only / side-effect-free --
+	 * plugins may issue cheap probe ioctls (e.g. MLX5_VFMIG_IOC_
+	 * QUERY_VF) but must not mutate state.
+	 *
+	 * Args:  ibdev (e.g. "rxe0", "mlx5_2"), kernel_driver_id
+	 *        (RDMA_DRIVER_* enum value as resolved from sysfs).
+	 * Return: RdmaCriuDriver value > 0 to claim, RCD_UNKNOWN to
+	 *         decline. Returning a negative errno indicates the
+	 *         plugin would normally claim but failed to probe, and
+	 *         is treated as a dump error (different from "decline").
+	 */
+	CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT = 16,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -90,6 +115,7 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__POST_FORKING, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RESTORE_INIT, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__DUMP_DEVICES_LATE, int id);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__UPDATE_INETSK, uint32_t family, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *ibdev, uint32_t kernel_driver_id);
 
 enum {
 	CR_PLUGIN_STAGE__DUMP,

@@ -32,9 +32,12 @@
  */
 
 #include "criu-log.h"
-#include "plugin.h"
+#include "criu-plugin.h"
+
+#include "images/rdma_criu.pb-c.h"
 
 #include <linux/mlx5_vfmig.h>
+#include <rdma/ib_user_ioctl_verbs.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -43,6 +46,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -182,5 +186,188 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 		vfmig_tracked_vf_count, vfmig_pf_count);
 }
 
+/*
+ * Resolve a /sys/.../device symlink under @sysfs_link_path to its
+ * basename (the PCI BDF the symlink points at). Caller-supplied
+ * @out is sized in @outsz. Returns 0 on success, -1 otherwise.
+ *
+ * Used to walk the chain
+ *   /sys/class/infiniband/<ibdev>/device   ->  VF BDF
+ *   /sys/bus/pci/devices/<vf>/physfn       ->  PF BDF
+ * needed to map an ibdev to its owning mlx5 PF cdev.
+ */
+static int resolve_pci_bdf_via_symlink(const char *sysfs_link_path,
+				       char *out, size_t outsz)
+{
+	char target[PATH_MAX];
+	const char *base;
+	ssize_t n;
+
+	n = readlink(sysfs_link_path, target, sizeof(target) - 1);
+	if (n <= 0)
+		return -1;
+	target[n] = '\0';
+	base = strrchr(target, '/');
+	snprintf(out, outsz, "%.*s", (int)(outsz - 1), base ? base + 1 : target);
+	return 0;
+}
+
+/*
+ * Map a VF's PCI BDF to its parent PF's vf_id (i.e. the index
+ * @virtfnN under the PF's pci_dev sysfs node). Returns the vf_id
+ * on success or -1 if no virtfn link matches @vf_bdf -- which is
+ * the expected outcome for any non-VF mlx5_core ibdev (PFs land
+ * here too) and is therefore not an error per se, just a "decline"
+ * signal back up the claim chain.
+ */
+static int find_vf_id_under_pf(const char *pf_bdf, const char *vf_bdf)
+{
+	char path[PATH_MAX];
+	struct dirent *de;
+	DIR *d;
+	int vf_id = -1;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s", pf_bdf);
+	d = opendir(path);
+	if (!d)
+		return -1;
+
+	while ((de = readdir(d)) != NULL) {
+		char vlpath[PATH_MAX], vlbase[64];
+
+		if (strncmp(de->d_name, "virtfn", 6) != 0)
+			continue;
+		if (snprintf(vlpath, sizeof(vlpath), "%s/%s", path,
+			     de->d_name) >= (int)sizeof(vlpath))
+			continue;
+		if (resolve_pci_bdf_via_symlink(vlpath, vlbase,
+						sizeof(vlbase)) != 0)
+			continue;
+		if (strcmp(vlbase, vf_bdf) == 0) {
+			vf_id = atoi(de->d_name + strlen("virtfn"));
+			break;
+		}
+	}
+
+	closedir(d);
+	return vf_id;
+}
+
+/*
+ * Per-context claim hook (CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT).
+ *
+ * The claim chain for a context backed by an mlx5_core ibdev:
+ *
+ *   1. Plugin must be active (init() found at least one tracked
+ *      VF on the host). If not, decline outright -- the dump-time
+ *      arbitration's "no claim" failure mode names every loaded
+ *      plugin so the operator gets a useful error.
+ *
+ *   2. Kernel driver must be RDMA_DRIVER_MLX5. mlx5_core ibdevs
+ *      are the only ones this plugin knows how to handle.
+ *
+ *   3. The ibdev's PCI device must have a /physfn link, i.e. it
+ *      must be a VF (not a PF). PFs are valid mlx5_core ibdevs
+ *      but vfmig deliberately operates only on VFs. Decline if
+ *      missing.
+ *
+ *   4. The VF must appear under the PF's virtfn<N> sysfs links
+ *      (we need vf_id to drive QUERY_VF). Fail closed if not -- a
+ *      missing virtfn link on a VF whose physfn we just resolved
+ *      is a sysfs inconsistency, not a "decline" condition.
+ *
+ *   5. /dev/mlx5_vfmig/<pf_bdf> must open. Same reasoning as (4):
+ *      if init() saw the cdev directory we expect the cdevs to
+ *      still be present at claim time. Failure here propagates
+ *      as a hard arbitration error.
+ *
+ *   6. MLX5_VFMIG_IOC_QUERY_VF on (pf_bdf, vf_id) must report
+ *      tracked=1. tracked=0 -> decline (the per-VF unmanaged
+ *      IOMMU domain isn't allocated, so SAVE/LOAD wouldn't
+ *      round-trip even if we accepted the dump).
+ *
+ * Returns RCD_MLX5_SRIOV_VFMIG on a successful claim, RCD_UNKNOWN
+ * on any decline (steps 1-3, 6), or a negative errno on the
+ * sysfs-inconsistency / open / ioctl failure cases (steps 4, 5).
+ */
+static int rdma_mlx5_vfmig_plugin_claim_uverbs_context(const char *ibdev,
+						       uint32_t kernel_driver_id)
+{
+	struct mlx5_vfmig_query_vf q;
+	char sysfs_path[PATH_MAX];
+	char cdev_path[PATH_MAX];
+	char vf_bdf[64], pf_bdf[64];
+	int vf_id, fd, rc;
+
+	if (!vfmig_active) {
+		pr_debug("claim(%s, kdrv=%u): plugin inactive, declining\n",
+			 ibdev, kernel_driver_id);
+		return RDMA_CRIU_DRIVER__RCD_UNKNOWN;
+	}
+	if (kernel_driver_id != RDMA_DRIVER_MLX5) {
+		pr_debug("claim(%s, kdrv=%u): not RDMA_DRIVER_MLX5 (%u), "
+			 "declining\n",
+			 ibdev, kernel_driver_id, (uint32_t)RDMA_DRIVER_MLX5);
+		return RDMA_CRIU_DRIVER__RCD_UNKNOWN;
+	}
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/class/infiniband/%s/device", ibdev);
+	if (resolve_pci_bdf_via_symlink(sysfs_path, vf_bdf, sizeof(vf_bdf))) {
+		pr_warn("claim(%s): cannot resolve VF BDF via %s\n", ibdev,
+			sysfs_path);
+		return -ENOENT;
+	}
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/bus/pci/devices/%s/physfn", vf_bdf);
+	if (resolve_pci_bdf_via_symlink(sysfs_path, pf_bdf, sizeof(pf_bdf))) {
+		pr_debug("claim(%s, vf_bdf=%s): no /physfn link, this is a "
+			 "PF or non-SR-IOV mlx5_core ibdev; declining\n",
+			 ibdev, vf_bdf);
+		return RDMA_CRIU_DRIVER__RCD_UNKNOWN;
+	}
+
+	vf_id = find_vf_id_under_pf(pf_bdf, vf_bdf);
+	if (vf_id < 0) {
+		pr_warn("claim(%s, vf_bdf=%s, pf_bdf=%s): no virtfnN link "
+			"under PF resolves to this VF -- sysfs inconsistency\n",
+			ibdev, vf_bdf, pf_bdf);
+		return -ENOENT;
+	}
+
+	snprintf(cdev_path, sizeof(cdev_path), "%s/%s", MLX5_VFMIG_DEV_DIR,
+		 pf_bdf);
+	fd = open(cdev_path, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		pr_warn("claim(%s): open(%s) failed: %s\n", ibdev, cdev_path,
+			strerror(errno));
+		return -errno;
+	}
+
+	memset(&q, 0, sizeof(q));
+	q.vf_id = vf_id;
+	rc = ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, &q);
+	close(fd);
+	if (rc != 0) {
+		pr_warn("claim(%s): QUERY_VF(vf_id=%d) on %s failed: %s\n",
+			ibdev, vf_id, cdev_path, strerror(errno));
+		return -errno;
+	}
+	if (!q.tracked) {
+		pr_info("claim(%s, vf_bdf=%s, pf=%s, vf_id=%d): VF not in "
+			"tracked mode, declining\n",
+			ibdev, vf_bdf, pf_bdf, vf_id);
+		return RDMA_CRIU_DRIVER__RCD_UNKNOWN;
+	}
+
+	pr_info("claim(%s, vf_bdf=%s, pf=%s, vf_id=%d): claiming as "
+		"RCD_MLX5_SRIOV_VFMIG\n",
+		ibdev, vf_bdf, pf_bdf, vf_id);
+	return RDMA_CRIU_DRIVER__RCD_MLX5_SRIOV_VFMIG;
+}
+
 CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init,
 		   rdma_mlx5_vfmig_plugin_fini)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
+			rdma_mlx5_vfmig_plugin_claim_uverbs_context)

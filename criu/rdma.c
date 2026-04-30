@@ -11,18 +11,21 @@
 #include <rdma/ib_user_ioctl_verbs.h>
 
 #include "common/compiler.h"
+#include "common/list.h"
 #include "imgset.h"
 #include "image.h"
 #include "files.h"
 #include "files-reg.h"
 #include "int.h"
 #include "log.h"
+#include "plugin.h"
 #include "protobuf.h"
 #include "rdma.h"
 #include "fdinfo.h"
 #include "xmalloc.h"
 
 #include "images/fdinfo.pb-c.h"
+#include "images/rdma_criu.pb-c.h"
 #include "images/uverbsfd.pb-c.h"
 
 #undef LOG_PREFIX
@@ -342,14 +345,77 @@ struct collect_image_info uverbsasyncevfd_cinfo = {
 	.collect = collect_one_uverbsasyncevfd,
 };
 
+/*
+ * Walk every plugin that registered the RDMA_CLAIM_UVERBS_CONTEXT
+ * hook and ask each one whether it claims the given uverbs context.
+ *
+ * Arbitration policy is exactly-one-claim:
+ *   - 0 plugins claim   -> RCD_UNKNOWN return, treated by caller as
+ *                          "no CRIU support for this device, fail
+ *                          dump (or fail restore -- same iterator
+ *                          runs in both directions)".
+ *   - 1 plugin claims   -> return that plugin's RdmaCriuDriver value;
+ *                          *claimer_name (if non-NULL) is set to the
+ *                          plugin's name for diagnostics.
+ *   - 2+ plugins claim  -> -EEXIST. The operator's plugin set is
+ *                          inconsistent (e.g. two plugins both think
+ *                          they own mlx5_core SAVE/LOAD) and we'd
+ *                          rather fail loudly than pick arbitrarily.
+ *   - any plugin fn returns < 0 -> propagated as a hard error
+ *                          (probe failure is distinct from "decline").
+ *
+ * Iterates the plugin list in registration order; that order is not
+ * stable across runs, hence no implicit "first wins" semantics.
+ */
+static int rdma_arbitrate_plugin_claim(const char *ibdev,
+				       uint32_t kernel_driver_id,
+				       const char **claimer_name)
+{
+	plugin_desc_t *this;
+	int winner = RDMA_CRIU_DRIVER__RCD_UNKNOWN;
+	const char *winner_name = NULL;
+
+	list_for_each_entry(this,
+		&cr_plugin_ctl.hook_chain[CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT],
+		link[CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT]) {
+		CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT_t *fn =
+			this->d->hooks[CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT];
+		int r = fn(ibdev, kernel_driver_id);
+
+		if (r < 0) {
+			pr_err("plugin '%s' claim() probe failed for ibdev=%s "
+			       "kdrv=%u: %d\n",
+			       this->d->name, ibdev, kernel_driver_id, r);
+			return r;
+		}
+		if (r == RDMA_CRIU_DRIVER__RCD_UNKNOWN)
+			continue;
+		if (winner != RDMA_CRIU_DRIVER__RCD_UNKNOWN) {
+			pr_err("RDMA plugin claim conflict on ibdev=%s: "
+			       "'%s' (rcd=%d) and '%s' (rcd=%d) both claim. "
+			       "Operator's plugin set is inconsistent.\n",
+			       ibdev, winner_name, winner,
+			       this->d->name, r);
+			return -EEXIST;
+		}
+		winner = r;
+		winner_name = this->d->name;
+	}
+
+	if (claimer_name)
+		*claimer_name = winner_name;
+	return winner;
+}
+
 static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 {
 	UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
 	FileEntry fe = FILE_ENTRY__INIT;
 	struct cr_img *img;
+	const char *claimer = NULL;
 	char ibdev[64];
 	char driver[64];
-	int ret = -1;
+	int rcd, ret = -1;
 
 	uve.id = id;
 
@@ -392,8 +458,37 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 		goto out;
 	}
 
-	pr_info("Dumping uverbs char device %d with id %#x ibdev=%s driver=%s id=%u",
-		lfd, id, ibdev, driver, uve.driver_id);
+	/*
+	 * Decide which CRIU plugin owns this context. Even if the kernel
+	 * driver is one we recognise, we still need a plugin loaded that
+	 * actually knows how to dump+restore it -- otherwise the image
+	 * we're about to write would be unrestorable on this very host,
+	 * never mind another one. Hard fail: better than silently
+	 * producing dead images.
+	 */
+	rcd = rdma_arbitrate_plugin_claim(ibdev, uve.driver_id, &claimer);
+	if (rcd < 0) {
+		pr_err("dump_uverbsfile: plugin arbitration failed for "
+		       "ibdev=%s driver=%s: %d\n",
+		       ibdev, driver, rcd);
+		goto out;
+	}
+	if (rcd == RDMA_CRIU_DRIVER__RCD_UNKNOWN) {
+		pr_err("dump_uverbsfile: no RDMA CRIU plugin claims "
+		       "ibdev=%s driver=%s (RDMA_DRIVER id=%u). Refusing "
+		       "to checkpoint a context that no plugin can "
+		       "restore. Load the appropriate plugin via "
+		       "CRIU_LIBS_DIR or install it into "
+		       "/usr/lib/criu/.\n",
+		       ibdev, driver, uve.driver_id);
+		goto out;
+	}
+	uve.criu_driver = rcd;
+	uve.has_criu_driver = true;
+
+	pr_info("Dumping uverbs char device %d with id %#x ibdev=%s driver=%s "
+		"id=%u claimed by plugin '%s' rcd=%d",
+		lfd, id, ibdev, driver, uve.driver_id, claimer, rcd);
 	if (uve.has_ctxn)
 		pr_info(" ctxn %u", uve.ctxn);
 	pr_info("\n");
@@ -442,6 +537,78 @@ ib_uverbs_get_context_ioctl(int cmd_fd, uint32_t driver_id)
 	return 0;
 }
 
+/*
+ * Restore-time counterpart of dump_uverbsfile()'s arbitration step.
+ *
+ * Re-runs the per-plugin claim() probe against the restoring host's
+ * loaded plugin set and confirms that the plugin which would claim
+ * this ibdev right now matches the one recorded in the image. This
+ * catches three classes of operator misconfiguration:
+ *
+ *   (a) image carries criu_driver=RCD_X but the destination has no
+ *       plugin loaded that returns RCD_X for this ibdev -- e.g.
+ *       missed installing rdma_rxe_plugin.so on the destination;
+ *
+ *   (b) destination has a *different* plugin claiming this ibdev
+ *       than the source did -- e.g. mlx5_core context dumped under
+ *       mlx5_sriov_vfmig but destination only has the future
+ *       fw-assisted-replay plugin loaded;
+ *
+ *   (c) destination's plugin set has the same ibdev but a stale
+ *       host-side gate (e.g. SET_TRACKED was never run on the
+ *       destination VF), so the plugin declines.
+ *
+ * In all three cases the restore must abort here, before we hand a
+ * cmd_fd to ib_uverbs_get_context_ioctl() that the kernel will
+ * happily accept but that no per-resource restore code will
+ * subsequently know how to populate.
+ */
+static int uverbsfd_validate_claim(const UverbsFileEntry *uvfe)
+{
+	const char *claimer = NULL;
+	int rcd;
+
+	if (!uvfe->has_criu_driver) {
+		pr_err("uverbsfd id %#x has no criu_driver in image; image "
+		       "predates plugin-claim arbitration. Re-dump with "
+		       "current criu.\n",
+		       uvfe->id);
+		return -1;
+	}
+
+	rcd = rdma_arbitrate_plugin_claim(uvfe->ib_dev ?: "?",
+					  uvfe->driver_id, &claimer);
+	if (rcd < 0) {
+		pr_err("uverbsfd id %#x: arbitration failed at restore: %d\n",
+		       uvfe->id, rcd);
+		return -1;
+	}
+	if (rcd == RDMA_CRIU_DRIVER__RCD_UNKNOWN) {
+		pr_err("uverbsfd id %#x: no RDMA plugin on this host "
+		       "claims ibdev=%s driver=%s. Image was dumped with "
+		       "criu_driver=%d; install the matching plugin "
+		       "before restoring.\n",
+		       uvfe->id, uvfe->ib_dev ?: "?",
+		       uvfe->driver_name ?: "?",
+		       (int)uvfe->criu_driver);
+		return -1;
+	}
+	if ((int)uvfe->criu_driver != rcd) {
+		pr_err("uverbsfd id %#x: image was dumped under "
+		       "criu_driver=%d but plugin '%s' (rcd=%d) claims "
+		       "ibdev=%s on this host. Refusing to silently swap "
+		       "plugins between dump and restore.\n",
+		       uvfe->id, (int)uvfe->criu_driver, claimer, rcd,
+		       uvfe->ib_dev ?: "?");
+		return -1;
+	}
+
+	pr_info("uverbsfd id %#x: restore claim OK (plugin '%s' rcd=%d "
+		"ibdev=%s)\n",
+		uvfe->id, claimer, rcd, uvfe->ib_dev ?: "?");
+	return 0;
+}
+
 static int uverbsfd_open(struct file_desc *d, int *new_fd)
 {
 	struct uverbsfd_file_info *ui;
@@ -463,6 +630,18 @@ static int uverbsfd_open(struct file_desc *d, int *new_fd)
 		return -1;
 	}
 	driver_id = ui->uvfe->driver_id;
+
+	/*
+	 * Confirm a plugin on this host claims the context before we
+	 * try the kernel ioctls. The actual per-plugin restore work
+	 * (PD/MR/CQ/QP recreate, mlx5 LOAD_VHCA_STATE, ...) lands in
+	 * later commits; this commit just gates the generic
+	 * GET_CONTEXT path on plugin coverage so an unsupported image
+	 * fails fast and loudly here rather than partially restoring
+	 * into an unusable context.
+	 */
+	if (uverbsfd_validate_claim(ui->uvfe))
+		return -1;
 
 	pr_info("Opening uverbsfd id %#x ibdev=%s driver=%s(%u) ctxn %u\n",
 		ui->uvfe->id,
