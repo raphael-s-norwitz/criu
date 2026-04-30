@@ -1,5 +1,11 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <rdma/rdma_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_verbs.h>
@@ -14,6 +20,7 @@
 #include "protobuf.h"
 #include "rdma.h"
 #include "fdinfo.h"
+#include "xmalloc.h"
 
 #include "images/fdinfo.pb-c.h"
 #include "images/uverbsfd.pb-c.h"
@@ -26,6 +33,146 @@
 
 /* FIXME: Probably replace with linked list or hasmap/xarray. */
 static u32 ctxn_uverbsfd_id_map[MAX_PROCESS_CONTEXTS];
+
+/*
+ * Read the entirety of a sysfs file into the caller's buffer, NUL-terminate,
+ * and trim a single trailing newline if present. Returns 0 on success, -1
+ * on any error. The caller-provided buffer must have room for the data plus
+ * a NUL byte.
+ */
+static int read_sysfs_file(const char *path, char *buf, size_t buflen)
+{
+	int fd, n;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, buflen - 1);
+	close(fd);
+	if (n < 0)
+		return -1;
+	buf[n] = '\0';
+	if (n > 0 && buf[n - 1] == '\n')
+		buf[n - 1] = '\0';
+	return 0;
+}
+
+/*
+ * Resolve the chrdev (major,minor) backing a uverbs cdev fd to its ibdev
+ * name (e.g. "rxe0", "mlx5_0") via /sys/dev/char/<maj>:<min>/ibdev. Works
+ * uniformly across PCI-backed and software-defined providers because the
+ * "ibdev" attribute is exposed by the kernel ib_uverbs class for every
+ * uverbs cdev. Result is written to @out (NUL-terminated). Returns 0 on
+ * success.
+ */
+static int rdma_ibdev_from_chrdev(unsigned int maj, unsigned int min,
+				  char *out, size_t outsz)
+{
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/ibdev", maj, min);
+	if (read_sysfs_file(path, out, outsz) < 0) {
+		pr_perror("Can't read %s", path);
+		return -1;
+	}
+	if (out[0] == '\0') {
+		pr_err("Empty ibdev name from %s\n", path);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Resolve an ibdev name to its backing kernel-module driver name (e.g.
+ * "mlx5_core", "rxe"). Strategy:
+ *   1. PCI-backed devices expose /sys/class/infiniband/<name>/device/driver
+ *      as a symlink whose basename is the driver module. This covers
+ *      mlx5/mlx4/bnxt_re/qedr/irdma/etc.
+ *   2. Software-defined providers (rxe, siw) have no PCI parent and no
+ *      such symlink. Fall back to a name-prefix mapping for the small set
+ *      of providers we explicitly support.
+ *
+ * Returns 0 on success with the driver name written to @out. Returns -1 if
+ * neither lookup yields a driver name -- callers should treat that as
+ * "unknown provider, fail dump."
+ */
+static int rdma_driver_name_from_ibdev(const char *ibdev,
+				       char *out, size_t outsz)
+{
+	char path[PATH_MAX];
+	char target[PATH_MAX];
+	const char *base;
+	ssize_t n;
+
+	snprintf(path, sizeof(path),
+		 "/sys/class/infiniband/%s/device/driver", ibdev);
+	n = readlink(path, target, sizeof(target) - 1);
+	if (n > 0) {
+		const char *src;
+
+		target[n] = '\0';
+		base = strrchr(target, '/');
+		src = base ? base + 1 : target;
+		/* width-bounded format so -Wformat-truncation is happy */
+		snprintf(out, outsz, "%.*s", (int)(outsz - 1), src);
+		return 0;
+	}
+
+	if (!strncmp(ibdev, "rxe", 3)) {
+		snprintf(out, outsz, "rxe");
+		return 0;
+	}
+	if (!strncmp(ibdev, "siw", 3)) {
+		snprintf(out, outsz, "siw");
+		return 0;
+	}
+
+	return -1;
+}
+
+/*
+ * Map a kernel-module driver name to the matching RDMA_DRIVER_* enum value
+ * the kernel UAPI uses. Returns RDMA_DRIVER_UNKNOWN for unrecognized names;
+ * dump_uverbsfile() treats that as a hard error so a checkpoint is never
+ * written that the restoring criu would have no provider for.
+ *
+ * When adding a new entry here, also extend rdma_driver_name_from_ibdev()
+ * if the new provider needs the name-prefix fallback (i.e. it is software-
+ * defined and has no PCI parent in sysfs).
+ */
+static uint32_t rdma_driver_name_to_id(const char *name)
+{
+	static const struct {
+		const char *name;
+		uint32_t id;
+	} map[] = {
+		{ "rxe",         RDMA_DRIVER_RXE },
+		{ "siw",         RDMA_DRIVER_SIW },
+		{ "mlx5_core",   RDMA_DRIVER_MLX5 },
+		{ "mlx4_core",   RDMA_DRIVER_MLX4 },
+		{ "bnxt_re",     RDMA_DRIVER_BNXT_RE },
+		{ "qedr",        RDMA_DRIVER_QEDR },
+		{ "irdma",       RDMA_DRIVER_IRDMA },
+		{ "i40iw",       RDMA_DRIVER_I40IW },
+		{ "hns_roce",    RDMA_DRIVER_HNS },
+		{ "ocrdma",      RDMA_DRIVER_OCRDMA },
+		{ "vmw_pvrdma",  RDMA_DRIVER_VMW_PVRDMA },
+		{ "iw_cxgb4",    RDMA_DRIVER_CXGB4 },
+		{ "iw_cxgb3",    RDMA_DRIVER_CXGB3 },
+		{ "ib_mthca",    RDMA_DRIVER_MTHCA },
+		{ "iw_nes",      RDMA_DRIVER_NES },
+		{ "usnic_verbs", RDMA_DRIVER_USNIC },
+		{ "efa",         RDMA_DRIVER_EFA },
+		{ "hfi1",        RDMA_DRIVER_HFI1 },
+		{ "qib",         RDMA_DRIVER_QIB },
+	};
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(map); i++)
+		if (!strcmp(name, map[i].name))
+			return map[i].id;
+	return RDMA_DRIVER_UNKNOWN;
+}
 
 bool is_async_eventfd(char *link)
 {
@@ -70,6 +217,16 @@ struct uverbsasyncevfd_file_info {
 	struct file_desc d;
 };
 
+/*
+ * Forward-declared here so uverbsasyncevfd_open() can container_of() back to
+ * the parent uverbs cdev's file_info to fish out its driver_id. The struct's
+ * full definition lives further down with the other uverbsfd plumbing.
+ */
+struct uverbsfd_file_info {
+	UverbsFileEntry *uvfe;
+	struct file_desc d;
+};
+
 static int
 ib_uverbs_alloc_async_event_fd_ioctl(int cmd_fd, uint32_t driver_id,
 				     int *async_fd_out)
@@ -104,8 +261,10 @@ ib_uverbs_alloc_async_event_fd_ioctl(int cmd_fd, uint32_t driver_id,
 static int uverbsasyncevfd_open(struct file_desc *d, int *new_fd)
 {
 	struct uverbsasyncevfd_file_info *ui;
+	struct uverbsfd_file_info *cmd_ui;
 	struct file_desc *cmd_fd_desc;
 	int async_fd = -1, cmd_fd, ret;
+	uint32_t driver_id;
 	u32 cmd_fd_id;
 
 	ui = container_of(d, struct uverbsasyncevfd_file_info, d);
@@ -126,20 +285,33 @@ static int uverbsasyncevfd_open(struct file_desc *d, int *new_fd)
 		return -1;
 	}
 
+	/*
+	 * driver_id is owned by the parent uverbs cdev's file_info; we
+	 * intentionally do not duplicate it on the async-ev entry. The
+	 * ctxn -> cmd_fd indirection above is the canonical lookup.
+	 */
+	cmd_ui = container_of(cmd_fd_desc, struct uverbsfd_file_info, d);
+	if (!cmd_ui->uvfe->has_driver_id) {
+		pr_err("Parent uverbsfd id %#x has no driver_id; image too "
+		       "old or produced by criu without RDMA driver detection.\n",
+		       cmd_fd_id);
+		return -1;
+	}
+	driver_id = cmd_ui->uvfe->driver_id;
 	cmd_fd = file_master(cmd_fd_desc)->fe->fd;
 
-	/* FIXME: Set correct driver_id */
-	ret = ib_uverbs_alloc_async_event_fd_ioctl(cmd_fd, RDMA_DRIVER_RXE, &async_fd);
+	ret = ib_uverbs_alloc_async_event_fd_ioctl(cmd_fd, driver_id,
+						   &async_fd);
 	if (ret) {
-		pr_info("asyncevfd alloc failed %s (%d) - cmd_fd %d id %#x ctxn %u\n",
-			strerror(-ret), ret, cmd_fd, ui->uvaefe->id,
+		pr_info("asyncevfd alloc failed %s (%d) - cmd_fd %d driver=%u id %#x ctxn %u\n",
+			strerror(-ret), ret, cmd_fd, driver_id, ui->uvaefe->id,
 			ui->uvaefe->has_ctxn ? ui->uvaefe->ctxn : 0);
 		return -1;
 	}
 
-	pr_info("Opened uverbs async ev fd id %#x ctxn %u with cmd_fd %d\n",
+	pr_info("Opened uverbs async ev fd id %#x ctxn %u with cmd_fd %d driver=%u\n",
 		ui->uvaefe->id, ui->uvaefe->has_ctxn ? ui->uvaefe->ctxn : 0,
-		cmd_fd);
+		cmd_fd, driver_id);
 
 	*new_fd = async_fd;
 	return 0;
@@ -175,6 +347,9 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
 	FileEntry fe = FILE_ENTRY__INIT;
 	struct cr_img *img;
+	char ibdev[64];
+	char driver[64];
+	int ret = -1;
 
 	uve.id = id;
 
@@ -184,19 +359,55 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	if (dump_one_reg_file(lfd, id, p))
 		return -1;
 
-	pr_info("Dumping uverbs char device %d with id %#x", lfd, id);
+	/*
+	 * Resolve the cdev to its ibdev and backing kernel driver. Both go
+	 * into the image so restore can pick the right RDMA_DRIVER_* without
+	 * inferring it (and so future per-provider plugins can claim the
+	 * context by driver name).
+	 */
+	if (rdma_ibdev_from_chrdev(major(p->stat.st_rdev),
+				   minor(p->stat.st_rdev),
+				   ibdev, sizeof(ibdev))) {
+		pr_err("Can't resolve ibdev for uverbs cdev %u:%u\n",
+		       major(p->stat.st_rdev), minor(p->stat.st_rdev));
+		goto out;
+	}
+	if (rdma_driver_name_from_ibdev(ibdev, driver, sizeof(driver))) {
+		pr_err("Can't resolve kernel driver for ibdev '%s'\n", ibdev);
+		goto out;
+	}
+
+	uve.ib_dev = xstrdup(ibdev);
+	uve.driver_name = xstrdup(driver);
+	if (!uve.ib_dev || !uve.driver_name)
+		goto out;
+
+	uve.driver_id = rdma_driver_name_to_id(driver);
+	uve.has_driver_id = true;
+	if (uve.driver_id == RDMA_DRIVER_UNKNOWN) {
+		pr_err("Unknown RDMA driver '%s' for ibdev '%s' (uverbs cdev %u:%u). "
+		       "Add a mapping to rdma_driver_name_to_id() in criu/rdma.c.\n",
+		       driver, ibdev,
+		       major(p->stat.st_rdev), minor(p->stat.st_rdev));
+		goto out;
+	}
+
+	pr_info("Dumping uverbs char device %d with id %#x ibdev=%s driver=%s id=%u",
+		lfd, id, ibdev, driver, uve.driver_id);
 	if (uve.has_ctxn)
 		pr_info(" ctxn %u", uve.ctxn);
 	pr_info("\n");
-
-	/* IB dev name, etc. */
 
 	fe.type = FD_TYPES__UVERBSFD;
 	fe.id = uve.id;
 	fe.uvfd = &uve;
 
 	img = img_from_set(glob_imgset, CR_FD_FILES);
-	return pb_write_one(img, &fe, PB_FILE);
+	ret = pb_write_one(img, &fe, PB_FILE);
+out:
+	xfree(uve.ib_dev);
+	xfree(uve.driver_name);
+	return ret;
 }
 
 const struct fdtype_ops uverbs_dump_ops = {
@@ -204,10 +415,7 @@ const struct fdtype_ops uverbs_dump_ops = {
 	.dump = dump_uverbsfile,
 };
 
-struct uverbsfd_file_info {
-	UverbsFileEntry *uvfe;
-	struct file_desc d;
-};
+/* struct uverbsfd_file_info is forward-declared near uverbsasyncevfd_open() */
 
 static int
 ib_uverbs_get_context_ioctl(int cmd_fd, uint32_t driver_id)
@@ -237,19 +445,37 @@ ib_uverbs_get_context_ioctl(int cmd_fd, uint32_t driver_id)
 static int uverbsfd_open(struct file_desc *d, int *new_fd)
 {
 	struct uverbsfd_file_info *ui;
+	uint32_t driver_id;
 	int fd, ret;
 
 	ui = container_of(d, struct uverbsfd_file_info, d);
 
-	pr_info("Opening uverbsfd id %#x ctxn %u\n", ui->uvfe->id,
+	/*
+	 * driver_id is mandatory in the image as of the rxe-hardcoding
+	 * removal. Older images without the field cannot be restored
+	 * (we explicitly chose not to carry backwards compatibility for
+	 * the in-flight rdma path).
+	 */
+	if (!ui->uvfe->has_driver_id) {
+		pr_err("uverbsfd id %#x has no driver_id; image too old or "
+		       "produced by criu without RDMA driver detection. "
+		       "Re-dump with current criu.\n", ui->uvfe->id);
+		return -1;
+	}
+	driver_id = ui->uvfe->driver_id;
+
+	pr_info("Opening uverbsfd id %#x ibdev=%s driver=%s(%u) ctxn %u\n",
+		ui->uvfe->id,
+		ui->uvfe->ib_dev ?: "?",
+		ui->uvfe->driver_name ?: "?",
+		driver_id,
 		ui->uvfe->has_ctxn ? ui->uvfe->ctxn : 0);
 
 	fd = open_reg_by_id(ui->uvfe->id);
 	if (fd < 0)
 		return -1;
 
-	// FIXME: Set correct driver_id
-	ret = ib_uverbs_get_context_ioctl(fd, RDMA_DRIVER_RXE);
+	ret = ib_uverbs_get_context_ioctl(fd, driver_id);
 	if (ret)
 		goto out_get_context;
 
