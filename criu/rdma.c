@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -757,7 +758,7 @@ static int dump_cov_cb(const struct rdma_nl_ctx_info *info, void *arg)
 
 	if (!pid_in_tree(cov->tree_pids, cov->n_tree_pids, info->pid)) {
 		pr_debug("ctx pid=%d ibdev=%s ctxn=%u outside snapshot tree, "
-			 "skipping (cross-tree check is a separate commit)\n",
+			 "skipping (handled by cross-tree exclusivity)\n",
 			 info->pid, info->ibdev, info->ctxn);
 		return 0;
 	}
@@ -865,4 +866,273 @@ int rdma_check_dump_coverage(struct pstree_item *root)
 		       cov.fail_reason);
 	}
 	return -1;
+}
+
+/*
+ * Cross-tree RDMA exclusivity check.
+ *
+ * The shape of the work:
+ *
+ *   1. One netlink pass collects every (pid, ibdev) tuple on the
+ *      host. We materialise all tuples up front rather than try to
+ *      do the analysis incrementally inside the iterator callback;
+ *      the analysis is "for ibdev D, is there an in-tree pid AND
+ *      an out-of-tree pid?", which is a join, not a stream filter.
+ *
+ *   2. Group tuples by ibdev. For each ibdev where any tree pid
+ *      holds a context, look at the non-tree pids on the same
+ *      ibdev (if any). For each such ibdev, ask the claiming
+ *      plugin's exclusivity policy via dlsym of
+ *      CR_PLUGIN_RDMA_SHARING_POLICY_SYM ("cr_rdma_sharing_policy"
+ *      const int) on the plugin's dlhandle.
+ *
+ *   3. If the plugin is EXCLUSIVE (or doesn't declare a policy --
+ *      safe default), fail with an actionable error naming both
+ *      the in-tree and out-of-tree pids and pointing the operator
+ *      at the offending non-snapshot process they need to deal
+ *      with first.
+ *
+ *   4. There is a small TOCTOU window between this check and the
+ *      eventual restore (or even between this check and SIGSTOP):
+ *      a non-tree process could open a fresh context after we
+ *      look. A future "freeze the RDMA subsystem to new uverbs
+ *      opens" locking API will close that window; for now we
+ *      document and accept it -- the same window already exists
+ *      for the per-fd dump path's sysfs probes, so the
+ *      cross-tree check isn't introducing a new class of race,
+ *      just inheriting an existing one.
+ */
+
+#define CROSS_TREE_TUPLE_CAP 256
+struct cross_tree_tuple {
+	pid_t pid;
+	char ibdev[64];
+};
+
+struct cross_tree_collect_ctx {
+	const pid_t *tree_pids;
+	size_t n_tree_pids;
+	struct cross_tree_tuple *tuples;
+	size_t n_tuples;
+	size_t cap;
+	int oom;
+};
+
+static int cross_tree_collect_cb(const struct rdma_nl_ctx_info *info,
+				 void *arg)
+{
+	struct cross_tree_collect_ctx *cc = arg;
+	struct cross_tree_tuple *t;
+
+	if (cc->n_tuples >= cc->cap) {
+		size_t newcap = cc->cap ? cc->cap * 2 : CROSS_TREE_TUPLE_CAP;
+		struct cross_tree_tuple *nt;
+
+		nt = xrealloc(cc->tuples,
+			      newcap * sizeof(struct cross_tree_tuple));
+		if (!nt) {
+			cc->oom = 1;
+			return -ENOMEM;
+		}
+		cc->tuples = nt;
+		cc->cap = newcap;
+	}
+
+	t = &cc->tuples[cc->n_tuples++];
+	t->pid = info->pid;
+	snprintf(t->ibdev, sizeof(t->ibdev), "%.*s",
+		 (int)(sizeof(t->ibdev) - 1), info->ibdev);
+	return 0;
+}
+
+/*
+ * Look up the per-plugin RDMA sharing policy by walking the loaded
+ * plugin list, matching by name (the arbitration helper already gave
+ * us the claimer's name, and that's the most stable identity we have
+ * across both the hook chain and the dlhandle list).
+ *
+ * Returns CR_RDMA_SHARING_EXCLUSIVE if:
+ *   - The plugin can't be located (shouldn't happen post-arbitration)
+ *   - The plugin doesn't export the symbol
+ *   - The symbol's value is not a recognised enum value
+ *
+ * That's deliberate: every "I don't know" path should fail closed.
+ */
+static int rdma_plugin_sharing_policy_by_name(const char *plugin_name)
+{
+	plugin_desc_t *this;
+
+	if (!plugin_name)
+		return CR_RDMA_SHARING_EXCLUSIVE;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->d->name)
+			continue;
+		if (strcmp(this->d->name, plugin_name) != 0)
+			continue;
+		if (!this->dlhandle)
+			return CR_RDMA_SHARING_EXCLUSIVE;
+		p = (const int *)dlsym(this->dlhandle,
+				       CR_PLUGIN_RDMA_SHARING_POLICY_SYM);
+		if (!p) {
+			pr_debug("plugin '%s' does not export %s; "
+				 "defaulting to EXCLUSIVE\n",
+				 plugin_name,
+				 CR_PLUGIN_RDMA_SHARING_POLICY_SYM);
+			return CR_RDMA_SHARING_EXCLUSIVE;
+		}
+		if (*p != CR_RDMA_SHARING_SHAREABLE &&
+		    *p != CR_RDMA_SHARING_EXCLUSIVE) {
+			pr_warn("plugin '%s' %s = %d is not a recognised "
+				"enum value; defaulting to EXCLUSIVE\n",
+				plugin_name,
+				CR_PLUGIN_RDMA_SHARING_POLICY_SYM, *p);
+			return CR_RDMA_SHARING_EXCLUSIVE;
+		}
+		return *p;
+	}
+	pr_debug("plugin '%s' not found in loaded list; defaulting "
+		 "to EXCLUSIVE\n", plugin_name);
+	return CR_RDMA_SHARING_EXCLUSIVE;
+}
+
+static bool tuple_pid_in_tree(const struct cross_tree_collect_ctx *cc,
+			      pid_t pid)
+{
+	size_t i;
+	for (i = 0; i < cc->n_tree_pids; i++)
+		if (cc->tree_pids[i] == pid)
+			return true;
+	return false;
+}
+
+int rdma_check_cross_tree_exclusivity(struct pstree_item *root)
+{
+	struct cross_tree_collect_ctx cc = { 0 };
+	struct pstree_item *item;
+	pid_t *pids;
+	size_t n = 0, cap = 0;
+	int ret;
+	size_t i, j;
+
+	if (!root)
+		return 0;
+
+	for_each_pstree_item(item)
+		cap++;
+
+	if (cap == 0)
+		return 0;
+
+	pids = xmalloc(cap * sizeof(pid_t));
+	if (!pids)
+		return -1;
+
+	for_each_pstree_item(item)
+		pids[n++] = item->pid->real;
+
+	cc.tree_pids = pids;
+	cc.n_tree_pids = n;
+
+	ret = rdma_nl_for_each_context(cross_tree_collect_cb, &cc);
+	if (ret < 0 || cc.oom) {
+		pr_err("cross-tree RDMA exclusivity check failed at "
+		       "netlink layer (%d). Failing closed.\n", ret);
+		xfree(pids);
+		xfree(cc.tuples);
+		return -1;
+	}
+
+	pr_debug("cross-tree exclusivity: %zu (pid, ibdev) tuple(s) on host, "
+		 "%zu pid(s) in snapshot tree\n", cc.n_tuples, n);
+
+	/*
+	 * O(N^2) over collected tuples. Real systems have a handful of
+	 * ibdevs and at most low hundreds of contexts; not worth a
+	 * proper hashmap until we see this in a profile.
+	 */
+	ret = 0;
+	for (i = 0; i < cc.n_tuples && ret == 0; i++) {
+		struct cross_tree_tuple *ti = &cc.tuples[i];
+		const char *claimer = NULL;
+		uint32_t kdrv;
+		char driver[64];
+		int policy;
+		int rcd;
+
+		if (!tuple_pid_in_tree(&cc, ti->pid))
+			continue;
+
+		for (j = 0; j < cc.n_tuples; j++) {
+			struct cross_tree_tuple *tj = &cc.tuples[j];
+
+			if (i == j)
+				continue;
+			if (strcmp(ti->ibdev, tj->ibdev) != 0)
+				continue;
+			if (tuple_pid_in_tree(&cc, tj->pid))
+				continue;
+
+			/*
+			 * (ti->pid in tree) holds a context on ibdev,
+			 * (tj->pid not in tree) also holds a context on
+			 * the same ibdev. Ask the claiming plugin if
+			 * that's a problem.
+			 */
+			if (rdma_driver_name_from_ibdev(ti->ibdev, driver,
+							sizeof(driver))) {
+				pr_err("cross-tree exclusivity: cannot "
+				       "resolve driver for ibdev=%s\n",
+				       ti->ibdev);
+				ret = -1;
+				break;
+			}
+			kdrv = rdma_driver_name_to_id(driver);
+			rcd = rdma_arbitrate_plugin_claim(ti->ibdev, kdrv,
+							  &claimer);
+			if (rcd < 0 || rcd == 0) {
+				/*
+				 * Coverage check should have rejected this
+				 * already. Treat as a hard failure -- if we
+				 * got here something racy happened.
+				 */
+				pr_err("cross-tree exclusivity: ibdev=%s "
+				       "lost its claim between coverage and "
+				       "exclusivity checks (rcd=%d)\n",
+				       ti->ibdev, rcd);
+				ret = -1;
+				break;
+			}
+
+			policy = rdma_plugin_sharing_policy_by_name(claimer);
+			if (policy == CR_RDMA_SHARING_SHAREABLE) {
+				pr_debug("cross-tree exclusivity: ibdev=%s "
+					 "shared between in-tree pid %d and "
+					 "out-of-tree pid %d, but plugin "
+					 "'%s' is SHAREABLE -- OK\n",
+					 ti->ibdev, ti->pid, tj->pid,
+					 claimer);
+				continue;
+			}
+
+			pr_err("cross-tree RDMA exclusivity: in-tree pid %d "
+			       "and out-of-tree pid %d both hold contexts on "
+			       "ibdev=%s, and the claiming plugin '%s' marks "
+			       "this device EXCLUSIVE. Snapshotting and "
+			       "restoring would destroy pid %d's context. "
+			       "Either include pid %d in the snapshot, stop "
+			       "it before dumping, or switch the device's "
+			       "claiming plugin to a sharing-aware one.\n",
+			       ti->pid, tj->pid, ti->ibdev, claimer,
+			       tj->pid, tj->pid);
+			ret = -1;
+			break;
+		}
+	}
+
+	xfree(pids);
+	xfree(cc.tuples);
+	return ret;
 }

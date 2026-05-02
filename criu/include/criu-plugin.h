@@ -117,6 +117,49 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__DUMP_DEVICES_LATE, int id);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__UPDATE_INETSK, uint32_t family, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *ibdev, uint32_t kernel_driver_id);
 
+/*
+ * RDMA sharing policy.
+ *
+ * RDMA-class plugins SHOULD export a const int symbol named
+ *   "cr_rdma_sharing_policy"
+ * with one of the values below, telling criu whether snapshotting
+ * (and later restoring) one process's contexts on a device this
+ * plugin owns is safe in the presence of other, non-snapshot-tree
+ * processes that also hold contexts on the same device.
+ *
+ *   CR_RDMA_SHARING_SHAREABLE  (= 0)
+ *       Per-context state is fully isolated. Snapshotting one
+ *       owner's context on device D and restoring it elsewhere
+ *       does not perturb other live owners of device D on this
+ *       host. Soft-RoCE (rxe) is the canonical example: rxe is
+ *       a software provider whose per-uverbs-context state lives
+ *       in the kernel module's per-fd objects, not in shared
+ *       device-wide registers.
+ *
+ *   CR_RDMA_SHARING_EXCLUSIVE  (= 1)
+ *       Snapshot+restore of any context on device D implies
+ *       reconfiguring shared device-wide state. Other live owners
+ *       of D would lose access. mlx5 SR-IOV VF migration is the
+ *       canonical example: vfmig snapshots and restores the
+ *       entire VF as one unit, and any non-snapshot context on
+ *       that VF is destroyed by the restore.
+ *
+ * If a plugin does not export this symbol, criu treats it as
+ * EXCLUSIVE -- safe default. Cross-tree exclusivity check (see
+ * criu/rdma.c) hard-fails the dump if it finds a non-snapshot-tree
+ * pid holding a context on a device that any snapshot-tree pid
+ * also uses, when the claiming plugin's policy is EXCLUSIVE.
+ */
+enum {
+	CR_RDMA_SHARING_SHAREABLE = 0,
+	CR_RDMA_SHARING_EXCLUSIVE = 1,
+};
+
+#define CR_PLUGIN_RDMA_SHARING_POLICY_SYM "cr_rdma_sharing_policy"
+
+#define CR_PLUGIN_DECLARE_RDMA_SHARING(__value) \
+	const int cr_rdma_sharing_policy = (__value)
+
 enum {
 	CR_PLUGIN_STAGE__DUMP,
 	CR_PLUGIN_STAGE__PRE_DUMP,

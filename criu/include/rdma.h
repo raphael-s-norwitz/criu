@@ -37,6 +37,29 @@ bool is_async_eventfd(char *link);
 int rdma_check_dump_coverage(struct pstree_item *root);
 
 /*
+ * Cross-tree RDMA exclusivity check.
+ *
+ * Companion to rdma_check_dump_coverage(). Where coverage asks
+ * "is every snapshot-tree context handled by some plugin?", this
+ * one asks "for every snapshot-tree context, is there a non-
+ * snapshot-tree pid sharing the same device, and does the
+ * claiming plugin's exclusivity policy say that's a problem?".
+ *
+ * A non-snapshot pid sharing a device is fine when the claiming
+ * plugin marks itself CR_RDMA_SHARING_SHAREABLE (rxe and other
+ * software providers fit this); it's a hard dump failure when
+ * the plugin marks itself CR_RDMA_SHARING_EXCLUSIVE (mlx5
+ * SR-IOV VF migration, where any non-snapshot context on the
+ * tracked VF is destroyed by the eventual restore). The default
+ * for plugins that don't declare a policy is EXCLUSIVE -- safe
+ * default, fail-closed.
+ *
+ * Runs after rdma_check_dump_coverage() so we already know every
+ * snapshot-tree context has exactly one claiming plugin to ask.
+ */
+int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
+
+/*
  * Internal-but-shared helpers used by both criu/rdma.c and the
  * pre-suspend coverage check above. Defined in criu/rdma.c.
  *

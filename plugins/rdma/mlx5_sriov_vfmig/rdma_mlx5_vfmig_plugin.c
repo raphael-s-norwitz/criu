@@ -371,3 +371,27 @@ CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init,
 		   rdma_mlx5_vfmig_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
 			rdma_mlx5_vfmig_plugin_claim_uverbs_context)
+
+/*
+ * RDMA sharing policy: EXCLUSIVE.
+ *
+ * mlx5 SR-IOV VF migration snapshots and restores the entire VF as
+ * one atomic unit (the QUERY_VF / SAVE_VF / LOAD_VF ioctls all
+ * operate at VF granularity, not per-uverbs-context). Any context
+ * any other process holds on the same VF will be invalidated by
+ * the eventual LOAD_VF on the destination -- the device-side state
+ * (queue pairs, completion queues, memory keys) gets fully replaced
+ * with the snapshot, so by the time the restored process resumes
+ * the cohabiting process's hardware-backed handles point at stale
+ * or freed objects.
+ *
+ * Cross-tree exclusivity check (criu/rdma.c) consults this to
+ * refuse a dump in which the snapshot tree shares a tracked VF
+ * with any pid not in the snapshot. The operator's options at that
+ * point are: include the cohabiting pid in the snapshot, stop it
+ * before dumping, or, if they really know what they're doing,
+ * detach its uverbs context first. EXCLUSIVE is also what we'd
+ * default to anyway if this declaration were missing -- we
+ * declare it explicitly so future maintainers see the intent.
+ */
+CR_PLUGIN_DECLARE_RDMA_SHARING(CR_RDMA_SHARING_EXCLUSIVE);

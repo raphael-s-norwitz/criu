@@ -216,3 +216,22 @@ CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
 			rdma_rxe_plugin_claim_uverbs_context)
+
+/*
+ * RDMA sharing policy: SHAREABLE.
+ *
+ * rxe is a software provider whose per-uverbs-context state lives
+ * entirely inside the kernel module's per-fd objects (uobjs, GIDs,
+ * QP numbers etc.). Snapshotting and restoring one process's context
+ * on rxe<N> does not touch the kernel state of any other live owner
+ * of rxe<N>: there is no shared device-wide register file to
+ * reconfigure, no firmware to flash, no DMA mappings to invalidate.
+ *
+ * Concretely: cross-tree exclusivity check (criu/rdma.c) will see
+ * other pids holding rxe<N> contexts and skip them on the strength
+ * of this declaration. Without this, the safe default would be
+ * EXCLUSIVE and we would refuse to dump any rxe-using process while
+ * another rxe-using process exists on the same ibdev -- which is
+ * the wrong call for a software provider.
+ */
+CR_PLUGIN_DECLARE_RDMA_SHARING(CR_RDMA_SHARING_SHAREABLE);
