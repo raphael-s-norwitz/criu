@@ -8,10 +8,26 @@
  * context, so a single ibv_open_device exercises both code paths in
  * criu/rdma.c (uverbsfd + uverbsasyncevfd).
  *
- * Then blocks until SIGTERM. SIGUSR1 re-queries the device and writes
- * "OK" or "FAIL: ..." to the status file given on the command line.
- * The runner script uses SIGUSR1 after restore to confirm the context
- * is still functional.
+ * Then allocates a Protection Domain (PD) and holds it. On SIGUSR1
+ * (sent by the runner script after restore) it does three things in
+ * order, and writes the first failure -- or "OK" -- to the status
+ * file:
+ *
+ *   1. ibv_query_device on the restored ibv_context. Confirms the
+ *      cdev fd + ucontext were re-established.
+ *
+ *   2. ibv_dealloc_pd on the *pre-dump* PD. This is the strict test:
+ *      the kernel uobject behind the PD must have survived the
+ *      cdev-close-and-reopen that the dump path performs. Today, in
+ *      the absence of full uobject-state preservation, this is
+ *      expected to fail; it's the regression test that turns green
+ *      when uobject save/replay lands.
+ *
+ *   3. ibv_alloc_pd + ibv_dealloc_pd of a *fresh* PD. Confirms the
+ *      restored ucontext can still issue commands to the kernel,
+ *      independent of whether step 2 worked.
+ *
+ * Then blocks until SIGTERM.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -24,6 +40,7 @@
 #include <infiniband/verbs.h>
 
 static struct ibv_context *g_ctx;
+static struct ibv_pd *g_pd;
 static const char *g_status_path;
 static volatile sig_atomic_t g_terminate;
 static volatile sig_atomic_t g_query;
@@ -43,6 +60,69 @@ static void write_status(const char *line)
 	fputs(line, f);
 	fputc('\n', f);
 	fclose(f);
+}
+
+/*
+ * Run the post-restore checks. Writes the first failure verbatim
+ * to the status file and returns; if everything passes, writes "OK".
+ */
+static void run_post_restore_checks(void)
+{
+	struct ibv_device_attr a;
+	struct ibv_pd *fresh;
+	char msg[256];
+	int rc;
+
+	if (ibv_query_device(g_ctx, &a)) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: ibv_query_device after restore: %s",
+			 strerror(errno));
+		write_status(msg);
+		return;
+	}
+
+	/*
+	 * Strict: the pre-dump PD's kernel uobject must still exist.
+	 * If dealloc returns nonzero we've found the seam where
+	 * uobject state is lost across the dump.
+	 */
+	if (g_pd) {
+		rc = ibv_dealloc_pd(g_pd);
+		if (rc != 0) {
+			snprintf(msg, sizeof(msg),
+				 "FAIL: ibv_dealloc_pd of pre-dump PD "
+				 "returned %d (%s) -- pre-dump uobject "
+				 "did not survive restore",
+				 rc, strerror(rc));
+			write_status(msg);
+			return;
+		}
+		g_pd = NULL;
+	}
+
+	/*
+	 * Fresh PD allocation proves the restored ucontext is still
+	 * a functional handle for new kernel commands, even if the
+	 * pre-dump uobject went away.
+	 */
+	fresh = ibv_alloc_pd(g_ctx);
+	if (!fresh) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: ibv_alloc_pd post-restore: %s",
+			 strerror(errno));
+		write_status(msg);
+		return;
+	}
+	rc = ibv_dealloc_pd(fresh);
+	if (rc != 0) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: ibv_dealloc_pd of fresh PD returned "
+			 "%d (%s)", rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+
+	write_status("OK");
 }
 
 int main(int argc, char **argv)
@@ -83,7 +163,14 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	if (ibv_query_device(g_ctx, &attr)) {
-		fprintf(stderr, "ibv_query_device baseline: %s\n", strerror(errno));
+		fprintf(stderr, "ibv_query_device baseline: %s\n",
+			strerror(errno));
+		return 2;
+	}
+
+	g_pd = ibv_alloc_pd(g_ctx);
+	if (!g_pd) {
+		fprintf(stderr, "ibv_alloc_pd baseline: %s\n", strerror(errno));
 		return 2;
 	}
 
@@ -91,24 +178,21 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_sigterm);
 	signal(SIGUSR1, on_sigusr1);
 
-	printf("READY pid=%d ctx=%s async_fd=%d\n",
-	       getpid(), devname, g_ctx->async_fd);
+	printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u\n",
+	       getpid(), devname, g_ctx->async_fd, g_pd->handle);
 	fflush(stdout);
 	write_status("READY");
 
 	while (!g_terminate) {
 		if (g_query) {
-			struct ibv_device_attr a;
-
 			g_query = 0;
-			if (ibv_query_device(g_ctx, &a))
-				write_status("FAIL: ibv_query_device after signal");
-			else
-				write_status("OK");
+			run_post_restore_checks();
 		}
 		pause();
 	}
 
+	if (g_pd)
+		ibv_dealloc_pd(g_pd);
 	ibv_close_device(g_ctx);
 	return 0;
 }

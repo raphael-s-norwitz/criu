@@ -138,6 +138,16 @@ echo "post-restore status: $RESULT"
 
 if [[ "$RESULT" != "OK" ]]; then
 	echo "FAIL"
+	# 'FAIL: ibv_dealloc_pd of pre-dump PD' is the canonical
+	# "kernel uobject state was not preserved across the cdev dump"
+	# signal -- distinct from a real regression. The test goes
+	# green when uobject save/replay lands; until then this is the
+	# regression-test fixture for that work.
+	case "$RESULT" in
+	"FAIL: ibv_dealloc_pd of pre-dump PD"*)
+		echo "(known PD-uobject preservation gap; not a regression)" >&2
+		;;
+	esac
 	echo "--- dump log tail ---" >&2
 	tail -80 "$DUMPDIR/dump.log" >&2 || true
 	echo "--- restore log tail ---" >&2
