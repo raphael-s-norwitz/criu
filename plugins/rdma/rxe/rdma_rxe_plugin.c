@@ -32,10 +32,12 @@
 #include "criu-plugin.h"
 
 #include "images/rdma_criu.pb-c.h"
+#include "images/uverbsfd.pb-c.h"
 
 #include <rdma/ib_user_ioctl_verbs.h>
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -212,10 +214,137 @@ static int rdma_rxe_plugin_claim_uverbs_context(const char *ibdev,
 	return RDMA_CRIU_DRIVER__RCD_RXE;
 }
 
+#define IB_UVERBS_CLASS_DIR "/sys/class/infiniband_verbs"
+
+/*
+ * Read a small sysfs file into @buf, NUL-terminate, strip a single
+ * trailing newline. Returns >=0 (bytes read) on success, -1 on
+ * any I/O error. @buflen must include space for the NUL.
+ */
+static int rxe_read_sysfs(const char *path, char *buf, size_t buflen)
+{
+	int fd, n;
+
+	if (buflen == 0)
+		return -1;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, buflen - 1);
+	close(fd);
+	if (n < 0)
+		return -1;
+	buf[n] = '\0';
+	if (n > 0 && buf[n - 1] == '\n')
+		buf[--n] = '\0';
+	return n;
+}
+
+/*
+ * Restore-side per-context cdev open
+ * (CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV).
+ *
+ * The image's reg_file_entry carries the source's cdev path,
+ * e.g. "/dev/infiniband/uverbs5". On the destination the same
+ * ibdev name (e.g. "rxe0") may be at a different minor: the
+ * kernel ib_uverbs class assigns minors in probe order, and probe
+ * order is not stable across boots, hosts, or rdma_link
+ * add/delete churn. The authoritative reverse-mapping (ibdev name
+ * -> cdev) is kept under /sys/class/infiniband_verbs/uverbsN/
+ * ibdev: each uverbs cdev exposes a one-line file naming the
+ * ibdev it serves. Walking that directory and matching on the
+ * recorded ib_dev string gives us the *current* destination cdev
+ * regardless of minor drift.
+ *
+ * Note we deliberately do NOT use /sys/class/infiniband/<ibdev>/
+ * for this reverse lookup: that subtree describes the InfiniBand
+ * device class itself and does not expose a 'dev' file -- only
+ * /sys/class/infiniband_verbs/ does, because the cdev *is* a
+ * member of the infiniband_verbs class.
+ *
+ * For rxe specifically there is no further work to do at restore
+ * time -- soft-RoCE is a software provider, the destination
+ * ibdev is assumed to already exist (the orchestrator/operator
+ * has run `rdma link add rxe0 ...`), and its uverbs cdev is just
+ * the matching /dev/infiniband/uverbsN node.
+ */
+static int rdma_rxe_plugin_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe)
+{
+	const UverbsFileEntry *u = (const UverbsFileEntry *)uvfe;
+	char path[PATH_MAX], ibdev[64], cdevpath[PATH_MAX];
+	struct dirent *de;
+	DIR *d;
+	int fd = -1;
+	bool found = false;
+
+	if (!u->ib_dev || u->ib_dev[0] == '\0') {
+		pr_err("open_uverbs_cdev: image record missing ib_dev "
+		       "(uvfe id %#x); cannot resolve cdev\n", u->id);
+		return -1;
+	}
+
+	d = opendir(IB_UVERBS_CLASS_DIR);
+	if (!d) {
+		pr_perror("open_uverbs_cdev: opendir(%s)",
+			  IB_UVERBS_CLASS_DIR);
+		return -1;
+	}
+
+	while ((de = readdir(d)) != NULL) {
+		if (strncmp(de->d_name, "uverbs", 6) != 0)
+			continue;
+
+		snprintf(path, sizeof(path), "%s/%s/ibdev",
+			 IB_UVERBS_CLASS_DIR, de->d_name);
+		if (rxe_read_sysfs(path, ibdev, sizeof(ibdev)) < 0)
+			continue;
+		if (strcmp(ibdev, u->ib_dev) != 0)
+			continue;
+
+		snprintf(cdevpath, sizeof(cdevpath), "/dev/infiniband/%s",
+			 de->d_name);
+		fd = open(cdevpath, O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			pr_perror("open_uverbs_cdev: open(%s) for ibdev=%s",
+				  cdevpath, u->ib_dev);
+			closedir(d);
+			return -1;
+		}
+		pr_info("open_uverbs_cdev: ibdev=%s -> %s (fd=%d)\n",
+			u->ib_dev, cdevpath, fd);
+		found = true;
+		break;
+	}
+	closedir(d);
+
+	if (!found) {
+		pr_err("open_uverbs_cdev: ibdev '%s' not found among "
+		       "%s/uverbs* -- the destination is missing the "
+		       "source's ibdev. For rxe: "
+		       "`rdma link add %s type rxe netdev <iface>`.\n",
+		       u->ib_dev, IB_UVERBS_CLASS_DIR, u->ib_dev);
+		return -1;
+	}
+	return fd;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
 			rdma_rxe_plugin_claim_uverbs_context)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV,
+			rdma_rxe_plugin_open_uverbs_cdev)
+
+/*
+ * RDMA provided driver: RCD_RXE.
+ *
+ * Tells the restore-side dispatcher in criu/rdma.c
+ * (rdma_dispatch_open_uverbs_cdev) that this plugin is the one to
+ * call when the image's UverbsFileEntry.criu_driver names
+ * RCD_RXE. Symmetric with the RCD_RXE return value of
+ * rdma_rxe_plugin_claim_uverbs_context() above.
+ */
+CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER(RDMA_CRIU_DRIVER__RCD_RXE);
 
 /*
  * RDMA sharing policy: SHAREABLE.

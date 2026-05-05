@@ -612,6 +612,99 @@ static int uverbsfd_validate_claim(const UverbsFileEntry *uvfe)
 	return 0;
 }
 
+/*
+ * Walk the loaded plugin list and dispatch the OPEN_UVERBS_CDEV
+ * hook to the single plugin whose cr_rdma_provided_driver constant
+ * matches uvfe->criu_driver. Mirrors rdma_plugin_sharing_policy_by_
+ * name() in shape: name-keyed walk over cr_plugin_ctl.head, dlsym
+ * the well-known per-plugin constant from the dlhandle, compare,
+ * dispatch.
+ *
+ * Why dispatch by image-recorded criu_driver rather than by plugin
+ * registration order:
+ *   The hook chain
+ *   cr_plugin_ctl.hook_chain[CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV]
+ *   contains every plugin that registered the hook -- i.e. all of
+ *   them, in unspecified order. A blind list_for_each that called
+ *   the first plugin would happily hand an mlx5 cdev to the rxe
+ *   plugin (or vice versa) on a host where both .so files are
+ *   loaded. Keying by criu_driver is the same arbitration
+ *   guarantee CLAIM enforces at dump-time, replayed on the open
+ *   side: exactly one plugin matches, and that plugin owns the
+ *   open.
+ *
+ * Failure modes:
+ *   - No plugin exports cr_rdma_provided_driver matching
+ *     uvfe->criu_driver: hard fail. Image was dumped against a
+ *     plugin that isn't present on this host -- the restore-time
+ *     CLAIM validation in uverbsfd_validate_claim() should have
+ *     caught this already, but defending in depth is cheap.
+ *   - Multiple plugins match: hard fail with a diagnostic.
+ *     Operator's plugin set is inconsistent (two .so files both
+ *     declare the same provided-driver), and we cannot know which
+ *     one the image was dumped against. Same posture as the
+ *     dump-time exactly-one-claims policy.
+ *   - The matching plugin's hook returns -1: propagate -1; the
+ *     plugin is responsible for its own pr_err.
+ */
+int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+	const char *winner_name = NULL;
+	CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV_t *fn;
+
+	if (!uvfe->has_criu_driver) {
+		pr_err("uverbsfd id %#x: no criu_driver in image; cannot "
+		       "dispatch OPEN_UVERBS_CDEV. Image too old.\n",
+		       uvfe->id);
+		return -1;
+	}
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		if (!this->d->hooks[CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV])
+			continue;
+		p = (const int *)dlsym(this->dlhandle,
+				       CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != uvfe->criu_driver)
+			continue;
+
+		if (winner) {
+			pr_err("uverbsfd id %#x: multiple plugins declare "
+			       "cr_rdma_provided_driver=%d ('%s' and '%s'); "
+			       "operator's plugin set is inconsistent.\n",
+			       uvfe->id, (int)uvfe->criu_driver,
+			       winner_name, this->d->name);
+			return -1;
+		}
+		winner = this;
+		winner_name = this->d->name;
+	}
+
+	if (!winner) {
+		pr_err("uverbsfd id %#x: no loaded RDMA plugin exports "
+		       "cr_rdma_provided_driver=%d for ibdev=%s. Restore "
+		       "cannot proceed without a plugin to open the "
+		       "destination cdev.\n",
+		       uvfe->id, (int)uvfe->criu_driver,
+		       uvfe->ib_dev ?: "?");
+		return -1;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV];
+	pr_debug("uverbsfd id %#x: dispatching OPEN_UVERBS_CDEV to "
+		 "plugin '%s' (criu_driver=%d ibdev=%s)\n",
+		 uvfe->id, winner_name, (int)uvfe->criu_driver,
+		 uvfe->ib_dev ?: "?");
+	return fn(uvfe);
+}
+
 static int uverbsfd_open(struct file_desc *d, int *new_fd)
 {
 	struct uverbsfd_file_info *ui;
@@ -653,7 +746,21 @@ static int uverbsfd_open(struct file_desc *d, int *new_fd)
 		driver_id,
 		ui->uvfe->has_ctxn ? ui->uvfe->ctxn : 0);
 
-	fd = open_reg_by_id(ui->uvfe->id);
+	/*
+	 * Resolve the destination cdev via the claiming plugin rather
+	 * than open_reg_by_id(). The image's reg_file_entry carries
+	 * the source's cdev path (e.g. "/dev/infiniband/uverbs5"); on
+	 * the destination the same ibdev name may live at a different
+	 * minor (cross-host migration, post-reboot probe order, rdma
+	 * link churn, mlx5 SR-IOV VF re-creation). The plugin walks
+	 * /sys/class/infiniband/<ibdev>/dev to find the *current*
+	 * minor, and for non-trivial providers (mlx5 vfmig) drives
+	 * the per-context restore dance before opening. The
+	 * source-recorded reg_file_entry is intentionally left in the
+	 * image -- it's a useful diagnostic for `crit decode` and
+	 * costs little, but nothing on the restore side opens it.
+	 */
+	fd = rdma_dispatch_open_uverbs_cdev(ui->uvfe);
 	if (fd < 0)
 		return -1;
 

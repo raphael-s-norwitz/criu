@@ -85,4 +85,20 @@ int rdma_arbitrate_plugin_claim(const char *ibdev, uint32_t kernel_driver_id,
 int rdma_driver_name_from_ibdev(const char *ibdev, char *out, size_t outsz);
 uint32_t rdma_driver_name_to_id(const char *driver);
 
+/*
+ * Dispatch the per-context cdev open to the loaded plugin whose
+ * cr_rdma_provided_driver constant matches uvfe->criu_driver. Used
+ * by uverbsfd_open() in place of the historical open_reg_by_id()
+ * call so the destination cdev's actual minor (which may differ
+ * from the source's) is resolved by the plugin via sysfs rather
+ * than being assumed equal to the image-recorded path. Returns the
+ * fd on success, -1 on failure (already pr_err'd).
+ *
+ * Header takes the protobuf-c struct as opaque so callers don't
+ * need to include images/uverbsfd.pb-c.h just to forward-declare;
+ * criu/rdma.c (which defines this) does include the pb-c header.
+ */
+struct _UverbsFileEntry;
+int rdma_dispatch_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe);
+
 #endif /* __CR_RDMA_H__ */

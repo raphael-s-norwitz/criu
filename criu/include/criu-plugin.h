@@ -93,6 +93,49 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT = 16,
 
+	/*
+	 * RDMA per-context cdev open. Invoked at restore time by
+	 * criu/rdma.c after CLAIM arbitration has selected a winning
+	 * plugin. The selected plugin (and only the selected plugin)
+	 * is responsible for opening a fresh fd against whichever
+	 * /dev/infiniband/uverbsN device is the *destination's*
+	 * counterpart of the dumped context.
+	 *
+	 * Why this can't reuse the source-recorded path:
+	 *   The image's reg_file_entry carries the source's cdev path
+	 *   (e.g. "/dev/infiniband/uverbs5"). On the destination -- be
+	 *   it a different host, the same host after a reboot, or even
+	 *   the same host after rdma_link {add,delete} churn -- the
+	 *   minor number that the kernel's ib_uverbs class assigned to
+	 *   the same ibdev name may differ. open(source-path) then
+	 *   either ENOENTs or, worse, succeeds against the wrong
+	 *   device. The plugin walks
+	 *   /sys/class/infiniband/<ibdev>/dev to resolve the *current*
+	 *   cdev minor for the ibdev recorded in the image, and opens
+	 *   that. For mlx5 SR-IOV VF migration the plugin additionally
+	 *   drives ENABLE_MIGRATABLE / SET_TRACKED / LOAD_VHCA_STATE /
+	 *   MARK_RESTORED / driver bind before the sysfs walk; for rxe
+	 *   the sysfs walk is the entire job.
+	 *
+	 * Dispatched on uvfe->criu_driver: the dispatcher walks the
+	 * loaded plugin list and calls only the plugin whose
+	 * cr_rdma_provided_driver constant matches the image's
+	 * recorded RdmaCriuDriver value (see CR_PLUGIN_DECLARE_RDMA_
+	 * PROVIDED_DRIVER below). Loser plugins are not called.
+	 *
+	 * Args:  uvfe -- the dumped UverbsFileEntry, full image record
+	 *        including ib_dev, driver_name, driver_id, criu_driver,
+	 *        and (when present) any plugin-specific hint blob the
+	 *        dump-side counterpart hook stashed there.
+	 * Return: a freshly-opened, O_RDWR, O_CLOEXEC fd on the
+	 *         destination cdev on success; -1 on failure (with the
+	 *         plugin emitting its own pr_err for the operator).
+	 *         CRIU's restore machinery dups the returned fd into
+	 *         the target process's fd table; the plugin must not
+	 *         hold its own reference after returning.
+	 */
+	CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV = 17,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -116,6 +159,13 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RESTORE_INIT, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__DUMP_DEVICES_LATE, int id);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__UPDATE_INETSK, uint32_t family, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *ibdev, uint32_t kernel_driver_id);
+/*
+ * Forward-declared opaque so plugins can take a UverbsFileEntry * without
+ * pulling the protobuf-c headers into criu-plugin.h. Plugin sources that
+ * implement OPEN_UVERBS_CDEV pull in images/uverbsfd.pb-c.h themselves.
+ */
+struct _UverbsFileEntry;
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const struct _UverbsFileEntry *uvfe);
 
 /*
  * RDMA sharing policy.
@@ -159,6 +209,34 @@ enum {
 
 #define CR_PLUGIN_DECLARE_RDMA_SHARING(__value) \
 	const int cr_rdma_sharing_policy = (__value)
+
+/*
+ * RDMA provided driver -- the RdmaCriuDriver enum value (RCD_RXE,
+ * RCD_MLX5_SRIOV_VFMIG, ...) that this plugin claims and serves.
+ *
+ * RDMA-class plugins that implement CR_PLUGIN_HOOK__RDMA_OPEN_
+ * UVERBS_CDEV MUST export a const int symbol named
+ *   "cr_rdma_provided_driver"
+ * carrying the same RdmaCriuDriver value the plugin returns from
+ * its CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT implementation.
+ *
+ * The dispatcher in criu/rdma.c uses this symbol to find which
+ * loaded plugin should be invoked at restore time for a uverbs
+ * cdev whose image-recorded UverbsFileEntry.criu_driver names a
+ * specific provider. Walking the hook chain alone is not enough:
+ * every plugin registers the same hook id, but only the one whose
+ * provided-driver matches the image's criu_driver should run.
+ *
+ * Defaults: a plugin that does not export this symbol is treated
+ * as "claims nothing" (RCD_UNKNOWN) by the open dispatcher and
+ * will be skipped. That is intentional -- a plugin without a
+ * provided-driver declaration cannot be safely matched to an
+ * image record.
+ */
+#define CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM "cr_rdma_provided_driver"
+
+#define CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER(__value) \
+	const int cr_rdma_provided_driver = (__value)
 
 enum {
 	CR_PLUGIN_STAGE__DUMP,
