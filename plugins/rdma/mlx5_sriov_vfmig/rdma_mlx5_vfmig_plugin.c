@@ -35,11 +35,13 @@
 #include "criu-plugin.h"
 
 #include "images/rdma_criu.pb-c.h"
+#include "images/mlx5_vfmig.pb-c.h"
 
 #include <linux/mlx5_vfmig.h>
 #include <rdma/ib_user_ioctl_verbs.h>
 
 #include <dirent.h>
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -50,6 +52,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #ifdef LOG_PREFIX
@@ -58,10 +62,61 @@
 #define LOG_PREFIX "rdma_mlx5_vfmig_plugin: "
 
 #define MLX5_VFMIG_DEV_DIR "/dev/mlx5_vfmig"
+#define MLX5_VFMIG_IMG_NAME "mlx5_vfmig.img"
 
 static bool vfmig_active = false;
 static int  vfmig_tracked_vf_count = 0;
 static int  vfmig_pf_count = 0;
+
+/*
+ * Per-dump deduplication cache.
+ *
+ * The mlx5 firmware SAVE_VHCA_STATE captures one blob per VF, not
+ * per uverbs context. A process may legitimately hold several
+ * contexts on the same VF (e.g. one per worker thread); without
+ * deduplication we'd issue SAVE_VHCA_STATE multiple times against
+ * the same VF and produce N copies of the same blob in the image
+ * directory. Worse, the per-VF kernel SAVE session is exclusive
+ * (-EBUSY on the second open), so every duplicate would fail.
+ *
+ * The cache is process-local (CRIU's lifetime) and is reset by
+ * init() so a CRIU re-invocation starts fresh. Each entry remembers
+ * the (pf_bdf, vf_id) tuple that already had its blob captured
+ * during this dump, plus the per-VF state that the per-context
+ * record needs (vhca_id, blob path, blob size). Subsequent contexts
+ * on the same VF reuse this state.
+ */
+struct vfmig_saved_vf {
+	struct vfmig_saved_vf *next;
+	char pf_bdf[64];
+	uint32_t vf_id;
+	uint32_t vhca_id;
+	char blob_path[PATH_MAX];
+	uint64_t blob_size;
+};
+static struct vfmig_saved_vf *vfmig_saved_head = NULL;
+
+static struct vfmig_saved_vf *
+vfmig_saved_lookup(const char *pf_bdf, uint32_t vf_id)
+{
+	struct vfmig_saved_vf *p;
+
+	for (p = vfmig_saved_head; p; p = p->next)
+		if (p->vf_id == vf_id && !strcmp(p->pf_bdf, pf_bdf))
+			return p;
+	return NULL;
+}
+
+static void vfmig_saved_clear(void)
+{
+	struct vfmig_saved_vf *p, *n;
+
+	for (p = vfmig_saved_head; p; p = n) {
+		n = p->next;
+		free(p);
+	}
+	vfmig_saved_head = NULL;
+}
 
 /*
  * Probe one PF cdev. Returns the number of VFs on this PF that have
@@ -130,6 +185,7 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 	vfmig_active = false;
 	vfmig_tracked_vf_count = 0;
 	vfmig_pf_count = 0;
+	vfmig_saved_clear();
 
 	d = opendir(MLX5_VFMIG_DEV_DIR);
 	if (!d) {
@@ -184,6 +240,7 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 		"%d PF(s)\n",
 		stage, ret, vfmig_active ? "active" : "inactive",
 		vfmig_tracked_vf_count, vfmig_pf_count);
+	vfmig_saved_clear();
 }
 
 /*
@@ -367,10 +424,372 @@ static int rdma_mlx5_vfmig_plugin_claim_uverbs_context(const char *ibdev,
 	return RDMA_CRIU_DRIVER__RCD_MLX5_SRIOV_VFMIG;
 }
 
+/*
+ * Resolve an ibdev name to its (pf_bdf, vf_id) pair via the same
+ * sysfs walk the CLAIM hook performs. Returns 0 on success with
+ * @pf_bdf (sized @pf_bdfsz) and @vf_id populated, -1 on any
+ * resolution failure -- which here is treated as a hard error
+ * because by the time we run, CLAIM has already accepted this
+ * ibdev as ours, so a sysfs miss is an inconsistency, not a polite
+ * decline.
+ */
+static int vfmig_resolve_pf_vf(const char *ibdev,
+			       char *pf_bdf, size_t pf_bdfsz,
+			       uint32_t *vf_id)
+{
+	char sysfs_path[PATH_MAX];
+	char vf_bdf[64];
+	int v;
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/class/infiniband/%s/device", ibdev);
+	if (resolve_pci_bdf_via_symlink(sysfs_path, vf_bdf,
+					sizeof(vf_bdf))) {
+		pr_err("dump(%s): cannot resolve VF BDF via %s\n",
+		       ibdev, sysfs_path);
+		return -1;
+	}
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/bus/pci/devices/%s/physfn", vf_bdf);
+	if (resolve_pci_bdf_via_symlink(sysfs_path, pf_bdf, pf_bdfsz)) {
+		pr_err("dump(%s, vf_bdf=%s): cannot resolve PF BDF via "
+		       "%s\n", ibdev, vf_bdf, sysfs_path);
+		return -1;
+	}
+
+	v = find_vf_id_under_pf(pf_bdf, vf_bdf);
+	if (v < 0) {
+		pr_err("dump(%s, vf_bdf=%s, pf=%s): no virtfnN link "
+		       "matches\n", ibdev, vf_bdf, pf_bdf);
+		return -1;
+	}
+	*vf_id = (uint32_t)v;
+	return 0;
+}
+
+/*
+ * Stream the SAVE_VHCA_STATE save_fd byte-stream into a freshly-
+ * created blob file under the CRIU image directory. Returns 0 on
+ * success with @save_fd already drained and closed, and total
+ * bytes written written into *@out_size; -1 on any I/O failure
+ * (the partially-written blob file is left in place for
+ * post-mortem -- CRIU will fail the dump regardless).
+ */
+static int vfmig_drain_save_fd_to_blob(int save_fd,
+				       const char *blob_path,
+				       uint64_t *out_size)
+{
+	int img_dir, blob_fd;
+	uint64_t total = 0;
+	ssize_t n;
+	char buf[64 * 1024];
+
+	img_dir = criu_get_image_dir();
+	if (img_dir < 0) {
+		pr_err("vfmig: criu_get_image_dir() returned %d -- "
+		       "no image dir set, cannot write blob\n", img_dir);
+		return -1;
+	}
+
+	blob_fd = openat(img_dir, blob_path,
+			 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (blob_fd < 0) {
+		pr_perror("vfmig: openat(image_dir/%s) for blob write",
+			  blob_path);
+		return -1;
+	}
+
+	for (;;) {
+		ssize_t off = 0;
+
+		n = read(save_fd, buf, sizeof(buf));
+		if (n == 0)
+			break;
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("vfmig: read(save_fd) for %s", blob_path);
+			close(blob_fd);
+			return -1;
+		}
+		while (off < n) {
+			ssize_t w = write(blob_fd, buf + off, n - off);
+			if (w < 0) {
+				if (errno == EINTR)
+					continue;
+				pr_perror("vfmig: write(%s)", blob_path);
+				close(blob_fd);
+				return -1;
+			}
+			off += w;
+		}
+		total += (uint64_t)n;
+	}
+
+	if (close(blob_fd)) {
+		pr_perror("vfmig: close(%s)", blob_path);
+		return -1;
+	}
+
+	*out_size = total;
+	return 0;
+}
+
+/*
+ * Capture the firmware blob for one (pf_bdf, vf_id) pair.
+ *
+ * Steps (matching the source-side lifecycle in the kernel UAPI doc
+ * on MLX5_VFMIG_IOC_SAVE_VHCA_STATE):
+ *   1. open /dev/mlx5_vfmig/<pf_bdf>
+ *   2. ioctl MLX5_VFMIG_IOC_GET_VHCA_ID    (record vhca_id for diags)
+ *   3. ioctl MLX5_VFMIG_IOC_SAVE_VHCA_STATE { vf_id,
+ *        flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED }
+ *      -> kernel quiesces the VF (SUSPEND_VHCA INITIATOR/RESPONDER),
+ *         allocates DMA-mapped image pages, runs SAVE_VHCA_STATE,
+ *         returns a read-only anon-inode fd.
+ *   4. read the save_fd to EOF, write into the image dir.
+ *   5. close(save_fd) WITHOUT issuing RESUME -- KEEP_SUSPENDED told
+ *      the kernel to leave the source VF stopped; the orchestrator
+ *      tears the VF down before any resume on the source. (See
+ *      cover note: post-SAVE the VF is intentionally not runnable
+ *      on the source side.)
+ *
+ * On success the @out fields are populated and the blob file
+ * exists in the image directory; on failure the file may exist
+ * partially-written (we don't unlink it; an aborted dump will
+ * abort the image directory wholesale).
+ */
+static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
+				struct vfmig_saved_vf *out)
+{
+	struct mlx5_vfmig_get_vhca_id gv;
+	struct mlx5_vfmig_save_state ss;
+	char cdev_path[PATH_MAX];
+	int cdev_fd;
+
+	snprintf(cdev_path, sizeof(cdev_path), "%s/%s",
+		 MLX5_VFMIG_DEV_DIR, pf_bdf);
+	cdev_fd = open(cdev_path, O_RDWR | O_CLOEXEC);
+	if (cdev_fd < 0) {
+		pr_perror("vfmig: open(%s)", cdev_path);
+		return -1;
+	}
+
+	memset(&gv, 0, sizeof(gv));
+	gv.vf_id = vf_id;
+	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_GET_VHCA_ID, &gv)) {
+		pr_perror("vfmig: GET_VHCA_ID(pf=%s, vf_id=%u)",
+			  pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+	out->vhca_id = gv.vhca_id;
+
+	memset(&ss, 0, sizeof(ss));
+	ss.vf_id = vf_id;
+	ss.flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
+	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_SAVE_VHCA_STATE, &ss)) {
+		pr_perror("vfmig: SAVE_VHCA_STATE(pf=%s, vf_id=%u, "
+			  "KEEP_SUSPENDED)", pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+
+	snprintf(out->blob_path, sizeof(out->blob_path),
+		 "mlx5_vfmig-pf%s-vf%u.blob", pf_bdf, vf_id);
+
+	if (vfmig_drain_save_fd_to_blob(ss.save_fd, out->blob_path,
+					&out->blob_size)) {
+		close(ss.save_fd);
+		close(cdev_fd);
+		return -1;
+	}
+
+	close(ss.save_fd);
+	close(cdev_fd);
+
+	pr_info("vfmig: captured pf=%s vf_id=%u vhca_id=%u "
+		"blob='%s' size=%llu (KEEP_SUSPENDED)\n",
+		pf_bdf, vf_id, out->vhca_id, out->blob_path,
+		(unsigned long long)out->blob_size);
+	return 0;
+}
+
+/*
+ * Append one Mlx5VfmigStateEntry record to <img-dir>/mlx5_vfmig.img,
+ * length-prefixed (uint32 LE byte length, then the protobuf-packed
+ * bytes). Each record is independent; the restore-side reader walks
+ * length-prefixed records until EOF.
+ *
+ * Why hand-rolled framing instead of the criu/protobuf.c PB_*
+ * helpers: those helpers are tied to criu_image_streamer + the
+ * cr_img abstraction and live in the criu binary, not in the
+ * plugin's address space. The plugin-private mlx5_vfmig.img is just
+ * a flat file under criu_get_image_dir(); a fixed 4-byte little-
+ * endian length prefix is plenty.
+ */
+static int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
+				    const struct vfmig_saved_vf *st)
+{
+	Mlx5VfmigStateEntry e = MLX5_VFMIG_STATE_ENTRY__INIT;
+	int img_dir, fd;
+	void *buf;
+	size_t plen;
+	uint32_t lenle;
+	struct iovec iov[2];
+
+	e.ctxn = ctxn;
+	e.ibdev = (char *)ibdev;
+	e.pf_bdf = (char *)st->pf_bdf;
+	e.vf_id = st->vf_id;
+	e.vhca_id = st->vhca_id;
+	e.blob_path = (char *)st->blob_path;
+	e.blob_size = st->blob_size;
+	/* blob_sha256 is optional; leave unset for v0. */
+
+	plen = mlx5_vfmig_state_entry__get_packed_size(&e);
+	if (plen > 0xffffffffu) {
+		pr_err("vfmig: state entry too large (%zu) for u32 prefix\n",
+		       plen);
+		return -1;
+	}
+	buf = malloc(plen);
+	if (!buf) {
+		pr_err("vfmig: malloc(%zu) for state entry\n", plen);
+		return -1;
+	}
+	if (mlx5_vfmig_state_entry__pack(&e, buf) != plen) {
+		pr_err("vfmig: pack returned unexpected size\n");
+		free(buf);
+		return -1;
+	}
+
+	img_dir = criu_get_image_dir();
+	if (img_dir < 0) {
+		pr_err("vfmig: criu_get_image_dir() returned %d\n", img_dir);
+		free(buf);
+		return -1;
+	}
+	fd = openat(img_dir, MLX5_VFMIG_IMG_NAME,
+		    O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		pr_perror("vfmig: openat(image_dir/%s)", MLX5_VFMIG_IMG_NAME);
+		free(buf);
+		return -1;
+	}
+
+	lenle = htole32((uint32_t)plen);
+	iov[0].iov_base = &lenle;
+	iov[0].iov_len = sizeof(lenle);
+	iov[1].iov_base = buf;
+	iov[1].iov_len = plen;
+
+	if (writev(fd, iov, 2) != (ssize_t)(sizeof(lenle) + plen)) {
+		pr_perror("vfmig: writev(%s)", MLX5_VFMIG_IMG_NAME);
+		close(fd);
+		free(buf);
+		return -1;
+	}
+
+	if (close(fd)) {
+		pr_perror("vfmig: close(%s)", MLX5_VFMIG_IMG_NAME);
+		free(buf);
+		return -1;
+	}
+	free(buf);
+
+	pr_info("vfmig: appended state entry ctxn=%u ibdev=%s pf=%s vf_id=%u "
+		"-> %s\n", ctxn, ibdev, st->pf_bdf, st->vf_id,
+		MLX5_VFMIG_IMG_NAME);
+	return 0;
+}
+
+/*
+ * Per-context dump hook (CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT).
+ *
+ * Runs after CLAIM has named us as the winning plugin for this
+ * uverbs context. Job:
+ *
+ *   1. Resolve ibdev -> (pf_bdf, vf_id). Same sysfs walk CLAIM
+ *      already did; we redo it here rather than threading the
+ *      resolved tuple through the hook ABI -- the cost is two
+ *      readlink()s and a small directory scan, well below the
+ *      cost of the firmware SAVE we're about to run.
+ *
+ *   2. Dedup against vfmig_saved_head. If the (pf_bdf, vf_id)
+ *      tuple has already been captured this dump (i.e. another
+ *      uverbs context on the same VF), skip the SAVE and reuse
+ *      the cached state -- the per-VF kernel SAVE session is
+ *      exclusive (-EBUSY on a second open) and the resulting
+ *      blob would be byte-for-byte identical anyway.
+ *
+ *   3. First time on this VF: vfmig_capture_one_vf() runs
+ *      SAVE_VHCA_STATE (with KEEP_SUSPENDED so the VF stays
+ *      stopped post-dump per the agreed source-side
+ *      orchestration), drains the save_fd into the image dir
+ *      blob, and stashes the resulting state in the dedup cache.
+ *
+ *   4. vfmig_append_state_entry() emits one protobuf-encoded
+ *      Mlx5VfmigStateEntry into mlx5_vfmig.img. The join key is
+ *      ctxn -- restore reads the file, indexes by ctxn, and uses
+ *      the recorded blob_path to feed LOAD_VHCA_STATE.
+ *
+ * lfd and pid are unused for v0 (KEEP_SUSPENDED leaves the VF
+ * suspended without consulting the source process; we don't need
+ * an open fd against the cdev for SAVE). They're in the hook ABI
+ * so future plugins that do need them have them.
+ */
+static int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
+						      uint32_t kernel_driver_id,
+						      uint32_t ctxn,
+						      int lfd, pid_t pid)
+{
+	struct vfmig_saved_vf *st;
+	char pf_bdf[64];
+	uint32_t vf_id;
+
+	(void)kernel_driver_id;
+	(void)lfd;
+	(void)pid;
+
+	if (vfmig_resolve_pf_vf(ibdev, pf_bdf, sizeof(pf_bdf), &vf_id))
+		return -1;
+
+	st = vfmig_saved_lookup(pf_bdf, vf_id);
+	if (st) {
+		pr_info("vfmig: dedup hit ibdev=%s pf=%s vf_id=%u ctxn=%u "
+			"(reusing blob '%s')\n",
+			ibdev, pf_bdf, vf_id, ctxn, st->blob_path);
+	} else {
+		struct vfmig_saved_vf *nst = calloc(1, sizeof(*nst));
+
+		if (!nst) {
+			pr_err("vfmig: calloc(saved_vf)\n");
+			return -1;
+		}
+		snprintf(nst->pf_bdf, sizeof(nst->pf_bdf), "%s", pf_bdf);
+		nst->vf_id = vf_id;
+
+		if (vfmig_capture_one_vf(pf_bdf, vf_id, nst)) {
+			free(nst);
+			return -1;
+		}
+
+		nst->next = vfmig_saved_head;
+		vfmig_saved_head = nst;
+		st = nst;
+	}
+
+	return vfmig_append_state_entry(ctxn, ibdev, st);
+}
+
 CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init,
 		   rdma_mlx5_vfmig_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
 			rdma_mlx5_vfmig_plugin_claim_uverbs_context)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT,
+			rdma_mlx5_vfmig_plugin_dump_uverbs_context)
 
 /*
  * RDMA sharing policy: EXCLUSIVE.
@@ -395,3 +814,22 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
  * declare it explicitly so future maintainers see the intent.
  */
 CR_PLUGIN_DECLARE_RDMA_SHARING(CR_RDMA_SHARING_EXCLUSIVE);
+
+/*
+ * RDMA provided driver: RCD_MLX5_SRIOV_VFMIG.
+ *
+ * Symmetric with the RCD_MLX5_SRIOV_VFMIG return value of
+ * rdma_mlx5_vfmig_plugin_claim_uverbs_context() above. The
+ * dispatchers in criu/rdma.c (rdma_dispatch_dump_uverbs_context
+ * and rdma_dispatch_open_uverbs_cdev) use this constant to find
+ * the right plugin to invoke when an image's
+ * UverbsFileEntry.criu_driver names RCD_MLX5_SRIOV_VFMIG -- both
+ * for dump-side capture and for restore-side cdev open + LOAD
+ * dance. Without this declaration the plugin's CLAIM would still
+ * succeed (CLAIM walks the hook chain by registration, not by
+ * driver), but the dump-side dispatcher would fail to find the
+ * winning plugin to invoke DUMP_UVERBS_CONTEXT on, and the
+ * restore-side dispatcher would have no plugin to ask for the
+ * destination cdev. Land both halves together.
+ */
+CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER(RDMA_CRIU_DRIVER__RCD_MLX5_SRIOV_VFMIG);

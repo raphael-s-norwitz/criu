@@ -496,6 +496,28 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 		pr_info(" ctxn %u", uve.ctxn);
 	pr_info("\n");
 
+	/*
+	 * Per-context dump-side state capture (e.g. mlx5
+	 * SAVE_VHCA_STATE). Optional: rxe and other plugins that have
+	 * no per-context firmware state to persist do not register
+	 * the hook and the dispatcher returns 0 without doing
+	 * anything. Run after CLAIM (so we know the winning plugin)
+	 * but before pb_write_one (so a hook failure aborts the dump
+	 * before any uverbsfd record is committed -- the restore
+	 * would have nothing to read otherwise). uve.ctxn is the
+	 * join key the plugin's restore-side counterpart will use to
+	 * find this capture again.
+	 */
+	if (rdma_dispatch_dump_uverbs_context(ibdev, uve.driver_id,
+					      uve.criu_driver,
+					      uve.has_ctxn ? uve.ctxn : 0,
+					      lfd, p->pid)) {
+		pr_err("dump_uverbsfile: per-context dump hook failed for "
+		       "ibdev=%s ctxn=%u; aborting dump\n",
+		       ibdev, uve.has_ctxn ? uve.ctxn : 0);
+		goto out;
+	}
+
 	fe.type = FD_TYPES__UVERBSFD;
 	fe.id = uve.id;
 	fe.uvfd = &uve;
@@ -647,6 +669,124 @@ static int uverbsfd_validate_claim(const UverbsFileEntry *uvfe)
  *   - The matching plugin's hook returns -1: propagate -1; the
  *     plugin is responsible for its own pr_err.
  */
+/*
+ * Generic per-plugin name lookup: walk the loaded plugin list and
+ * return the (single) plugin whose dlhandle exposes a
+ * cr_rdma_provided_driver constant equal to @criu_driver. Returns
+ * NULL on miss. Returns NULL with *ambiguous=true if more than one
+ * plugin matches (caller decides whether to treat that as a hard
+ * error). Used by both the dump-side and restore-side dispatchers
+ * so the matching policy stays in one place.
+ */
+static plugin_desc_t *rdma_find_plugin_by_provided_driver(uint32_t criu_driver,
+							  bool *ambiguous,
+							  const char **first_name,
+							  const char **second_name)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+
+	if (ambiguous)
+		*ambiguous = false;
+	if (first_name)
+		*first_name = NULL;
+	if (second_name)
+		*second_name = NULL;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		p = (const int *)dlsym(this->dlhandle,
+				       CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != criu_driver)
+			continue;
+
+		if (winner) {
+			if (ambiguous)
+				*ambiguous = true;
+			if (second_name)
+				*second_name = this->d->name;
+			return NULL;
+		}
+		winner = this;
+		if (first_name)
+			*first_name = this->d->name;
+	}
+	return winner;
+}
+
+/*
+ * Dump-side dispatcher. Mirrors rdma_dispatch_open_uverbs_cdev but
+ * for the dump-time DUMP_UVERBS_CONTEXT hook:
+ *
+ *   - Match by image's just-arbitrated criu_driver against each
+ *     plugin's cr_rdma_provided_driver symbol (same matching policy
+ *     CLAIM/OPEN use).
+ *   - If the matching plugin doesn't register
+ *     CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT, the hook is treated
+ *     as optional: this is a successful no-op. rxe takes this path
+ *     -- it has no firmware blob to capture beyond what the generic
+ *     UverbsFileEntry already records, so it doesn't bother
+ *     registering the hook.
+ *   - If multiple plugins match, hard fail. Operator's plugin set
+ *     is inconsistent and we do not pick arbitrarily, same posture
+ *     as CLAIM and OPEN.
+ *   - If no plugin matches the recorded criu_driver at all, hard
+ *     fail. This shouldn't happen in practice -- CLAIM
+ *     arbitration just succeeded against this very criu_driver --
+ *     but defending in depth is cheap and the alternative
+ *     (silently skip) would let an mis-staged plugin set produce
+ *     incomplete images.
+ */
+int rdma_dispatch_dump_uverbs_context(const char *ibdev,
+				      uint32_t kernel_driver_id,
+				      uint32_t criu_driver,
+				      uint32_t ctxn,
+				      int lfd, pid_t pid)
+{
+	plugin_desc_t *winner;
+	const char *first_name = NULL, *second_name = NULL;
+	bool ambiguous = false;
+	CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT_t *fn;
+
+	winner = rdma_find_plugin_by_provided_driver(criu_driver, &ambiguous,
+						     &first_name, &second_name);
+	if (ambiguous) {
+		pr_err("dump_uverbs_context: multiple plugins declare "
+		       "cr_rdma_provided_driver=%u ('%s' and '%s'); "
+		       "operator's plugin set is inconsistent.\n",
+		       criu_driver, first_name, second_name);
+		return -1;
+	}
+	if (!winner) {
+		pr_err("dump_uverbs_context: no loaded RDMA plugin exports "
+		       "cr_rdma_provided_driver=%u for ibdev=%s -- CLAIM "
+		       "arbitration just named this driver, so the plugin "
+		       "list changed mid-dump or the winning plugin is "
+		       "missing its CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER "
+		       "declaration.\n",
+		       criu_driver, ibdev);
+		return -1;
+	}
+
+	if (!winner->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT]) {
+		pr_debug("dump_uverbs_context: plugin '%s' (criu_driver=%u "
+			 "ibdev=%s) does not register the hook; skipping.\n",
+			 winner->d->name, criu_driver, ibdev);
+		return 0;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT];
+	pr_debug("dump_uverbs_context: dispatching to plugin '%s' "
+		 "(criu_driver=%u ibdev=%s ctxn=%u pid=%d)\n",
+		 winner->d->name, criu_driver, ibdev, ctxn, (int)pid);
+	return fn(ibdev, kernel_driver_id, ctxn, lfd, pid);
+}
+
 int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 {
 	plugin_desc_t *this;

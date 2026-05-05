@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 
 #define CRIU_PLUGIN_GEN_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + (c))
 #define CRIU_PLUGIN_VERSION_MAJOR	 0
@@ -136,6 +137,51 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV = 17,
 
+	/*
+	 * RDMA per-context dump-side state capture. Invoked at dump
+	 * time by criu/rdma.c after CLAIM arbitration has selected a
+	 * winning plugin and the generic UverbsFileEntry fields
+	 * (id, ib_dev, driver_name, driver_id, criu_driver, ctxn)
+	 * have been populated. The selected plugin (and only the
+	 * selected plugin) is responsible for capturing whatever
+	 * provider-specific state needs to survive the round-trip --
+	 * for mlx5 SR-IOV VF migration that means
+	 * MLX5_VFMIG_IOC_SAVE_VHCA_STATE plus persisting the returned
+	 * firmware blob into the CRIU image directory; for rxe it's
+	 * a no-op (rxe has no firmware state, hence the plugin does
+	 * not register the hook at all).
+	 *
+	 * Optional. CLAIM is mandatory for any plugin that wants to
+	 * own a context; DUMP_UVERBS_CONTEXT is registered only by
+	 * plugins that have something to capture beyond what the
+	 * generic UverbsFileEntry already records. The dispatcher in
+	 * criu/rdma.c (rdma_dispatch_dump_uverbs_context) walks the
+	 * loaded plugin list, finds the plugin whose
+	 * cr_rdma_provided_driver constant matches the just-arbitrated
+	 * criu_driver, and invokes this hook on it iff the plugin
+	 * registered one. Plugins that do not register a hook are a
+	 * no-op success.
+	 *
+	 * Plugins write their state into the CRIU image directory via
+	 * openat(criu_get_image_dir(), ...) using whatever per-plugin
+	 * file naming convention they choose. The companion restore-
+	 * side OPEN_UVERBS_CDEV hook is responsible for reading those
+	 * files back. The join key between this dump-side capture and
+	 * the restore-side consumption is uvfe->ctxn (also recorded
+	 * in the generic UverbsFileEntry image record) plus whatever
+	 * device identification the plugin embeds in its private
+	 * image (e.g. ibdev name, PF BDF, vf_id).
+	 *
+	 * Args:  ibdev (e.g. "mlx5_2"), kernel_driver_id, ctxn (the
+	 *        per-process context number from /proc/<pid>/fdinfo),
+	 *        lfd (an open fd against the source process's uverbs
+	 *        cdev, valid for the duration of the call), pid (the
+	 *        host pid of the dumped task).
+	 * Return: 0 on success, -1 on failure (which fails the dump).
+	 *         The plugin emits its own pr_err on failure paths.
+	 */
+	CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT = 18,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -166,6 +212,9 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *
  */
 struct _UverbsFileEntry;
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const struct _UverbsFileEntry *uvfe);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT,
+			 const char *ibdev, uint32_t kernel_driver_id,
+			 uint32_t ctxn, int lfd, pid_t pid);
 
 /*
  * RDMA sharing policy.

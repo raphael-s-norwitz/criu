@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 struct pstree_item;
 
@@ -100,5 +101,32 @@ uint32_t rdma_driver_name_to_id(const char *driver);
  */
 struct _UverbsFileEntry;
 int rdma_dispatch_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe);
+
+/*
+ * Dump-side counterpart to rdma_dispatch_open_uverbs_cdev(). Walks
+ * the loaded plugin list, finds the plugin whose
+ * cr_rdma_provided_driver constant matches @criu_driver (the value
+ * that the just-completed CLAIM arbitration returned), and invokes
+ * its CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT hook iff the plugin
+ * registered one.
+ *
+ * Optional hook semantics: a winning plugin that does not register
+ * the hook is a no-op success -- rxe is the canonical example, since
+ * a software provider has no firmware-side state to capture beyond
+ * what the generic UverbsFileEntry already records. mlx5_sriov_vfmig
+ * uses the hook to fire SAVE_VHCA_STATE and persist the resulting
+ * blob into the CRIU image directory.
+ *
+ * Returns 0 on success (including the no-op case), -1 on failure
+ * (multiple plugins match, the hook itself returns -1, or no plugin
+ * matches the recorded criu_driver -- which would mean CLAIM
+ * arbitration named a plugin that is not actually loaded, an
+ * inconsistency the dispatcher refuses to paper over).
+ */
+int rdma_dispatch_dump_uverbs_context(const char *ibdev,
+				      uint32_t kernel_driver_id,
+				      uint32_t criu_driver,
+				      uint32_t ctxn,
+				      int lfd, pid_t pid);
 
 #endif /* __CR_RDMA_H__ */
