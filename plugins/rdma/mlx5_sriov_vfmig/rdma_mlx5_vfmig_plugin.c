@@ -52,6 +52,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -469,6 +470,84 @@ static int vfmig_resolve_pf_vf(const char *ibdev,
 }
 
 /*
+ * Quiet variant of vfmig_resolve_pf_vf used by HANDLE_DEVICE_VMA.
+ * Same sysfs walk, but failures (which here mean "this VMA's
+ * backing chrdev is not a tracked-mlx5-VF uverbs cdev") log at
+ * pr_debug instead of pr_err -- HANDLE_DEVICE_VMA is invoked on
+ * every non-regular VMA in the dumped tree, including ones the
+ * mlx5 plugin has no business claiming, so we mustn't spam the
+ * log on the common decline path.
+ */
+static int vfmig_resolve_pf_vf_quiet(const char *ibdev,
+				     char *pf_bdf, size_t pf_bdfsz,
+				     uint32_t *vf_id)
+{
+	char sysfs_path[PATH_MAX];
+	char vf_bdf[64];
+	int v;
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/class/infiniband/%s/device", ibdev);
+	if (resolve_pci_bdf_via_symlink(sysfs_path, vf_bdf,
+					sizeof(vf_bdf))) {
+		pr_debug("handle_vma(%s): cannot resolve VF BDF via %s\n",
+			 ibdev, sysfs_path);
+		return -1;
+	}
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/bus/pci/devices/%s/physfn", vf_bdf);
+	if (resolve_pci_bdf_via_symlink(sysfs_path, pf_bdf, pf_bdfsz)) {
+		pr_debug("handle_vma(%s, vf_bdf=%s): no /physfn link "
+			 "(PF or non-SR-IOV device); declining\n",
+			 ibdev, vf_bdf);
+		return -1;
+	}
+
+	v = find_vf_id_under_pf(pf_bdf, vf_bdf);
+	if (v < 0) {
+		pr_debug("handle_vma(%s, vf_bdf=%s, pf=%s): no virtfnN "
+			 "link matches; declining\n",
+			 ibdev, vf_bdf, pf_bdf);
+		return -1;
+	}
+	*vf_id = (uint32_t)v;
+	return 0;
+}
+
+/*
+ * Resolve a char-device's dev_t to its ibdev name via
+ * /sys/dev/char/<maj>:<min>/ibdev. Returns 0 with @out populated
+ * (NUL-terminated, trailing newline stripped) on success, -1 if
+ * @rdev does not name an InfiniBand uverbs char device -- the
+ * only chrdev type whose /sys/dev/char node exposes an @ibdev
+ * attribute. This is a cheap pre-filter for HANDLE_DEVICE_VMA,
+ * which is invoked on every non-regular VMA in the dumped tree
+ * (e.g. anonymous-shmem, DRM render-node mappings, anything a
+ * foreign plugin handles).
+ */
+static int vfmig_chrdev_to_ibdev(dev_t rdev, char *out, size_t outsz)
+{
+	char path[PATH_MAX];
+	int fd;
+	ssize_t n;
+
+	snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/ibdev",
+		 major(rdev), minor(rdev));
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = read(fd, out, outsz - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == ' '))
+		n--;
+	out[n] = '\0';
+	return n > 0 ? 0 : -1;
+}
+
+/*
  * Stream the SAVE_VHCA_STATE save_fd byte-stream into a freshly-
  * created blob file under the CRIU image directory. Returns 0 on
  * success with @save_fd already drained and closed, and total
@@ -784,12 +863,122 @@ static int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 	return vfmig_append_state_entry(ctxn, ibdev, st);
 }
 
+/*
+ * Per-VMA dump-side hook (CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA).
+ *
+ * mlx5 ibverbs userspace (libmlx5) memory-maps three or four pages
+ * off /dev/infiniband/uverbsN per ibv_context: the UAR doorbell
+ * page(s), the realtime-clock register, and (on some firmware) a
+ * non-cached UAR. CRIU's proc_parse encounters those VMAs, sees
+ * S_ISCHR, and asks every loaded plugin "is this VMA yours?".
+ * Without us claiming them the dump aborts with the standard
+ * "Can't handle non-regular mapping" error.
+ *
+ * The check we perform here is symmetric with the dump-side
+ * predicate the rest of this plugin uses:
+ *
+ *   1. /sys/dev/char/<maj>:<min>/ibdev exists and reads as an
+ *      ibdev name. (Fast pre-filter -- non-uverbs chrdev VMAs
+ *      decline silently here.)
+ *
+ *   2. ibdev resolves via the standard sysfs walk to a
+ *      (pf_bdf, vf_id) tuple, AND /dev/mlx5_vfmig/<pf_bdf>
+ *      opens. Anything that doesn't (PFs, non-mlx5 ibdevs,
+ *      hosts where vfmig isn't loaded) declines silently.
+ *
+ *   3. MLX5_VFMIG_IOC_QUERY_VF on (pf_bdf, vf_id) reports
+ *      tracked=1. tracked=0 means "this is an mlx5 VF but it
+ *      was never armed for migration", which is one of the few
+ *      cases where we want to log loudly: the operator almost
+ *      certainly meant to run SET_TRACKED before snapshotting,
+ *      and silently declining would let CRIU fail the dump
+ *      with a generic "Can't handle non-regular mapping"
+ *      instead of a directed "VF X is not save/restorable".
+ *      We still return -ENOTSUP (rather than a hard error) so
+ *      the existing handle_vma_plugin() error path runs --
+ *      that surfaces the original VMA address, which is more
+ *      useful for triage than the bare ioctl() failure would
+ *      be.
+ *
+ * Returns 0 on a successful claim, -ENOTSUP for any decline
+ * (which lets run_plugins() fall through to the next hook, or to
+ * proc_parse's "Can't handle non-regular mapping" if no plugin
+ * claims). We deliberately never return any other negative value
+ * here: a negative-but-not-ENOTSUP return short-circuits
+ * run_plugins() and would prevent any future plugin (or future
+ * hook in this plugin) from claiming a VMA we mishandled.
+ *
+ * @fd is unused: we do all the resolution off @stat->st_rdev,
+ * because the source-side proc fd is opened against the dumpee's
+ * /proc/<pid>/map_files/<addr> and can be revoked underneath us
+ * if the dumpee races the dump (rare but possible).
+ */
+static int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd,
+						    const struct stat *st)
+{
+	struct mlx5_vfmig_query_vf q;
+	char ibdev[64];
+	char pf_bdf[64];
+	char cdev_path[PATH_MAX];
+	uint32_t vf_id;
+	int cdev_fd, rc;
+
+	(void)fd;
+
+	if (!vfmig_active)
+		return -ENOTSUP;
+	if (!S_ISCHR(st->st_mode))
+		return -ENOTSUP;
+
+	if (vfmig_chrdev_to_ibdev(st->st_rdev, ibdev, sizeof(ibdev)))
+		return -ENOTSUP;
+	if (vfmig_resolve_pf_vf_quiet(ibdev, pf_bdf, sizeof(pf_bdf),
+				      &vf_id))
+		return -ENOTSUP;
+
+	snprintf(cdev_path, sizeof(cdev_path), "%s/%s",
+		 MLX5_VFMIG_DEV_DIR, pf_bdf);
+	cdev_fd = open(cdev_path, O_RDWR | O_CLOEXEC);
+	if (cdev_fd < 0) {
+		pr_debug("handle_vma(%s, pf=%s): open(%s) failed: %s; "
+			 "declining\n", ibdev, pf_bdf, cdev_path,
+			 strerror(errno));
+		return -ENOTSUP;
+	}
+
+	memset(&q, 0, sizeof(q));
+	q.vf_id = vf_id;
+	rc = ioctl(cdev_fd, MLX5_VFMIG_IOC_QUERY_VF, &q);
+	close(cdev_fd);
+	if (rc) {
+		pr_warn("handle_vma(%s, pf=%s, vf_id=%u): QUERY_VF "
+			"failed: %s; declining\n",
+			ibdev, pf_bdf, vf_id, strerror(errno));
+		return -ENOTSUP;
+	}
+	if (!q.tracked) {
+		pr_err("handle_vma(%s, pf=%s, vf_id=%u): VF is not "
+		       "tracked (not save/restorable); CRIU dump "
+		       "will fail. Run SET_TRACKED on this VF before "
+		       "snapshotting.\n",
+		       ibdev, pf_bdf, vf_id);
+		return -ENOTSUP;
+	}
+
+	pr_info("handle_vma(%s, pf=%s, vf_id=%u): claiming "
+		"uverbs-cdev mapping (UAR/clock/NC, tracked VF)\n",
+		ibdev, pf_bdf, vf_id);
+	return 0;
+}
+
 CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init,
 		   rdma_mlx5_vfmig_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
 			rdma_mlx5_vfmig_plugin_claim_uverbs_context)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT,
 			rdma_mlx5_vfmig_plugin_dump_uverbs_context)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA,
+			rdma_mlx5_vfmig_plugin_handle_device_vma)
 
 /*
  * RDMA sharing policy: EXCLUSIVE.
