@@ -345,6 +345,26 @@ static inline void cr_plugin_dummy_exit(int stage, int ret)
 extern int criu_get_image_dir(void);
 
 /*
+ * Issue an UVERBS_METHOD_GET_CONTEXT ioctl against an already-open
+ * uverbs cdev fd, creating the kernel ucontext object on @fd.
+ *
+ * Exposed to plugins so the RDMA_OPEN_UVERBS_CDEV hook can return a
+ * fully-armed fd (one with a kernel ucontext established) -- the
+ * uniform contract that lets uverbsfd_open() avoid a second
+ * GET_CONTEXT (which would fail: the kernel allows exactly one
+ * ucontext per struct file). For a software provider like rxe this
+ * is just a small wrapper around the verbs ioctl. For mlx5 vfmig
+ * the same call is issued in the plugin's init(RESTORE) on each
+ * eagerly-cached cdev fd, before any UPDATE_VMA_MAP can dup() that
+ * fd to satisfy a UAR mmap (mlx5_ib_mmap requires an active
+ * ucontext on the file).
+ *
+ * @driver_id is the RDMA_DRIVER_* enum value from the uverbs file
+ * entry. Returns 0 on success or -errno on ioctl failure.
+ */
+extern int criu_ib_uverbs_get_context(int fd, uint32_t driver_id);
+
+/*
  * Deprecated, will be removed in next version.
  */
 typedef int(cr_plugin_init_t)(void);

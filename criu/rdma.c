@@ -537,8 +537,16 @@ const struct fdtype_ops uverbs_dump_ops = {
 
 /* struct uverbsfd_file_info is forward-declared near uverbsasyncevfd_open() */
 
-static int
-ib_uverbs_get_context_ioctl(int cmd_fd, uint32_t driver_id)
+/*
+ * Public-API entry point: see criu_ib_uverbs_get_context() doc in
+ * criu/include/criu-plugin.h. Plugins (rxe, mlx5_vfmig) call this
+ * from their RDMA_OPEN_UVERBS_CDEV hook (or, for mlx5, from the
+ * eager init(RESTORE)) so the fd they hand back to CRIU already
+ * has a kernel ucontext on it; uverbsfd_open() therefore no longer
+ * issues GET_CONTEXT itself (issuing it twice on the same struct
+ * file is rejected by the kernel).
+ */
+int criu_ib_uverbs_get_context(int cmd_fd, uint32_t driver_id)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;
@@ -583,10 +591,12 @@ ib_uverbs_get_context_ioctl(int cmd_fd, uint32_t driver_id)
  *       host-side gate (e.g. SET_TRACKED was never run on the
  *       destination VF), so the plugin declines.
  *
- * In all three cases the restore must abort here, before we hand a
- * cmd_fd to ib_uverbs_get_context_ioctl() that the kernel will
- * happily accept but that no per-resource restore code will
- * subsequently know how to populate.
+ * In all three cases the restore must abort here, before the
+ * plugin opens a fresh cdev fd and calls criu_ib_uverbs_get_context
+ * on it -- that ioctl would happily succeed against any uverbs
+ * cdev for which the kernel module is loaded, but no per-resource
+ * restore code would subsequently know how to populate the
+ * resulting ucontext.
  */
 static int uverbsfd_validate_claim(const UverbsFileEntry *uvfe)
 {
@@ -849,7 +859,7 @@ static int uverbsfd_open(struct file_desc *d, int *new_fd)
 {
 	struct uverbsfd_file_info *ui;
 	uint32_t driver_id;
-	int fd, ret;
+	int fd;
 
 	ui = container_of(d, struct uverbsfd_file_info, d);
 
@@ -899,23 +909,31 @@ static int uverbsfd_open(struct file_desc *d, int *new_fd)
 	 * source-recorded reg_file_entry is intentionally left in the
 	 * image -- it's a useful diagnostic for `crit decode` and
 	 * costs little, but nothing on the restore side opens it.
+	 *
+	 * Contract: the plugin returns a fd that already has a kernel
+	 * ucontext established on it (i.e. the plugin has already
+	 * issued criu_ib_uverbs_get_context, or has dup()ed a fd it
+	 * eagerly armed in init(RESTORE)). This is uniform across
+	 * plugins -- rxe issues GET_CONTEXT inline in its hook, mlx5
+	 * vfmig issues it in init(RESTORE) on the cached cdev fds and
+	 * hands back dup()s. That avoids the kernel's
+	 * "one-ucontext-per-struct-file" rule from biting us if
+	 * uverbsfd_open() also tried to issue GET_CONTEXT after the
+	 * plugin already had.
+	 *
+	 * @driver_id is preserved here for the future rdma_image and
+	 * for diagnostics; it is no longer used as a GET_CONTEXT
+	 * argument by this function.
 	 */
+	(void)driver_id;
 	fd = rdma_dispatch_open_uverbs_cdev(ui->uvfe);
 	if (fd < 0)
 		return -1;
-
-	ret = ib_uverbs_get_context_ioctl(fd, driver_id);
-	if (ret)
-		goto out_get_context;
 
 	ctxn_uverbsfd_id_map[ui->uvfe->ctxn] = ui->uvfe->id;
 
 	*new_fd = fd;
 	return 0;
-
-out_get_context:
-	close(fd);
-	return -1;
 }
 
 static struct file_desc_ops uverbs_desc_ops = {

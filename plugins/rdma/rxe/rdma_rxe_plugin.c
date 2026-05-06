@@ -325,6 +325,25 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe)
 		       u->ib_dev, IB_UVERBS_CLASS_DIR, u->ib_dev);
 		return -1;
 	}
+
+	/*
+	 * Per the uniform RDMA_OPEN_UVERBS_CDEV contract, hand back a
+	 * fd that already has a kernel ucontext on it -- uverbsfd_open
+	 * no longer issues GET_CONTEXT itself. For rxe this is just
+	 * the verbs ioctl against the cdev we just opened (rxe is
+	 * software-only, no per-VF restore dance). The driver_id
+	 * comes straight from the image record so a future
+	 * RDMA_DRIVER_RXE2 (or whatever) just works without changes
+	 * here.
+	 */
+	if (criu_ib_uverbs_get_context(fd, u->driver_id) != 0) {
+		pr_perror("open_uverbs_cdev: GET_CONTEXT(driver_id=%u) "
+			  "on fd=%d for ibdev=%s",
+			  u->driver_id, fd, u->ib_dev);
+		close(fd);
+		return -1;
+	}
+
 	return fd;
 }
 
