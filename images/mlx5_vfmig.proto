@@ -111,4 +111,36 @@ message mlx5_vfmig_state_entry {
 	 * field is optional only so older images would still parse.
 	 */
 	optional string		blob_sha256	= 8;
+
+	/*
+	 * Source-side cdev path (e.g. "/dev/infiniband/uverbs2") of
+	 * the uverbs cdev this context was opened against on the
+	 * source. Captured at dump time via readlink() against the
+	 * lfd that DUMP_UVERBS_CONTEXT receives.
+	 *
+	 * Restore uses this as the join key for UPDATE_VMA_MAP: the
+	 * VMA records in the standard CRIU image carry the source
+	 * cdev path verbatim (CRIU records reg_file_entry.name
+	 * without rewriting), and the plugin's eager-init restore
+	 * caches per-source-path destination cdev fds. UPDATE_VMA_MAP
+	 * receives @path = source_cdev_path, looks it up in the
+	 * cache, and hands back a dup() of the dest cdev fd plus the
+	 * source's pgoff verbatim.
+	 *
+	 * On a single-host dump-then-restore (the common case for
+	 * v0) the destination's cdev path will typically be the
+	 * same string, but we deliberately don't rely on that --
+	 * different probe order, post-reboot churn, or rdma_link
+	 * add/delete will move the path. The plugin always re-
+	 * resolves the destination cdev via /sys/class/infiniband_
+	 * verbs/uverbsN/ibdev after LOAD_VHCA_STATE + bind, and
+	 * uses source_cdev_path purely as a per-process-tree key
+	 * into its own cache.
+	 *
+	 * Required because UPDATE_VMA_MAP receives only the source
+	 * path and must dispatch on it; without this field the
+	 * plugin would need to walk every loaded
+	 * mlx5_vfmig_state_entry per VMA to find a match.
+	 */
+	required string		source_cdev_path	= 9;
 }
