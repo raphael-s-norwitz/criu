@@ -120,6 +120,107 @@ static void vfmig_saved_clear(void)
 }
 
 /*
+ * Per-context dump-time queue.
+ *
+ * DUMP_UVERBS_CONTEXT runs once per uverbs cdev being dumped, while
+ * SAVE_VHCA_STATE is per-VF firmware work and is the most invasive
+ * thing this plugin does to the host. Decouple the two by having
+ * the per-context hook just record (ctxn, ibdev, pf_bdf, vf_id)
+ * onto this queue, and let fini(DUMP) drain it -- the kernel SAVE
+ * is then the very last thing CRIU asks for, after every other
+ * piece of dump work has either succeeded or surfaced a failure
+ * the operator can act on without ever having touched the VF's
+ * firmware. (See the cover-letter discussion of "fail early" vs.
+ * "defer the most invasive thing".)
+ */
+struct vfmig_pending_ctx {
+	struct vfmig_pending_ctx *next;
+	uint32_t ctxn;
+	char ibdev[64];
+	char pf_bdf[64];
+	uint32_t vf_id;
+};
+static struct vfmig_pending_ctx *vfmig_pending_head = NULL;
+
+static int vfmig_pending_enqueue(uint32_t ctxn, const char *ibdev,
+				 const char *pf_bdf, uint32_t vf_id)
+{
+	struct vfmig_pending_ctx *p = calloc(1, sizeof(*p));
+
+	if (!p)
+		return -1;
+	p->ctxn = ctxn;
+	snprintf(p->ibdev, sizeof(p->ibdev), "%s", ibdev);
+	snprintf(p->pf_bdf, sizeof(p->pf_bdf), "%s", pf_bdf);
+	p->vf_id = vf_id;
+	p->next = vfmig_pending_head;
+	vfmig_pending_head = p;
+	return 0;
+}
+
+static void vfmig_pending_clear(void)
+{
+	struct vfmig_pending_ctx *p, *n;
+
+	for (p = vfmig_pending_head; p; p = n) {
+		n = p->next;
+		free(p);
+	}
+	vfmig_pending_head = NULL;
+}
+
+/*
+ * Per-VF SAVE-failure cache.
+ *
+ * fini(DUMP) iterates the pending queue in arbitrary order. If
+ * SAVE_VHCA_STATE fails for a given (pf_bdf, vf_id), every other
+ * pending context against the same VF must be dropped too -- the
+ * blob doesn't exist, so emitting a state entry referencing it
+ * would leave the image internally inconsistent. Stash failed
+ * tuples here so subsequent contexts on the same VF skip cleanly
+ * without retrying the (now expensive and wedging) SAVE.
+ */
+struct vfmig_failed_vf {
+	struct vfmig_failed_vf *next;
+	char pf_bdf[64];
+	uint32_t vf_id;
+};
+static struct vfmig_failed_vf *vfmig_failed_head = NULL;
+
+static bool vfmig_failed_lookup(const char *pf_bdf, uint32_t vf_id)
+{
+	struct vfmig_failed_vf *p;
+
+	for (p = vfmig_failed_head; p; p = p->next)
+		if (p->vf_id == vf_id && !strcmp(p->pf_bdf, pf_bdf))
+			return true;
+	return false;
+}
+
+static void vfmig_failed_mark(const char *pf_bdf, uint32_t vf_id)
+{
+	struct vfmig_failed_vf *p = calloc(1, sizeof(*p));
+
+	if (!p)
+		return; /* best-effort; worst case is a redundant SAVE retry */
+	snprintf(p->pf_bdf, sizeof(p->pf_bdf), "%s", pf_bdf);
+	p->vf_id = vf_id;
+	p->next = vfmig_failed_head;
+	vfmig_failed_head = p;
+}
+
+static void vfmig_failed_clear(void)
+{
+	struct vfmig_failed_vf *p, *n;
+
+	for (p = vfmig_failed_head; p; p = n) {
+		n = p->next;
+		free(p);
+	}
+	vfmig_failed_head = NULL;
+}
+
+/*
  * Probe one PF cdev. Returns the number of VFs on this PF that have
  * MLX5_VFMIG_IOC_SET_TRACKED { enable=1 } currently in effect, or -1
  * on a hard ioctl/open failure (which we report but treat as "no
@@ -178,6 +279,11 @@ static int probe_pf_cdev(const char *path)
 	return tracked;
 }
 
+/* Forward declaration: drain is defined alongside the per-context dump
+ * hook (after CLAIM and the SAVE helpers it depends on); fini() above
+ * those needs to call it. */
+static void vfmig_drain_pending_in_fini(void);
+
 static int rdma_mlx5_vfmig_plugin_init(int stage)
 {
 	DIR *d;
@@ -187,6 +293,8 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 	vfmig_tracked_vf_count = 0;
 	vfmig_pf_count = 0;
 	vfmig_saved_clear();
+	vfmig_pending_clear();
+	vfmig_failed_clear();
 
 	d = opendir(MLX5_VFMIG_DEV_DIR);
 	if (!d) {
@@ -237,11 +345,29 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 
 static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 {
+	/*
+	 * Drain the pending SAVE queue at the very end of dump and
+	 * only when the rest of CRIU's dump pipeline succeeded. If
+	 * @ret != 0 the dump has already been declared lost
+	 * upstream and there is no point firing SAVE_VHCA_STATE --
+	 * the resulting blob would never be paired with an image
+	 * the orchestrator could restore from, and we would be
+	 * needlessly suspending VFs (KEEP_SUSPENDED is permanent
+	 * until the orchestrator does an SR-IOV teardown). On the
+	 * RESTORE side the queue is empty -- DUMP_UVERBS_CONTEXT is
+	 * not invoked during restore -- so the drain is effectively
+	 * skipped there too.
+	 */
+	if (stage == CR_PLUGIN_STAGE__DUMP && ret == 0)
+		vfmig_drain_pending_in_fini();
+
 	pr_info("fini (stage %d ret %d): was %s, %d tracked VF(s) across "
 		"%d PF(s)\n",
 		stage, ret, vfmig_active ? "active" : "inactive",
 		vfmig_tracked_vf_count, vfmig_pf_count);
 	vfmig_saved_clear();
+	vfmig_pending_clear();
+	vfmig_failed_clear();
 }
 
 /*
@@ -788,43 +914,38 @@ static int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
  * Per-context dump hook (CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT).
  *
  * Runs after CLAIM has named us as the winning plugin for this
- * uverbs context. Job:
+ * uverbs context. The hook used to fire SAVE_VHCA_STATE inline,
+ * but SAVE is the most invasive thing this plugin does to the
+ * host -- it suspends the source VF's firmware and (with
+ * KEEP_SUSPENDED) leaves it parked. We now defer the actual
+ * SAVE to fini(DUMP), so it runs only after every other piece
+ * of dump work has either succeeded or surfaced a failure the
+ * operator can act on without ever having touched the VF's
+ * firmware.
+ *
+ * The hook's job is therefore reduced to:
  *
  *   1. Resolve ibdev -> (pf_bdf, vf_id). Same sysfs walk CLAIM
  *      already did; we redo it here rather than threading the
- *      resolved tuple through the hook ABI -- the cost is two
- *      readlink()s and a small directory scan, well below the
- *      cost of the firmware SAVE we're about to run.
+ *      resolved tuple through the hook ABI. The cost is two
+ *      readlink()s and a small directory scan, negligible.
  *
- *   2. Dedup against vfmig_saved_head. If the (pf_bdf, vf_id)
- *      tuple has already been captured this dump (i.e. another
- *      uverbs context on the same VF), skip the SAVE and reuse
- *      the cached state -- the per-VF kernel SAVE session is
- *      exclusive (-EBUSY on a second open) and the resulting
- *      blob would be byte-for-byte identical anyway.
+ *   2. Enqueue a (ctxn, ibdev, pf_bdf, vf_id) record onto the
+ *      pending queue. fini(DUMP) walks this queue, dedups by
+ *      (pf_bdf, vf_id), runs SAVE_VHCA_STATE per unique VF, and
+ *      emits one Mlx5VfmigStateEntry per pending context. (See
+ *      vfmig_drain_pending_in_fini below.)
  *
- *   3. First time on this VF: vfmig_capture_one_vf() runs
- *      SAVE_VHCA_STATE (with KEEP_SUSPENDED so the VF stays
- *      stopped post-dump per the agreed source-side
- *      orchestration), drains the save_fd into the image dir
- *      blob, and stashes the resulting state in the dedup cache.
- *
- *   4. vfmig_append_state_entry() emits one protobuf-encoded
- *      Mlx5VfmigStateEntry into mlx5_vfmig.img. The join key is
- *      ctxn -- restore reads the file, indexes by ctxn, and uses
- *      the recorded blob_path to feed LOAD_VHCA_STATE.
- *
- * lfd and pid are unused for v0 (KEEP_SUSPENDED leaves the VF
+ * @lfd and @pid are unused for v0 (KEEP_SUSPENDED leaves the VF
  * suspended without consulting the source process; we don't need
- * an open fd against the cdev for SAVE). They're in the hook ABI
- * so future plugins that do need them have them.
+ * an open fd against the cdev for SAVE). They remain in the
+ * hook ABI so future plugins that do need them have them.
  */
 static int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 						      uint32_t kernel_driver_id,
 						      uint32_t ctxn,
 						      int lfd, pid_t pid)
 {
-	struct vfmig_saved_vf *st;
 	char pf_bdf[64];
 	uint32_t vf_id;
 
@@ -835,32 +956,101 @@ static int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 	if (vfmig_resolve_pf_vf(ibdev, pf_bdf, sizeof(pf_bdf), &vf_id))
 		return -1;
 
-	st = vfmig_saved_lookup(pf_bdf, vf_id);
-	if (st) {
-		pr_info("vfmig: dedup hit ibdev=%s pf=%s vf_id=%u ctxn=%u "
-			"(reusing blob '%s')\n",
-			ibdev, pf_bdf, vf_id, ctxn, st->blob_path);
-	} else {
-		struct vfmig_saved_vf *nst = calloc(1, sizeof(*nst));
-
-		if (!nst) {
-			pr_err("vfmig: calloc(saved_vf)\n");
-			return -1;
-		}
-		snprintf(nst->pf_bdf, sizeof(nst->pf_bdf), "%s", pf_bdf);
-		nst->vf_id = vf_id;
-
-		if (vfmig_capture_one_vf(pf_bdf, vf_id, nst)) {
-			free(nst);
-			return -1;
-		}
-
-		nst->next = vfmig_saved_head;
-		vfmig_saved_head = nst;
-		st = nst;
+	if (vfmig_pending_enqueue(ctxn, ibdev, pf_bdf, vf_id)) {
+		pr_err("vfmig: enqueue(ctxn=%u, pf=%s, vf_id=%u) "
+		       "OOM\n", ctxn, pf_bdf, vf_id);
+		return -1;
 	}
 
-	return vfmig_append_state_entry(ctxn, ibdev, st);
+	pr_info("vfmig: queued ctxn=%u ibdev=%s pf=%s vf_id=%u for "
+		"fini-time SAVE\n", ctxn, ibdev, pf_bdf, vf_id);
+	return 0;
+}
+
+/*
+ * Drain the pending queue at fini(DUMP) time. Per (pf_bdf, vf_id)
+ * the first context "owns" the SAVE; subsequent contexts on the
+ * same VF reuse the cached blob via vfmig_saved_lookup. SAVE
+ * failure for one VF only kills that VF's records -- contexts on
+ * other VFs continue to land in the image. This matches the
+ * "partial image best-effort" policy: a more-complete partial
+ * image is more useful for debugging than a wholesale dump abort,
+ * especially when the failing VF is one of several being
+ * snapshotted.
+ *
+ * Best-effort logging only: fini's signature is void (criu's
+ * cr_plugin_fini drops any return) so we can't propagate a
+ * partial-failure indication back up. The pr_err lines below
+ * are the operator's surface for "which VF's records didn't make
+ * it into the image".
+ */
+static void vfmig_drain_pending_in_fini(void)
+{
+	struct vfmig_pending_ctx *p;
+	int total = 0, written = 0, failed = 0, captured = 0;
+
+	for (p = vfmig_pending_head; p; p = p->next) {
+		struct vfmig_saved_vf *st;
+
+		total++;
+
+		if (vfmig_failed_lookup(p->pf_bdf, p->vf_id)) {
+			pr_warn("vfmig: skipping ctxn=%u (pf=%s vf_id=%u "
+				"already failed earlier in this dump)\n",
+				p->ctxn, p->pf_bdf, p->vf_id);
+			failed++;
+			continue;
+		}
+
+		st = vfmig_saved_lookup(p->pf_bdf, p->vf_id);
+		if (!st) {
+			struct vfmig_saved_vf *nst = calloc(1, sizeof(*nst));
+
+			if (!nst) {
+				pr_err("vfmig: calloc(saved_vf) for ctxn=%u "
+				       "pf=%s vf_id=%u; marking VF failed\n",
+				       p->ctxn, p->pf_bdf, p->vf_id);
+				vfmig_failed_mark(p->pf_bdf, p->vf_id);
+				failed++;
+				continue;
+			}
+			snprintf(nst->pf_bdf, sizeof(nst->pf_bdf), "%s",
+				 p->pf_bdf);
+			nst->vf_id = p->vf_id;
+
+			if (vfmig_capture_one_vf(p->pf_bdf, p->vf_id, nst)) {
+				pr_err("vfmig: SAVE_VHCA_STATE failed for "
+				       "pf=%s vf_id=%u; dropping all "
+				       "pending records for this VF\n",
+				       p->pf_bdf, p->vf_id);
+				free(nst);
+				vfmig_failed_mark(p->pf_bdf, p->vf_id);
+				failed++;
+				continue;
+			}
+			nst->next = vfmig_saved_head;
+			vfmig_saved_head = nst;
+			st = nst;
+			captured++;
+		} else {
+			pr_info("vfmig: dedup hit ibdev=%s pf=%s vf_id=%u "
+				"ctxn=%u (reusing blob '%s')\n",
+				p->ibdev, p->pf_bdf, p->vf_id, p->ctxn,
+				st->blob_path);
+		}
+
+		if (vfmig_append_state_entry(p->ctxn, p->ibdev, st)) {
+			pr_err("vfmig: failed to append state entry for "
+			       "ctxn=%u (pf=%s vf_id=%u)\n",
+			       p->ctxn, p->pf_bdf, p->vf_id);
+			failed++;
+			continue;
+		}
+		written++;
+	}
+
+	pr_info("fini-DUMP drain: total=%d captured_vfs=%d records_written=%d "
+		"failed=%d\n", total, captured, written, failed);
 }
 
 /*
