@@ -867,10 +867,64 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 
 	memset(&ss, 0, sizeof(ss));
 	ss.vf_id = vf_id;
-	ss.flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
+
+	/*
+	 * SAVE flag policy: default flags=0 (kernel auto-RESUMEs the
+	 * source VF on save_fd close), opt in to KEEP_SUSPENDED via
+	 * the CRIU_VFMIG_KEEP_SUSPENDED=1 env var.
+	 *
+	 * Why default=0:
+	 *
+	 *   The kernel's reference vfmig test (tools/testing/mlx5_vfmig/
+	 *   test_m2r_iova.sh) issues SAVE_VHCA_STATE with no flags and
+	 *   then does sriov_numvfs=0 cheaply -- exactly the flow CRIU
+	 *   needs to support same-host dump-and-restore validation. The
+	 *   KEEP_SUSPENDED + sriov_numvfs=0 path that the kernel UAPI
+	 *   doc gestures at ("CRIU dump-then-destroy where the VF is
+	 *   about to be torn down via sriov_numvfs=0 anyway") is not
+	 *   exercised by the kernel test suite, and on the current
+	 *   kernel mlx5_core's release path walks the suspended VF's
+	 *   own cmd ring -- DESTROY_QP, DESTROY_CQ, DESTROY_MKEY,
+	 *   DEALLOC_PD, DEALLOC_UAR, DESTROY_UCTX, ... ~15-20 commands,
+	 *   each timing out at the kernel's 60s MLX5_CMD_TIMEOUT --
+	 *   making sriov_numvfs=0 take 15-25 minutes. Until the kernel
+	 *   gains a fast-teardown path that detects suspended VHCAs
+	 *   and skips per-resource DESTROY commands (or a vfmig-
+	 *   specific destroy ioctl that bypasses the cmd ring), shipping
+	 *   KEEP_SUSPENDED as the default makes CRIU's dump uncomposable
+	 *   with the orchestrator's expected destroy step in any
+	 *   reasonable timeframe.
+	 *
+	 * Why we keep an opt-in:
+	 *
+	 *   The KEEP_SUSPENDED semantic is genuinely useful for
+	 *   production deployments where the orchestrator handles
+	 *   destroy out-of-band asynchronously (paying the long
+	 *   teardown off-line) and wants to guarantee no resumed-source
+	 *   window between SAVE and destroy. Once kernel fast-teardown
+	 *   lands, we may flip this default again.
+	 *
+	 * Implementation note: env var (not a build flag) so the same
+	 * plugin .so works for both dev and prod -- CRIU's plugin
+	 * loader doesn't differentiate.
+	 */
+	{
+		const char *env = getenv("CRIU_VFMIG_KEEP_SUSPENDED");
+
+		if (env && strcmp(env, "1") == 0) {
+			ss.flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
+			pr_info("vfmig: SAVE with KEEP_SUSPENDED "
+				"(CRIU_VFMIG_KEEP_SUSPENDED=1); source "
+				"VF will be left suspended after save_fd "
+				"close. Caller is responsible for tearing "
+				"the VF down before any orchestrator "
+				"action that would race a resume.\n");
+		}
+	}
+
 	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_SAVE_VHCA_STATE, &ss)) {
 		pr_perror("vfmig: SAVE_VHCA_STATE(pf=%s, vf_id=%u, "
-			  "KEEP_SUSPENDED)", pf_bdf, vf_id);
+			  "flags=%#x)", pf_bdf, vf_id, ss.flags);
 		close(cdev_fd);
 		return -1;
 	}
@@ -889,9 +943,11 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 	close(cdev_fd);
 
 	pr_info("vfmig: captured pf=%s vf_id=%u vhca_id=%u "
-		"blob='%s' size=%llu (KEEP_SUSPENDED)\n",
+		"blob='%s' size=%llu (flags=%#x%s)\n",
 		pf_bdf, vf_id, out->vhca_id, out->blob_path,
-		(unsigned long long)out->blob_size);
+		(unsigned long long)out->blob_size, ss.flags,
+		(ss.flags & MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED)
+			? "" : ", source-resumed-after-save");
 	return 0;
 }
 
@@ -1829,11 +1885,18 @@ static int vfmig_restore_init_all_vfs(void)
 			pr_perror("vfmig: open(%s)", v->dest_cdev_path);
 			goto err;
 		}
-		if (criu_ib_uverbs_get_context(fd, RDMA_DRIVER_MLX5)) {
-			pr_err("vfmig: GET_CONTEXT on %s for ctxn=%u "
-			       "failed\n", v->dest_cdev_path, e->ctxn);
-			close(fd);
-			goto err;
+		{
+			int gc_rc = criu_ib_uverbs_get_context(
+				fd, RDMA_DRIVER_MLX5);
+			if (gc_rc) {
+				pr_err("vfmig: GET_CONTEXT on %s for "
+				       "ctxn=%u failed: rc=%d errno=%d "
+				       "(%s)\n",
+				       v->dest_cdev_path, e->ctxn,
+				       gc_rc, -gc_rc, strerror(-gc_rc));
+				close(fd);
+				goto err;
+			}
 		}
 
 		c = calloc(1, sizeof(*c));
