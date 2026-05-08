@@ -143,4 +143,97 @@ message mlx5_vfmig_state_entry {
 	 * mlx5_vfmig_state_entry per VMA to find a match.
 	 */
 	required string		source_cdev_path	= 9;
+
+	/*
+	 * VFMIG ucontext snapshot, captured at dump time on the
+	 * source's uverbs cdev fd via two-pass
+	 * MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT (kernel UAPI in
+	 * include/uapi/rdma/mlx5_user_ioctl_cmds.h). Replayed at
+	 * restore time after the destination ucontext is opened with
+	 * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE: the plugin issues
+	 * MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT to seed the
+	 * destination's bfregi->sys_pages[] with the source's FW UAR
+	 * ids verbatim, skipping the per-slot ALLOC_UAR FW commands
+	 * that mlx5_ib_alloc_ucontext() would normally issue.
+	 *
+	 * Without this snapshot the destination's GET_CONTEXT call
+	 * after LOAD_VHCA_STATE returns -EINVAL: the FW UARs that
+	 * were live on the source VHCA are now reserved in the
+	 * destination VHCA (carried over by LOAD_VHCA_STATE), and
+	 * mlx5_ib_alloc_ucontext()'s allocate_uars() loop tries to
+	 * ALLOC_UAR new ids and the firmware rejects.
+	 *
+	 * uctx_meta: opaque-to-criu serialized
+	 *     `struct mlx5_ib_vfmig_ucontext_meta` (32 bytes; see
+	 *     include/uapi/rdma/mlx5_user_ioctl_cmds.h). Carried as
+	 *     bytes, not broken out into individual proto fields,
+	 *     because the kernel handler does a strict bitwise
+	 *     equality check on every field at RESTORE_UCONTEXT
+	 *     time -- preserving wire byte-identity is what the
+	 *     handler needs, and exposing the struct as bytes makes
+	 *     the criu side oblivious to fields the kernel may add
+	 *     in future minor revisions of the meta blob.
+	 *
+	 * uctx_uar_table: snapshot of bfregi->sys_pages[], length
+	 *     equals meta.num_sys_pages. Each entry is an opaque
+	 *     32-bit FW UAR id (or MLX5_IB_INVALID_UAR_INDEX for an
+	 *     unallocated dynamic slot). Replayed verbatim by
+	 *     RESTORE_UCONTEXT.
+	 *
+	 * uctx_bfreg_count: snapshot of bfregi->count[], length
+	 *     equals meta.total_num_bfregs. v0 enforces all entries
+	 *     are zero (no live QPs / claimed dyn UARs to restore);
+	 *     this remains in the wire format so a future MR/QP
+	 *     restore step can lift the constraint without an ABI
+	 *     bump. Stored as bytes for the same wire-shape-locked
+	 *     reasons as uctx_meta.
+	 *
+	 * All three are optional purely for forward/back-compat
+	 * with the v0 image written before Step 3 landed: an image
+	 * dumped without uctx_* will fail RESTORE with a clear
+	 * "image predates VFMIG_RESTORE_UCONTEXT support" message
+	 * rather than silently producing a broken ucontext.
+	 *
+	 * EXACTLY ONE of {uctx_meta + uctx_uar_table (+ uctx_bfreg_count)}
+	 * vs uctx_dyn_uar_records is populated per entry, depending on
+	 * which mode the source ucontext ran in. See uctx_dyn_uar_records
+	 * below for the lib_uar_dyn=true counterpart. An entry carrying
+	 * neither is treated as a pre-Step-3 image and rejected on
+	 * restore.
+	 */
+	optional bytes		uctx_meta		= 10;
+	optional bytes		uctx_uar_table		= 11;
+	optional bytes		uctx_bfreg_count	= 12;
+
+	/*
+	 * VFMIG dynamic-UAR ucontext snapshot. Populated when the source
+	 * ucontext was opened by libmlx5 in lib_uar_dyn=true mode (the
+	 * default for modern libmlx5: MLX5_LIB_CAP_DYN_UAR is advertised
+	 * automatically). In that mode mlx5_ib_alloc_ucontext bypasses
+	 * bfregi->sys_pages[] entirely; UARs are MLX5_IB_OBJECT_UAR
+	 * uobjects allocated lazily via MLX5_IB_METHOD_UAR_OBJ_ALLOC and
+	 * exposed to userspace as (handle, mmap_offset) pairs.
+	 *
+	 * Captured at dump time via two-pass
+	 * MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS (which the kernel rejects
+	 * for static ucontexts with -EINVAL, and the static
+	 * QUERY_UCONTEXT verb rejects dyn ucontexts with -EOPNOTSUPP --
+	 * exactly-one-of-two by construction). Replayed at restore time
+	 * after a destination ucontext is opened with
+	 * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE | MLX5_LIB_CAP_DYN_UAR via
+	 * MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS, which pins each
+	 * MLX5_IB_OBJECT_UAR uobject at its source-side handle and
+	 * re-inserts the rdma_user_mmap_entry at the same start_pgoff,
+	 * so userspace's captured (handle, mmap_offset) pairs round-trip
+	 * byte-for-byte against the destination ucontext.
+	 *
+	 * Wire shape: contiguous array of `struct
+	 * mlx5_ib_vfmig_dyn_uar_record` (24 bytes each; see
+	 * include/uapi/rdma/mlx5_user_ioctl_cmds.h). Carried as opaque
+	 * bytes for the same wire-shape-locked rationale as uctx_meta /
+	 * uctx_uar_table -- the kernel's QUERY/RESTORE handlers exchange
+	 * the same struct verbatim, so byte-identity is exactly the
+	 * round-trip property userspace cares about.
+	 */
+	optional bytes		uctx_dyn_uar_records	= 13;
 }

@@ -39,7 +39,160 @@
 #include "images/uverbsfd.pb-c.h"
 
 #include <linux/mlx5_vfmig.h>
+#include <rdma/ib_user_verbs.h>
 #include <rdma/ib_user_ioctl_verbs.h>
+#include <rdma/rdma_user_ioctl_cmds.h>
+
+/*
+ * Inlined kernel UAPI for the VFMIG ucontext verbs and the
+ * mlx5_ib_alloc_ucontext_req_v2 driver_data carried over the
+ * legacy IB_USER_VERBS_CMD_GET_CONTEXT write() path.
+ *
+ * Core uverbs surface (cmd_hdr, get_context, ioctl_hdr/attr,
+ * RDMA_VERBS_IOCTL, UVERBS_ATTR_F_*) comes from the system
+ * rdma-core-devel headers above.
+ *
+ * Why inline the rest:
+ *   - rdma/mlx5_user_ioctl_cmds.h and rdma/mlx5-abi.h are not yet
+ *     part of every distribution's rdma-core-devel package, so
+ *     building criu against them would require contributors to run
+ *     `make headers_install` from a bleeding-edge kernel tree. The
+ *     companion kernel reference exerciser
+ *     (tools/testing/mlx5_vfmig/mlx5_vfmig_uctx.c) inlines the same
+ *     surface for the same reason.
+ *   - mlx5_ib_alloc_ucontext_req_v2 has been stable ABI for years.
+ *
+ * If the kernel UAPI evolves, keep this block in sync with:
+ *   include/uapi/rdma/ib_user_ioctl_cmds.h    (UVERBS_ID_NS_SHIFT)
+ *   include/uapi/rdma/mlx5_user_ioctl_cmds.h  (VFMIG object/methods)
+ *   include/uapi/rdma/mlx5-abi.h              (ALLOC_UCTX flags)
+ */
+
+/* mlx5_ib_alloc_ucontext_req_v2 / _resp + ALLOC_UCTX flags */
+enum {
+	MLX5_LIB_CAP_4K_UAR = (uint64_t)1 << 0,
+	MLX5_LIB_CAP_DYN_UAR = (uint64_t)1 << 1,
+};
+enum {
+	MLX5_IB_ALLOC_UCTX_DEVX = 1 << 0,
+	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE = 1 << 1,
+};
+struct mlx5_ib_alloc_ucontext_req_v2_local {
+	uint32_t total_num_bfregs;
+	uint32_t num_low_latency_bfregs;
+	uint32_t flags;
+	uint32_t comp_mask;
+	uint8_t  max_cqe_version;
+	uint8_t  reserved0;
+	uint16_t reserved1;
+	uint32_t reserved2;
+	uint64_t lib_caps;
+} __attribute__((aligned(8)));
+struct mlx5_ib_alloc_ucontext_resp_local {
+	uint32_t qp_tab_size;
+	uint32_t bf_reg_size;
+	uint32_t tot_bfregs;
+	uint32_t cache_line_size;
+	uint16_t max_sq_desc_sz;
+	uint16_t max_rq_desc_sz;
+	uint32_t max_send_wqebb;
+	uint32_t max_recv_wr;
+	uint32_t max_srq_recv_wr;
+	uint16_t num_ports;
+	uint16_t flow_action_flags;
+	uint32_t comp_mask;
+	uint32_t response_length;
+	uint8_t  cqe_version;
+	uint8_t  cmds_supp_uhw;
+	uint8_t  eth_min_inline;
+	uint8_t  clock_info_versions;
+	uint64_t hca_core_clock_offset;
+	uint32_t log_uar_size;
+	uint32_t num_uars_per_page;
+	uint32_t num_dyn_bfregs;
+	uint32_t dump_fill_mkey;
+} __attribute__((aligned(8)));
+
+/*
+ * VFMIG object/method/attr ids. The kernel header arithmetic is
+ *   MLX5_IB_OBJECT_DEVX = (1u << UVERBS_ID_NS_SHIFT)
+ *   ... 9 entries between DEVX and VFMIG ...
+ *   MLX5_IB_OBJECT_VFMIG = DEVX + 10
+ * Update if entries are inserted before VFMIG in the kernel enum.
+ */
+#define UVERBS_ID_NS_SHIFT_LOCAL 12
+#define MLX5_IB_OBJECT_VFMIG_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 10)
+#define MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_UAR_TABLE_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_BFREG_COUNT_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_META_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_UAR_TABLE_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_BFREG_COUNT_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define MLX5_IB_INVALID_UAR_INDEX_LOCAL (1u << 31)
+
+struct mlx5_ib_vfmig_ucontext_meta_local {
+	uint32_t num_static_sys_pages;
+	uint32_t num_sys_pages;
+	uint32_t num_dyn_bfregs;
+	uint32_t num_low_latency_bfregs;
+	uint32_t total_num_bfregs;
+	uint32_t reserved0;
+	uint64_t lib_caps;
+	uint8_t  lib_uar_4k;
+	uint8_t  lib_uar_dyn;
+	uint8_t  cqe_version;
+	uint8_t  reserved1[5];
+} __attribute__((aligned(8)));
+
+/*
+ * Dynamic-UAR (lib_uar_dyn=true) snapshot/restore verbs and record.
+ *
+ * QUERY_DYN_UARS / RESTORE_DYN_UARS run on the same MLX5_IB_OBJECT_VFMIG
+ * object as QUERY_UCONTEXT / RESTORE_UCONTEXT but cover the ucontext
+ * mode where libmlx5 doesn't use bfregi->sys_pages[] -- UARs are
+ * MLX5_IB_OBJECT_UAR uobjects with their own table, and snapshots are
+ * arrays of (handle, uar_index, mmap_offset, alloc_type). The two
+ * paths are mutually exclusive at runtime: the kernel rejects
+ * QUERY_UCONTEXT with -EOPNOTSUPP on a dyn ucontext, and rejects
+ * QUERY_DYN_UARS with -EINVAL on a static ucontext.
+ *
+ * Method id arithmetic mirrors the static path -- the dyn methods are
+ * the next two slots in the VFMIG enum.
+ */
+#define MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 3)
+#define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+
+/*
+ * Per-dynamic-UAR record (see include/uapi/rdma/mlx5_user_ioctl_cmds.h
+ * for the full doc). Wire layout MUST match the kernel struct exactly
+ * -- both QUERY and RESTORE consume/produce raw arrays of these.
+ */
+struct mlx5_ib_vfmig_dyn_uar_record_local {
+	uint32_t handle;
+	uint32_t uar_index;
+	uint64_t mmap_offset;
+	uint8_t  alloc_type;
+	uint8_t  reserved0[7];
+} __attribute__((aligned(8)));
 
 #include <dirent.h>
 #include <endian.h>
@@ -147,12 +300,60 @@ struct vfmig_pending_ctx {
 	 * side's UPDATE_VMA_MAP can dispatch by source path.
 	 */
 	char source_cdev_path[PATH_MAX];
+
+	/*
+	 * VFMIG ucontext snapshot, captured during the per-context
+	 * dump hook from the workload's lfd. The snapshot is owned by
+	 * the pending entry; freed by vfmig_pending_clear(). Persisted
+	 * into the proto entry by vfmig_append_state_entry() at fini-
+	 * time.
+	 *
+	 * EXACTLY ONE of the static-mode (uctx_meta + uctx_uar_table +
+	 * uctx_bfreg_count) or dyn-mode (uctx_dyn_records) slot blocks
+	 * is populated, depending on which kernel verb succeeded:
+	 *
+	 *   - lib_uar_dyn=false ucontext: vfmig_snapshot_uctx() succeeds
+	 *     via QUERY_UCONTEXT; uctx_uar_table != NULL, uctx_dyn_records
+	 *     == NULL.
+	 *   - lib_uar_dyn=true ucontext: QUERY_UCONTEXT returns
+	 *     EOPNOTSUPP and the dump hook falls back to
+	 *     vfmig_snapshot_dyn_uars() / QUERY_DYN_UARS;
+	 *     uctx_dyn_records != NULL, uctx_uar_table == NULL.
+	 *     uctx_meta is left zeroed -- the dyn path's RESTORE doesn't
+	 *     need a meta cross-check (the kernel handler validates by
+	 *     ucontext mode, not by per-field equality), and the
+	 *     destination GET_CONTEXT call on restore uses libmlx5-
+	 *     default (lib_caps, total_bfregs, ...) instead of
+	 *     mirroring the source.
+	 */
+	struct mlx5_ib_vfmig_ucontext_meta_local uctx_meta;
+	uint32_t *uctx_uar_table;
+	size_t uctx_uar_n;
+	uint32_t *uctx_bfreg_count;
+	size_t uctx_bfreg_n;
+
+	struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn_records;
+	size_t uctx_dyn_n;
 };
 static struct vfmig_pending_ctx *vfmig_pending_head = NULL;
 
+/*
+ * Either-or factory: pass static-mode args (uctx_meta + uar table +
+ * bfreg counts) and leave dyn args NULL, or pass dyn args (records +
+ * count) and leave the static args NULL/zero. The dump hook decides
+ * which path the source ucontext was in (QUERY_UCONTEXT vs
+ * QUERY_DYN_UARS) and calls accordingly. Mixed input is a programming
+ * error and is silently merged here -- the dump hook is the single
+ * caller, so we don't bother defending against it at runtime.
+ */
 static int vfmig_pending_enqueue(uint32_t ctxn, const char *ibdev,
 				 const char *pf_bdf, uint32_t vf_id,
-				 const char *source_cdev_path)
+				 const char *source_cdev_path,
+				 const struct mlx5_ib_vfmig_ucontext_meta_local *uctx_meta,
+				 uint32_t *uctx_uar_table, size_t uctx_uar_n,
+				 uint32_t *uctx_bfreg_count, size_t uctx_bfreg_n,
+				 struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn_records,
+				 size_t uctx_dyn_n)
 {
 	struct vfmig_pending_ctx *p = calloc(1, sizeof(*p));
 
@@ -164,6 +365,14 @@ static int vfmig_pending_enqueue(uint32_t ctxn, const char *ibdev,
 	p->vf_id = vf_id;
 	snprintf(p->source_cdev_path, sizeof(p->source_cdev_path),
 		 "%s", source_cdev_path);
+	if (uctx_meta)
+		p->uctx_meta = *uctx_meta;
+	p->uctx_uar_table = uctx_uar_table;
+	p->uctx_uar_n = uctx_uar_n;
+	p->uctx_bfreg_count = uctx_bfreg_count;
+	p->uctx_bfreg_n = uctx_bfreg_n;
+	p->uctx_dyn_records = uctx_dyn_records;
+	p->uctx_dyn_n = uctx_dyn_n;
 	p->next = vfmig_pending_head;
 	vfmig_pending_head = p;
 	return 0;
@@ -175,6 +384,9 @@ static void vfmig_pending_clear(void)
 
 	for (p = vfmig_pending_head; p; p = n) {
 		n = p->next;
+		free(p->uctx_uar_table);
+		free(p->uctx_bfreg_count);
+		free(p->uctx_dyn_records);
 		free(p);
 	}
 	vfmig_pending_head = NULL;
@@ -306,6 +518,8 @@ static void vfmig_drain_pending_in_fini(void);
  * (RESTORE) closes the cached fds.
  */
 static int vfmig_restore_init_all_vfs(void);
+struct vfmig_restored_ctx;
+static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c);
 static void vfmig_restore_fini_close_all(void);
 
 static int rdma_mlx5_vfmig_plugin_init(int stage)
@@ -748,6 +962,396 @@ static int vfmig_chrdev_to_ibdev(dev_t rdev, char *out, size_t outsz)
 }
 
 /*
+ * Issue IB_USER_VERBS_CMD_GET_CONTEXT via the legacy write() path.
+ *
+ * The new RDMA_VERBS_IOCTL UVERBS_METHOD_GET_CONTEXT path doesn't
+ * accept driver-specific data (no UHW attribute defined for it),
+ * but the MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE flag has to land in
+ * mlx5_ib_alloc_ucontext_req_v2.flags. The legacy write() path is
+ * the only way to get the flag to mlx5_ib's alloc_ucontext handler.
+ *
+ * The companion test in tools/testing/mlx5_vfmig/mlx5_vfmig_uctx.c
+ * uses the same approach and is the reference for the wire layout.
+ *
+ * @flags carries MLX5_IB_ALLOC_UCTX_* bits.
+ * @lib_caps carries MLX5_LIB_CAP_* bits (MLX5_LIB_CAP_4K_UAR is the
+ *           v0 baseline; DYN_UAR is rejected by the kernel when
+ *           combined with VFMIG_RESTORE).
+ * @total_bfregs / @ll_bfregs / @max_cqe_version mirror the source
+ *           ucontext's resolved meta so the destination's
+ *           mlx5_ib_alloc_ucontext computes a meta that bitwise-
+ *           matches the source's; RESTORE_UCONTEXT enforces this.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+static int vfmig_send_get_context_v2(int fd, uint32_t flags,
+				     uint64_t lib_caps,
+				     uint32_t total_bfregs,
+				     uint32_t ll_bfregs,
+				     uint8_t max_cqe_version)
+{
+	struct {
+		struct ib_uverbs_cmd_hdr hdr;
+		struct ib_uverbs_get_context get_ctx;
+		struct mlx5_ib_alloc_ucontext_req_v2_local req;
+	} cmd = {};
+	struct {
+		struct ib_uverbs_get_context_resp resp;
+		struct mlx5_ib_alloc_ucontext_resp_local drv;
+	} resp = {};
+	ssize_t n;
+
+	cmd.hdr.command = IB_USER_VERBS_CMD_GET_CONTEXT;
+	cmd.hdr.in_words = sizeof(cmd) / 4;
+	cmd.hdr.out_words = sizeof(resp) / 4;
+	cmd.get_ctx.response = (uintptr_t)&resp;
+	cmd.req.total_num_bfregs = total_bfregs;
+	cmd.req.num_low_latency_bfregs = ll_bfregs;
+	cmd.req.flags = flags;
+	cmd.req.max_cqe_version = max_cqe_version;
+	cmd.req.lib_caps = lib_caps;
+
+	n = write(fd, &cmd, sizeof(cmd));
+	if (n < 0)
+		return -errno;
+	if ((size_t)n != sizeof(cmd))
+		return -EIO;
+	/*
+	 * The legacy IB_USER_VERBS_CMD_GET_CONTEXT path always installs
+	 * a fresh async-event fd in our fdtable and returns its number
+	 * via resp.async_fd. We don't use it -- criu reconstructs the
+	 * workload's async-event fd separately via UverbsAsyncEvFile +
+	 * UVERBS_METHOD_ASYNC_EVENT_ALLOC ioctl on the destination
+	 * cdev (criu/rdma.c uverbsasyncevfd_open). Letting our
+	 * vestigial async fd linger occupies a low fd slot the
+	 * UverbsAsyncEvFile install will then collide with: the
+	 * follow-up ioctl-allocated fd lands at the next free slot,
+	 * which trips util.c reopen_fd_as ("fd N already in use") when
+	 * criu wants the workload's async fd at our occupied slot.
+	 * Drop it as soon as we've parsed the response.
+	 */
+	close((int)resp.resp.async_fd);
+	return 0;
+}
+
+/*
+ * Issue MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT via RDMA_VERBS_IOCTL.
+ * Two-pass aware: pass uar_table=NULL/uar_n=0 and the same for
+ * bfreg to learn array sizes from @meta only.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+static int vfmig_query_uctx(int fd,
+			    uint32_t *uar_table, size_t uar_n,
+			    uint32_t *bfreg_count, size_t bfreg_n,
+			    struct mlx5_ib_vfmig_ucontext_meta_local *meta)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[3];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	if (uar_table) {
+		cmd.attrs[n].attr_id =
+			MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_UAR_TABLE_LOCAL;
+		cmd.attrs[n].len = (uint16_t)(uar_n * sizeof(*uar_table));
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)uar_table;
+		n++;
+	}
+	if (bfreg_count) {
+		cmd.attrs[n].attr_id =
+			MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_BFREG_COUNT_LOCAL;
+		cmd.attrs[n].len = (uint16_t)(bfreg_n * sizeof(*bfreg_count));
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)bfreg_count;
+		n++;
+	}
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_META_LOCAL;
+	cmd.attrs[n].len = sizeof(*meta);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)meta;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Issue MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT via RDMA_VERBS_IOCTL.
+ *
+ * Preconditions enforced by the kernel handler (see kernel UAPI doc):
+ *   1. ucontext was created with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE
+ *   2. lib_uar_dyn=false
+ *   3. @meta bitwise-matches the destination's resolved meta
+ *   4. uar_table length == meta.num_sys_pages * 4
+ *   5. uar_table[0..num_static_sys_pages) all valid
+ *   6. bfreg_count, if supplied, all-zero (v0)
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+static int vfmig_restore_uctx(int fd,
+			      const uint32_t *uar_table, size_t uar_n,
+			      const uint32_t *bfreg_count, size_t bfreg_n,
+			      const struct mlx5_ib_vfmig_ucontext_meta_local *meta)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[3];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[n].attr_id =
+		MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_UAR_TABLE_LOCAL;
+	cmd.attrs[n].len = (uint16_t)(uar_n * sizeof(*uar_table));
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)uar_table;
+	n++;
+
+	if (bfreg_count) {
+		cmd.attrs[n].attr_id =
+			MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_BFREG_COUNT_LOCAL;
+		cmd.attrs[n].len = (uint16_t)(bfreg_n * sizeof(*bfreg_count));
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)bfreg_count;
+		n++;
+	}
+
+	cmd.attrs[n].attr_id =
+		MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META_LOCAL;
+	cmd.attrs[n].len = sizeof(*meta);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)meta;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Snapshot a fully-populated source ucontext via the two-pass QUERY
+ * idiom. On success, @meta_out is filled and @uar_out / @cnt_out
+ * point to caller-owned arrays of size meta.num_sys_pages and
+ * meta.total_num_bfregs respectively (free with free()).
+ *
+ * Returns 0 on success, -errno on failure (with all out-pointers
+ * left NULL).
+ */
+static int vfmig_snapshot_uctx(int fd,
+			       struct mlx5_ib_vfmig_ucontext_meta_local *meta_out,
+			       uint32_t **uar_out, size_t *uar_n_out,
+			       uint32_t **cnt_out, size_t *cnt_n_out)
+{
+	struct mlx5_ib_vfmig_ucontext_meta_local meta = {};
+	uint32_t *uar = NULL, *cnt = NULL;
+	int rc;
+
+	*uar_out = NULL;
+	*cnt_out = NULL;
+	*uar_n_out = 0;
+	*cnt_n_out = 0;
+
+	rc = vfmig_query_uctx(fd, NULL, 0, NULL, 0, &meta);
+	if (rc)
+		return rc;
+
+	if (meta.num_sys_pages == 0 || meta.total_num_bfregs == 0)
+		return -EINVAL;
+
+	uar = calloc(meta.num_sys_pages, sizeof(*uar));
+	cnt = calloc(meta.total_num_bfregs, sizeof(*cnt));
+	if (!uar || !cnt) {
+		free(uar);
+		free(cnt);
+		return -ENOMEM;
+	}
+
+	rc = vfmig_query_uctx(fd, uar, meta.num_sys_pages,
+			      cnt, meta.total_num_bfregs, &meta);
+	if (rc) {
+		free(uar);
+		free(cnt);
+		return rc;
+	}
+
+	*meta_out = meta;
+	*uar_out = uar;
+	*uar_n_out = meta.num_sys_pages;
+	*cnt_out = cnt;
+	*cnt_n_out = meta.total_num_bfregs;
+	return 0;
+}
+
+/*
+ * Issue MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS via RDMA_VERBS_IOCTL.
+ *
+ * Two-pass aware:
+ *   - Pass 1 (sizing): records=NULL, n_records=0; @count_out is filled.
+ *   - Pass 2 (snapshot): records points at a caller-allocated buffer
+ *     of @n_records elements; @count_out is filled with the number of
+ *     records the kernel emitted (kernel cross-checks against
+ *     @n_records and rejects with -EINVAL on mismatch, so a concurrent
+ *     UAR_OBJ_ALLOC between passes surfaces here rather than silently
+ *     truncating).
+ *
+ * The kernel rejects this verb with -EINVAL on a static-mode ucontext
+ * (use vfmig_query_uctx instead). The caller distinguishes by trying
+ * QUERY_UCONTEXT first.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+static int vfmig_query_dyn_uars(int fd,
+				struct mlx5_ib_vfmig_dyn_uar_record_local *records,
+				size_t n_records,
+				uint32_t *count_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[2];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	if (records) {
+		cmd.attrs[n].attr_id =
+			MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS_LOCAL;
+		cmd.attrs[n].len = (uint16_t)(n_records * sizeof(*records));
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)records;
+		n++;
+	}
+	cmd.attrs[n].attr_id =
+		MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT_LOCAL;
+	cmd.attrs[n].len = sizeof(*count_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)count_out;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Issue MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS via RDMA_VERBS_IOCTL.
+ *
+ * Preconditions enforced by the kernel handler:
+ *   1. ucontext was created with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE
+ *   2. lib_uar_dyn=true (i.e. opened with MLX5_LIB_CAP_DYN_UAR; the
+ *      dyn-UAR alloc path bypasses sys_pages[] init and waits for
+ *      this verb to seed the MLX5_IB_OBJECT_UAR uobjects).
+ *   3. RECORDS length is a multiple of sizeof(record).
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+static int vfmig_restore_dyn_uars(int fd,
+				  const struct mlx5_ib_vfmig_dyn_uar_record_local *records,
+				  size_t n_records)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[1];
+	} cmd = {};
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[0].attr_id =
+		MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS_LOCAL;
+	cmd.attrs[0].len = (uint16_t)(n_records * sizeof(*records));
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = (uintptr_t)records;
+
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd.hdr) + sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Two-pass dyn-UAR snapshot for a source ucontext. On success,
+ * *@records_out / *@n_out point at a caller-owned array (free()).
+ *
+ * A successful sizing pass that returns count==0 (a dyn-UAR ucontext
+ * with no live UARs) is preserved as records=NULL, n=0 and reported
+ * as success. The dump-side hook treats that as a valid snapshot --
+ * the proto entry will carry a zero-length uctx_dyn_uar_records, and
+ * RESTORE_DYN_UARS will be a no-op-effective call on the destination
+ * (the kernel handler iterates 0 records and clears
+ * vfmig_restore_pending).
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+static int vfmig_snapshot_dyn_uars(int fd,
+				   struct mlx5_ib_vfmig_dyn_uar_record_local **records_out,
+				   size_t *n_out)
+{
+	struct mlx5_ib_vfmig_dyn_uar_record_local *recs = NULL;
+	uint32_t count = 0, count2 = 0;
+	int rc;
+
+	*records_out = NULL;
+	*n_out = 0;
+
+	rc = vfmig_query_dyn_uars(fd, NULL, 0, &count);
+	if (rc)
+		return rc;
+
+	if (count == 0)
+		return 0;
+
+	recs = calloc(count, sizeof(*recs));
+	if (!recs)
+		return -ENOMEM;
+
+	rc = vfmig_query_dyn_uars(fd, recs, count, &count2);
+	if (rc) {
+		free(recs);
+		return rc;
+	}
+	if (count2 != count) {
+		/*
+		 * Concurrent UAR_OBJ_ALLOC/destroy between passes. The
+		 * workload is CRIU-suspended at this point, so this is
+		 * a structural surprise rather than a benign race; surface
+		 * it.
+		 */
+		free(recs);
+		return -EAGAIN;
+	}
+
+	*records_out = recs;
+	*n_out = count;
+	return 0;
+}
+
+/*
  * Stream the SAVE_VHCA_STATE save_fd byte-stream into a freshly-
  * created blob file under the CRIU image directory. Returns 0 on
  * success with @save_fd already drained and closed, and total
@@ -966,7 +1570,12 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
  */
 static int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
 				    const char *source_cdev_path,
-				    const struct vfmig_saved_vf *st)
+				    const struct vfmig_saved_vf *st,
+				    const struct mlx5_ib_vfmig_ucontext_meta_local *uctx_meta,
+				    const uint32_t *uctx_uar, size_t uctx_uar_n,
+				    const uint32_t *uctx_cnt, size_t uctx_cnt_n,
+				    const struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn,
+				    size_t uctx_dyn_n)
 {
 	Mlx5VfmigStateEntry e = MLX5_VFMIG_STATE_ENTRY__INIT;
 	int img_dir, fd;
@@ -984,6 +1593,46 @@ static int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
 	e.blob_size = st->blob_size;
 	e.source_cdev_path = (char *)source_cdev_path;
 	/* blob_sha256 is optional; leave unset for v0. */
+
+	/*
+	 * uctx snapshot. Stored as raw bytes (struct + arrays) for the
+	 * wire-shape-locked reasons documented in
+	 * images/mlx5_vfmig.proto. The destination's RESTORE_UCONTEXT
+	 * handler does a strict bitwise compare on the meta blob and
+	 * length-checks UAR_TABLE / BFREG_COUNT against meta, so any
+	 * accidental field reordering on either side surfaces as an
+	 * EINVAL on restore rather than a silent corruption.
+	 *
+	 * Static and dyn paths are mutually exclusive at runtime: the
+	 * dump hook's QUERY_UCONTEXT-vs-QUERY_DYN_UARS fork populates
+	 * exactly one block. Mirror that on the wire by gating each
+	 * has_* flag on the presence of its source-side buffer
+	 * pointer rather than always-setting them.
+	 */
+	if (uctx_uar) {
+		e.has_uctx_meta = 1;
+		e.uctx_meta.data = (uint8_t *)(void *)uctx_meta;
+		e.uctx_meta.len = sizeof(*uctx_meta);
+		e.has_uctx_uar_table = 1;
+		e.uctx_uar_table.data = (uint8_t *)(void *)uctx_uar;
+		e.uctx_uar_table.len = uctx_uar_n * sizeof(*uctx_uar);
+		e.has_uctx_bfreg_count = 1;
+		e.uctx_bfreg_count.data = (uint8_t *)(void *)uctx_cnt;
+		e.uctx_bfreg_count.len = uctx_cnt_n * sizeof(*uctx_cnt);
+	} else {
+		/*
+		 * lib_uar_dyn=true ucontext: the dyn-UAR records array
+		 * is the entire snapshot, replayed via RESTORE_DYN_UARS
+		 * on the destination. A zero-length array is still
+		 * populated (a dyn ucontext with no live UARs is a
+		 * valid, restorable state -- restore is then a no-op-
+		 * effective ioctl that just clears the kernel's
+		 * vfmig_restore_pending flag).
+		 */
+		e.has_uctx_dyn_uar_records = 1;
+		e.uctx_dyn_uar_records.data = (uint8_t *)(void *)uctx_dyn;
+		e.uctx_dyn_uar_records.len = uctx_dyn_n * sizeof(*uctx_dyn);
+	}
 
 	plen = mlx5_vfmig_state_entry__get_packed_size(&e);
 	if (plen > 0xffffffffu) {
@@ -1109,11 +1758,101 @@ static int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 	}
 	src_cdev[n] = '\0';
 
-	if (vfmig_pending_enqueue(ctxn, ibdev, pf_bdf, vf_id, src_cdev)) {
-		pr_err("vfmig: enqueue(ctxn=%u, pf=%s, vf_id=%u, "
-		       "src_cdev=%s) OOM\n", ctxn, pf_bdf, vf_id,
-		       src_cdev);
-		return -1;
+	/*
+	 * Snapshot the workload's ucontext UAR table + bfreg counts +
+	 * meta now, while the workload is suspended and the lfd
+	 * references the live source ucontext. The snapshot is
+	 * captured in user memory, written into the image at fini
+	 * time, and replayed on the restored destination ucontext via
+	 * RESTORE_UCONTEXT (post-LOAD_VHCA_STATE) -- see the
+	 * mlx5_vfmig_state_entry.uctx_* doc in
+	 * images/mlx5_vfmig.proto for the wire-format rationale.
+	 *
+	 * Hard fail on QUERY error: a missing snapshot would leave
+	 * the image unrestorable (the destination's GET_CONTEXT
+	 * after LOAD_VHCA_STATE EINVALs without VFMIG_RESTORE +
+	 * RESTORE_UCONTEXT). Better to abort here than to write a
+	 * silently-broken image. v0 also enforces "all bfreg counts
+	 * must be zero" (no live QPs / dyn UARs) on the kernel side
+	 * -- snapshotting non-zero counts would still serialize
+	 * cleanly here, and the kernel's RESTORE_UCONTEXT handler is
+	 * the one that rejects the restore.
+	 */
+	/*
+	 * Snapshot the source ucontext. Try the static-UAR path first
+	 * (QUERY_UCONTEXT). On -EOPNOTSUPP, the source ran in libmlx5's
+	 * default lib_uar_dyn=true mode -- fall back to the dyn-UAR
+	 * verb (QUERY_DYN_UARS). The two paths are mutually exclusive
+	 * by kernel construction (each rejects the other ucontext mode),
+	 * so exactly one will succeed.
+	 *
+	 * Hard fail on any other QUERY error: a missing snapshot would
+	 * leave the image unrestorable -- the destination's GET_CONTEXT
+	 * after LOAD_VHCA_STATE EINVALs without VFMIG_RESTORE +
+	 * RESTORE_{UCONTEXT,DYN_UARS}. Better to abort the dump than to
+	 * write a silently-broken image.
+	 */
+	{
+		struct mlx5_ib_vfmig_ucontext_meta_local uctx_meta = {};
+		uint32_t *uctx_uar = NULL, *uctx_cnt = NULL;
+		size_t uctx_uar_n = 0, uctx_cnt_n = 0;
+		struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn = NULL;
+		size_t uctx_dyn_n = 0;
+		int rc;
+
+		rc = vfmig_snapshot_uctx(lfd, &uctx_meta,
+					 &uctx_uar, &uctx_uar_n,
+					 &uctx_cnt, &uctx_cnt_n);
+		if (rc == -EOPNOTSUPP) {
+			pr_info("vfmig: ctxn=%u: static QUERY_UCONTEXT "
+				"returned EOPNOTSUPP (lib_uar_dyn=true "
+				"ucontext) -- falling back to "
+				"QUERY_DYN_UARS\n", ctxn);
+
+			rc = vfmig_snapshot_dyn_uars(lfd, &uctx_dyn,
+						     &uctx_dyn_n);
+			if (rc) {
+				pr_err("vfmig: QUERY_DYN_UARS(ctxn=%u, "
+				       "ibdev=%s) failed: %d (%s)\n",
+				       ctxn, ibdev, rc, strerror(-rc));
+				return -1;
+			}
+			pr_info("vfmig: snapshotted ctxn=%u (dyn-UAR): "
+				"%zu UAR uobject record(s)\n",
+				ctxn, uctx_dyn_n);
+		} else if (rc) {
+			pr_err("vfmig: QUERY_UCONTEXT(ctxn=%u, ibdev=%s) "
+			       "failed: %d (%s)\n", ctxn, ibdev,
+			       rc, strerror(-rc));
+			return -1;
+		} else {
+			pr_info("vfmig: snapshotted ctxn=%u (static): "
+				"num_static=%u num_sys_pages=%u "
+				"total_bfregs=%u lib_caps=%#llx 4k=%u "
+				"dyn=%u cqe=%u\n",
+				ctxn, uctx_meta.num_static_sys_pages,
+				uctx_meta.num_sys_pages,
+				uctx_meta.total_num_bfregs,
+				(unsigned long long)uctx_meta.lib_caps,
+				uctx_meta.lib_uar_4k,
+				uctx_meta.lib_uar_dyn,
+				uctx_meta.cqe_version);
+		}
+
+		if (vfmig_pending_enqueue(ctxn, ibdev, pf_bdf, vf_id,
+					  src_cdev,
+					  uctx_uar ? &uctx_meta : NULL,
+					  uctx_uar, uctx_uar_n,
+					  uctx_cnt, uctx_cnt_n,
+					  uctx_dyn, uctx_dyn_n)) {
+			pr_err("vfmig: enqueue(ctxn=%u, pf=%s, vf_id=%u, "
+			       "src_cdev=%s) OOM\n", ctxn, pf_bdf,
+			       vf_id, src_cdev);
+			free(uctx_uar);
+			free(uctx_cnt);
+			free(uctx_dyn);
+			return -1;
+		}
 	}
 
 	pr_info("vfmig: queued ctxn=%u ibdev=%s pf=%s vf_id=%u "
@@ -1195,7 +1934,14 @@ static void vfmig_drain_pending_in_fini(void)
 		}
 
 		if (vfmig_append_state_entry(p->ctxn, p->ibdev,
-					     p->source_cdev_path, st)) {
+					     p->source_cdev_path, st,
+					     &p->uctx_meta,
+					     p->uctx_uar_table,
+					     p->uctx_uar_n,
+					     p->uctx_bfreg_count,
+					     p->uctx_bfreg_n,
+					     p->uctx_dyn_records,
+					     p->uctx_dyn_n)) {
 			pr_err("vfmig: failed to append state entry for "
 			       "ctxn=%u (pf=%s vf_id=%u)\n",
 			       p->ctxn, p->pf_bdf, p->vf_id);
@@ -1368,12 +2114,49 @@ struct vfmig_restored_vf {
 };
 static struct vfmig_restored_vf *vfmig_restored_vfs;
 
+/*
+ * Per-context restore cache.
+ *
+ * Populated by init(RESTORE) from the on-disk Mlx5VfmigStateEntry, but
+ * the actual cdev open + GET_CONTEXT(VFMIG_RESTORE) + RESTORE_{UCONTEXT,
+ * DYN_UARS} ioctls are deferred to vfmig_ensure_cdev_open(), called
+ * from the first consumer hook (UPDATE_VMA_MAP or OPEN_UVERBS_CDEV).
+ *
+ * Why deferred: criu/files.c c7395f4cb (post-9/2025) forks per-task
+ * restore helpers without CLONE_FILES, and the helper's
+ * setup_newborn_fds calls close_old_fds() which purges any fd that
+ * isn't a service-fd. An fd opened in init(RESTORE) (criu main's
+ * fdtable) gets nuked in every helper before prepare_fds runs --
+ * dup(8) on a closed slot returns EBADF, and the workload's fdtable
+ * never receives the cdev. Lazy-opening from inside the helper
+ * avoids the purge entirely: each helper opens its own fd and the
+ * plugin's per-helper globals (this list is forked-from-criu, then
+ * mutated independently per helper) hold helper-local fd state.
+ *
+ * Snapshot bytes (uctx_meta + uar_table + bfreg_count for static,
+ * dyn_records for dyn) are deep-copied out of the unpacked
+ * Mlx5VfmigStateEntry at init time so the entry array can be freed
+ * before any helper forks. is_dyn picks which restore verb to issue
+ * at lazy-open time.
+ */
 struct vfmig_restored_ctx {
 	struct vfmig_restored_ctx *next;
 	uint32_t source_ctxn;
 	char source_ibdev[64];
 	char source_cdev_path[PATH_MAX];
+	char dest_cdev_path[PATH_MAX];
 	int dest_cdev_fd;
+
+	bool is_dyn;
+	/* Static (lib_uar_dyn=false) snapshot, valid iff !is_dyn. */
+	struct mlx5_ib_vfmig_ucontext_meta_local meta;
+	uint32_t *uar_table;
+	size_t uar_n;
+	uint32_t *bfreg_count;
+	size_t bfreg_n;
+	/* Dyn (lib_uar_dyn=true) snapshot, valid iff is_dyn. */
+	struct mlx5_ib_vfmig_dyn_uar_record_local *dyn_records;
+	size_t dyn_n;
 };
 static struct vfmig_restored_ctx *vfmig_restored_ctxs;
 
@@ -1803,6 +2586,267 @@ static int vfmig_resolve_dest_cdev_path(const char *ibdev, char *out,
 	return -1;
 }
 
+/*
+ * Lazy open of the destination uverbs cdev for a per-context cache
+ * entry. Idempotent: if c->dest_cdev_fd is already a live fd, return
+ * it unchanged.
+ *
+ * Runs under whichever process the caller is in -- specifically, the
+ * per-task restore helpers spawned by criu/files.c that don't share
+ * fdtables with criu main (post c7395f4cb). Because criu's helper
+ * setup_newborn_fds calls close_old_fds() on every fork, fds opened
+ * in init(RESTORE) (criu main) are already gone by the time
+ * UPDATE_VMA_MAP / OPEN_UVERBS_CDEV run, so we re-open here in the
+ * helper's own fdtable. Each helper that calls into the plugin gets
+ * its own copy of the fd; the snapshot bytes (read-only after init)
+ * are forked-in unchanged.
+ *
+ * On success c->dest_cdev_fd holds an O_RDWR | O_CLOEXEC fd whose
+ * underlying struct file has its ucontext seeded by RESTORE_UCONTEXT
+ * (static path) or RESTORE_DYN_UARS (dyn path). The hooks dup() this
+ * fd before handing it back to criu so c->dest_cdev_fd survives even
+ * after criu installs the workload's fd into the restored task and
+ * implicitly closes its own copy.
+ *
+ * Returns 0 on success, -1 on any failure (with c->dest_cdev_fd left
+ * < 0 and the partial fd cleaned up, so a retry attempt is safe).
+ */
+/*
+ * Park our long-lived helper-side cached fds at a high fd number so
+ * they don't collide with the fd slots the workload is about to be
+ * restored into. criu/util.c uses fcntl(F_DUPFD, want) and treats
+ * "the requested slot is occupied" as a hard error -- so if open()
+ * lands our cdev at fd 3 and the workload's UverbsFileEntry id 0x1b
+ * also needs fd 3, the install of the workload's fd fails with
+ * "fd 3 already in use". 1024 is comfortably above any plausible
+ * workload's small-numbered fd table; F_DUPFD won't go there because
+ * F_DUPFD picks the lowest free slot. CLOEXEC is preserved.
+ */
+#define VFMIG_CACHED_FD_FLOOR 1024
+
+static int vfmig_park_fd_high(int fd)
+{
+	int hi = fcntl(fd, F_DUPFD_CLOEXEC, VFMIG_CACHED_FD_FLOOR);
+
+	if (hi < 0) {
+		pr_perror("vfmig: F_DUPFD_CLOEXEC(%d, >=%d)",
+			  fd, VFMIG_CACHED_FD_FLOOR);
+		return -1;
+	}
+	close(fd);
+	return hi;
+}
+
+static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
+{
+	int fd, rc;
+
+	if (c->dest_cdev_fd >= 0)
+		return 0;
+
+	fd = open(c->dest_cdev_path, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		pr_perror("vfmig: open(%s) for ctxn=%u",
+			  c->dest_cdev_path, c->source_ctxn);
+		return -1;
+	}
+
+	if (!c->is_dyn) {
+		/*
+		 * Static (lib_uar_dyn=false) restore path. GET_CONTEXT
+		 * mirrors the source's resolved (lib_caps,
+		 * total_bfregs, ll_bfregs, max_cqe_version) verbatim
+		 * so the destination's mlx5_ib_alloc_ucontext computes
+		 * a meta that bitwise-matches the source's;
+		 * RESTORE_UCONTEXT enforces equality with -EINVAL.
+		 */
+		const struct mlx5_ib_vfmig_ucontext_meta_local *m = &c->meta;
+
+		rc = vfmig_send_get_context_v2(
+			fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+			m->lib_caps, m->total_num_bfregs,
+			m->num_low_latency_bfregs, m->cqe_version);
+		if (rc) {
+			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE, static) "
+			       "on %s ctxn=%u failed: %d (%s)\n",
+			       c->dest_cdev_path, c->source_ctxn,
+			       rc, strerror(-rc));
+			close(fd);
+			return -1;
+		}
+
+		rc = vfmig_restore_uctx(fd, c->uar_table, c->uar_n,
+					c->bfreg_count, c->bfreg_n, m);
+		if (rc) {
+			pr_err("vfmig: RESTORE_UCONTEXT on %s ctxn=%u "
+			       "failed: %d (%s)\n",
+			       c->dest_cdev_path, c->source_ctxn,
+			       rc, strerror(-rc));
+			close(fd);
+			return -1;
+		}
+
+		/*
+		 * Bitwise sanity: re-QUERY and confirm sys_pages[]
+		 * matches. A divergence here means RESTORE was
+		 * accepted but didn't actually seed sys_pages[].
+		 */
+		{
+			struct mlx5_ib_vfmig_ucontext_meta_local meta_b = {};
+			uint32_t *uar_b = NULL, *cnt_b = NULL;
+			size_t uar_bn = 0, cnt_bn = 0;
+			int qrc;
+
+			qrc = vfmig_snapshot_uctx(fd, &meta_b,
+						  &uar_b, &uar_bn,
+						  &cnt_b, &cnt_bn);
+			if (qrc) {
+				pr_err("vfmig: post-restore re-QUERY on %s "
+				       "ctxn=%u failed: %d (%s)\n",
+				       c->dest_cdev_path, c->source_ctxn,
+				       qrc, strerror(-qrc));
+				close(fd);
+				return -1;
+			}
+			if (memcmp(&meta_b, m, sizeof(*m)) != 0 ||
+			    uar_bn != c->uar_n ||
+			    memcmp(uar_b, c->uar_table,
+				   c->uar_n * sizeof(*uar_b)) != 0) {
+				pr_err("vfmig: post-restore re-QUERY on %s "
+				       "ctxn=%u diverged from snapshot\n",
+				       c->dest_cdev_path, c->source_ctxn);
+				free(uar_b);
+				free(cnt_b);
+				close(fd);
+				return -1;
+			}
+			free(uar_b);
+			free(cnt_b);
+			pr_info("vfmig: post-restore re-QUERY ctxn=%u "
+				"(static): bitwise match (num_sys_pages="
+				"%zu)\n", c->source_ctxn, c->uar_n);
+		}
+	} else {
+		/*
+		 * Dyn (lib_uar_dyn=true) restore path. The kernel's
+		 * RESTORE_DYN_UARS handler gates only on the destination
+		 * being lib_uar_dyn=true and vfmig_restore_pending; no
+		 * per-field cross-check. We open with libmlx5-default
+		 * payload values + DYN_UAR cap and let the alloc path's
+		 * skip-allocate-uars branch leave sys_pages[]
+		 * uninitialized + UAR uobject list empty for
+		 * RESTORE_DYN_UARS to seed.
+		 */
+		rc = vfmig_send_get_context_v2(
+			fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+			MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR,
+			/* total_num_bfregs */ 8,
+			/* num_low_latency_bfregs */ 0,
+			/* max_cqe_version */ 1);
+		if (rc) {
+			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE | DYN_UAR) "
+			       "on %s ctxn=%u failed: %d (%s)\n",
+			       c->dest_cdev_path, c->source_ctxn,
+			       rc, strerror(-rc));
+			close(fd);
+			return -1;
+		}
+
+		rc = vfmig_restore_dyn_uars(fd, c->dyn_records, c->dyn_n);
+		if (rc) {
+			pr_err("vfmig: RESTORE_DYN_UARS(%zu) on %s ctxn=%u "
+			       "failed: %d (%s)\n",
+			       c->dyn_n, c->dest_cdev_path,
+			       c->source_ctxn, rc, strerror(-rc));
+			close(fd);
+			return -1;
+		}
+
+		/*
+		 * Bitwise sanity by handle (record order isn't
+		 * guaranteed -- the kernel emits in
+		 * ufile->uobjects iteration order, which RESTORE
+		 * mutates as it prepends each new uobj).
+		 */
+		{
+			struct mlx5_ib_vfmig_dyn_uar_record_local *recs_b = NULL;
+			size_t recs_bn = 0;
+			int qrc;
+			size_t i_a;
+			bool ok = true;
+
+			qrc = vfmig_snapshot_dyn_uars(fd, &recs_b, &recs_bn);
+			if (qrc) {
+				pr_err("vfmig: post-restore QUERY_DYN_UARS "
+				       "on %s ctxn=%u failed: %d (%s)\n",
+				       c->dest_cdev_path, c->source_ctxn,
+				       qrc, strerror(-qrc));
+				close(fd);
+				return -1;
+			}
+			if (recs_bn != c->dyn_n) {
+				pr_err("vfmig: post-restore QUERY_DYN_UARS "
+				       "on %s ctxn=%u count mismatch: got "
+				       "%zu, expected %zu\n",
+				       c->dest_cdev_path, c->source_ctxn,
+				       recs_bn, c->dyn_n);
+				free(recs_b);
+				close(fd);
+				return -1;
+			}
+			for (i_a = 0; ok && i_a < c->dyn_n; i_a++) {
+				const struct mlx5_ib_vfmig_dyn_uar_record_local
+					*a = &c->dyn_records[i_a];
+				size_t i_b;
+				const struct mlx5_ib_vfmig_dyn_uar_record_local
+					*b = NULL;
+
+				for (i_b = 0; i_b < recs_bn; i_b++) {
+					if (recs_b[i_b].handle == a->handle) {
+						b = &recs_b[i_b];
+						break;
+					}
+				}
+				if (!b ||
+				    b->uar_index   != a->uar_index ||
+				    b->mmap_offset != a->mmap_offset ||
+				    b->alloc_type  != a->alloc_type) {
+					pr_err("vfmig: post-restore dyn "
+					       "record drift on %s ctxn=%u "
+					       "handle=%u\n",
+					       c->dest_cdev_path,
+					       c->source_ctxn, a->handle);
+					ok = false;
+				}
+			}
+			free(recs_b);
+			if (!ok) {
+				close(fd);
+				return -1;
+			}
+			pr_info("vfmig: post-restore re-QUERY ctxn=%u "
+				"(dyn): bitwise match (records=%zu)\n",
+				c->source_ctxn, c->dyn_n);
+		}
+	}
+
+	/*
+	 * Move the cached fd up to the high range so the workload's
+	 * fd-install pass at criu/util.c doesn't trip on us occupying
+	 * the slot it wants for this same uverbsfd.
+	 */
+	fd = vfmig_park_fd_high(fd);
+	if (fd < 0)
+		return -1;
+
+	c->dest_cdev_fd = fd;
+	pr_info("vfmig: lazy-opened ctxn=%u dest_cdev=%s -> dest_fd=%d "
+		"(parked above %d)\n",
+		c->source_ctxn, c->dest_cdev_path, fd,
+		VFMIG_CACHED_FD_FLOOR - 1);
+	return 0;
+}
+
 static int vfmig_restore_init_all_vfs(void)
 {
 	Mlx5VfmigStateEntry **entries = NULL;
@@ -1863,7 +2907,6 @@ static int vfmig_restore_init_all_vfs(void)
 		Mlx5VfmigStateEntry *e = entries[i];
 		struct vfmig_restored_vf *v;
 		struct vfmig_restored_ctx *c;
-		int fd;
 
 		v = vfmig_restored_vf_lookup(e->pf_bdf, e->vf_id);
 		if (!v) {
@@ -1880,43 +2923,167 @@ static int vfmig_restore_init_all_vfs(void)
 			goto err;
 		}
 
-		fd = open(v->dest_cdev_path, O_RDWR | O_CLOEXEC);
-		if (fd < 0) {
-			pr_perror("vfmig: open(%s)", v->dest_cdev_path);
-			goto err;
-		}
+		/*
+		 * Validate uctx snapshot presence before opening any
+		 * fd. The image must carry exactly one of:
+		 *
+		 *   - static-mode snapshot (uctx_meta + uctx_uar_table,
+		 *     plus optional uctx_bfreg_count): source ucontext
+		 *     was opened in lib_uar_dyn=false mode (older
+		 *     libmlx5 / static-UAR test holders).
+		 *
+		 *   - dyn-mode snapshot (uctx_dyn_uar_records): source
+		 *     ucontext was opened in libmlx5's default
+		 *     lib_uar_dyn=true mode.
+		 *
+		 * An image with neither was dumped before Step 3 landed;
+		 * refuse here rather than issuing a flagless GET_CONTEXT
+		 * that would EINVAL downstream and leave the destination
+		 * VHCA half-initialized. An image carrying both is a
+		 * structural bug -- the dump fork enforces exactly-one
+		 * by construction.
+		 */
 		{
-			int gc_rc = criu_ib_uverbs_get_context(
-				fd, RDMA_DRIVER_MLX5);
-			if (gc_rc) {
-				pr_err("vfmig: GET_CONTEXT on %s for "
-				       "ctxn=%u failed: rc=%d errno=%d "
-				       "(%s)\n",
-				       v->dest_cdev_path, e->ctxn,
-				       gc_rc, -gc_rc, strerror(-gc_rc));
-				close(fd);
+			bool has_static = e->has_uctx_meta &&
+					  e->has_uctx_uar_table;
+			bool has_dyn    = e->has_uctx_dyn_uar_records;
+
+			if (!has_static && !has_dyn) {
+				pr_err("vfmig: image entry ctxn=%u missing "
+				       "uctx snapshot (static_present=%d "
+				       "dyn_present=%d) -- image predates "
+				       "VFMIG_RESTORE support and is not "
+				       "restorable; re-dump with a current "
+				       "criu build\n",
+				       e->ctxn, has_static, has_dyn);
+				goto err;
+			}
+			if (has_static && has_dyn) {
+				pr_err("vfmig: image entry ctxn=%u carries "
+				       "BOTH static and dyn uctx snapshots "
+				       "-- malformed image\n", e->ctxn);
+				goto err;
+			}
+			if (has_static &&
+			    e->uctx_meta.len !=
+				sizeof(struct mlx5_ib_vfmig_ucontext_meta_local)) {
+				pr_err("vfmig: image entry ctxn=%u static "
+				       "uctx_meta length=%zu != %zu\n",
+				       e->ctxn, e->uctx_meta.len,
+				       sizeof(struct mlx5_ib_vfmig_ucontext_meta_local));
+				goto err;
+			}
+			if (has_dyn &&
+			    e->uctx_dyn_uar_records.len %
+				sizeof(struct mlx5_ib_vfmig_dyn_uar_record_local)) {
+				pr_err("vfmig: image entry ctxn=%u dyn "
+				       "records length=%zu not a multiple "
+				       "of record size %zu\n", e->ctxn,
+				       e->uctx_dyn_uar_records.len,
+				       sizeof(struct mlx5_ib_vfmig_dyn_uar_record_local));
 				goto err;
 			}
 		}
 
+		/*
+		 * Stash the snapshot bytes into the per-ctx cache and
+		 * stop. The cdev open + GET_CONTEXT + RESTORE_{UCONTEXT,
+		 * DYN_UARS} happen lazily on first consumer
+		 * (vfmig_ensure_cdev_open, called from UPDATE_VMA_MAP /
+		 * OPEN_UVERBS_CDEV in the per-task helper). Doing the
+		 * fd work here, in criu main, would lose the fd to
+		 * close_old_fds() in every newborn helper fdtable --
+		 * see the cache struct's docstring above.
+		 */
 		c = calloc(1, sizeof(*c));
-		if (!c) {
-			close(fd);
+		if (!c)
 			goto err;
-		}
 		c->source_ctxn = e->ctxn;
 		snprintf(c->source_ibdev, sizeof(c->source_ibdev), "%s",
 			 e->ibdev);
 		snprintf(c->source_cdev_path, sizeof(c->source_cdev_path),
 			 "%s", e->source_cdev_path);
-		c->dest_cdev_fd = fd;
+		snprintf(c->dest_cdev_path, sizeof(c->dest_cdev_path),
+			 "%s", v->dest_cdev_path);
+		c->dest_cdev_fd = -1;
+
+		if (e->has_uctx_meta) {
+			const struct mlx5_ib_vfmig_ucontext_meta_local *m =
+				(const void *)e->uctx_meta.data;
+			size_t uar_n = e->uctx_uar_table.len /
+				sizeof(uint32_t);
+			size_t cnt_n = e->has_uctx_bfreg_count ?
+				(e->uctx_bfreg_count.len / sizeof(uint32_t))
+				: 0;
+
+			if (uar_n != m->num_sys_pages) {
+				pr_err("vfmig: image entry ctxn=%u "
+				       "uar_table len mismatch: %zu != "
+				       "meta.num_sys_pages=%u\n",
+				       e->ctxn, uar_n, m->num_sys_pages);
+				free(c);
+				goto err;
+			}
+			if (cnt_n && cnt_n != m->total_num_bfregs) {
+				pr_err("vfmig: image entry ctxn=%u "
+				       "bfreg_count len mismatch: %zu != "
+				       "meta.total_num_bfregs=%u\n",
+				       e->ctxn, cnt_n,
+				       m->total_num_bfregs);
+				free(c);
+				goto err;
+			}
+
+			c->is_dyn = false;
+			c->meta = *m;
+			c->uar_n = uar_n;
+			c->uar_table = malloc(e->uctx_uar_table.len);
+			if (!c->uar_table) {
+				free(c);
+				goto err;
+			}
+			memcpy(c->uar_table, e->uctx_uar_table.data,
+			       e->uctx_uar_table.len);
+			if (cnt_n) {
+				c->bfreg_n = cnt_n;
+				c->bfreg_count = malloc(e->uctx_bfreg_count.len);
+				if (!c->bfreg_count) {
+					free(c->uar_table);
+					free(c);
+					goto err;
+				}
+				memcpy(c->bfreg_count,
+				       e->uctx_bfreg_count.data,
+				       e->uctx_bfreg_count.len);
+			}
+		} else {
+			size_t recs_n = e->uctx_dyn_uar_records.len /
+				sizeof(struct mlx5_ib_vfmig_dyn_uar_record_local);
+
+			c->is_dyn = true;
+			c->dyn_n = recs_n;
+			if (recs_n) {
+				c->dyn_records =
+					malloc(e->uctx_dyn_uar_records.len);
+				if (!c->dyn_records) {
+					free(c);
+					goto err;
+				}
+				memcpy(c->dyn_records,
+				       e->uctx_dyn_uar_records.data,
+				       e->uctx_dyn_uar_records.len);
+			}
+		}
+
 		c->next = vfmig_restored_ctxs;
 		vfmig_restored_ctxs = c;
-
-		pr_info("vfmig: cached restored ctx ctxn=%u "
-			"source_ibdev=%s source_cdev=%s -> dest_fd=%d\n",
+		pr_info("vfmig: cached ctxn=%u source_ibdev=%s "
+			"source_cdev=%s dest_cdev=%s mode=%s "
+			"(snapshot deferred-open)\n",
 			c->source_ctxn, c->source_ibdev,
-			c->source_cdev_path, c->dest_cdev_fd);
+			c->source_cdev_path, c->dest_cdev_path,
+			c->is_dyn ? "dyn-UAR" : "static");
+		continue;
 	}
 
 	for (i = 0; i < n_entries; i++)
@@ -1944,6 +3111,9 @@ static void vfmig_restore_fini_close_all(void)
 		cn = c->next;
 		if (c->dest_cdev_fd >= 0)
 			close(c->dest_cdev_fd);
+		free(c->uar_table);
+		free(c->bfreg_count);
+		free(c->dyn_records);
 		free(c);
 	}
 	vfmig_restored_ctxs = NULL;
@@ -1988,6 +3158,9 @@ static int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path,
 	c = vfmig_ctx_lookup_by_source_path(path);
 	if (!c)
 		return -ENOTSUP;
+
+	if (vfmig_ensure_cdev_open(c))
+		return -1;
 
 	dup_fd = dup(c->dest_cdev_fd);
 	if (dup_fd < 0) {
@@ -2043,6 +3216,9 @@ rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe)
 		return -1;
 	}
 
+	if (vfmig_ensure_cdev_open(c))
+		return -1;
+
 	dup_fd = dup(c->dest_cdev_fd);
 	if (dup_fd < 0) {
 		pr_perror("vfmig: dup(dest_cdev_fd=%d) for ctxn=%u",
@@ -2051,7 +3227,7 @@ rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe)
 	}
 
 	pr_info("vfmig: open_uverbs_cdev: ctxn=%u -> dest_fd=%d (dup of "
-		"cached)\n", u->ctxn, dup_fd);
+		"cached fd=%d)\n", u->ctxn, dup_fd, c->dest_cdev_fd);
 	return dup_fd;
 }
 
