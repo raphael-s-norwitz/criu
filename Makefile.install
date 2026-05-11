@@ -80,12 +80,20 @@ install-cuda_plugin: cuda_plugin
 	$(Q) $(MAKE) -C plugins/cuda install
 .PHONY: install-cuda_plugin
 
+install-rdma_rxe_plugin: rdma_rxe_plugin
+	$(Q) $(MAKE) -C plugins/rdma/rxe install
+.PHONY: install-rdma_rxe_plugin
+
+install-rdma_mlx5_vfmig_plugin: rdma_mlx5_vfmig_plugin
+	$(Q) $(MAKE) -C plugins/rdma/mlx5_sriov_vfmig install
+.PHONY: install-rdma_mlx5_vfmig_plugin
+
 install-compel: $(compel-install-targets)
 	$(Q) $(MAKE) $(build)=compel install
 	$(Q) $(MAKE) $(build)=compel/plugins install
 .PHONY: install-compel
 
-install: install-man install-lib install-crit install-criu install-compel install-amdgpu_plugin install-cuda_plugin ;
+install: install-man install-lib install-crit install-criu install-compel install-amdgpu_plugin install-cuda_plugin install-rdma_rxe_plugin install-rdma_mlx5_vfmig_plugin ;
 .PHONY: install
 
 uninstall:
@@ -97,4 +105,6 @@ uninstall:
 	$(Q) $(MAKE) $(build)=compel/plugins $@
 	$(Q) $(MAKE) -C plugins/amdgpu $@
 	$(Q) $(MAKE) -C plugins/cuda $@
+	$(Q) $(MAKE) -C plugins/rdma/rxe $@
+	$(Q) $(MAKE) -C plugins/rdma/mlx5_sriov_vfmig $@
 .PHONY: uninstall
