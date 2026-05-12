@@ -77,6 +77,7 @@ proto-obj-y	+= pidfd.o
 proto-obj-y	+= rdma_criu.o
 proto-obj-y	+= uverbsfd.o
 proto-obj-y	+= mlx5_vfmig.o
+proto-obj-y	+= rdma_uobj.o
 
 CFLAGS		+= -iquote $(obj)/
 

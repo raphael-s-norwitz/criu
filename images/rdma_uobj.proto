@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: MIT
+
+/*
+ * Per-uobject image schema for R3: the per-context DAG of ib_uobjects
+ * (PD / CQ / QP / MR / SRQ / AH / completion-channel-fd / async-event-fd)
+ * captured at dump and replayed at restore.
+ *
+ * Sequenced under the design described in
+ *   linux/tools/testing/mlx5_vfmig/DESIGN_R3_uobj_restore.md
+ * Builds on top of uverbs_file_entry (uverbsfd.proto): every
+ * rdma_uobj_entry refers back to the parent uverbs_file_entry.id
+ * via ufile_id, and per-driver plugin state per uobject lives in
+ * the opaque plugin_blob (recommended encoding: a per-plugin .proto,
+ * see for example mlx5_vfmig.proto, but criu core never parses these
+ * bytes).
+ *
+ * Image layout written by criu/rdma.c at dump time:
+ *
+ *   <img-dir>/rdma_uobj.img
+ *       Sequence of length-prefixed rdma_uobj_entry records, one per
+ *       ib_uobject discovered across all dumped uverbs files. Records
+ *       are not ordered; the restore side topo-sorts via the xref
+ *       graph. Each record carries enough identity (ufile_id + type
+ *       + ufile_handle + restrack_id) to be its own join key.
+ *
+ * Two distinct identifiers per uobject -- both load-bearing:
+ *
+ *   ufile_handle: small integer (typically 0..N), per-uverbs-file id
+ *                 space. This is what user code sees as e.g. pd->handle
+ *                 or qp->handle. Restore must install the new
+ *                 ib_uobject at the same value so user code's saved
+ *                 handles remain valid.
+ *
+ *   restrack_id:  per-ibdev integer assigned by the rdma_restrack
+ *                 subsystem. Surfaced via NLDEV (rdma resource show)
+ *                 as the per-resource `id`, and used by NLDEV's own
+ *                 cross-resource references (PDN-of-QP, CQN-of-QP,
+ *                 ...). R3 uses it as the xref edge target (see
+ *                 rdma_uobj_xref). Note this *is* user-visible via
+ *                 NLDEV: any consumer caching by restrack_id breaks
+ *                 silently across restore (fresh ids on the
+ *                 destination ibdev). Documented in the design doc
+ *                 as a known externally-visible identity discontinuity.
+ */
+
+syntax = "proto2";
+
+import "rdma_criu.proto";
+
+/*
+ * UVERBS_OBJECT_* coverage. v0 lists only types R3 will dump in
+ * the first cut (PD/CQ/QP/MR/SRQ/AH/CC/AEF). The remaining types
+ * (DM, DEVX_*, MW, FLOW, XRCD, CM_ID) are placeholders: the enum
+ * reserves their integers so the wire format stays stable as
+ * follow-on stages add them. Image consumers MUST tolerate
+ * unknown values (a future criu may emit them; crit / older criu
+ * should ignore the entry rather than crash).
+ *
+ * Names are R3UT_-prefixed because proto2 enum values share a
+ * global namespace across the criu image schema; bare PD/CQ/QP
+ * collide trivially. The prefix matches the enum-name initials.
+ */
+enum r3_uobj_type {
+	R3UT_UNKNOWN			= 0;
+	R3UT_PD				= 1;
+	R3UT_CQ				= 2;
+	R3UT_QP				= 3;
+	R3UT_MR				= 4;
+	R3UT_SRQ			= 5;
+	R3UT_AH				= 6;
+	R3UT_COMP_CHANNEL_FILE		= 7;
+	R3UT_ASYNC_EVENT_FILE		= 8;
+	/* Reserved for follow-on stages: */
+	R3UT_DM				= 9;
+	R3UT_DEVX_OBJ			= 10;
+	R3UT_DEVX_UMEM			= 11;
+	R3UT_MW				= 12;
+	R3UT_FLOW			= 13;
+	R3UT_XRCD			= 14;
+	R3UT_CM_ID			= 15;
+};
+
+/*
+ * Edge label in the per-ucontext DAG. Names a typed reference from
+ * one uobject to another. The set is intentionally small in v0:
+ * everything an ib_write_bw workload needs.
+ *
+ * Reserved values exist so follow-on stages (DM, DEVX, XRCD, ...)
+ * can be added without renumbering. Unknown roles are tolerable on
+ * decode (skip the edge with a warning) for forward compatibility.
+ */
+enum r3_xref_role {
+	R3XR_UNKNOWN			= 0;
+	R3XR_PARENT_PD			= 1;
+	R3XR_SEND_CQ			= 2;
+	R3XR_RECV_CQ			= 3;
+	R3XR_SRQ			= 4;
+	R3XR_COMP_CHANNEL		= 5;
+	/* Reserved for follow-on: */
+	R3XR_DM				= 6;
+	R3XR_XRCD			= 7;
+	R3XR_DEVX_UAR			= 8;
+};
+
+/*
+ * One typed reference from a source uobject to a target uobject.
+ * The (target_type, target_restrack_id) pair uniquely identifies
+ * the target inside the same image. Restore resolves to the
+ * destination-side ufile_handle via the per-ufile handle map
+ * built up as uobjects are restored in topo order.
+ */
+message rdma_uobj_xref {
+	required r3_xref_role	role			= 1;
+	required r3_uobj_type	target_type		= 2;
+	required uint32		target_restrack_id	= 3;
+};
+
+/* ---------------- per-class hw-agnostic attribute messages ---------------- */
+
+/*
+ * PD has no wire-visible identity and only carries access-style
+ * flags (currently empty for v0; PD allocation is access-flag-less
+ * in IB verbs). FW pdn lives in plugin_blob, not here.
+ */
+message rdma_pd_attrs {
+	optional uint32		alloc_flags		= 1;
+};
+
+/*
+ * CQ hw-agnostic state: cqe count, completion vector, modern flags.
+ * Comp-channel binding is encoded as an xref (R3XR_COMP_CHANNEL)
+ * not as a field here, so the same shape covers "no channel"
+ * uniformly.
+ */
+message rdma_cq_attrs {
+	required uint32		cqe_count		= 1;
+	optional uint32		comp_vector		= 2;
+	optional uint32		flags			= 3;
+};
+
+/*
+ * QP capability fields, mirroring `struct ib_qp_cap` 1:1. Snapshot
+ * at dump from CMD_QUERY_QP; restore passes through to
+ * ib_qp_init_attr.cap.
+ */
+message rdma_qp_cap {
+	required uint32		max_send_wr		= 1;
+	required uint32		max_recv_wr		= 2;
+	required uint32		max_send_sge		= 3;
+	required uint32		max_recv_sge		= 4;
+	optional uint32		max_inline_data		= 5;
+};
+
+/*
+ * GRH / RoCE address vector tail. Embedded inside rdma_ah_attrs
+ * (and inside rdma_qp_attrs.av / .alt_av). Present iff the
+ * underlying ah_attr has GRH bit set, which is always true on RoCE.
+ *
+ * Contents mirror struct ib_global_route / rdma_ah_attr.grh,
+ * encoded as bytes for raw 16-byte GID values to avoid endian
+ * gymnastics on the wire.
+ */
+message rdma_grh_attrs {
+	required bytes		dgid			= 1;	/* 16 bytes */
+	required uint32		sgid_index		= 2;
+	required uint32		hop_limit		= 3;
+	required uint32		traffic_class		= 4;
+	required uint32		flow_label		= 5;
+};
+
+/*
+ * Address vector. Mirrors struct rdma_ah_attr. Used both as a
+ * standalone AH uobject's payload and as the path/altpath inside
+ * a QP. ROCE-specific dmac is optional because IB-only AH attrs
+ * don't carry it.
+ */
+message rdma_ah_attrs {
+	required uint32		ah_attr_type		= 1;	/* IB / ROCE / OPA */
+	required uint32		port_num		= 2;
+	required uint32		sl			= 3;
+	required uint32		src_path_bits		= 4;
+	required uint32		static_rate		= 5;
+	optional rdma_grh_attrs	grh			= 6;
+	optional bytes		dmac			= 10;	/* 6 bytes, ROCE */
+};
+
+/*
+ * QP hw-agnostic state. Combination of init_attr fields (set at
+ * create) and qp_attr fields (set across the modify_qp transition
+ * chain INIT -> RTR -> RTS). Identity hints (qp_num, sq_psn,
+ * rq_psn, q_key) are always populated; the kernel restore handler
+ * decides whether failure to honour is fail-loud or silent
+ * fallback (per the doc's identity-continuity policy table).
+ */
+message rdma_qp_attrs {
+	/* From ib_qp_init_attr */
+	required uint32		qp_type			= 1;	/* RC/UC/UD/...   */
+	required rdma_qp_cap	cap			= 2;
+	optional uint32		sq_sig_type		= 3;
+	optional uint32		create_flags		= 4;
+	/* From ib_qp_attr -- the full transition state */
+	required uint32		state			= 10;
+	required uint32		qp_num			= 11;	/* identity hint  */
+	optional uint32		dest_qp_num		= 12;
+	optional uint32		sq_psn			= 13;
+	optional uint32		rq_psn			= 14;
+	optional uint32		q_key			= 15;
+	optional rdma_ah_attrs	av			= 16;
+	optional rdma_ah_attrs	alt_av			= 17;
+	optional uint32		path_mtu		= 18;
+	optional uint32		retry_cnt		= 19;
+	optional uint32		rnr_retry		= 20;
+	optional uint32		timeout			= 21;
+	optional uint32		rnr_timer		= 22;
+	optional uint32		max_rd_atomic		= 23;
+	optional uint32		max_dest_rd_atomic	= 24;
+	optional uint32		min_rnr_timer		= 25;
+	optional uint32		pkey_index		= 26;
+	optional uint32		port_num		= 27;
+	optional uint32		alt_pkey_index		= 28;
+	optional uint32		alt_port_num		= 29;
+	required uint32		qp_access_flags		= 30;
+	optional uint32		sq_draining		= 31;
+};
+
+/*
+ * MR hw-agnostic state. virt_addr/length/access_flags reproduce
+ * the user's ibv_reg_mr() arguments. lkey/rkey are identity hints
+ * the kernel restore handler attempts to honour (fail-loud per
+ * the doc's policy table -- rkey is wire-visible). iova may
+ * differ from virt_addr when the MR was registered with an
+ * explicit IOVA.
+ */
+message rdma_mr_attrs {
+	required uint64		virt_addr		= 1;
+	required uint64		length			= 2;
+	required uint32		access_flags		= 3;
+	required uint32		lkey			= 10;	/* identity hint  */
+	required uint32		rkey			= 11;	/* identity hint  */
+	optional uint64		iova			= 12;
+};
+
+/*
+ * SRQ hw-agnostic state. Mirrors ib_srq_init_attr's standard
+ * fields plus the live srq_limit. XRC SRQ adds an XRCD xref
+ * (deferred).
+ */
+message rdma_srq_attrs {
+	required uint32		srq_type		= 1;	/* BASIC / XRC    */
+	required uint32		max_wr			= 2;
+	required uint32		max_sge			= 3;
+	optional uint32		srq_limit		= 4;
+};
+
+/*
+ * Comp channel and async event fd are uobjects (UVERBS_TYPE_ALLOC_FD)
+ * additionally exposed as fd numbers in the user's fd table. The
+ * uobject install lives in the per-uobj restore verb path; the
+ * fd-table install reuses CRIU's existing fd machinery, keyed off
+ * user_fd_no. user_fd_no is the fd number the source process held;
+ * restore installs the destination-side fd at the same number.
+ */
+message rdma_cc_attrs {
+	required uint32		user_fd_no		= 1;
+};
+
+message rdma_aef_attrs {
+	required uint32		user_fd_no		= 1;
+};
+
+/* ---------------- top-level per-uobject record ---------------- */
+
+/*
+ * One per discovered ib_uobject across all dumped uverbs files.
+ *
+ * Identity:
+ *   ufile_id      cross-references uverbs_file_entry.id; names the
+ *                 owning ucontext.
+ *   hw_driver_id  mirror of the parent uverbs_file_entry.criu_driver
+ *                 for image-inspection convenience (so `crit decode
+ *                 rdma_uobj.img` can render plugin attribution
+ *                 without a join).
+ *   type          which uobject class this record carries.
+ *   ufile_handle  small per-ufile id user code holds (e.g.
+ *                 pd->handle, qp->handle); restore installs the new
+ *                 ib_uobject at this value.
+ *   restrack_id   per-ibdev id; xref edge target (see rdma_uobj_xref).
+ *
+ * Payload:
+ *   EXACTLY ONE of pd/cq/qp/mr/srq/ah/cc/aef matches `type`. Reserved-
+ *   type entries (DM/DEVX/MW/...) carry the matching sub-message
+ *   when added in follow-on stages; v0 emits none.
+ *
+ *   plugin_blob is the per-plugin opaque hw-specific state (FW pdn,
+ *   FW mkey, FW qpn context, ...). Encoding is plugin-defined;
+ *   recommended path is a per-plugin protobuf (e.g.
+ *   mlx5_vfmig.proto) wrapped as bytes here. criu core never
+ *   parses this field.
+ *
+ *   xref records the typed edges this uobject has into other
+ *   uobjects in the same ufile (parent PD, send_cq, recv_cq,
+ *   srq, comp_channel). Restore resolves edges through the per-
+ *   ufile handle map built up as uobjects are restored in topo
+ *   order.
+ */
+message rdma_uobj_entry {
+	required uint32		ufile_id		= 1;
+	required rdma_criu_driver hw_driver_id		= 2;
+	required r3_uobj_type	type			= 3;
+	required uint32		ufile_handle		= 4;
+	required uint32		restrack_id		= 5;
+
+	/* HW-agnostic per-class attrs. EXACTLY ONE matches `type`. */
+	optional rdma_pd_attrs	pd			= 10;
+	optional rdma_cq_attrs	cq			= 11;
+	optional rdma_qp_attrs	qp			= 12;
+	optional rdma_mr_attrs	mr			= 13;
+	optional rdma_srq_attrs	srq			= 14;
+	optional rdma_ah_attrs	ah			= 15;
+	optional rdma_cc_attrs	cc			= 16;
+	optional rdma_aef_attrs	aef			= 17;
+
+	/* Edges into the same image. */
+	repeated rdma_uobj_xref	xref			= 30;
+
+	/*
+	 * Plugin-specific opaque blob (FW state). v0 ships the field
+	 * but emits empty bytes from S1; first real consumer is S3
+	 * (mlx5 PD restore). See plugin .proto files for blob
+	 * structure where used.
+	 */
+	optional bytes		plugin_blob		= 40;
+};
