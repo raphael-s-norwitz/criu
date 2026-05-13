@@ -115,6 +115,47 @@ fi
 echo "dump ok; holder gone"
 
 #
+# 3a. R3 (S1.b) dump-side DAG image assertion.
+#
+# rdma-uobj.img must exist and carry at least one entry. The
+# holder allocates exactly one PD on rxe0 before its session is
+# dumped, so the discovery walk should land one R3UT_PD record.
+# We don't decode the protobuf body here -- crit's pycriu
+# decoder doesn't know rdma-uobj yet (pre-existing crit/proto
+# sync gap, tracked separately) -- but we do verify magic and
+# that there's at least one length-prefixed entry past the
+# IMG_COMMON + RDMA_UOBJ headers.
+#
+DAG_IMG="$DUMPDIR/rdma-uobj.img"
+[[ -f "$DAG_IMG" ]] || {
+	echo "FAIL: $DAG_IMG missing -- S1.b dump-side DAG walk" \
+	     "didn't run or produced no image" >&2
+	echo "--- dump log tail ---" >&2
+	tail -40 "$DUMPDIR/dump.log" >&2 || true
+	exit 1
+}
+DAG_SIZE=$(stat -c %s "$DAG_IMG")
+[[ "$DAG_SIZE" -ge 18 ]] || {
+	# 8 bytes of header + at least one nonzero-length entry.
+	echo "FAIL: $DAG_IMG too small ($DAG_SIZE bytes) -- expected" \
+	     "at least one rdma_uobj_entry" >&2
+	exit 1
+}
+# uobj DAG: ibdev=... emitted=N dropped=M is the dump-side
+# pr_info from rdma_dump_uobj_dag(). Confirm at least one
+# entry was emitted (not dropped).
+if ! grep -qE 'uobj DAG: ibdev=rxe0 emitted=[1-9]' \
+	"$DUMPDIR/dump.log"; then
+	echo "FAIL: dump.log shows no PD/CQ/QP/MR/SRQ uobjects" \
+	     "emitted to rdma-uobj.img for ibdev=rxe0" >&2
+	echo "--- dump log uobj DAG lines ---" >&2
+	grep -E 'uobj DAG' "$DUMPDIR/dump.log" >&2 || \
+		echo "(no uobj DAG lines at all)" >&2
+	exit 1
+fi
+echo "rdma-uobj.img ok ($DAG_SIZE bytes; dump emitted >=1 uobject)"
+
+#
 # 4. Restore.
 #
 echo "criu restore -d -D $DUMPDIR"
@@ -122,6 +163,33 @@ echo "criu restore -d -D $DUMPDIR"
 	--pidfile "$RESTORED_PIDFILE"
 RESTORED_PID="$(cat "$RESTORED_PIDFILE")"
 echo "restored pid=$RESTORED_PID"
+
+#
+# 4a. R3 (S1.c) restore-side DAG read+verify assertion.
+#
+# rdma_collect_uobj_dag() runs in crtools_prepare_shared() right
+# after prepare_files(), and pr_info's a per-ufile DAG summary
+# plus a "read+verify ok: N entries..." line on success. Confirm
+# both showed up: the one-line-per-ufile summary (parameterised by
+# the holder's hw_drv=RDMA_CRIU_DRIVER__RCD_RXE = 1) and the
+# total-entries close-out.
+#
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ hw_drv=1 ' \
+	"$DUMPDIR/restore.log"; then
+	echo "FAIL: restore.log shows no R3 per-ufile DAG summary" \
+	     "(rdma_collect_uobj_dag() didn't run, or didn't see" \
+	     "any rxe ufile)" >&2
+	echo "--- restore log uobj DAG lines ---" >&2
+	grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+		echo "(no uobj DAG lines at all)" >&2
+	exit 1
+fi
+if ! grep -qE 'uobj DAG: read\+verify ok' "$DUMPDIR/restore.log"; then
+	echo "FAIL: restore.log shows no S1.c read+verify success" \
+	     "line; the verify pass either errored or didn't run" >&2
+	exit 1
+fi
+echo "rdma-uobj.img verify pass ran clean on restore"
 
 #
 # 5. Verify post-restore context is functional.

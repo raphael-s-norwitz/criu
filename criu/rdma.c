@@ -2008,3 +2008,251 @@ out:
 	}
 	return ret;
 }
+
+/*
+ * R3 restore-side: read+verify pass on rdma-uobj.img.
+ *
+ * S1.c. Validates that what dump_uobj_dag wrote is internally
+ * consistent: every xref edge resolves within its ufile group, and
+ * (ufile_id, type, restrack_id) tuples are unique. No restore
+ * action; per-uobject restore handlers land incrementally in S2+.
+ */
+struct uobj_collected {
+	RdmaUobjEntry *e;
+	struct list_head link;	/* link in uobj_ufile_group.entries */
+};
+
+struct uobj_ufile_group {
+	uint32_t ufile_id;
+	uint32_t hw_driver_id;	/* taken from first entry; verified equal */
+	struct list_head entries;
+	int n_pd, n_cq, n_qp, n_mr, n_srq, n_ah, n_cc, n_aef, n_other;
+	int n_xref_total;
+	int n_xref_resolved;
+	struct list_head link;
+};
+
+static struct uobj_ufile_group *uobj_ufile_group_get_or_add(
+		struct list_head *head, uint32_t ufile_id, uint32_t hw_driver_id)
+{
+	struct uobj_ufile_group *g;
+
+	list_for_each_entry(g, head, link)
+		if (g->ufile_id == ufile_id) {
+			if (g->hw_driver_id != hw_driver_id) {
+				pr_err("uobj DAG: ufile_id=%#x has entries "
+				       "claiming both hw_driver=%u and "
+				       "hw_driver=%u; image is inconsistent\n",
+				       ufile_id, g->hw_driver_id, hw_driver_id);
+				return NULL;
+			}
+			return g;
+		}
+	g = xzalloc(sizeof(*g));
+	if (!g)
+		return NULL;
+	g->ufile_id = ufile_id;
+	g->hw_driver_id = hw_driver_id;
+	INIT_LIST_HEAD(&g->entries);
+	INIT_LIST_HEAD(&g->link);
+	list_add_tail(&g->link, head);
+	return g;
+}
+
+static void uobj_ufile_group_count(struct uobj_ufile_group *g,
+				   R3UobjType type)
+{
+	switch (type) {
+	case R3_UOBJ_TYPE__R3UT_PD:	g->n_pd++;	break;
+	case R3_UOBJ_TYPE__R3UT_CQ:	g->n_cq++;	break;
+	case R3_UOBJ_TYPE__R3UT_QP:	g->n_qp++;	break;
+	case R3_UOBJ_TYPE__R3UT_MR:	g->n_mr++;	break;
+	case R3_UOBJ_TYPE__R3UT_SRQ:	g->n_srq++;	break;
+	case R3_UOBJ_TYPE__R3UT_AH:	g->n_ah++;	break;
+	case R3_UOBJ_TYPE__R3UT_COMP_CHANNEL_FILE:
+					g->n_cc++;	break;
+	case R3_UOBJ_TYPE__R3UT_ASYNC_EVENT_FILE:
+					g->n_aef++;	break;
+	default:			g->n_other++;	break;
+	}
+}
+
+/*
+ * Find an entry by (type, restrack_id) within @g. Used to resolve
+ * xref edges. Returns the entry pointer, or NULL if not found or
+ * if the candidate has no restrack_id (matches against
+ * has_restrack_id false should not resolve).
+ */
+static const RdmaUobjEntry *uobj_ufile_group_find(
+		const struct uobj_ufile_group *g,
+		R3UobjType target_type, uint32_t target_restrack_id)
+{
+	struct uobj_collected *c;
+
+	list_for_each_entry(c, &g->entries, link) {
+		const RdmaUobjEntry *e = c->e;
+
+		if (!e->has_restrack_id)
+			continue;
+		if (e->type != target_type)
+			continue;
+		if (e->restrack_id != target_restrack_id)
+			continue;
+		return e;
+	}
+	return NULL;
+}
+
+/*
+ * Per-group dedup check: (type, restrack_id) must be unique.
+ * Returns -1 on duplicate. O(n^2) but uobject counts per ufile
+ * are O(10s), not O(thousands), so the simple sweep beats setting
+ * up a hash for the size we actually see.
+ */
+static int uobj_ufile_group_check_unique(const struct uobj_ufile_group *g)
+{
+	struct uobj_collected *ci, *cj;
+
+	list_for_each_entry(ci, &g->entries, link) {
+		const RdmaUobjEntry *ei = ci->e;
+
+		if (!ei->has_restrack_id)
+			continue;
+		for (cj = list_entry(ci->link.next, struct uobj_collected, link);
+		     &cj->link != &g->entries;
+		     cj = list_entry(cj->link.next, struct uobj_collected, link)) {
+			const RdmaUobjEntry *ej = cj->e;
+
+			if (!ej->has_restrack_id)
+				continue;
+			if (ei->type != ej->type)
+				continue;
+			if (ei->restrack_id != ej->restrack_id)
+				continue;
+			pr_err("uobj DAG: ufile_id=%#x has duplicate "
+			       "(type=%u, restrack_id=%u) entries; image "
+			       "is inconsistent\n",
+			       g->ufile_id, ei->type, ei->restrack_id);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int uobj_ufile_group_check_xrefs(struct uobj_ufile_group *g)
+{
+	struct uobj_collected *c;
+
+	list_for_each_entry(c, &g->entries, link) {
+		const RdmaUobjEntry *e = c->e;
+
+		for (size_t k = 0; k < e->n_xref; k++) {
+			const RdmaUobjXref *xr = e->xref[k];
+
+			g->n_xref_total++;
+			if (uobj_ufile_group_find(g, xr->target_type,
+						  xr->target_restrack_id)) {
+				g->n_xref_resolved++;
+				continue;
+			}
+			pr_err("uobj DAG: ufile_id=%#x entry "
+			       "(type=%u, restrack_id=%s%u) has unresolvable "
+			       "xref role=%u target_type=%u "
+			       "target_restrack_id=%u\n",
+			       g->ufile_id, e->type,
+			       e->has_restrack_id ? "" : "?",
+			       e->has_restrack_id ? e->restrack_id : 0,
+			       xr->role, xr->target_type,
+			       xr->target_restrack_id);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+int rdma_collect_uobj_dag(void)
+{
+	struct cr_img *img;
+	LIST_HEAD(groups);
+	struct uobj_ufile_group *g, *gnext;
+	struct uobj_collected *c, *cnext;
+	int ret = -1;
+	int n_entries = 0;
+
+	img = open_image(CR_FD_RDMA_UOBJ, O_RSTR);
+	if (!img)
+		return -1;
+	if (empty_image(img)) {
+		pr_debug("uobj DAG: no rdma-uobj.img in dump (no in-tree "
+			 "RDMA at dump time); nothing to verify\n");
+		close_image(img);
+		return 0;
+	}
+
+	while (1) {
+		RdmaUobjEntry *e = NULL;
+		int r;
+
+		r = pb_read_one_eof(img, &e, PB_RDMA_UOBJ);
+		if (r < 0)
+			goto out;
+		if (r == 0)
+			break;
+
+		g = uobj_ufile_group_get_or_add(&groups, e->ufile_id,
+						e->hw_driver_id);
+		if (!g) {
+			rdma_uobj_entry__free_unpacked(e, NULL);
+			goto out;
+		}
+
+		c = xzalloc(sizeof(*c));
+		if (!c) {
+			rdma_uobj_entry__free_unpacked(e, NULL);
+			goto out;
+		}
+		c->e = e;
+		INIT_LIST_HEAD(&c->link);
+		list_add_tail(&c->link, &g->entries);
+		uobj_ufile_group_count(g, e->type);
+		n_entries++;
+	}
+
+	/*
+	 * Per-ufile validation. Run uniqueness + xref resolution per
+	 * group; bail on the first inconsistency so the operator gets
+	 * a single actionable error rather than a cascade.
+	 */
+	list_for_each_entry(g, &groups, link) {
+		if (uobj_ufile_group_check_unique(g) < 0)
+			goto out;
+		if (uobj_ufile_group_check_xrefs(g) < 0)
+			goto out;
+		pr_info("uobj DAG: ufile_id=%#x hw_drv=%u "
+			"pds=%d cqs=%d qps=%d mrs=%d srqs=%d ahs=%d "
+			"ccs=%d aefs=%d xrefs=%d/%d\n",
+			g->ufile_id, g->hw_driver_id,
+			g->n_pd, g->n_cq, g->n_qp, g->n_mr, g->n_srq,
+			g->n_ah, g->n_cc, g->n_aef,
+			g->n_xref_resolved, g->n_xref_total);
+	}
+
+	pr_info("uobj DAG: read+verify ok: %d entries across "
+		"%d ufile_id group(s)\n",
+		n_entries,
+		({ int n = 0; list_for_each_entry(g, &groups, link) n++; n; }));
+
+	ret = 0;
+out:
+	close_image(img);
+	list_for_each_entry_safe(g, gnext, &groups, link) {
+		list_for_each_entry_safe(c, cnext, &g->entries, link) {
+			list_del(&c->link);
+			rdma_uobj_entry__free_unpacked(c->e, NULL);
+			xfree(c);
+		}
+		list_del(&g->link);
+		xfree(g);
+	}
+	return ret;
+}

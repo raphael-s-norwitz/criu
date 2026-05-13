@@ -84,6 +84,34 @@ int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
 int rdma_dump_uobj_dag(void);
 
 /*
+ * R3 restore-side per-uobject DAG read+verify pass.
+ *
+ * S1.c. Opens rdma-uobj.img, reads every rdma_uobj_entry, groups
+ * by ufile_id, and validates internal consistency:
+ *
+ *   * Every xref edge resolves to an entry of matching type within
+ *     the same ufile_id group (PARENT_PD edge -> a PD entry with
+ *     the matching target_restrack_id must exist).
+ *
+ *   * (ufile_id, type, restrack_id) is unique within the image
+ *     for the types that emit restrack_id (PD/CQ/MR/SRQ); a
+ *     duplicate indicates a dump-side bug.
+ *
+ * The verify pass is informational only -- it does NOT install any
+ * uobjects on the destination. Per-uobject restore verbs land
+ * incrementally across S2-S6 as kernel support arrives. Logs a
+ * one-line per-ufile summary at pr_info so an operator inspecting
+ * a restore log can confirm what the dump captured without
+ * reaching for `crit decode`.
+ *
+ * No-op (returns 0) when the image is absent (no in-tree RDMA at
+ * dump time). Returns -1 on any internal-inconsistency or read
+ * error -- the dump is broken if this trips, so failing closed
+ * surfaces it before any S2+ stage tries to act on the same image.
+ */
+int rdma_collect_uobj_dag(void);
+
+/*
  * Internal-but-shared helpers used by both criu/rdma.c and the
  * pre-suspend coverage check above. Defined in criu/rdma.c.
  *

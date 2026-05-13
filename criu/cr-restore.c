@@ -77,6 +77,7 @@
 #include "fdstore.h"
 #include "string.h"
 #include "memfd.h"
+#include "rdma.h"
 #include "timens.h"
 #include "bpfmap.h"
 #include "apparmor.h"
@@ -240,6 +241,16 @@ static int crtools_prepare_shared(void)
 		return -1;
 
 	if (prepare_files())
+		return -1;
+
+	/*
+	 * R3 (per-uobject DAG) read+verify pass on rdma-uobj.img.
+	 * Runs after prepare_files() so any future cross-check
+	 * against the just-collected uverbsfd file_desc state has
+	 * the data available. No-op if the dump carries no RDMA
+	 * uobjects; per-uobject restore handlers land at S2+.
+	 */
+	if (rdma_collect_uobj_dag())
 		return -1;
 
 	/* We might want to remove ghost files on failed restore */
