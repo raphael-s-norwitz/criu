@@ -61,6 +61,29 @@ int rdma_check_dump_coverage(struct pstree_item *root);
 int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
 
 /*
+ * R3 dump-side per-uobject DAG walk.
+ *
+ * Runs once at end-of-dump, after every pstree task has been
+ * dumped. Walks NLDEV per in-tree ibdev to enumerate the PD/CQ/
+ * QP/MR/SRQ uobjects under each in-tree ucontext, and writes one
+ * rdma_uobj_entry per discovered uobject into rdma_uobj.img.
+ *
+ * S1.b scope: discovery and image emission only -- no restore-side
+ * action consumes rdma_uobj.img yet (that lands in S1.c). Per-
+ * uobject restore verbs come progressively across S2-S6 as kernel
+ * support arrives, with the per-class tagging table in
+ * linux/tools/testing/mlx5_vfmig/DESIGN_R3_uobj_restore.md
+ * gating which uobjects gain restore handlers when.
+ *
+ * No-op (returns 0 without opening rdma_uobj.img) when no in-tree
+ * uverbs context was dumped, which is the common case for the vast
+ * majority of CRIU dump targets (no RDMA workload).
+ *
+ * Returns 0 on success, -1 on netlink/image-emission failure.
+ */
+int rdma_dump_uobj_dag(void);
+
+/*
  * Internal-but-shared helpers used by both criu/rdma.c and the
  * pre-suspend coverage check above. Defined in criu/rdma.c.
  *

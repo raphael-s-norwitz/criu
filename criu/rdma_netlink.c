@@ -46,6 +46,7 @@
 #include <libnl3/netlink/msg.h>
 #include <rdma/rdma_netlink.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -282,10 +283,36 @@ static int ctx_per_msg_cb(struct nlmsghdr *hdr, void *arg)
 	return 0;
 }
 
+/*
+ * Run the host-wide RDMA_NLDEV_CMD_GET dump and collect each ibdev
+ * the kernel knows about into @out. Caller frees the list with
+ * free_dev_list(). Shared by rdma_nl_for_each_context (which then
+ * issues per-device follow-up dumps) and rdma_nl_for_each_ibdev
+ * (the bare-list public wrapper).
+ */
+static void free_dev_list(struct nl_dev *head)
+{
+	struct nl_dev *d, *next;
+
+	for (d = head; d != NULL; d = next) {
+		next = d->next;
+		free(d);
+	}
+}
+
+static int collect_devs(int sk, struct dev_collect_ctx *out)
+{
+	memset(out, 0, sizeof(*out));
+	return rdma_nl_dump(sk,
+			    RDMA_NL_GET_TYPE(RDMA_NL_NLDEV,
+					     RDMA_NLDEV_CMD_GET),
+			    NULL, 0, dev_collect_cb, out);
+}
+
 int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg)
 {
-	struct dev_collect_ctx devs = { 0 };
-	struct nl_dev *d, *next;
+	struct dev_collect_ctx devs;
+	struct nl_dev *d;
 	int sk, ret;
 
 	if (!cb)
@@ -303,13 +330,10 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg)
 	 * DEV_INDEX argument -- the kernel walks ib_enum_all_devs() on
 	 * its behalf.
 	 */
-	ret = rdma_nl_dump(sk,
-			   RDMA_NL_GET_TYPE(RDMA_NL_NLDEV,
-					    RDMA_NLDEV_CMD_GET),
-			   NULL, 0, dev_collect_cb, &devs);
+	ret = collect_devs(sk, &devs);
 	if (ret < 0) {
 		close(sk);
-		goto out;
+		return ret;
 	}
 
 	pr_debug("device enum: %d ibdev(s) found\n", devs.n);
@@ -353,10 +377,281 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg)
 	}
 
 	close(sk);
-out:
-	for (d = devs.head; d != NULL; d = next) {
-		next = d->next;
-		free(d);
-	}
+	free_dev_list(devs.head);
 	return ret;
+}
+
+int rdma_nl_for_each_ibdev(rdma_nl_ibdev_cb_t cb, void *arg)
+{
+	struct dev_collect_ctx devs;
+	struct nl_dev *d;
+	int sk, ret;
+
+	if (!cb)
+		return -EINVAL;
+
+	sk = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_RDMA);
+	if (sk < 0) {
+		pr_perror("socket(NETLINK_RDMA) failed");
+		return -errno;
+	}
+
+	ret = collect_devs(sk, &devs);
+	close(sk);
+	if (ret < 0)
+		return ret;
+
+	for (d = devs.head; d != NULL; d = d->next) {
+		ret = cb(d->dev_index, d->ibdev, arg);
+		if (ret != 0)
+			break;
+	}
+
+	free_dev_list(devs.head);
+	return ret;
+}
+
+/*
+ * Per-resource walker.
+ *
+ * For every R3-relevant uobject class (PD/CQ/QP/MR/SRQ) the kernel
+ * exposes an RDMA_NLDEV_CMD_RES_<TYPE>_GET that dumps every
+ * non-kernel resource of that type on a given ibdev (DEV_INDEX is
+ * mandatory). The reply layout is uniform: one nlmsg per device
+ * containing a top-level RDMA_NLDEV_ATTR_RES_<TYPE> nested table,
+ * inside which sit zero or more RES_<TYPE>_ENTRY nested children,
+ * each carrying that resource's per-attr leaves.
+ *
+ * Per-class field availability tracks fill_res_<type>_entry in the
+ * upstream kernel; see the doc comment in rdma_netlink.h for what
+ * the iterator promises to surface today.
+ */
+struct res_walk_ctx {
+	rdma_nl_res_cb_t user_cb;
+	void *user_arg;
+	enum rdma_nl_res_type type;
+	uint32_t dev_index;
+	const char *ibdev;
+	int cb_ret;
+};
+
+/*
+ * Per-type metadata: which CMD code drives the dump, which top-level
+ * NLDEV attribute IDs nest the entry list and the entries inside it,
+ * and which kernel attr carries the resource's restrack_id.
+ *
+ * Keep the order matching enum rdma_nl_res_type so a switch can be
+ * collapsed to indexed array access.
+ */
+static const struct res_type_info {
+	uint16_t cmd;
+	uint16_t list_attr;	/* RDMA_NLDEV_ATTR_RES_<TYPE>      */
+	uint16_t entry_attr;	/* RDMA_NLDEV_ATTR_RES_<TYPE>_ENTRY */
+	uint16_t restrack_attr;	/* RDMA_NLDEV_ATTR_RES_PDN/CQN/...  */
+	const char *name;
+} res_types[] = {
+	[RDMA_NL_RES_PD]  = { RDMA_NLDEV_CMD_RES_PD_GET,
+			      RDMA_NLDEV_ATTR_RES_PD,
+			      RDMA_NLDEV_ATTR_RES_PD_ENTRY,
+			      RDMA_NLDEV_ATTR_RES_PDN, "pd" },
+	[RDMA_NL_RES_CQ]  = { RDMA_NLDEV_CMD_RES_CQ_GET,
+			      RDMA_NLDEV_ATTR_RES_CQ,
+			      RDMA_NLDEV_ATTR_RES_CQ_ENTRY,
+			      RDMA_NLDEV_ATTR_RES_CQN, "cq" },
+	[RDMA_NL_RES_QP]  = { RDMA_NLDEV_CMD_RES_QP_GET,
+			      RDMA_NLDEV_ATTR_RES_QP,
+			      RDMA_NLDEV_ATTR_RES_QP_ENTRY,
+			      0, /* QP has no restrack_id attr today */ "qp" },
+	[RDMA_NL_RES_MR]  = { RDMA_NLDEV_CMD_RES_MR_GET,
+			      RDMA_NLDEV_ATTR_RES_MR,
+			      RDMA_NLDEV_ATTR_RES_MR_ENTRY,
+			      RDMA_NLDEV_ATTR_RES_MRN, "mr" },
+	[RDMA_NL_RES_SRQ] = { RDMA_NLDEV_CMD_RES_SRQ_GET,
+			      RDMA_NLDEV_ATTR_RES_SRQ,
+			      RDMA_NLDEV_ATTR_RES_SRQ_ENTRY,
+			      RDMA_NLDEV_ATTR_RES_SRQN, "srq" },
+};
+
+/*
+ * Parse one RES_<TYPE>_ENTRY nested attribute into @e. Reads
+ * everything fill_res_<type>_entry currently emits per type; the
+ * caller's switch on @e->type already determines which union arm
+ * the per-leaf code populates.
+ */
+static int parse_res_entry(struct nlattr *entry,
+			   const struct res_type_info *info,
+			   struct rdma_nl_res_entry *e)
+{
+	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
+
+	if (nla_parse(tb, RDMA_NLDEV_ATTR_MAX - 1,
+		      nla_data(entry), nla_len(entry), NULL) < 0)
+		return -1;
+
+	if (info->restrack_attr && tb[info->restrack_attr]) {
+		e->has_restrack_id = true;
+		e->restrack_id = nla_get_u32(tb[info->restrack_attr]);
+	}
+	if (tb[RDMA_NLDEV_ATTR_RES_CTXN]) {
+		e->has_ctxn = true;
+		e->ctxn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_CTXN]);
+	}
+	if (tb[RDMA_NLDEV_ATTR_RES_PDN]) {
+		e->has_pdn = true;
+		e->pdn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_PDN]);
+	}
+	if (tb[RDMA_NLDEV_ATTR_RES_PID]) {
+		e->has_pid = true;
+		e->pid = (pid_t)nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_PID]);
+	}
+
+	switch (e->type) {
+	case RDMA_NL_RES_PD:
+		if (tb[RDMA_NLDEV_ATTR_RES_USECNT])
+			e->pd.usecnt = nla_get_u64(tb[RDMA_NLDEV_ATTR_RES_USECNT]);
+		break;
+	case RDMA_NL_RES_CQ:
+		if (tb[RDMA_NLDEV_ATTR_RES_CQE])
+			e->cq.cqe = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_CQE]);
+		if (tb[RDMA_NLDEV_ATTR_RES_USECNT])
+			e->cq.usecnt = nla_get_u64(tb[RDMA_NLDEV_ATTR_RES_USECNT]);
+		break;
+	case RDMA_NL_RES_QP:
+		if (tb[RDMA_NLDEV_ATTR_RES_LQPN])
+			e->qp.lqpn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_LQPN]);
+		if (tb[RDMA_NLDEV_ATTR_RES_RQPN]) {
+			e->qp.has_rqpn = true;
+			e->qp.rqpn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_RQPN]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_RQ_PSN]) {
+			e->qp.has_rq_psn = true;
+			e->qp.rq_psn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_RQ_PSN]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_SQ_PSN]) {
+			e->qp.has_sq_psn = true;
+			e->qp.sq_psn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_SQ_PSN]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_TYPE])
+			e->qp.qp_type = nla_get_u8(tb[RDMA_NLDEV_ATTR_RES_TYPE]);
+		if (tb[RDMA_NLDEV_ATTR_RES_STATE])
+			e->qp.qp_state = nla_get_u8(tb[RDMA_NLDEV_ATTR_RES_STATE]);
+		if (tb[RDMA_NLDEV_ATTR_PORT_INDEX]) {
+			e->qp.has_port = true;
+			e->qp.port = nla_get_u32(tb[RDMA_NLDEV_ATTR_PORT_INDEX]);
+		}
+		break;
+	case RDMA_NL_RES_MR:
+		if (tb[RDMA_NLDEV_ATTR_RES_MRLEN])
+			e->mr.mrlen = nla_get_u64(tb[RDMA_NLDEV_ATTR_RES_MRLEN]);
+		if (tb[RDMA_NLDEV_ATTR_RES_IOVA]) {
+			e->mr.has_iova = true;
+			e->mr.iova = nla_get_u64(tb[RDMA_NLDEV_ATTR_RES_IOVA]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_LKEY]) {
+			e->mr.has_lkey = true;
+			e->mr.lkey = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_LKEY]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_RKEY]) {
+			e->mr.has_rkey = true;
+			e->mr.rkey = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_RKEY]);
+		}
+		break;
+	case RDMA_NL_RES_SRQ:
+		if (tb[RDMA_NLDEV_ATTR_RES_TYPE])
+			e->srq.srq_type = nla_get_u8(tb[RDMA_NLDEV_ATTR_RES_TYPE]);
+		if (tb[RDMA_NLDEV_ATTR_RES_CQN]) {
+			e->srq.has_cqn = true;
+			e->srq.cqn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_CQN]);
+		}
+		break;
+	}
+	return 0;
+}
+
+static int res_per_msg_cb(struct nlmsghdr *hdr, void *arg)
+{
+	struct res_walk_ctx *rw = arg;
+	const struct res_type_info *info = &res_types[rw->type];
+	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
+	struct nlattr *list, *entry;
+	int rem;
+
+	if (nlmsg_parse(hdr, 0, tb, RDMA_NLDEV_ATTR_MAX - 1, NULL) < 0)
+		return 0;
+
+	list = tb[info->list_attr];
+	if (!list)
+		return 0;
+
+	nla_for_each_nested(entry, list, rem) {
+		struct rdma_nl_res_entry e = { 0 };
+		int r;
+
+		if (nla_type(entry) != info->entry_attr)
+			continue;
+
+		e.type = rw->type;
+		e.dev_index = rw->dev_index;
+		snprintf(e.ibdev, sizeof(e.ibdev), "%.*s",
+			 (int)(sizeof(e.ibdev) - 1), rw->ibdev);
+
+		if (parse_res_entry(entry, info, &e) != 0)
+			continue;
+
+		r = rw->user_cb(&e, rw->user_arg);
+		if (r != 0) {
+			rw->cb_ret = r;
+			return r;
+		}
+	}
+
+	return 0;
+}
+
+int rdma_nl_for_each_resource(uint32_t dev_index, const char *ibdev,
+			      enum rdma_nl_res_type type,
+			      rdma_nl_res_cb_t cb, void *arg)
+{
+	const struct res_type_info *info;
+	struct res_walk_ctx rw;
+	struct {
+		struct nlattr nla;
+		uint32_t val;
+	} __attribute__((aligned(NLA_ALIGNTO))) req_attr;
+	int sk, ret;
+
+	if (!cb || (unsigned)type >= ARRAY_SIZE(res_types))
+		return -EINVAL;
+
+	info = &res_types[type];
+
+	sk = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_RDMA);
+	if (sk < 0) {
+		pr_perror("socket(NETLINK_RDMA) failed");
+		return -errno;
+	}
+
+	rw.user_cb = cb;
+	rw.user_arg = arg;
+	rw.type = type;
+	rw.dev_index = dev_index;
+	rw.ibdev = ibdev;
+	rw.cb_ret = 0;
+
+	req_attr.nla.nla_type = RDMA_NLDEV_ATTR_DEV_INDEX;
+	req_attr.nla.nla_len = NLA_HDRLEN + sizeof(uint32_t);
+	req_attr.val = dev_index;
+
+	ret = rdma_nl_dump(sk,
+			   RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, info->cmd),
+			   &req_attr, sizeof(req_attr),
+			   res_per_msg_cb, &rw);
+	close(sk);
+
+	if (ret < 0) {
+		pr_warn("res %s dump for ibdev %s (idx=%u) failed: %d\n",
+			info->name, ibdev, dev_index, ret);
+		return ret;
+	}
+	return rw.cb_ret;
 }

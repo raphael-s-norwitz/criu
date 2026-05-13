@@ -131,9 +131,16 @@ message rdma_pd_attrs {
  * Comp-channel binding is encoded as an xref (R3XR_COMP_CHANNEL)
  * not as a field here, so the same shape covers "no channel"
  * uniformly.
+ *
+ * Field provenance:
+ *   cqe_count    NLDEV RES_CQE (always present from S1.b dump).
+ *   comp_vector  not in NLDEV; comes from plugin-private query
+ *                (FW comp-vector binding) at S3+. Optional.
+ *   flags        not in NLDEV; mirrors `enum ib_create_cq_flags`,
+ *                filled from plugin blob at S3+. Optional.
  */
 message rdma_cq_attrs {
-	required uint32		cqe_count		= 1;
+	optional uint32		cqe_count		= 1;
 	optional uint32		comp_vector		= 2;
 	optional uint32		flags			= 3;
 };
@@ -142,12 +149,20 @@ message rdma_cq_attrs {
  * QP capability fields, mirroring `struct ib_qp_cap` 1:1. Snapshot
  * at dump from CMD_QUERY_QP; restore passes through to
  * ib_qp_init_attr.cap.
+ *
+ * All fields are optional in the wire format because NLDEV's
+ * fill_res_qp_entry does NOT emit ib_qp_cap (the kernel calls
+ * ib_query_qp internally but only puts a subset of qp_attr/init_attr
+ * into the message). Filled progressively: S2/S3+ via the plugin
+ * blob until a kernel emission lands that surfaces ib_qp_cap on
+ * NLDEV. A reader that finds an rdma_qp_cap with all fields unset
+ * should treat the QP as "shape unknown, restore will need a blob".
  */
 message rdma_qp_cap {
-	required uint32		max_send_wr		= 1;
-	required uint32		max_recv_wr		= 2;
-	required uint32		max_send_sge		= 3;
-	required uint32		max_recv_sge		= 4;
+	optional uint32		max_send_wr		= 1;
+	optional uint32		max_recv_wr		= 2;
+	optional uint32		max_send_sge		= 3;
+	optional uint32		max_recv_sge		= 4;
 	optional uint32		max_inline_data		= 5;
 };
 
@@ -159,13 +174,19 @@ message rdma_qp_cap {
  * Contents mirror struct ib_global_route / rdma_ah_attr.grh,
  * encoded as bytes for raw 16-byte GID values to avoid endian
  * gymnastics on the wire.
+ *
+ * Fields are optional because GRH is not exposed by NLDEV; the
+ * data lives in libibverbs userspace state and (for QPs in INIT+)
+ * in driver state. Filled at S5/S6 from LIST_UOBJS + per-driver
+ * QUERY callbacks. dgid stays bytes-typed but no longer
+ * `required` so partial AH/QP entries decode cleanly.
  */
 message rdma_grh_attrs {
-	required bytes		dgid			= 1;	/* 16 bytes */
-	required uint32		sgid_index		= 2;
-	required uint32		hop_limit		= 3;
-	required uint32		traffic_class		= 4;
-	required uint32		flow_label		= 5;
+	optional bytes		dgid			= 1;	/* 16 bytes */
+	optional uint32		sgid_index		= 2;
+	optional uint32		hop_limit		= 3;
+	optional uint32		traffic_class		= 4;
+	optional uint32		flow_label		= 5;
 };
 
 /*
@@ -173,13 +194,18 @@ message rdma_grh_attrs {
  * standalone AH uobject's payload and as the path/altpath inside
  * a QP. ROCE-specific dmac is optional because IB-only AH attrs
  * don't carry it.
+ *
+ * All fields are optional in the wire format: AH itself is
+ * deferred to S5 (needs K2 LIST_UOBJS) and the QP-embedded
+ * av/alt_av is filled from LIST_UOBJS + plugin blob at S5/S6.
+ * S1.b emits no rdma_ah_attrs.
  */
 message rdma_ah_attrs {
-	required uint32		ah_attr_type		= 1;	/* IB / ROCE / OPA */
-	required uint32		port_num		= 2;
-	required uint32		sl			= 3;
-	required uint32		src_path_bits		= 4;
-	required uint32		static_rate		= 5;
+	optional uint32		ah_attr_type		= 1;	/* IB / ROCE / OPA */
+	optional uint32		port_num		= 2;
+	optional uint32		sl			= 3;
+	optional uint32		src_path_bits		= 4;
+	optional uint32		static_rate		= 5;
 	optional rdma_grh_attrs	grh			= 6;
 	optional bytes		dmac			= 10;	/* 6 bytes, ROCE */
 };
@@ -188,19 +214,27 @@ message rdma_ah_attrs {
  * QP hw-agnostic state. Combination of init_attr fields (set at
  * create) and qp_attr fields (set across the modify_qp transition
  * chain INIT -> RTR -> RTS). Identity hints (qp_num, sq_psn,
- * rq_psn, q_key) are always populated; the kernel restore handler
- * decides whether failure to honour is fail-loud or silent
+ * rq_psn) are populated by S1.b from NLDEV; the kernel restore
+ * handler decides whether failure to honour is fail-loud or silent
  * fallback (per the doc's identity-continuity policy table).
+ *
+ * Wire-format note: all fields are optional. NLDEV's
+ * fill_res_qp_entry today emits qp_type, qp_state, qp_num,
+ * dest_qp_num, sq_psn, rq_psn, port_num. Everything else (cap,
+ * create_flags, q_key, av, alt_av, path_mtu, timer/retry knobs,
+ * rd_atomic, pkey_index, qp_access_flags, ...) is *not* on
+ * NLDEV today and is filled at S2/S3+ via the plugin blob (or a
+ * future kernel emission). S1.b emits the NLDEV-derived subset.
  */
 message rdma_qp_attrs {
 	/* From ib_qp_init_attr */
-	required uint32		qp_type			= 1;	/* RC/UC/UD/...   */
-	required rdma_qp_cap	cap			= 2;
+	optional uint32		qp_type			= 1;	/* RC/UC/UD/...   */
+	optional rdma_qp_cap	cap			= 2;
 	optional uint32		sq_sig_type		= 3;
 	optional uint32		create_flags		= 4;
 	/* From ib_qp_attr -- the full transition state */
-	required uint32		state			= 10;
-	required uint32		qp_num			= 11;	/* identity hint  */
+	optional uint32		state			= 10;
+	optional uint32		qp_num			= 11;	/* identity hint  */
 	optional uint32		dest_qp_num		= 12;
 	optional uint32		sq_psn			= 13;
 	optional uint32		rq_psn			= 14;
@@ -219,7 +253,7 @@ message rdma_qp_attrs {
 	optional uint32		port_num		= 27;
 	optional uint32		alt_pkey_index		= 28;
 	optional uint32		alt_port_num		= 29;
-	required uint32		qp_access_flags		= 30;
+	optional uint32		qp_access_flags		= 30;
 	optional uint32		sq_draining		= 31;
 };
 
@@ -230,13 +264,23 @@ message rdma_qp_attrs {
  * the doc's policy table -- rkey is wire-visible). iova may
  * differ from virt_addr when the MR was registered with an
  * explicit IOVA.
+ *
+ * Field provenance:
+ *   length        NLDEV RES_MRLEN. S1.b populates.
+ *   lkey, rkey    NLDEV RES_LKEY/RES_RKEY -- only emitted when
+ *                 dumper has CAP_NET_ADMIN, which CRIU does as
+ *                 root. S1.b populates.
+ *   iova          NLDEV RES_IOVA. S1.b populates.
+ *   virt_addr     not in NLDEV (only iova is); plugin blob in
+ *                 S3+. Optional.
+ *   access_flags  not in NLDEV; plugin blob. Optional.
  */
 message rdma_mr_attrs {
-	required uint64		virt_addr		= 1;
-	required uint64		length			= 2;
-	required uint32		access_flags		= 3;
-	required uint32		lkey			= 10;	/* identity hint  */
-	required uint32		rkey			= 11;	/* identity hint  */
+	optional uint64		virt_addr		= 1;
+	optional uint64		length			= 2;
+	optional uint32		access_flags		= 3;
+	optional uint32		lkey			= 10;	/* identity hint  */
+	optional uint32		rkey			= 11;	/* identity hint  */
 	optional uint64		iova			= 12;
 };
 
@@ -244,11 +288,18 @@ message rdma_mr_attrs {
  * SRQ hw-agnostic state. Mirrors ib_srq_init_attr's standard
  * fields plus the live srq_limit. XRC SRQ adds an XRCD xref
  * (deferred).
+ *
+ * Field provenance:
+ *   srq_type    NLDEV RES_TYPE. S1.b populates.
+ *   max_wr,
+ *   max_sge,
+ *   srq_limit   not in NLDEV; plugin blob (or future kernel
+ *               emission). Optional.
  */
 message rdma_srq_attrs {
-	required uint32		srq_type		= 1;	/* BASIC / XRC    */
-	required uint32		max_wr			= 2;
-	required uint32		max_sge			= 3;
+	optional uint32		srq_type		= 1;	/* BASIC / XRC    */
+	optional uint32		max_wr			= 2;
+	optional uint32		max_sge			= 3;
 	optional uint32		srq_limit		= 4;
 };
 
@@ -282,9 +333,18 @@ message rdma_aef_attrs {
  *                 without a join).
  *   type          which uobject class this record carries.
  *   ufile_handle  small per-ufile id user code holds (e.g.
- *                 pd->handle, qp->handle); restore installs the new
- *                 ib_uobject at this value.
- *   restrack_id   per-ibdev id; xref edge target (see rdma_uobj_xref).
+ *                 pd->handle, qp->handle); restore installs the
+ *                 new ib_uobject at this value. NOT exposed by
+ *                 NLDEV today -- comes from K2 LIST_UOBJS at S5,
+ *                 so optional in S1.b dumps.
+ *   restrack_id   per-ibdev id; xref edge target (see
+ *                 rdma_uobj_xref). Available from NLDEV for PD
+ *                 (RES_PDN), CQ (RES_CQN), MR (RES_MRN), SRQ
+ *                 (RES_SRQN), AH (via LIST_UOBJS at S5). NOT
+ *                 emitted for QP today -- a small kernel patch
+ *                 to fill_res_qp_entry would add it; until then
+ *                 QP entries are restrack_id-less and cannot be
+ *                 xref edge targets (no v0 edge targets QP).
  *
  * Payload:
  *   EXACTLY ONE of pd/cq/qp/mr/srq/ah/cc/aef matches `type`. Reserved-
@@ -307,8 +367,8 @@ message rdma_uobj_entry {
 	required uint32		ufile_id		= 1;
 	required rdma_criu_driver hw_driver_id		= 2;
 	required r3_uobj_type	type			= 3;
-	required uint32		ufile_handle		= 4;
-	required uint32		restrack_id		= 5;
+	optional uint32		ufile_handle		= 4;
+	optional uint32		restrack_id		= 5;
 
 	/* HW-agnostic per-class attrs. EXACTLY ONE matches `type`. */
 	optional rdma_pd_attrs	pd			= 10;

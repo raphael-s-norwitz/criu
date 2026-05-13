@@ -29,6 +29,7 @@
 
 #include "images/fdinfo.pb-c.h"
 #include "images/rdma_criu.pb-c.h"
+#include "images/rdma_uobj.pb-c.h"
 #include "images/uverbsfd.pb-c.h"
 
 #undef LOG_PREFIX
@@ -39,6 +40,55 @@
 
 /* FIXME: Probably replace with linked list or hasmap/xarray. */
 static u32 ctxn_uverbsfd_id_map[MAX_PROCESS_CONTEXTS];
+
+/*
+ * Dump-side R3 (per-uobject DAG) state.
+ *
+ * dump_uverbsfile() records every uverbs context it commits to the
+ * image into rdma_dumped_ufiles, and rdma_dump_uobj_dag() (called
+ * once after every pstree task has been dumped) consumes the list
+ * to drive the per-ibdev NLDEV walks that build rdma_uobj.img.
+ *
+ * The list is single-threaded by construction (cr-dump.c walks the
+ * pstree sequentially), grows monotonically during dump, and is
+ * never freed -- the dump process exits shortly after image close.
+ */
+struct rdma_dumped_ufile {
+	pid_t pid;
+	uint32_t ctxn;
+	bool has_ctxn;
+	uint32_t uvfe_id;
+	uint32_t criu_driver;
+	uint32_t kernel_driver_id;
+	uint32_t dev_index;	/* filled lazily in rdma_dump_uobj_dag */
+	bool has_dev_index;
+	char ibdev[64];
+	struct list_head link;
+};
+static LIST_HEAD(rdma_dumped_ufiles);
+
+static int rdma_record_dumped_ufile(pid_t pid, const char *ibdev,
+				    uint32_t kernel_driver_id,
+				    uint32_t criu_driver,
+				    uint32_t uvfe_id,
+				    bool has_ctxn, uint32_t ctxn)
+{
+	struct rdma_dumped_ufile *r;
+
+	r = xzalloc(sizeof(*r));
+	if (!r)
+		return -1;
+	r->pid = pid;
+	r->ctxn = ctxn;
+	r->has_ctxn = has_ctxn;
+	r->uvfe_id = uvfe_id;
+	r->criu_driver = criu_driver;
+	r->kernel_driver_id = kernel_driver_id;
+	snprintf(r->ibdev, sizeof(r->ibdev), "%.*s",
+		 (int)(sizeof(r->ibdev) - 1), ibdev);
+	list_add_tail(&r->link, &rdma_dumped_ufiles);
+	return 0;
+}
 
 /*
  * Read the entirety of a sysfs file into the caller's buffer, NUL-terminate,
@@ -521,6 +571,21 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	fe.type = FD_TYPES__UVERBSFD;
 	fe.id = uve.id;
 	fe.uvfd = &uve;
+
+	/*
+	 * Record this ufile for the post-dump R3 per-uobject DAG
+	 * walk. Done before pb_write_one so a record-side OOM aborts
+	 * the dump with the same atomicity guarantee as a write
+	 * failure -- partial uverbs records on disk without a
+	 * matching DAG entry would be confusing on inspection.
+	 */
+	if (rdma_record_dumped_ufile(p->pid, ibdev, uve.driver_id,
+				     uve.criu_driver, uve.id,
+				     uve.has_ctxn, uve.ctxn)) {
+		pr_err("dump_uverbsfile: failed to record ufile id=%#x for "
+		       "post-dump uobj DAG walk\n", uve.id);
+		goto out;
+	}
 
 	img = img_from_set(glob_imgset, CR_FD_FILES);
 	ret = pb_write_one(img, &fe, PB_FILE);
@@ -1399,5 +1464,547 @@ int rdma_check_cross_tree_exclusivity(struct pstree_item *root)
 
 	xfree(pids);
 	xfree(cc.tuples);
+	return ret;
+}
+
+/*
+ * R3 dump-side: walk the per-ucontext uobject DAG.
+ *
+ * Runs once at end-of-dump, after every pstree task has been
+ * dump_one_task'd (so dump_uverbsfile() has populated the
+ * rdma_dumped_ufiles list with every ufile we just committed to
+ * the image). For each in-tree ucontext, asks NLDEV to enumerate
+ * its PD/CQ/QP/MR/SRQ uobjects and emits one rdma_uobj_entry per
+ * uobject into rdma_uobj.img.
+ *
+ * S1.b scope: discovery + image emission only. No restore action.
+ * Coverage:
+ *   * AH                  deferred to S5 (needs K2 LIST_UOBJS).
+ *   * comp-channel-fd /
+ *     async-event-fd      deferred to S1.c follow-up (NLDEV does
+ *                         not enumerate file-typed uobjects;
+ *                         discovery is via fdinfo).
+ *   * Plugin blob         empty in S1.b; first non-empty blob
+ *                         lands at S3 (mlx5 PD restore).
+ *
+ * Field provenance per resource type is documented inline in
+ * images/rdma_uobj.proto. Briefly: PD/CQ have direct CTXN; QP/MR/
+ * SRQ get their owning ucontext via PDN-join (the K1 cleanup
+ * collapses this to a one-hop filter but isn't required for v0).
+ *
+ * Failure policy:
+ *   * Netlink failure on any per-resource walk -> hard fail.
+ *     We've already accepted the cost of pre-suspend coverage's
+ *     netlink dump; failing closed here is consistent.
+ *   * Image open / write failure -> hard fail.
+ *   * An NLDEV uobj whose pdn doesn't map to any in-tree PD ->
+ *     silently dropped (kernel resource, or a userspace resource
+ *     belonging to a non-snapshot-tree ucontext sharing the
+ *     ibdev; coverage check has already proven any in-tree
+ *     ucontext is claimable).
+ *   * An NLDEV uobj whose direct ctxn doesn't map to any in-tree
+ *     ufile -> silently dropped (same reason as above).
+ */
+
+/* Per-ibdev book-keeping built up during a uobj DAG dump. */
+struct uobj_ibdev {
+	char ibdev[64];
+	uint32_t dev_index;
+	bool has_dev_index;
+
+	/* In-tree ufiles using this ibdev. */
+	struct rdma_dumped_ufile **ufiles;
+	size_t n_ufiles;
+
+	/* PD inventory: pdn -> ufile (built from PD walk, then read by
+	 * the QP/MR/SRQ walks for the PDN-join). */
+	struct {
+		uint32_t pdn;
+		struct rdma_dumped_ufile *uf;
+	} *pdn_map;
+	size_t n_pdn;
+	size_t pdn_cap;
+
+	struct list_head link;
+};
+
+/* Cross-walk state shared by the per-resource callbacks. */
+struct uobj_walk_ctx {
+	struct uobj_ibdev *ib;
+	struct cr_img *img;
+	int n_emitted;
+	int n_dropped;
+	int err;
+};
+
+static struct uobj_ibdev *uobj_ibdev_find(struct list_head *head,
+					  const char *ibdev)
+{
+	struct uobj_ibdev *ib;
+
+	list_for_each_entry(ib, head, link)
+		if (strcmp(ib->ibdev, ibdev) == 0)
+			return ib;
+	return NULL;
+}
+
+static struct uobj_ibdev *uobj_ibdev_get_or_add(struct list_head *head,
+						const char *ibdev)
+{
+	struct uobj_ibdev *ib = uobj_ibdev_find(head, ibdev);
+
+	if (ib)
+		return ib;
+	ib = xzalloc(sizeof(*ib));
+	if (!ib)
+		return NULL;
+	snprintf(ib->ibdev, sizeof(ib->ibdev), "%.*s",
+		 (int)(sizeof(ib->ibdev) - 1), ibdev);
+	INIT_LIST_HEAD(&ib->link);
+	list_add_tail(&ib->link, head);
+	return ib;
+}
+
+/* Look up an in-tree ufile on this ibdev by ctxn. */
+static struct rdma_dumped_ufile *uobj_ibdev_ufile_by_ctxn(
+		const struct uobj_ibdev *ib, uint32_t ctxn)
+{
+	for (size_t i = 0; i < ib->n_ufiles; i++) {
+		struct rdma_dumped_ufile *u = ib->ufiles[i];
+
+		if (u->has_ctxn && u->ctxn == ctxn)
+			return u;
+	}
+	return NULL;
+}
+
+static int uobj_ibdev_pdn_add(struct uobj_ibdev *ib, uint32_t pdn,
+			      struct rdma_dumped_ufile *uf)
+{
+	if (ib->n_pdn == ib->pdn_cap) {
+		size_t newcap = ib->pdn_cap ? ib->pdn_cap * 2 : 16;
+		void *p = xrealloc(ib->pdn_map,
+				   newcap * sizeof(*ib->pdn_map));
+		if (!p)
+			return -1;
+		ib->pdn_map = p;
+		ib->pdn_cap = newcap;
+	}
+	ib->pdn_map[ib->n_pdn].pdn = pdn;
+	ib->pdn_map[ib->n_pdn].uf = uf;
+	ib->n_pdn++;
+	return 0;
+}
+
+static struct rdma_dumped_ufile *uobj_ibdev_pdn_lookup(
+		const struct uobj_ibdev *ib, uint32_t pdn)
+{
+	for (size_t i = 0; i < ib->n_pdn; i++)
+		if (ib->pdn_map[i].pdn == pdn)
+			return ib->pdn_map[i].uf;
+	return NULL;
+}
+
+/*
+ * Common emission step: build an RdmaUobjEntry skeleton (ufile_id,
+ * hw_driver_id, type, restrack_id) populated from the join result,
+ * leave per-class attrs and xrefs to the caller.
+ */
+static void uobj_entry_init_common(RdmaUobjEntry *e,
+				   const struct rdma_dumped_ufile *uf,
+				   R3UobjType type,
+				   bool has_restrack_id, uint32_t restrack_id)
+{
+	rdma_uobj_entry__init(e);
+	e->ufile_id = uf->uvfe_id;
+	e->hw_driver_id = uf->criu_driver;
+	e->type = type;
+	if (has_restrack_id) {
+		e->has_restrack_id = true;
+		e->restrack_id = restrack_id;
+	}
+}
+
+static int uobj_emit(struct uobj_walk_ctx *w, RdmaUobjEntry *e)
+{
+	if (pb_write_one(w->img, e, PB_RDMA_UOBJ) < 0) {
+		pr_err("rdma_dump_uobj_dag: pb_write_one(rdma_uobj.img) "
+		       "failed for ufile_id=%#x type=%u\n",
+		       e->ufile_id, e->type);
+		return -1;
+	}
+	w->n_emitted++;
+	return 0;
+}
+
+/* PD callback: direct CTXN, populate the ibdev's pdn_map for later
+ * QP/MR/SRQ joins. */
+static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct uobj_walk_ctx *w = arg;
+	struct rdma_dumped_ufile *uf;
+	RdmaUobjEntry pe;
+	RdmaPdAttrs attrs;
+
+	if (!e->has_ctxn || !e->has_restrack_id) {
+		w->n_dropped++;
+		return 0;
+	}
+	uf = uobj_ibdev_ufile_by_ctxn(w->ib, e->ctxn);
+	if (!uf) {
+		w->n_dropped++;
+		return 0;
+	}
+	if (uobj_ibdev_pdn_add(w->ib, e->restrack_id, uf) < 0) {
+		w->err = -1;
+		return -1;
+	}
+
+	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_PD,
+			       e->has_restrack_id, e->restrack_id);
+	rdma_pd_attrs__init(&attrs);
+	pe.pd = &attrs;
+	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
+}
+
+/* CQ callback: direct CTXN. */
+static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct uobj_walk_ctx *w = arg;
+	struct rdma_dumped_ufile *uf;
+	RdmaUobjEntry pe;
+	RdmaCqAttrs attrs;
+
+	if (!e->has_ctxn) {
+		w->n_dropped++;
+		return 0;
+	}
+	uf = uobj_ibdev_ufile_by_ctxn(w->ib, e->ctxn);
+	if (!uf) {
+		w->n_dropped++;
+		return 0;
+	}
+
+	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_CQ,
+			       e->has_restrack_id, e->restrack_id);
+	rdma_cq_attrs__init(&attrs);
+	attrs.has_cqe_count = true;
+	attrs.cqe_count = e->cq.cqe;
+	pe.cq = &attrs;
+	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
+}
+
+/*
+ * Build a single PARENT_PD xref edge as a one-element repeated
+ * field. Helper because QP/MR/SRQ all need exactly this shape.
+ */
+static void uobj_attach_parent_pd(RdmaUobjEntry *pe, RdmaUobjXref *xref,
+				  RdmaUobjXref **xref_arr, uint32_t pdn)
+{
+	rdma_uobj_xref__init(xref);
+	xref->role = R3_XREF_ROLE__R3XR_PARENT_PD;
+	xref->target_type = R3_UOBJ_TYPE__R3UT_PD;
+	xref->target_restrack_id = pdn;
+
+	xref_arr[0] = xref;
+	pe->n_xref = 1;
+	pe->xref = xref_arr;
+}
+
+/* QP callback: PDN-join, NLDEV-derived qp identity hints. */
+static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct uobj_walk_ctx *w = arg;
+	struct rdma_dumped_ufile *uf;
+	RdmaUobjEntry pe;
+	RdmaQpAttrs attrs;
+	RdmaUobjXref xref;
+	RdmaUobjXref *xref_arr[1];
+
+	if (!e->has_pdn) {
+		w->n_dropped++;
+		return 0;
+	}
+	uf = uobj_ibdev_pdn_lookup(w->ib, e->pdn);
+	if (!uf) {
+		w->n_dropped++;
+		return 0;
+	}
+
+	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_QP,
+			       e->has_restrack_id, e->restrack_id);
+	rdma_qp_attrs__init(&attrs);
+	attrs.has_qp_type = true;
+	attrs.qp_type = e->qp.qp_type;
+	attrs.has_state = true;
+	attrs.state = e->qp.qp_state;
+	attrs.has_qp_num = true;
+	attrs.qp_num = e->qp.lqpn;
+	if (e->qp.has_rqpn) {
+		attrs.has_dest_qp_num = true;
+		attrs.dest_qp_num = e->qp.rqpn;
+	}
+	if (e->qp.has_sq_psn) {
+		attrs.has_sq_psn = true;
+		attrs.sq_psn = e->qp.sq_psn;
+	}
+	if (e->qp.has_rq_psn) {
+		attrs.has_rq_psn = true;
+		attrs.rq_psn = e->qp.rq_psn;
+	}
+	if (e->qp.has_port) {
+		attrs.has_port_num = true;
+		attrs.port_num = e->qp.port;
+	}
+	pe.qp = &attrs;
+
+	uobj_attach_parent_pd(&pe, &xref, xref_arr, e->pdn);
+	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
+}
+
+/* MR callback: PDN-join, NLDEV-derived MR identity hints. */
+static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct uobj_walk_ctx *w = arg;
+	struct rdma_dumped_ufile *uf;
+	RdmaUobjEntry pe;
+	RdmaMrAttrs attrs;
+	RdmaUobjXref xref;
+	RdmaUobjXref *xref_arr[1];
+
+	if (!e->has_pdn) {
+		w->n_dropped++;
+		return 0;
+	}
+	uf = uobj_ibdev_pdn_lookup(w->ib, e->pdn);
+	if (!uf) {
+		w->n_dropped++;
+		return 0;
+	}
+
+	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_MR,
+			       e->has_restrack_id, e->restrack_id);
+	rdma_mr_attrs__init(&attrs);
+	attrs.has_length = true;
+	attrs.length = e->mr.mrlen;
+	if (e->mr.has_lkey) {
+		attrs.has_lkey = true;
+		attrs.lkey = e->mr.lkey;
+	}
+	if (e->mr.has_rkey) {
+		attrs.has_rkey = true;
+		attrs.rkey = e->mr.rkey;
+	}
+	if (e->mr.has_iova) {
+		attrs.has_iova = true;
+		attrs.iova = e->mr.iova;
+	}
+	pe.mr = &attrs;
+
+	uobj_attach_parent_pd(&pe, &xref, xref_arr, e->pdn);
+	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
+}
+
+/*
+ * SRQ callback: PDN-join, plus an optional CQN xref for XRC SRQs
+ * (the only SRQ flavour where the kernel emits RES_CQN today, per
+ * fill_res_srq_entry's ib_srq_has_cq() gate). The CQN xref's
+ * target_restrack_id is the CQ's restrack id, which the CQ walk
+ * has already emitted for any in-tree CQ -- a restore-side reader
+ * can join on it.
+ */
+static int uobj_srq_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct uobj_walk_ctx *w = arg;
+	struct rdma_dumped_ufile *uf;
+	RdmaUobjEntry pe;
+	RdmaSrqAttrs attrs;
+	RdmaUobjXref xrefs[2];
+	RdmaUobjXref *xref_arr[2];
+	int n = 0;
+
+	if (!e->has_pdn) {
+		w->n_dropped++;
+		return 0;
+	}
+	uf = uobj_ibdev_pdn_lookup(w->ib, e->pdn);
+	if (!uf) {
+		w->n_dropped++;
+		return 0;
+	}
+
+	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_SRQ,
+			       e->has_restrack_id, e->restrack_id);
+	rdma_srq_attrs__init(&attrs);
+	attrs.has_srq_type = true;
+	attrs.srq_type = e->srq.srq_type;
+	pe.srq = &attrs;
+
+	rdma_uobj_xref__init(&xrefs[n]);
+	xrefs[n].role = R3_XREF_ROLE__R3XR_PARENT_PD;
+	xrefs[n].target_type = R3_UOBJ_TYPE__R3UT_PD;
+	xrefs[n].target_restrack_id = e->pdn;
+	xref_arr[n] = &xrefs[n];
+	n++;
+
+	if (e->srq.has_cqn) {
+		rdma_uobj_xref__init(&xrefs[n]);
+		/*
+		 * Reuse SEND_CQ as the SRQ-CQ binding role. SRQ has
+		 * exactly one CQ when it has any (XRC), so a dedicated
+		 * R3XR_SRQ_CQ enumerant would carry no information
+		 * SEND_CQ doesn't already carry; keeping the role set
+		 * tight avoids adding values whose only purpose is
+		 * shape-of-edge documentation.
+		 */
+		xrefs[n].role = R3_XREF_ROLE__R3XR_SEND_CQ;
+		xrefs[n].target_type = R3_UOBJ_TYPE__R3UT_CQ;
+		xrefs[n].target_restrack_id = e->srq.cqn;
+		xref_arr[n] = &xrefs[n];
+		n++;
+	}
+
+	pe.n_xref = n;
+	pe.xref = xref_arr;
+	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
+}
+
+/*
+ * dev_index resolver. We have ibdev names from dump_uverbsfile but
+ * NLDEV per-resource walks need dev_index. Run a one-shot ibdev
+ * enumeration and patch the dev_index into matching entries on the
+ * per-ibdev list.
+ */
+struct devidx_resolver {
+	struct list_head *ibdevs;
+};
+
+static int devidx_resolver_cb(uint32_t dev_index, const char *ibdev,
+			      void *arg)
+{
+	struct devidx_resolver *r = arg;
+	struct uobj_ibdev *ib = uobj_ibdev_find(r->ibdevs, ibdev);
+
+	if (ib) {
+		ib->dev_index = dev_index;
+		ib->has_dev_index = true;
+	}
+	return 0;
+}
+
+int rdma_dump_uobj_dag(void)
+{
+	struct rdma_dumped_ufile *uf;
+	struct uobj_ibdev *ib, *ib_next;
+	LIST_HEAD(ibdevs);
+	struct cr_img *img = NULL;
+	int ret = -1;
+
+	if (list_empty(&rdma_dumped_ufiles)) {
+		pr_debug("uobj DAG: no in-tree uverbs contexts dumped, "
+			 "skipping per-uobject discovery\n");
+		return 0;
+	}
+
+	/*
+	 * 1. Group dumped ufiles by ibdev. Each per-ibdev bucket
+	 * carries the in-tree ufile list + (later) a pdn_map built
+	 * from the PD walk.
+	 */
+	list_for_each_entry(uf, &rdma_dumped_ufiles, link) {
+		void *p;
+		ib = uobj_ibdev_get_or_add(&ibdevs, uf->ibdev);
+		if (!ib)
+			goto out;
+		p = xrealloc(ib->ufiles,
+			     (ib->n_ufiles + 1) * sizeof(*ib->ufiles));
+		if (!p)
+			goto out;
+		ib->ufiles = p;
+		ib->ufiles[ib->n_ufiles++] = uf;
+	}
+
+	/*
+	 * 2. Resolve dev_index per ibdev (NLDEV per-resource walks
+	 * need dev_index, not name).
+	 */
+	{
+		struct devidx_resolver r = { .ibdevs = &ibdevs };
+		if (rdma_nl_for_each_ibdev(devidx_resolver_cb, &r) < 0) {
+			pr_err("uobj DAG: ibdev enumeration failed\n");
+			goto out;
+		}
+	}
+
+	/*
+	 * 3. Open the image. Only do so once we know we have at
+	 * least one ibdev to walk -- skipping the open-then-close
+	 * dance saves an empty rdma_uobj.img landing on disk for
+	 * dump trees with zero RDMA contexts (already guarded by
+	 * the list_empty check, but defence in depth).
+	 */
+	img = open_image_at(AT_FDCWD, CR_FD_RDMA_UOBJ, O_DUMP);
+	if (!img) {
+		pr_err("uobj DAG: open_image(rdma-uobj, O_DUMP) failed\n");
+		goto out;
+	}
+
+	/*
+	 * 4. Per-ibdev: PD first (populates pdn_map), then CQ
+	 * (direct ctxn), then QP/MR/SRQ (PDN-join through the just-
+	 * built pdn_map). Order matters only for the PDN-join
+	 * dependency; CQ could equally well run before or after PD.
+	 */
+	list_for_each_entry(ib, &ibdevs, link) {
+		struct uobj_walk_ctx w = { .ib = ib, .img = img };
+		static const struct {
+			enum rdma_nl_res_type t;
+			rdma_nl_res_cb_t cb;
+			const char *name;
+		} stages[] = {
+			{ RDMA_NL_RES_PD,  uobj_pd_cb,  "pd"  },
+			{ RDMA_NL_RES_CQ,  uobj_cq_cb,  "cq"  },
+			{ RDMA_NL_RES_QP,  uobj_qp_cb,  "qp"  },
+			{ RDMA_NL_RES_MR,  uobj_mr_cb,  "mr"  },
+			{ RDMA_NL_RES_SRQ, uobj_srq_cb, "srq" },
+		};
+
+		if (!ib->has_dev_index) {
+			pr_err("uobj DAG: ibdev '%s' had no dev_index "
+			       "(disappeared between dump and uobj walk?); "
+			       "aborting\n", ib->ibdev);
+			goto out;
+		}
+
+		for (size_t i = 0; i < ARRAY_SIZE(stages); i++) {
+			int r = rdma_nl_for_each_resource(ib->dev_index,
+							  ib->ibdev,
+							  stages[i].t,
+							  stages[i].cb, &w);
+			if (r < 0 || w.err) {
+				pr_err("uobj DAG: %s walk failed on ibdev "
+				       "'%s' (idx=%u): r=%d err=%d\n",
+				       stages[i].name, ib->ibdev,
+				       ib->dev_index, r, w.err);
+				goto out;
+			}
+		}
+
+		pr_info("uobj DAG: ibdev=%s emitted=%d dropped=%d "
+			"(in-tree-ufiles=%zu pdn-map=%zu)\n",
+			ib->ibdev, w.n_emitted, w.n_dropped,
+			ib->n_ufiles, ib->n_pdn);
+	}
+
+	ret = 0;
+out:
+	if (img)
+		close_image(img);
+	list_for_each_entry_safe(ib, ib_next, &ibdevs, link) {
+		list_del(&ib->link);
+		xfree(ib->ufiles);
+		xfree(ib->pdn_map);
+		xfree(ib);
+	}
 	return ret;
 }

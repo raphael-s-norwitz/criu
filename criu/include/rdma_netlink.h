@@ -63,4 +63,122 @@ typedef int (*rdma_nl_ctx_cb_t)(const struct rdma_nl_ctx_info *info,
  */
 int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
 
+/*
+ * Per-resource enumeration. Used by R3 (per-uobject restore)
+ * dump-side discovery in criu/rdma.c -- walk every PD/CQ/QP/MR/SRQ
+ * on a given ibdev, surface the hw-agnostic attrs the kernel emits
+ * via NLDEV today.
+ *
+ * Each per-resource walker takes a single ibdev (named by
+ * dev_index, the same kernel-side index returned by
+ * rdma_nl_for_each_context). The kernel's RES_*_GET dumps require
+ * a per-device argument (no host-wide variant exists), so callers
+ * that want every device must enumerate ibdev indices first --
+ * use rdma_nl_for_each_context to harvest them, or rdma_nl_for_
+ * each_ibdev for the bare list.
+ *
+ * Field availability per resource type tracks the kernel's
+ * fill_res_<type>_entry coverage as of v6.x:
+ *
+ *   PD   pd.usecnt; restrack_id, ctxn always set.
+ *   CQ   cq.cqe, cq.usecnt; restrack_id, ctxn always set.
+ *   QP   qp.lqpn, qp.{has_rqpn?, has_rq_psn?, has_sq_psn?,
+ *        qp_type, qp_state, port}; pdn always set, restrack_id
+ *        and ctxn currently absent (kernel doesn't emit RES_QPN
+ *        as restrack id, doesn't emit RES_CTXN -- per K1 doc).
+ *   MR   mr.{mrlen, has_lkey?, has_rkey?, has_iova?}; pdn,
+ *        restrack_id always set; ctxn absent until K1.
+ *   SRQ  srq.{srq_type, has_cqn?}; pdn, restrack_id always set;
+ *        ctxn absent until K1.
+ *
+ * The "has_*" booleans gate fields the kernel makes conditional on
+ * QP type / CAP_NET_ADMIN / etc. Callers must check them before
+ * reading the matching value.
+ *
+ * Iterator return semantics match rdma_nl_for_each_context.
+ */
+enum rdma_nl_res_type {
+	RDMA_NL_RES_PD,
+	RDMA_NL_RES_CQ,
+	RDMA_NL_RES_QP,
+	RDMA_NL_RES_MR,
+	RDMA_NL_RES_SRQ,
+};
+
+struct rdma_nl_res_entry {
+	enum rdma_nl_res_type	type;
+	uint32_t		dev_index;
+	char			ibdev[64];
+
+	/* Kernel-side identity. has_*_id semantics reflect what the
+	 * kernel's fill_res_<type>_entry currently emits; NLDEV is
+	 * stable enough that we treat absence as "feature not
+	 * emitted yet" (cleanup K1 etc.) rather than as protocol
+	 * uncertainty. */
+	bool			has_restrack_id;
+	uint32_t		restrack_id;	/* PDN/CQN/MRN/SRQN; QP absent */
+	bool			has_ctxn;
+	uint32_t		ctxn;		/* PD/CQ direct; others wait on K1 */
+	bool			has_pdn;
+	uint32_t		pdn;		/* QP/MR/SRQ; PD/CQ n/a */
+	bool			has_pid;
+	pid_t			pid;		/* RES_PID */
+
+	/* Per-type leaves -- read after switch on `type`. */
+	union {
+		struct {
+			uint64_t usecnt;
+		} pd;
+		struct {
+			uint32_t cqe;
+			uint64_t usecnt;
+		} cq;
+		struct {
+			uint32_t lqpn;
+			bool has_rqpn;
+			uint32_t rqpn;
+			bool has_rq_psn;
+			uint32_t rq_psn;
+			bool has_sq_psn;
+			uint32_t sq_psn;
+			uint8_t qp_type;
+			uint8_t qp_state;
+			bool has_port;
+			uint32_t port;
+		} qp;
+		struct {
+			uint64_t mrlen;
+			bool has_iova;
+			uint64_t iova;
+			bool has_lkey;
+			uint32_t lkey;
+			bool has_rkey;
+			uint32_t rkey;
+		} mr;
+		struct {
+			uint8_t srq_type;
+			bool has_cqn;
+			uint32_t cqn;
+		} srq;
+	};
+};
+
+typedef int (*rdma_nl_res_cb_t)(const struct rdma_nl_res_entry *e,
+				void *arg);
+
+int rdma_nl_for_each_resource(uint32_t dev_index, const char *ibdev,
+			      enum rdma_nl_res_type type,
+			      rdma_nl_res_cb_t cb, void *arg);
+
+/*
+ * Bare ibdev enumeration. Convenience wrapper that emits one
+ * (dev_index, ibdev) per host ibdev. Same NLDEV CMD_GET dump as
+ * rdma_nl_for_each_context's first phase, exposed standalone so
+ * callers that don't need ucontext info don't pay for the
+ * per-device CTX_GET that follows.
+ */
+typedef int (*rdma_nl_ibdev_cb_t)(uint32_t dev_index, const char *ibdev,
+				  void *arg);
+int rdma_nl_for_each_ibdev(rdma_nl_ibdev_cb_t cb, void *arg);
+
 #endif /* __CR_RDMA_NETLINK_H__ */

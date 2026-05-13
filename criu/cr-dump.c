@@ -2276,6 +2276,17 @@ int cr_dump_tasks(pid_t pid)
 			goto err;
 	}
 
+	/*
+	 * R3 (per-uobject DAG) dump. Runs once after every task has
+	 * been dumped, so dump_uverbsfile() has fully populated the
+	 * in-memory list of dumped ufiles that drives the per-ibdev
+	 * NLDEV walks. No-op for trees that hold no RDMA contexts.
+	 * S1.b scope is discovery + image emission only; restore
+	 * action lands incrementally across S1.c-S6.
+	 */
+	if (rdma_dump_uobj_dag())
+		goto err;
+
 	ret = run_plugins(DUMP_DEVICES_LATE, pid);
 	if (ret && ret != -ENOTSUP)
 		goto err;
