@@ -250,17 +250,36 @@ echo "post-restore status: $RESULT"
 
 if [[ "$RESULT" != "OK" ]]; then
 	echo "FAIL"
-	# Strict from S2 onward: ibv_dealloc_pd of the pre-dump PD
-	# must succeed, because uverbsfd_open() now drives
-	# UVERBS_METHOD_RESTORE_PD per rdma-uobj.img entry to
-	# reinstall the kernel-side PD uobject at its original
-	# ufile_handle. Any "FAIL: ibv_dealloc_pd of pre-dump PD"
-	# from the holder is a real regression in that path -- one
-	# of: rxe_send_get_context_restore() not opening the cdev
-	# in restore mode (-> RESTORE_PD -EPERM), kernel rev pre-K3
-	# /K4 (-> -EOPNOTSUPP), DAG-side dropping ufile_handle, or
-	# the dispatcher passing the wrong driver_id (-> -EINVAL,
-	# the bug found and fixed during S2 bring-up).
+	# Holder runs the §S3b incremental-coverage acid test:
+	# build a fresh CQ + QP + MR on top of the *restored* PD,
+	# then tear them down in dependency order, then dealloc
+	# the restored PD. The shape mirrors the orchestrator-level
+	# multi-host migration test and avoids the v0
+	# dealloc-ordering tripwire (S3b alone leaves source
+	# dependents alive in FW; rxe ducks the issue because it
+	# has no FW gating but the same shape carries to mlx5).
+	#
+	# Specific failure modes the holder distinguishes:
+	#   - "ibv_query_device after restore": ucontext / cdev
+	#     reattach broken (RDMA_OPEN_UVERBS_CDEV path).
+	#   - "ibv_create_cq on restored ucontext": fresh-resource
+	#     creation against the restore-mode ucontext broken --
+	#     usually means GET_CONTEXT didn't actually run in
+	#     restore mode or the kernel ucontext is wedged.
+	#   - "ibv_create_qp on pre-dump PD": Model A pdn adoption
+	#     broken -- the kernel resolved g_pd->handle to the
+	#     restored ib_pd but FW rejected CREATE_QP with that
+	#     pdn under the new ucontext's uid. (For rxe, no FW;
+	#     a failure here means the kernel-side ib_uobject /
+	#     ib_pd binding is broken.)
+	#   - "ibv_reg_mr on pre-dump PD": same as above for
+	#     CREATE_MKEY -- the second half of Model A's gate.
+	#   - "ibv_dealloc_pd of pre-dump PD (after draining
+	#     dependents)": dependency-ordered teardown reached
+	#     PD with all dependents already gone, so DEALLOC_PD
+	#     should be unconditional. A failure here means
+	#     the kernel-side ib_uobject leaked a dependent or
+	#     adopted mpd->pdn is stale.
 	echo "--- dump log tail ---" >&2
 	tail -80 "$DUMPDIR/dump.log" >&2 || true
 	echo "--- restore log tail ---" >&2
