@@ -91,6 +91,19 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
  *   SRQ  srq.{srq_type, has_cqn?}; pdn, restrack_id always set;
  *        ctxn absent until K1.
  *
+ * Per-uobject ufile_handle (the per-ufile obj->id user code holds in
+ * its restored memory) is emitted by the kernel for every
+ * user-created resource as of upstream commit 0601c496b413 (K8a,
+ * design/uobject_restore.md §7.5.1). On older kernels the attribute
+ * is absent and `has_ufile_handle` stays false; on newer kernels we
+ * read RDMA_NLDEV_ATTR_RES_HANDLE -- the join key the R3 dump path
+ * needs to map a parent restrack_id (e.g. QP's parent_pdn) onto the
+ * caller-specified target_handle K3 RESTORE_<TYPE> methods install
+ * at. Build-time probe FEATURE_TEST_RDMA_NLDEV_ATTR_RES_HANDLE in
+ * scripts/feature-tests.mak gates the symbol availability for the
+ * compat shim in rdma_netlink.c; runtime presence is independent and
+ * is reported by has_ufile_handle.
+ *
  * The "has_*" booleans gate fields the kernel makes conditional on
  * QP type / CAP_NET_ADMIN / etc. Callers must check them before
  * reading the matching value.
@@ -123,6 +136,8 @@ struct rdma_nl_res_entry {
 	uint32_t		pdn;		/* QP/MR/SRQ; PD/CQ n/a */
 	bool			has_pid;
 	pid_t			pid;		/* RES_PID */
+	bool			has_ufile_handle;
+	uint32_t		ufile_handle;	/* ib_uobject->id; needs K8a kernel */
 
 	/* Per-type leaves -- read after switch on `type`. */
 	union {

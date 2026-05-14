@@ -52,8 +52,42 @@
 #include <unistd.h>
 
 #include "common/compiler.h"
+#include "common/config.h"
 #include "log.h"
 #include "rdma_netlink.h"
+
+/*
+ * Compat shim for distros whose <rdma/rdma_netlink.h> pre-dates
+ * upstream kernel commit 0601c496b413 ("RDMA/nldev: Expose ufile
+ * handle alongside per-class restrack id", aka K8a in
+ * linux/tools/testing/mlx5_vfmig/design/uobject_restore.md §7.5.1).
+ * The kernel emits the new u32 attribute by numeric value at
+ * runtime; the build-side probe in scripts/feature-tests.mak only
+ * checks whether the host header provides the symbolic name.
+ *
+ * The hard-coded value (105) matches the upstream enum slot the
+ * kernel patch added; changing it would require an in-lockstep
+ * kernel-side change. Drop this whole block once the distro
+ * rdma-core that ships the symbol is the build's minimum.
+ */
+#ifndef CONFIG_HAS_RDMA_NLDEV_ATTR_RES_HANDLE
+#define RDMA_NLDEV_ATTR_RES_HANDLE 105
+#endif
+
+/*
+ * libnl3's nla_parse stores attribute pointers in a caller-supplied
+ * table indexed by nla_type, bounded by the @maxtype argument. We
+ * size that argument off RDMA_NLDEV_ATTR_MAX, which on older host
+ * headers (pre-K8a) is < RDMA_NLDEV_ATTR_RES_HANDLE -- so a literal
+ * RDMA_NLDEV_ATTR_MAX cap silently drops the new attr and stack-
+ * overruns reads past tb[]. Take the max of the host enum tail and
+ * (compat constant + 1) to keep both the table and the parse range
+ * large enough on either kernel.
+ */
+#define CRIU_RDMA_NLDEV_ATTR_TBSZ \
+	(RDMA_NLDEV_ATTR_MAX > (RDMA_NLDEV_ATTR_RES_HANDLE + 1) \
+		? RDMA_NLDEV_ATTR_MAX \
+		: (RDMA_NLDEV_ATTR_RES_HANDLE + 1))
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "rdma_netlink: "
@@ -194,11 +228,11 @@ struct dev_collect_ctx {
 static int dev_collect_cb(struct nlmsghdr *hdr, void *arg)
 {
 	struct dev_collect_ctx *cc = arg;
-	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
+	struct nlattr *tb[CRIU_RDMA_NLDEV_ATTR_TBSZ];
 	struct nl_dev *d;
 	const char *name;
 
-	if (nlmsg_parse(hdr, 0, tb, RDMA_NLDEV_ATTR_MAX - 1, NULL) < 0)
+	if (nlmsg_parse(hdr, 0, tb, CRIU_RDMA_NLDEV_ATTR_TBSZ - 1, NULL) < 0)
 		return 0;
 	if (!tb[RDMA_NLDEV_ATTR_DEV_INDEX] ||
 	    !tb[RDMA_NLDEV_ATTR_DEV_NAME])
@@ -225,9 +259,9 @@ static int dev_collect_cb(struct nlmsghdr *hdr, void *arg)
 static int parse_ctx_entry(struct nlattr *entry, pid_t *pid_out,
 			   uint32_t *ctxn_out)
 {
-	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
+	struct nlattr *tb[CRIU_RDMA_NLDEV_ATTR_TBSZ];
 
-	if (nla_parse(tb, RDMA_NLDEV_ATTR_MAX - 1,
+	if (nla_parse(tb, CRIU_RDMA_NLDEV_ATTR_TBSZ - 1,
 		      nla_data(entry), nla_len(entry), NULL) < 0)
 		return -1;
 	if (!tb[RDMA_NLDEV_ATTR_RES_PID] ||
@@ -249,11 +283,11 @@ struct ctx_walk_ctx {
 static int ctx_per_msg_cb(struct nlmsghdr *hdr, void *arg)
 {
 	struct ctx_walk_ctx *cw = arg;
-	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
+	struct nlattr *tb[CRIU_RDMA_NLDEV_ATTR_TBSZ];
 	struct nlattr *list, *entry;
 	int rem;
 
-	if (nlmsg_parse(hdr, 0, tb, RDMA_NLDEV_ATTR_MAX - 1, NULL) < 0)
+	if (nlmsg_parse(hdr, 0, tb, CRIU_RDMA_NLDEV_ATTR_TBSZ - 1, NULL) < 0)
 		return 0;
 
 	list = tb[RDMA_NLDEV_ATTR_RES_CTX];
@@ -482,9 +516,9 @@ static int parse_res_entry(struct nlattr *entry,
 			   const struct res_type_info *info,
 			   struct rdma_nl_res_entry *e)
 {
-	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
+	struct nlattr *tb[CRIU_RDMA_NLDEV_ATTR_TBSZ];
 
-	if (nla_parse(tb, RDMA_NLDEV_ATTR_MAX - 1,
+	if (nla_parse(tb, CRIU_RDMA_NLDEV_ATTR_TBSZ - 1,
 		      nla_data(entry), nla_len(entry), NULL) < 0)
 		return -1;
 
@@ -503,6 +537,20 @@ static int parse_res_entry(struct nlattr *entry,
 	if (tb[RDMA_NLDEV_ATTR_RES_PID]) {
 		e->has_pid = true;
 		e->pid = (pid_t)nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_PID]);
+	}
+	/*
+	 * RES_HANDLE is the per-uobject ib_uobject->id (the user-visible
+	 * ufile handle) emitted alongside the per-class restrack id by
+	 * the kernel patch K8a -- see compat shim above and
+	 * design/uobject_restore.md §7.5.1. Only present on user-created
+	 * resources (kernel-internal restrack entries -- no ib_uobject
+	 * backing -- omit it by construction); has_ufile_handle stays
+	 * false on older kernels and gates downstream consumers (the R3
+	 * dump path that emits target_handle into rdma-uobj.img).
+	 */
+	if (tb[RDMA_NLDEV_ATTR_RES_HANDLE]) {
+		e->has_ufile_handle = true;
+		e->ufile_handle = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_HANDLE]);
 	}
 
 	switch (e->type) {
@@ -572,11 +620,11 @@ static int res_per_msg_cb(struct nlmsghdr *hdr, void *arg)
 {
 	struct res_walk_ctx *rw = arg;
 	const struct res_type_info *info = &res_types[rw->type];
-	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
+	struct nlattr *tb[CRIU_RDMA_NLDEV_ATTR_TBSZ];
 	struct nlattr *list, *entry;
 	int rem;
 
-	if (nlmsg_parse(hdr, 0, tb, RDMA_NLDEV_ATTR_MAX - 1, NULL) < 0)
+	if (nlmsg_parse(hdr, 0, tb, CRIU_RDMA_NLDEV_ATTR_TBSZ - 1, NULL) < 0)
 		return 0;
 
 	list = tb[info->list_attr];

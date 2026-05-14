@@ -19,7 +19,7 @@ CRIU="${CRIU:-criu}"
 NETDEV="${1:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROG="$HERE/uverbs_ctx_holder"
-WORKDIR="$(mktemp -d /tmp/uverbs-cr-XXXXXX)"
+WORKDIR="/tmp/uverbs-cr-keep-aeypy7"
 PIDFILE="$WORKDIR/holder.pid"
 RESTORED_PIDFILE="$WORKDIR/restored.pid"
 STATUS="$WORKDIR/status"
@@ -37,7 +37,7 @@ cleanup() {
 	done
 	rm -rf "$WORKDIR"
 }
-trap cleanup EXIT
+
 
 require() {
 	command -v "$1" >/dev/null 2>&1 || {
@@ -189,7 +189,31 @@ if ! grep -qE 'uobj DAG: read\+verify ok' "$DUMPDIR/restore.log"; then
 	     "line; the verify pass either errored or didn't run" >&2
 	exit 1
 fi
-echo "rdma-uobj.img verify pass ran clean on restore"
+
+# K8a (kernel commit 0601c496b413, design/uobject_restore.md §7.5.1)
+# emits ufile_handle alongside the existing per-class restrack id. The
+# dump-side NLDEV walk picks it up for every entry that NLDEV emitted
+# (PD/CQ/QP/MR/SRQ -- AH/CC/AEF flow via INFO_HANDLES, separate from
+# this assertion). At least one of those entries must therefore arrive
+# at restore with a populated ufile_handle, surfaced in the per-ufile
+# summary as "handles=N/M" with N>0. Catch a regression where the new
+# RES_HANDLE attr stops being parsed (compat shim wrong, kernel rev
+# without K8a, the structured init path losing the field, etc.).
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ .* handles=[1-9][0-9]*/[0-9]+' \
+	"$DUMPDIR/restore.log"; then
+	echo "FAIL: restore.log shows no per-ufile DAG summary with" \
+	     "ufile_handle populated (handles=N/M, N>0)." \
+	     "Either the kernel under test pre-dates K8a" \
+	     "(0601c496b413), the build's compat shim doesn't match" \
+	     "the kernel's RES_HANDLE numeric value, or the dump-side" \
+	     "join lost the field." >&2
+	echo "--- restore log uobj DAG lines ---" >&2
+	grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+		echo "(no uobj DAG lines at all)" >&2
+	exit 1
+fi
+echo "rdma-uobj.img verify pass ran clean on restore" \
+     "(per-uobj ufile_handle populated)"
 
 #
 # 5. Verify post-restore context is functional.

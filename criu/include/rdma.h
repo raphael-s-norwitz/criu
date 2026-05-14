@@ -72,7 +72,7 @@ int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
  * action consumes rdma_uobj.img yet (that lands in S1.c). Per-
  * uobject restore verbs come progressively across S2-S6 as kernel
  * support arrives, with the per-class tagging table in
- * linux/tools/testing/mlx5_vfmig/DESIGN_R3_uobj_restore.md
+ * linux/tools/testing/mlx5_vfmig/design/uobject_restore.md
  * gating which uobjects gain restore handlers when.
  *
  * No-op (returns 0 without opening rdma_uobj.img) when no in-tree

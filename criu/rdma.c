@@ -1607,13 +1607,22 @@ static struct rdma_dumped_ufile *uobj_ibdev_pdn_lookup(
 
 /*
  * Common emission step: build an RdmaUobjEntry skeleton (ufile_id,
- * hw_driver_id, type, restrack_id) populated from the join result,
- * leave per-class attrs and xrefs to the caller.
+ * hw_driver_id, type, restrack_id, ufile_handle) populated from the
+ * join result, leave per-class attrs and xrefs to the caller.
+ *
+ * ufile_handle is the per-ufile ib_uobject->id NLDEV emits via
+ * RDMA_NLDEV_ATTR_RES_HANDLE on kernels carrying upstream commit
+ * 0601c496b413 (K8a). On older kernels the flag stays unset and the
+ * field is omitted from the image; the restore-side install uses
+ * INFO_HANDLES fallbacks (none plumbed yet, see
+ * design/uobject_restore.md §7.5.1 -- once the new attr is the
+ * minimum, drop the conditional and require it).
  */
 static void uobj_entry_init_common(RdmaUobjEntry *e,
 				   const struct rdma_dumped_ufile *uf,
 				   R3UobjType type,
-				   bool has_restrack_id, uint32_t restrack_id)
+				   bool has_restrack_id, uint32_t restrack_id,
+				   bool has_ufile_handle, uint32_t ufile_handle)
 {
 	rdma_uobj_entry__init(e);
 	e->ufile_id = uf->uvfe_id;
@@ -1622,6 +1631,10 @@ static void uobj_entry_init_common(RdmaUobjEntry *e,
 	if (has_restrack_id) {
 		e->has_restrack_id = true;
 		e->restrack_id = restrack_id;
+	}
+	if (has_ufile_handle) {
+		e->has_ufile_handle = true;
+		e->ufile_handle = ufile_handle;
 	}
 }
 
@@ -1661,7 +1674,8 @@ static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_PD,
-			       e->has_restrack_id, e->restrack_id);
+			       e->has_restrack_id, e->restrack_id,
+			       e->has_ufile_handle, e->ufile_handle);
 	rdma_pd_attrs__init(&attrs);
 	pe.pd = &attrs;
 	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
@@ -1686,7 +1700,8 @@ static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_CQ,
-			       e->has_restrack_id, e->restrack_id);
+			       e->has_restrack_id, e->restrack_id,
+			       e->has_ufile_handle, e->ufile_handle);
 	rdma_cq_attrs__init(&attrs);
 	attrs.has_cqe_count = true;
 	attrs.cqe_count = e->cq.cqe;
@@ -1732,7 +1747,8 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_QP,
-			       e->has_restrack_id, e->restrack_id);
+			       e->has_restrack_id, e->restrack_id,
+			       e->has_ufile_handle, e->ufile_handle);
 	rdma_qp_attrs__init(&attrs);
 	attrs.has_qp_type = true;
 	attrs.qp_type = e->qp.qp_type;
@@ -1783,7 +1799,8 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_MR,
-			       e->has_restrack_id, e->restrack_id);
+			       e->has_restrack_id, e->restrack_id,
+			       e->has_ufile_handle, e->ufile_handle);
 	rdma_mr_attrs__init(&attrs);
 	attrs.has_length = true;
 	attrs.length = e->mr.mrlen;
@@ -1834,7 +1851,8 @@ static int uobj_srq_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	uobj_entry_init_common(&pe, uf, R3_UOBJ_TYPE__R3UT_SRQ,
-			       e->has_restrack_id, e->restrack_id);
+			       e->has_restrack_id, e->restrack_id,
+			       e->has_ufile_handle, e->ufile_handle);
 	rdma_srq_attrs__init(&attrs);
 	attrs.has_srq_type = true;
 	attrs.srq_type = e->srq.srq_type;
@@ -2029,6 +2047,8 @@ struct uobj_ufile_group {
 	int n_pd, n_cq, n_qp, n_mr, n_srq, n_ah, n_cc, n_aef, n_other;
 	int n_xref_total;
 	int n_xref_resolved;
+	int n_with_handle;	/* entries with has_ufile_handle set */
+	int n_total;		/* total entries in this group */
 	struct list_head link;
 };
 
@@ -2104,10 +2124,13 @@ static const RdmaUobjEntry *uobj_ufile_group_find(
 }
 
 /*
- * Per-group dedup check: (type, restrack_id) must be unique.
- * Returns -1 on duplicate. O(n^2) but uobject counts per ufile
- * are O(10s), not O(thousands), so the simple sweep beats setting
- * up a hash for the size we actually see.
+ * Per-group dedup check: (type, restrack_id) must be unique. So
+ * must ufile_handle within the same ufile (it's the kernel's
+ * ufile->uobjects xarray index -- unique by construction across
+ * every uobject class). Returns -1 on duplicate. O(n^2) but
+ * uobject counts per ufile are O(10s), not O(thousands), so the
+ * simple sweep beats setting up a hash for the size we actually
+ * see.
  */
 static int uobj_ufile_group_check_unique(const struct uobj_ufile_group *g)
 {
@@ -2116,24 +2139,40 @@ static int uobj_ufile_group_check_unique(const struct uobj_ufile_group *g)
 	list_for_each_entry(ci, &g->entries, link) {
 		const RdmaUobjEntry *ei = ci->e;
 
-		if (!ei->has_restrack_id)
-			continue;
 		for (cj = list_entry(ci->link.next, struct uobj_collected, link);
 		     &cj->link != &g->entries;
 		     cj = list_entry(cj->link.next, struct uobj_collected, link)) {
 			const RdmaUobjEntry *ej = cj->e;
 
-			if (!ej->has_restrack_id)
-				continue;
-			if (ei->type != ej->type)
-				continue;
-			if (ei->restrack_id != ej->restrack_id)
-				continue;
-			pr_err("uobj DAG: ufile_id=%#x has duplicate "
-			       "(type=%u, restrack_id=%u) entries; image "
-			       "is inconsistent\n",
-			       g->ufile_id, ei->type, ei->restrack_id);
-			return -1;
+			if (ei->has_restrack_id && ej->has_restrack_id &&
+			    ei->type == ej->type &&
+			    ei->restrack_id == ej->restrack_id) {
+				pr_err("uobj DAG: ufile_id=%#x has duplicate "
+				       "(type=%u, restrack_id=%u) entries; "
+				       "image is inconsistent\n",
+				       g->ufile_id, ei->type, ei->restrack_id);
+				return -1;
+			}
+			/*
+			 * ufile_handle uniqueness is cross-type within one
+			 * ufile because the kernel's ufile->uobjects xarray
+			 * is keyed by ib_uobject->id only (the type isn't
+			 * part of the key). A duplicate here means the
+			 * dump-side join logic merged two NLDEV walks
+			 * incorrectly, the kernel emitted a stale id, or
+			 * the image was hand-edited. Bail.
+			 */
+			if (ei->has_ufile_handle && ej->has_ufile_handle &&
+			    ei->ufile_handle == ej->ufile_handle) {
+				pr_err("uobj DAG: ufile_id=%#x has duplicate "
+				       "ufile_handle=%u across types %u and %u; "
+				       "image is inconsistent (ufile->uobjects "
+				       "ids are unique per ufile by construction)"
+				       "\n",
+				       g->ufile_id, ei->ufile_handle,
+				       ei->type, ej->type);
+				return -1;
+			}
 		}
 	}
 	return 0;
@@ -2215,6 +2254,9 @@ int rdma_collect_uobj_dag(void)
 		INIT_LIST_HEAD(&c->link);
 		list_add_tail(&c->link, &g->entries);
 		uobj_ufile_group_count(g, e->type);
+		g->n_total++;
+		if (e->has_ufile_handle)
+			g->n_with_handle++;
 		n_entries++;
 	}
 
@@ -2230,11 +2272,12 @@ int rdma_collect_uobj_dag(void)
 			goto out;
 		pr_info("uobj DAG: ufile_id=%#x hw_drv=%u "
 			"pds=%d cqs=%d qps=%d mrs=%d srqs=%d ahs=%d "
-			"ccs=%d aefs=%d xrefs=%d/%d\n",
+			"ccs=%d aefs=%d xrefs=%d/%d handles=%d/%d\n",
 			g->ufile_id, g->hw_driver_id,
 			g->n_pd, g->n_cq, g->n_qp, g->n_mr, g->n_srq,
 			g->n_ah, g->n_cc, g->n_aef,
-			g->n_xref_resolved, g->n_xref_total);
+			g->n_xref_resolved, g->n_xref_total,
+			g->n_with_handle, g->n_total);
 	}
 
 	pr_info("uobj DAG: read+verify ok: %d entries across "
