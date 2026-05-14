@@ -112,6 +112,32 @@ int rdma_dump_uobj_dag(void);
 int rdma_collect_uobj_dag(void);
 
 /*
+ * R3 restore-side per-ufile RESTORE_<TYPE> dispatcher.
+ *
+ * Called by uverbsfd_open() after the loaded RDMA plugin has handed
+ * back an open uverbs cdev fd with a kernel ucontext established on
+ * it. Walks the per-@ufile_id DAG group built earlier by
+ * rdma_collect_uobj_dag() and issues RESTORE_<TYPE> verbs (currently
+ * just UVERBS_METHOD_RESTORE_PD; CQ/QP/MR/SRQ/AH land as their
+ * driver hooks come up) per uobject entry, installing each at the
+ * kernel-side ufile_handle the dump captured.
+ *
+ * Restore-mode gating is the plugin's job: the cdev fd this gets is
+ * already opened in the per-driver restore mode (rxe via
+ * RXE_ALLOC_UCTX_RESTORE_MODE, mlx5 via
+ * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE), so the kernel
+ * ib_device_ops.ucontext_is_restore_mode predicate doesn't reject
+ * the dispatch.
+ *
+ * No-op (returns 0) when @ufile_id has no DAG group -- e.g. the
+ * dump pre-dated R3 image emission or skipped this ufile. Returns
+ * -1 on the first per-entry restore failure (already pr_err'd with
+ * driver/handle context).
+ */
+int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
+				    uint32_t kernel_driver_id);
+
+/*
  * Internal-but-shared helpers used by both criu/rdma.c and the
  * pre-suspend coverage check above. Defined in criu/rdma.c.
  *

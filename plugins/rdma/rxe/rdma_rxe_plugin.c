@@ -35,8 +35,10 @@
 #include "images/uverbsfd.pb-c.h"
 
 #include <rdma/ib_user_ioctl_verbs.h>
+#include <rdma/ib_user_verbs.h>
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -45,6 +47,30 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/*
+ * Inlined kernel UAPI for the rxe ucontext-restore-mode flag, lifted
+ * from include/uapi/rdma/rdma_user_rxe.h. The installed rdma-core uapi
+ * tree lags the in-tree kernel UAPI; this enum + struct land in
+ * upstream rdma-core only after a `make headers_install` from a kernel
+ * carrying f0623eb9659f ("RDMA/rxe: Wire ucontext_is_restore_mode
+ * predicate"). Same self-contained-inline pattern as the mlx5_vfmig
+ * plugin uses for its alloc-ucontext-req surface, and as the kernel-
+ * side reference exerciser
+ * tools/testing/mlx5_vfmig/uobject_restore/pd_restore/pd_restore_probe_rxe.c
+ * uses for the same reason.
+ *
+ * If the kernel UAPI evolves, keep this block in sync with:
+ *   include/uapi/rdma/rdma_user_rxe.h     (the flag enum + req struct)
+ *   drivers/infiniband/sw/rxe/rxe_verbs.c (the parser side)
+ */
+enum {
+	RXE_ALLOC_UCTX_RESTORE_MODE = 1u << 0,
+};
+struct rxe_alloc_ucontext_req_local {
+	uint32_t flags;
+	uint32_t reserved;
+};
 
 #ifdef LOG_PREFIX
 #undef LOG_PREFIX
@@ -241,6 +267,57 @@ static int rxe_read_sysfs(const char *path, char *buf, size_t buflen)
 }
 
 /*
+ * Issue IB_USER_VERBS_CMD_GET_CONTEXT via the legacy write() path
+ * with RXE_ALLOC_UCTX_RESTORE_MODE in the trailing
+ * rxe_alloc_ucontext_req driver_data.
+ *
+ * The new RDMA_VERBS_IOCTL UVERBS_METHOD_GET_CONTEXT path doesn't
+ * currently accept driver-specific data (no UHW attribute defined for
+ * it), so the rxe restore-mode flag has to land in udata via the
+ * legacy write() path. mlx5_vfmig has the same constraint and uses
+ * the same shape (vfmig_send_get_context_v2 in the mlx5 plugin); a
+ * future "add UHW to UVERBS_METHOD_GET_CONTEXT" kernel patch would
+ * let both helpers migrate to the ioctl path -- until then, legacy
+ * write is the canonical way to get a per-driver alloc-ucontext-req
+ * to the driver hook.
+ *
+ * Restore mode is unconditional here. RDMA_OPEN_UVERBS_CDEV is only
+ * invoked from CRIU's restore path, and the kernel-side
+ * rxe_ucontext.restore_mode bit is sticky-and-harmless: it only gates
+ * the per-class UVERBS_METHOD_RESTORE_<TYPE> dispatchers, which
+ * non-restoring callers won't issue anyway. So every cdev we open
+ * here gets opened in restore mode, no plugin-visible flag needed.
+ *
+ * Returns 0 on success, -errno on failure. Closes the vestigial
+ * resp.async_fd the kernel installs; CRIU reconstructs the workload's
+ * async-event fd separately via UverbsAsyncEvFile.
+ */
+static int rxe_send_get_context_restore(int fd)
+{
+	struct {
+		struct ib_uverbs_cmd_hdr hdr;
+		struct ib_uverbs_get_context get_ctx;
+		struct rxe_alloc_ucontext_req_local req;
+	} cmd = {};
+	struct ib_uverbs_get_context_resp resp = {};
+	ssize_t n;
+
+	cmd.hdr.command = IB_USER_VERBS_CMD_GET_CONTEXT;
+	cmd.hdr.in_words = sizeof(cmd) / 4;
+	cmd.hdr.out_words = sizeof(resp) / 4;
+	cmd.get_ctx.response = (uintptr_t)&resp;
+	cmd.req.flags = RXE_ALLOC_UCTX_RESTORE_MODE;
+
+	n = write(fd, &cmd, sizeof(cmd));
+	if (n < 0)
+		return -errno;
+	if ((size_t)n != sizeof(cmd))
+		return -EIO;
+	close((int)resp.async_fd);
+	return 0;
+}
+
+/*
  * Restore-side per-context cdev open
  * (CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV).
  *
@@ -274,7 +351,7 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe)
 	char path[PATH_MAX], ibdev[64], cdevpath[PATH_MAX];
 	struct dirent *de;
 	DIR *d;
-	int fd = -1;
+	int fd = -1, rc;
 	bool found = false;
 
 	if (!u->ib_dev || u->ib_dev[0] == '\0') {
@@ -329,17 +406,20 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe)
 	/*
 	 * Per the uniform RDMA_OPEN_UVERBS_CDEV contract, hand back a
 	 * fd that already has a kernel ucontext on it -- uverbsfd_open
-	 * no longer issues GET_CONTEXT itself. For rxe this is just
-	 * the verbs ioctl against the cdev we just opened (rxe is
-	 * software-only, no per-VF restore dance). The driver_id
-	 * comes straight from the image record so a future
-	 * RDMA_DRIVER_RXE2 (or whatever) just works without changes
-	 * here.
+	 * no longer issues GET_CONTEXT itself.
+	 *
+	 * Open in restore mode (RXE_ALLOC_UCTX_RESTORE_MODE) so the
+	 * generic UVERBS_METHOD_RESTORE_<TYPE> dispatchers in
+	 * criu/rdma.c::rdma_restore_uobj_dag() are unblocked for the
+	 * uobjects this ufile holds. Restore mode is sticky and harmless
+	 * for callers that never issue RESTORE_<TYPE>, so no contract
+	 * change is needed -- every restore-side cdev gets it.
 	 */
-	if (criu_ib_uverbs_get_context(fd, u->driver_id) != 0) {
-		pr_perror("open_uverbs_cdev: GET_CONTEXT(driver_id=%u) "
-			  "on fd=%d for ibdev=%s",
-			  u->driver_id, fd, u->ib_dev);
+	rc = rxe_send_get_context_restore(fd);
+	if (rc) {
+		pr_err("open_uverbs_cdev: GET_CONTEXT(restore mode) "
+		       "on fd=%d for ibdev=%s failed: %d (%s)\n",
+		       fd, u->ib_dev, rc, strerror(-rc));
 		close(fd);
 		return -1;
 	}

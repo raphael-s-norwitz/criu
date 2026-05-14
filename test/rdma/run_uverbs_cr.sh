@@ -215,6 +215,26 @@ fi
 echo "rdma-uobj.img verify pass ran clean on restore" \
      "(per-uobj ufile_handle populated)"
 
+# S2 RESTORE_PD dispatch. uverbsfd_open() calls
+# rdma_restore_uobj_dag_for_ufile() right after the plugin hands
+# back the open cdev fd, which then issues UVERBS_METHOD_RESTORE_PD
+# per PD entry recorded in rdma-uobj.img. The dispatcher logs a
+# one-liner per-ufile when it actually issued any RESTORE_<TYPE>
+# verbs. The holder allocates exactly one PD before dump, so we
+# expect "restored 1 PD(s), skipped 0".
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ restored [1-9][0-9]* PD\(s\), skipped 0' \
+	"$DUMPDIR/restore.log"; then
+	echo "FAIL: restore.log shows no RESTORE_PD dispatch by" \
+	     "rdma_restore_uobj_dag_for_ufile() -- the per-ufile" \
+	     "S2 restore pass either didn't run, found no PD entry," \
+	     "or skipped the entry for missing ufile_handle." >&2
+	echo "--- restore log uobj DAG lines ---" >&2
+	grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+		echo "(no uobj DAG lines at all)" >&2
+	exit 1
+fi
+echo "RESTORE_PD dispatched ok by rdma_restore_uobj_dag_for_ufile()"
+
 #
 # 5. Verify post-restore context is functional.
 #
@@ -230,16 +250,17 @@ echo "post-restore status: $RESULT"
 
 if [[ "$RESULT" != "OK" ]]; then
 	echo "FAIL"
-	# 'FAIL: ibv_dealloc_pd of pre-dump PD' is the canonical
-	# "kernel uobject state was not preserved across the cdev dump"
-	# signal -- distinct from a real regression. The test goes
-	# green when uobject save/replay lands; until then this is the
-	# regression-test fixture for that work.
-	case "$RESULT" in
-	"FAIL: ibv_dealloc_pd of pre-dump PD"*)
-		echo "(known PD-uobject preservation gap; not a regression)" >&2
-		;;
-	esac
+	# Strict from S2 onward: ibv_dealloc_pd of the pre-dump PD
+	# must succeed, because uverbsfd_open() now drives
+	# UVERBS_METHOD_RESTORE_PD per rdma-uobj.img entry to
+	# reinstall the kernel-side PD uobject at its original
+	# ufile_handle. Any "FAIL: ibv_dealloc_pd of pre-dump PD"
+	# from the holder is a real regression in that path -- one
+	# of: rxe_send_get_context_restore() not opening the cdev
+	# in restore mode (-> RESTORE_PD -EPERM), kernel rev pre-K3
+	# /K4 (-> -EOPNOTSUPP), DAG-side dropping ufile_handle, or
+	# the dispatcher passing the wrong driver_id (-> -EINVAL,
+	# the bug found and fixed during S2 bring-up).
 	echo "--- dump log tail ---" >&2
 	tail -80 "$DUMPDIR/dump.log" >&2 || true
 	echo "--- restore log tail ---" >&2

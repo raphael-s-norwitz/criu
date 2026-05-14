@@ -990,10 +990,31 @@ static int uverbsfd_open(struct file_desc *d, int *new_fd)
 	 * for diagnostics; it is no longer used as a GET_CONTEXT
 	 * argument by this function.
 	 */
-	(void)driver_id;
 	fd = rdma_dispatch_open_uverbs_cdev(ui->uvfe);
 	if (fd < 0)
 		return -1;
+
+	/*
+	 * R3 per-uobject restore. Plugin gave us an open cdev with
+	 * a restore-mode ucontext on it; replay every uobject the
+	 * dump captured under this ufile by issuing the matching
+	 * RESTORE_<TYPE> verb per entry. PD only at S2; CQ/QP/MR/
+	 * SRQ/AH come online as the kernel side gains the per-class
+	 * driver callbacks (see design/uobject_restore.md). No-op
+	 * when the dump produced no rdma-uobj.img coverage for this
+	 * ufile_id (treated as best-effort -- the empty ucontext
+	 * matches the pre-R3 baseline behavior).
+	 *
+	 * @driver_id (the kernel's RDMA_DRIVER_* enum value, not the
+	 * CRIU per-plugin RdmaCriuDriver enum that the per-uobj DAG
+	 * group caches under hw_driver_id) is what the kernel's
+	 * UVERBS_OBJECT_RESTORE dispatcher matches in the ioctl
+	 * header.
+	 */
+	if (rdma_restore_uobj_dag_for_ufile(fd, ui->uvfe->id, driver_id)) {
+		close(fd);
+		return -1;
+	}
 
 	ctxn_uverbsfd_id_map[ui->uvfe->ctxn] = ui->uvfe->id;
 
@@ -2052,6 +2073,30 @@ struct uobj_ufile_group {
 	struct list_head link;
 };
 
+/*
+ * The DAG built by rdma_collect_uobj_dag() (early in restore, before
+ * file restore) and consumed by rdma_restore_uobj_dag_for_ufile()
+ * (per cdev fd, called from uverbsfd_open() after the plugin hands
+ * back the open fd). Lives for the rest of the restore; free is at
+ * process exit so we deliberately don't have a release entry point.
+ *
+ * Local LIST_HEAD() inside rdma_collect_uobj_dag() would have been
+ * nicer but the consumer phase is in a different translation unit's
+ * call chain.
+ */
+static LIST_HEAD(rdma_uobj_groups);
+
+static struct uobj_ufile_group *
+rdma_uobj_group_lookup(uint32_t ufile_id)
+{
+	struct uobj_ufile_group *g;
+
+	list_for_each_entry(g, &rdma_uobj_groups, link)
+		if (g->ufile_id == ufile_id)
+			return g;
+	return NULL;
+}
+
 static struct uobj_ufile_group *uobj_ufile_group_get_or_add(
 		struct list_head *head, uint32_t ufile_id, uint32_t hw_driver_id)
 {
@@ -2209,10 +2254,179 @@ static int uobj_ufile_group_check_xrefs(struct uobj_ufile_group *g)
 	return 0;
 }
 
+/*
+ * UAPI lag shim for UVERBS_OBJECT_RESTORE / UVERBS_METHOD_RESTORE_PD /
+ * UVERBS_ATTR_RESTORE_PD_HANDLE.
+ *
+ * Upstream kernel: include/uapi/rdma/ib_user_ioctl_cmds.h carries
+ *   UVERBS_OBJECT_RESTORE       = 18
+ *   UVERBS_METHOD_RESTORE_PD    = 0    (within OBJECT_RESTORE)
+ *   UVERBS_ATTR_RESTORE_PD_HANDLE = 0  (within METHOD_RESTORE_PD)
+ *
+ * At wire time the kernel matches by integer, never by enumerator
+ * name, so a stable numeric copy here is sufficient to talk to a
+ * kernel that has the support, and a fresh-enough kernel is the
+ * gate on the operation succeeding (it'll return -EOPNOTSUPP if
+ * the dispatch table doesn't know the object_id, which is the
+ * already-handled "kernel too old" signal).
+ *
+ * The mlx5_vfmig plugin uses the same self-contained-numeric pattern
+ * for its own per-driver verbs (MLX5_IB_OBJECT_VFMIG_LOCAL etc).
+ *
+ * Drop the shim once the build's minimum rdma-core ships these
+ * symbols upstream.
+ */
+#ifndef UVERBS_OBJECT_RESTORE
+#define UVERBS_OBJECT_RESTORE			18
+#endif
+#ifndef UVERBS_METHOD_RESTORE_PD
+#define UVERBS_METHOD_RESTORE_PD		0
+#endif
+#ifndef UVERBS_ATTR_RESTORE_PD_HANDLE
+#define UVERBS_ATTR_RESTORE_PD_HANDLE		0
+#endif
+
+/*
+ * Issue UVERBS_METHOD_RESTORE_PD on @cmd_fd, asking the kernel to
+ * mint a PD uobject at the caller-chosen ufile handle
+ * @target_handle. Returns 0 on success, -errno on ioctl failure.
+ *
+ * Wire-format mirrors the kernel-side reference exerciser
+ * tools/testing/mlx5_vfmig/uobject_restore/pd_restore/pd_restore_probe_rxe.c
+ * (do_restore_pd()). Using the inline data slot of struct
+ * ib_uverbs_attr (4 bytes <= sizeof(uintptr_t)), which is what the
+ * kernel-side uverbs_attr_ptr_is_inline() check expects.
+ */
+static int rdma_send_restore_pd(int cmd_fd, uint32_t driver_id,
+				uint32_t target_handle)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[1];
+	} cmd = {};
+
+	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_PD;
+	cmd.hdr.driver_id = driver_id;
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd);
+
+	cmd.attrs[0].attr_id = UVERBS_ATTR_RESTORE_PD_HANDLE;
+	cmd.attrs[0].len = sizeof(uint32_t);
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = target_handle;
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Per-ufile restore dispatcher. Called from uverbsfd_open() right
+ * after the plugin's RDMA_OPEN_UVERBS_CDEV hook returns the open
+ * cdev fd. Walks the DAG group built by rdma_collect_uobj_dag()
+ * for @ufile_id and issues the right RESTORE_<TYPE> verb per
+ * entry.
+ *
+ * S2 scope: PD only. CQ/QP/MR/SRQ/AH RESTORE_<TYPE> verbs land as
+ * the kernel side gains the corresponding driver callbacks; until
+ * then those entries are silently skipped (the post-restore
+ * application sees the empty ucontext, which is the same situation
+ * v0 has had).
+ *
+ * Skips entries without ufile_handle (kernel pre-K8a / future
+ * resource classes that aren't NLDEV-emitted) -- without a target
+ * handle there's nothing to ask the kernel for.
+ *
+ * Returns 0 on success (including the no-DAG / no-PD-entries
+ * cases); -1 on the first per-entry restore failure, with the
+ * offending (ufile_id, type, ufile_handle) in the pr_err.
+ */
+int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
+				    uint32_t kernel_driver_id)
+{
+	struct uobj_ufile_group *g;
+	struct uobj_collected *c;
+	int n_pd_restored = 0;
+	int n_pd_skipped = 0;
+
+	g = rdma_uobj_group_lookup(ufile_id);
+	if (!g) {
+		pr_debug("uobj DAG: ufile_id=%#x has no DAG group "
+			 "(no rdma-uobj.img coverage); nothing to restore\n",
+			 ufile_id);
+		return 0;
+	}
+
+	list_for_each_entry(c, &g->entries, link) {
+		const RdmaUobjEntry *e = c->e;
+		int rc;
+
+		switch (e->type) {
+		case R3_UOBJ_TYPE__R3UT_PD:
+			if (!e->has_ufile_handle) {
+				/*
+				 * Pre-K8a image, or NLDEV walk lost the
+				 * field. Without target_handle we can't
+				 * ask the kernel to install at a
+				 * specific slot. Count + move on; the
+				 * test fixture asserts handles>0 on a
+				 * fresh image so this surfaces upstream.
+				 */
+				n_pd_skipped++;
+				continue;
+			}
+			rc = rdma_send_restore_pd(cmd_fd, kernel_driver_id,
+						  e->ufile_handle);
+			if (rc) {
+				pr_err("uobj DAG: ufile_id=%#x RESTORE_PD"
+				       "(target_handle=%u, driver_id=%u) "
+				       "failed: %d (%s)%s\n",
+				       ufile_id, e->ufile_handle,
+				       kernel_driver_id, rc, strerror(-rc),
+				       rc == -EOPNOTSUPP
+				       ? " -- kernel pre-K3/K4, no "
+				         "ib_device_ops.restore_pd for this "
+				         "driver"
+				       : rc == -EPERM
+				       ? " -- ucontext not in restore mode "
+				         "(plugin's RDMA_OPEN_UVERBS_CDEV "
+				         "must use a per-driver restore-mode "
+				         "GET_CONTEXT)"
+				       : rc == -EBUSY
+				       ? " -- target_handle collision "
+				         "(another uobject already at this "
+				         "ufile slot; image is internally "
+				         "inconsistent or the kernel ufile "
+				         "is not pristine)"
+				       : "");
+				return -1;
+			}
+			n_pd_restored++;
+			break;
+		default:
+			/*
+			 * S2: only PD has a restore verb upstream. CQ
+			 * and onwards land in S3+; until then the
+			 * entries pass through silently. Restored
+			 * application will fault on missing CQ/QP at
+			 * its first verb call -- exactly what the
+			 * pre-S2 baseline did.
+			 */
+			break;
+		}
+	}
+
+	if (n_pd_restored || n_pd_skipped)
+		pr_info("uobj DAG: ufile_id=%#x restored %d PD(s), "
+			"skipped %d (no ufile_handle)\n",
+			ufile_id, n_pd_restored, n_pd_skipped);
+	return 0;
+}
+
 int rdma_collect_uobj_dag(void)
 {
 	struct cr_img *img;
-	LIST_HEAD(groups);
 	struct uobj_ufile_group *g, *gnext;
 	struct uobj_collected *c, *cnext;
 	int ret = -1;
@@ -2238,7 +2452,8 @@ int rdma_collect_uobj_dag(void)
 		if (r == 0)
 			break;
 
-		g = uobj_ufile_group_get_or_add(&groups, e->ufile_id,
+		g = uobj_ufile_group_get_or_add(&rdma_uobj_groups,
+						e->ufile_id,
 						e->hw_driver_id);
 		if (!g) {
 			rdma_uobj_entry__free_unpacked(e, NULL);
@@ -2265,7 +2480,7 @@ int rdma_collect_uobj_dag(void)
 	 * group; bail on the first inconsistency so the operator gets
 	 * a single actionable error rather than a cascade.
 	 */
-	list_for_each_entry(g, &groups, link) {
+	list_for_each_entry(g, &rdma_uobj_groups, link) {
 		if (uobj_ufile_group_check_unique(g) < 0)
 			goto out;
 		if (uobj_ufile_group_check_xrefs(g) < 0)
@@ -2283,12 +2498,15 @@ int rdma_collect_uobj_dag(void)
 	pr_info("uobj DAG: read+verify ok: %d entries across "
 		"%d ufile_id group(s)\n",
 		n_entries,
-		({ int n = 0; list_for_each_entry(g, &groups, link) n++; n; }));
+		({ int n = 0;
+		   list_for_each_entry(g, &rdma_uobj_groups, link) n++;
+		   n; }));
 
-	ret = 0;
+	close_image(img);
+	return 0;
 out:
 	close_image(img);
-	list_for_each_entry_safe(g, gnext, &groups, link) {
+	list_for_each_entry_safe(g, gnext, &rdma_uobj_groups, link) {
 		list_for_each_entry_safe(c, cnext, &g->entries, link) {
 			list_del(&c->link);
 			rdma_uobj_entry__free_unpacked(c->e, NULL);
