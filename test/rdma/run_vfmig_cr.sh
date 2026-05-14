@@ -25,8 +25,26 @@
 #        replays the dyn-UAR records.
 #     4. UPDATE_VMA_MAP hands the workload a dup of the dest cdev fd
 #        with the source's pgoff verbatim.
-#     5. SIGUSR1 to the restored holder -> ibv_query_device +
-#        ibv_alloc_pd checks.
+#     5. uverbsfd_open() drives rdma_restore_uobj_dag_for_ufile()
+#        which issues UVERBS_METHOD_RESTORE_PD per PD entry in
+#        rdma-uobj.img. For mlx5 the verb carries a UHW payload
+#        (struct mlx5_ib_restore_pd_req) with the source FW pdn
+#        captured from RDMA_NLDEV_ATTR_RES_PDN; mlx5_ib_restore_pd
+#        adopts that pdn into a fresh kernel-side mlx5_ib_pd via
+#        Model A (no destination FW round-trip; the source pdn is
+#        already reserved in firmware after LOAD_VHCA_STATE). See
+#        linux/tools/testing/mlx5_vfmig/design/uobject_restore.md
+#        §9.1 S3b.
+#     6. SIGUSR1 to the restored holder runs the §S3b incremental-
+#        coverage acid test: build a fresh CQ + QP + MR on top of
+#        the *adopted* PD (exercises FW CREATE_QP / CREATE_MKEY
+#        accepting the adopted pdn under the destination ucontext's
+#        uid -- the libibverbs version of pd_adopt's FW gate
+#        validation), then tear them down in dependency order
+#        ending in ibv_dealloc_pd(adopted PD). Avoids the v0
+#        dealloc-ordering tripwire because the source ucontext
+#        only holds a PD pre-dump -- no FW dependents to block
+#        DEALLOC_PD on the adopted PD.
 #
 # Usage:
 #   sudo PF=0000:08:00.0 ./run_vfmig_cr.sh
@@ -37,7 +55,7 @@ set -euo pipefail
 
 PF="${PF:-0000:08:00.0}"
 CRIU="${CRIU:-/usr/local/sbin/criu}"
-VFMIG_TOOL="${VFMIG_TOOL:-/opt/builds/linux/tools/testing/mlx5_vfmig/mlx5_vfmig}"
+VFMIG_TOOL="${VFMIG_TOOL:-/opt/builds/linux/tools/testing/mlx5_vfmig/tools/mlx5_vfmig}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROG="$HERE/uverbs_ctx_holder"
 WORKDIR="$(mktemp -d /tmp/vfmig-cr-XXXXXX)"
@@ -66,6 +84,28 @@ trap cleanup EXIT
 [[ -x "$PROG" ]]    || { echo "missing $PROG -- 'make -C $HERE'" >&2; exit 1; }
 [[ -x "$CRIU" ]]    || { echo "missing $CRIU" >&2; exit 1; }
 [[ -x "$VFMIG_TOOL" ]] || { echo "missing $VFMIG_TOOL" >&2; exit 1; }
+
+# CRIU has no --disable-plugin CLI; the closest knob is -L/--libdir
+# which overrides the entire plugin search dir. amdgpu_plugin
+# unconditionally hooks CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA and
+# returns an error (rather than declining) when /dev/kfd is absent
+# on hosts without an AMD GPU, which fires for any unrecognised
+# /dev/* mapping including the libmlx5 UAR write-only-shared
+# mapping at /dev/infiniband/uverbsN. Build a sandbox plugin dir
+# with only the RDMA plugins (the ones this test cares about) and
+# point criu at it via -L. cuda_plugin doesn't HANDLE_DEVICE_VMA
+# so it'd be harmless either way; we omit it for cleanliness.
+PLUGIN_SRC="${PLUGIN_SRC:-/usr/local/lib/criu}"
+PLUGIN_SANDBOX="$WORKDIR/plugins"
+mkdir -p "$PLUGIN_SANDBOX"
+for p in rdma_rxe_plugin.so rdma_mlx5_vfmig_plugin.so; do
+    [[ -f "$PLUGIN_SRC/$p" ]] || {
+        echo "missing plugin $PLUGIN_SRC/$p -- 'make install' first" >&2
+        exit 1
+    }
+    ln -s "$PLUGIN_SRC/$p" "$PLUGIN_SANDBOX/$p"
+done
+CRIU_LIB_FLAG="-L $PLUGIN_SANDBOX"
 
 vf_path() { echo "/sys/bus/pci/devices/$1"; }
 
@@ -155,7 +195,7 @@ grep -E '^READY ' "$LOG" || true
 mkdir -p "$DUMPDIR"
 echo "=== Phase C: criu dump ==="
 echo "criu dump -t $HOLDER_PID -D $DUMPDIR -v4"
-"$CRIU" dump -t "$HOLDER_PID" -D "$DUMPDIR" -v4 -o dump.log --shell-job || {
+"$CRIU" dump -t "$HOLDER_PID" -D "$DUMPDIR" -v4 -o dump.log --shell-job $CRIU_LIB_FLAG || {
     echo "FAIL: criu dump returned $?"
     echo "--- dump log tail ---"
     tail -120 "$DUMPDIR/dump.log" || true
@@ -174,7 +214,7 @@ reprovision_vf_for_restore
 # ---- Phase F: criu restore --------------------------------------------
 echo "=== Phase F: criu restore ==="
 "$CRIU" restore -D "$DUMPDIR" -v4 -o restore.log -d \
-    --pidfile "$RESTORED_PIDFILE" --shell-job || {
+    --pidfile "$RESTORED_PIDFILE" --shell-job $CRIU_LIB_FLAG || {
     echo "FAIL: criu restore returned $?"
     echo "--- restore log tail ---"
     tail -120 "$DUMPDIR/restore.log" || true
@@ -182,6 +222,28 @@ echo "=== Phase F: criu restore ==="
 }
 RESTORED_PID="$(cat "$RESTORED_PIDFILE")"
 echo "restored pid=$RESTORED_PID"
+
+# Positive RESTORE_PD dispatch assertion. uverbsfd_open() runs
+# rdma_restore_uobj_dag_for_ufile() right after the plugin's
+# init(RESTORE) opens the dest cdev; it pr_info's
+# "restored N PD(s), skipped 0" iff it actually issued
+# UVERBS_METHOD_RESTORE_PD against the kernel. The source ucontext
+# allocates exactly one PD, so we expect N=1 here. If the
+# RESTORE_PD path ever stops firing (kernel rev pre-K3/K4, plugin
+# not opening cdev in restore mode, DAG-side dropping ufile_handle,
+# UHW dispatcher misbranding the driver_id) this catches it before
+# the holder's post-restore checks would also fail later.
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ restored [1-9][0-9]* PD\(s\), skipped 0' \
+    "$DUMPDIR/restore.log"; then
+    echo "FAIL: restore.log shows no RESTORE_PD dispatch by" \
+         "rdma_restore_uobj_dag_for_ufile() -- the per-ufile S3b" \
+         "restore pass either didn't run, found no PD entry, or" \
+         "skipped the entry for missing ufile_handle." >&2
+    grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+        echo "(no uobj DAG lines at all)" >&2
+    exit 1
+fi
+echo "RESTORE_PD dispatched ok (mlx5 UHW path)"
 
 # ---- Phase G: verify --------------------------------------------------
 echo "=== Phase G: post-restore checks ==="
@@ -202,11 +264,23 @@ if [[ "$RESULT" == "OK" ]]; then
 fi
 
 echo "FAIL ($RESULT)"
-case "$RESULT" in
-"FAIL: ibv_dealloc_pd of pre-dump PD"*)
-    echo "(known PD-uobject preservation gap; not a regression)" >&2
-    ;;
-esac
+# Specific failure modes the holder distinguishes (see
+# uverbs_ctx_holder.c::run_post_restore_checks):
+#   - "ibv_query_device after restore": ucontext / cdev reattach
+#     broken (RDMA_OPEN_UVERBS_CDEV path).
+#   - "ibv_create_cq on restored ucontext": fresh-resource creation
+#     against the restore-mode ucontext broken.
+#   - "ibv_create_qp on pre-dump PD": Model A pdn adoption broken
+#     for QP -- FW CREATE_QP rejected the adopted pdn under the
+#     destination ucontext's uid (the live-fire half of the
+#     pd_adopt FW-gate test).
+#   - "ibv_reg_mr on pre-dump PD": same for FW CREATE_MKEY -- the
+#     specific verb pd_adopt validates empirically.
+#   - "ibv_dealloc_pd of pre-dump PD (after draining dependents)":
+#     dependency-ordered teardown reached PD with all dependents
+#     already gone, so DEALLOC_PD should be unconditional. A
+#     failure here means kernel-side ib_uobject leaked a
+#     dependent or the adopted mpd->pdn is stale.
 echo "--- dump log tail ---" >&2
 tail -120 "$DUMPDIR/dump.log" >&2 || true
 echo "--- restore log tail ---" >&2

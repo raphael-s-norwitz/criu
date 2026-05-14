@@ -157,18 +157,54 @@ static void run_post_restore_checks(void)
 	}
 
 	/*
-	 * Step 3: fresh QP on the *pre-dump* PD. RC QP because rxe
-	 * supports it without further setup and the kernel/FW path
-	 * for RC QP creation goes through the standard pdn-validating
-	 * code path. cap = (1, 1, 1, 1) is the minimum the kernel
-	 * accepts (a strict-zero cap is rejected by ib_uverbs_create_qp).
+	 * Step 3: fresh MR on the *pre-dump* PD. Local-write only is
+	 * the lightest-weight path; the kernel issues FW CREATE_MKEY
+	 * with mkc.pd = adopted_pdn. This is the verb the kernel-side
+	 * pd_adopt empirical test validated (see
+	 * tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/) and what
+	 * pd_restore_probe_mlx5_vfmig confirms via PROBE_PD; running
+	 * it before CREATE_QP isolates the FW-gate question from any
+	 * libibverbs/libmlx5-side complexity in QP construction.
 	 *
-	 * The wire CREATE_QP command carries pd_handle=g_pd->handle,
-	 * which the destination kernel resolves to the adopted
-	 * ib_pd whose mpd->pdn is the source's FW pdn. FW CREATE_QP
-	 * referencing that pdn must succeed under the new ucontext's
-	 * uid; if Model A's "uid=0 ungated" premise is wrong this
-	 * is where the test breaks.
+	 * The wire CREATE_MKEY carries pd_handle=g_pd->handle, which
+	 * the destination kernel resolves to the adopted ib_pd whose
+	 * mpd->pdn is the source's FW pdn. FW CREATE_MKEY referencing
+	 * that pdn must succeed under the new ucontext's uid -- if
+	 * Model A's "uid=0 ungated for CREATE_MKEY" premise is wrong
+	 * this is where the test breaks.
+	 */
+	if (posix_memalign(&mr_buf, 4096, mr_size) != 0 || !mr_buf) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: posix_memalign(%zu): %s",
+			 mr_size, strerror(errno));
+		write_status(msg);
+		goto cleanup_cq;
+	}
+	memset(mr_buf, 0, mr_size);
+	mr = ibv_reg_mr(g_pd, mr_buf, mr_size, IBV_ACCESS_LOCAL_WRITE);
+	if (!mr) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: ibv_reg_mr on pre-dump PD: %s "
+			 "(FW CREATE_MKEY rejected adopted pdn -- the "
+			 "Model A central premise; see "
+			 "linux/.../uobject_restore/pd_adopt/)",
+			 strerror(errno));
+		write_status(msg);
+		goto cleanup_buf;
+	}
+
+	/*
+	 * Step 4: fresh QP on the *pre-dump* PD. This goes beyond
+	 * what kernel-side pd_adopt empirically validates: pd_adopt
+	 * only checks CREATE_MKEY uid=0; libmlx5's CREATE_QP path
+	 * carries additional UHW (UAR offsets, doorbell records,
+	 * WQ buffer descriptors) that the destination ucontext's
+	 * dyn-UAR restore must have set up correctly. A failure
+	 * here distinguishes "Model A CREATE_QP gate broken" from
+	 * "libmlx5 CREATE_QP needs additional restore plumbing".
+	 *
+	 * RC QP, cap = (1, 1, 1, 1) -- the minimum kernel accepts
+	 * (a strict-zero cap is rejected by ib_uverbs_create_qp).
 	 */
 	memset(&qp_attr, 0, sizeof(qp_attr));
 	qp_attr.send_cq = cq;
@@ -183,37 +219,12 @@ static void run_post_restore_checks(void)
 	if (!qp) {
 		snprintf(msg, sizeof(msg),
 			 "FAIL: ibv_create_qp on pre-dump PD: %s "
-			 "(adopted pdn rejected by FW under restore-mode "
-			 "ucontext uid? Model A v0 premise broken)",
+			 "(adopted pdn accepted by FW CREATE_MKEY at "
+			 "step 3 but FW CREATE_QP failed -- check kernel "
+			 "dmesg for the FW syndrome)",
 			 strerror(errno));
 		write_status(msg);
-		goto cleanup_cq;
-	}
-
-	/*
-	 * Step 4: fresh MR on the *pre-dump* PD. Local-write only is
-	 * the lightest-weight path; the kernel issues FW CREATE_MKEY
-	 * with mkc.pd = adopted_pdn, which is the second half of the
-	 * Model A acid test (CREATE_MKEY is the verb pd_adopt.sh used
-	 * to validate the FW gate empirically -- see
-	 * tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/).
-	 */
-	if (posix_memalign(&mr_buf, 4096, mr_size) != 0 || !mr_buf) {
-		snprintf(msg, sizeof(msg),
-			 "FAIL: posix_memalign(%zu): %s",
-			 mr_size, strerror(errno));
-		write_status(msg);
-		goto cleanup_qp;
-	}
-	memset(mr_buf, 0, mr_size);
-	mr = ibv_reg_mr(g_pd, mr_buf, mr_size, IBV_ACCESS_LOCAL_WRITE);
-	if (!mr) {
-		snprintf(msg, sizeof(msg),
-			 "FAIL: ibv_reg_mr on pre-dump PD: %s "
-			 "(adopted pdn rejected by FW CREATE_MKEY?)",
-			 strerror(errno));
-		write_status(msg);
-		goto cleanup_buf;
+		goto cleanup_mr;
 	}
 
 	/*
@@ -270,14 +281,24 @@ static void run_post_restore_checks(void)
 	write_status("OK");
 	return;
 
+/*
+ * Cleanup labels: each callsite jumps in at the latest resource
+ * that's still alive. The four checks all set their respective
+ * pointers to NULL on a successful destroy / free, so the
+ * fall-through if-guards in the labels are no-ops on the success
+ * path and free the leak-on-error case correctly. PD is left to
+ * ibv_close_device / process exit because FW DEALLOC_PD has its
+ * own ordering invariant (see top of file).
+ *
+ * No path goes to cleanup_qp -- QP either fails creation (qp NULL,
+ * goto cleanup_mr) or destroy (qp NULL after destroy attempt, goto
+ * cleanup_mr) -- so it's elided to keep -Wunused-label clean.
+ */
 cleanup_mr:
 	if (mr)
 		ibv_dereg_mr(mr);
 cleanup_buf:
 	free(mr_buf);
-cleanup_qp:
-	if (qp)
-		ibv_destroy_qp(qp);
 cleanup_cq:
 	if (cq)
 		ibv_destroy_cq(cq);
