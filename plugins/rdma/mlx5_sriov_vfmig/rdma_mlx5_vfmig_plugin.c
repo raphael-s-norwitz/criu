@@ -3185,7 +3185,7 @@ static int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path,
  * upheld.
  */
 static int
-rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe)
+rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 {
 	const UverbsFileEntry *u = (const UverbsFileEntry *)uvfe;
 	struct vfmig_restored_ctx *p, *c = NULL;

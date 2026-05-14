@@ -862,22 +862,8 @@ int rdma_dispatch_dump_uverbs_context(const char *ibdev,
 	return fn(ibdev, kernel_driver_id, ctxn, lfd, pid);
 }
 
-/*
- * @uvfe is declared as `const struct _UverbsFileEntry *` in
- * criu/include/rdma.h (and the matching plugin-hook trampoline
- * decl in criu/include/criu-plugin.h) so that includers don't have
- * to pull in images/uverbsfd.pb-c.h just to forward-declare the
- * argument type. Strict GCC (>= 13ish, as observed on the
- * harness-runner host with -Werror=incompatible-pointer-types
- * flipped on by default) refuses to identify the opaque struct
- * tag with the protobuf-c typedef even though they refer to the
- * same struct, so the implementation has to spell the parameter
- * the same way the header does. Cast to the typedef here and
- * use it locally; the rest of the body stays unchanged.
- */
-int rdma_dispatch_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe_arg)
+int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 {
-	const UverbsFileEntry *uvfe = (const UverbsFileEntry *)uvfe_arg;
 	plugin_desc_t *this;
 	plugin_desc_t *winner = NULL;
 	const char *winner_name = NULL;
@@ -931,7 +917,7 @@ int rdma_dispatch_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe_arg)
 		 "plugin '%s' (criu_driver=%d ibdev=%s)\n",
 		 uvfe->id, winner_name, (int)uvfe->criu_driver,
 		 uvfe->ib_dev ?: "?");
-	return fn(uvfe_arg);
+	return fn(uvfe);
 }
 
 static int uverbsfd_open(struct file_desc *d, int *new_fd)

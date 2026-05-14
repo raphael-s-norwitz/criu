@@ -345,7 +345,7 @@ static int rxe_send_get_context_restore(int fd)
  * has run `rdma link add rxe0 ...`), and its uverbs cdev is just
  * the matching /dev/infiniband/uverbsN node.
  */
-static int rdma_rxe_plugin_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe)
+static int rdma_rxe_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 {
 	const UverbsFileEntry *u = (const UverbsFileEntry *)uvfe;
 	char path[PATH_MAX], ibdev[64], cdevpath[PATH_MAX];

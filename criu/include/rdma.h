@@ -175,9 +175,26 @@ uint32_t rdma_driver_name_to_id(const char *driver);
  * Header takes the protobuf-c struct as opaque so callers don't
  * need to include images/uverbsfd.pb-c.h just to forward-declare;
  * criu/rdma.c (which defines this) does include the pb-c header.
+ *
+ * The forward-decl AND the typedef are both declared so the
+ * prototype's pointed-to type can be spelled as the typedef name.
+ * Without the typedef, GCC versions with strict
+ * -Wincompatible-pointer-types treat
+ *   struct _UverbsFileEntry *  (header forward-decl form)
+ * and
+ *   UverbsFileEntry *          (pb-c.h typedef form, used at the
+ *                               call site in uverbsfd_open())
+ * as incompatible pointer types even though both name the same
+ * struct, breaking rdma_dispatch_open_uverbs_cdev(ui->uvfe). With
+ * the typedef visible here, the prototype and the call site agree
+ * on a single spelling. Duplicate identical-type typedefs are
+ * permitted by C11 / GNU C, so includers that also pull in
+ * images/uverbsfd.pb-c.h (where the typedef ultimately lives) get
+ * no redefinition diagnostic.
  */
 struct _UverbsFileEntry;
-int rdma_dispatch_open_uverbs_cdev(const struct _UverbsFileEntry *uvfe);
+typedef struct _UverbsFileEntry UverbsFileEntry;
+int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe);
 
 /*
  * Dump-side counterpart to rdma_dispatch_open_uverbs_cdev(). Walks

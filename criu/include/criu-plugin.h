@@ -209,9 +209,20 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *
  * Forward-declared opaque so plugins can take a UverbsFileEntry * without
  * pulling the protobuf-c headers into criu-plugin.h. Plugin sources that
  * implement OPEN_UVERBS_CDEV pull in images/uverbsfd.pb-c.h themselves.
+ *
+ * The typedef is declared alongside the forward-decl so the hook
+ * trampoline argument can be spelled as the typedef name and stay
+ * type-compatible with call sites that go through pb-c.h. Strict
+ * -Wincompatible-pointer-types refuses to identify
+ *   struct _UverbsFileEntry * <-> UverbsFileEntry *
+ * even though they're the same type when only one name is in
+ * scope at the prototype site. Duplicate identical typedefs are
+ * legal under C11 / GNU C, so plugin .c files that pull in
+ * uverbsfd.pb-c.h directly are unaffected.
  */
 struct _UverbsFileEntry;
-DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const struct _UverbsFileEntry *uvfe);
+typedef struct _UverbsFileEntry UverbsFileEntry;
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const UverbsFileEntry *uvfe);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT,
 			 const char *ibdev, uint32_t kernel_driver_id,
 			 uint32_t ctxn, int lfd, pid_t pid);
