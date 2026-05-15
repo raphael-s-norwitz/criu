@@ -206,22 +206,17 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__DUMP_DEVICES_LATE, int id);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__UPDATE_INETSK, uint32_t family, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *ibdev, uint32_t kernel_driver_id);
 /*
- * Forward-declared opaque so plugins can take a UverbsFileEntry * without
- * pulling the protobuf-c headers into criu-plugin.h. Plugin sources that
- * implement OPEN_UVERBS_CDEV pull in images/uverbsfd.pb-c.h themselves.
- *
- * The typedef is declared alongside the forward-decl so the hook
- * trampoline argument can be spelled as the typedef name and stay
- * type-compatible with call sites that go through pb-c.h. Strict
- * -Wincompatible-pointer-types refuses to identify
- *   struct _UverbsFileEntry * <-> UverbsFileEntry *
- * even though they're the same type when only one name is in
- * scope at the prototype site. Duplicate identical typedefs are
- * legal under C11 / GNU C, so plugin .c files that pull in
- * uverbsfd.pb-c.h directly are unaffected.
+ * Pull in the protobuf-c definition of UverbsFileEntry directly.
+ * A forward-declared struct tag would be cheaper but isn't
+ * portable: protoc-c versions disagree on whether the generated
+ * struct is named `struct UverbsFileEntry` or
+ * `struct _UverbsFileEntry`. With only the typedef name visible
+ * (which IS stable across generator versions), the trampoline
+ * decl below stays consistent with both call sites in
+ * criu/rdma.c and plugin OPEN_UVERBS_CDEV implementations
+ * regardless of which protoc-c built images/uverbsfd.pb-c.h.
  */
-struct _UverbsFileEntry;
-typedef struct _UverbsFileEntry UverbsFileEntry;
+#include "images/uverbsfd.pb-c.h"
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const UverbsFileEntry *uvfe);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT,
 			 const char *ibdev, uint32_t kernel_driver_id,
