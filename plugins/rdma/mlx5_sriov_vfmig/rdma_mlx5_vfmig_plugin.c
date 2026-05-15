@@ -2934,61 +2934,45 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 		 */
 		const struct mlx5_ib_vfmig_ucontext_meta_local *m = &c->meta;
 		uint32_t flags = MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE;
-		uint32_t adopt_uid = 0;
 
 		/*
-		 * If the source ucontext was DEVX-opted-in (libmlx5
-		 * default lib_uar_dyn=true silently sets this even
-		 * without an explicit mlx5dv_open_device call), the
-		 * source's PDs are owned by devx_uid != 0 in FW.
-		 * mlx5_ib_restore_pd's FW probe then requires
-		 * (req_pdn, ucontext->devx_uid) to match the source's
-		 * (mpd->pdn, mpd->uid). Adopt the source's devx_uid
-		 * verbatim so the destination ucontext owns the
-		 * inherited FW state.
+		 * v0 limitation: DEVX adoption is unworkable on current
+		 * mlx5 FW. LOAD_VHCA_STATE preserves the FW
+		 * next_free_uctx counter but NOT the uctx registration
+		 * table -- the source's devx_uid is unregistered on the
+		 * destination post-LOAD, so re-claiming it via
+		 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID lands on a uid that
+		 * FW will reject with "unknown uid" on every subsequent
+		 * CREATE_MKEY/CREATE_QP. See kernel commits
+		 * 73c76f299c01 ("RDMA/mlx5: mark ADOPT_DEVX_UID
+		 * vestigial; rewrite restore_pd pr_warn") and
+		 * a10dc00106a1 ("mlx5_vfmig design: record DEVX-
+		 * adoption blind spot in S3b"), and the DEVX-source
+		 * matrix in tools/testing/mlx5_vfmig/uobject_restore/
+		 * pd_adopt/test_pd_adopt.sh.
 		 *
-		 * Static-mode ucontexts shouldn't normally have
-		 * source_devx_uid != 0 (DEVX-and-static is uncommon),
-		 * but we handle it uniformly here -- the kernel only
-		 * rejects (ADOPT_DEVX_UID set, adopt_devx_uid == 0).
+		 * Until either FW gains uctx-state preservation or we
+		 * wire a fresh-uctx-with-PD-rebind path on the dest,
+		 * the destination ucontext is opened WITHOUT DEVX and
+		 * all adopted resources live under uid=0
+		 * (host-privileged) -- the only lane that survives
+		 * LOAD_VHCA_STATE. DEVX features (mlx5dv_*) are
+		 * unavailable to the restored process; basic verbs
+		 * work. c->source_devx_uid stays in the image for
+		 * diagnostics but is intentionally not consumed here.
 		 */
-		if (c->source_devx_uid) {
-			flags |= MLX5_IB_ALLOC_UCTX_DEVX |
-				 MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID;
-			adopt_uid = c->source_devx_uid;
-		}
-
 		rc = vfmig_send_get_context_v2(
 			fd, flags,
 			m->lib_caps, m->total_num_bfregs,
 			m->num_low_latency_bfregs, m->cqe_version,
-			adopt_uid);
+			/* adopt_devx_uid */ 0);
 		if (rc) {
-			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE%s, static) "
-			       "on %s ctxn=%u adopt_devx_uid=%u failed: "
-			       "%d (%s)%s\n",
-			       adopt_uid ? "|DEVX|ADOPT_DEVX_UID" : "",
+			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE, static) "
+			       "on %s ctxn=%u failed: %d (%s) "
+			       "[source_devx_uid=%u (image-only, not "
+			       "consumed at restore)]\n",
 			       c->dest_cdev_path, c->source_ctxn,
-			       adopt_uid, rc, strerror(-rc),
-			       rc == -EINVAL && adopt_uid
-			       ? " -- ADOPT_DEVX_UID consistency rejected. "
-			         "Kernel requires VFMIG_RESTORE + DEVX "
-			         "both set and adopt_devx_uid in [1, "
-			         "U16_MAX]; the legacy GET_CONTEXT path "
-			         "passes the longer mlx5_ib_alloc_ucontext_"
-			         "req_v2 (ABI tail added by kernel "
-			         "afb3b5614af3)"
-			       : rc == -EOPNOTSUPP && adopt_uid
-			       ? " -- kernel pre-dates afb3b5614af3 "
-			         "(adopt source devx_uid). Upgrade or "
-			         "dump source without DEVX (libmlx5 "
-			         "MLX5_LIB_CAP_DYN_UAR=0)"
-			       : adopt_uid
-			       ? " -- source devx_uid not live in dest "
-			         "VF: LOAD_VHCA_STATE may not have "
-			         "preserved the uid, or the dest VF is "
-			         "the wrong one"
-			       : "");
+			       rc, strerror(-rc), c->source_devx_uid);
 			close(fd);
 			return -1;
 		}
@@ -3056,44 +3040,32 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 		 * RESTORE_DYN_UARS to seed.
 		 */
 		uint32_t flags = MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE;
-		uint32_t adopt_uid = 0;
 
 		/*
-		 * Mirror the static path: adopt the source's devx_uid
-		 * if non-zero. lib_uar_dyn=true is the libmlx5 default
-		 * and (for the same internal reasons) tends to also
-		 * imply DEVX, so this is the common case in practice.
-		 * See the static path above for the kernel-side gating
-		 * details.
+		 * v0 limitation: DEVX adoption is unworkable on current
+		 * mlx5 FW (see static-path comment above for the full
+		 * empirical chain and kernel commit refs). lib_uar_dyn=
+		 * true is the libmlx5 default and silently implies
+		 * DEVX on the source, so dyn-mode source ucontexts
+		 * commonly have source_devx_uid != 0. We still open
+		 * the destination WITHOUT DEVX and let restored
+		 * resources live under uid=0; downstream verbs that
+		 * don't depend on DEVX continue to work.
 		 */
-		if (c->source_devx_uid) {
-			flags |= MLX5_IB_ALLOC_UCTX_DEVX |
-				 MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID;
-			adopt_uid = c->source_devx_uid;
-		}
-
 		rc = vfmig_send_get_context_v2(
 			fd, flags,
 			MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR,
 			/* total_num_bfregs */ 8,
 			/* num_low_latency_bfregs */ 0,
 			/* max_cqe_version */ 1,
-			adopt_uid);
+			/* adopt_devx_uid */ 0);
 		if (rc) {
-			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE|DYN_UAR%s) "
-			       "on %s ctxn=%u adopt_devx_uid=%u failed: "
-			       "%d (%s)%s\n",
-			       adopt_uid ? "|DEVX|ADOPT_DEVX_UID" : "",
+			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE|DYN_UAR) "
+			       "on %s ctxn=%u failed: %d (%s) "
+			       "[source_devx_uid=%u (image-only, not "
+			       "consumed at restore)]\n",
 			       c->dest_cdev_path, c->source_ctxn,
-			       adopt_uid, rc, strerror(-rc),
-			       rc == -EINVAL && adopt_uid
-			       ? " -- ADOPT_DEVX_UID consistency rejected "
-			         "(see static-path comment)"
-			       : rc == -EOPNOTSUPP && adopt_uid
-			       ? " -- kernel pre-dates afb3b5614af3"
-			       : adopt_uid
-			       ? " -- source devx_uid not live in dest VF"
-			       : "");
+			       rc, strerror(-rc), c->source_devx_uid);
 			close(fd);
 			return -1;
 		}
