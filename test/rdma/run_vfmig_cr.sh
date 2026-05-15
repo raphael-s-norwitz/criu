@@ -67,6 +67,17 @@ DUMPDIR="$WORKDIR/img"
 
 SRIOV_NUMVFS="/sys/bus/pci/devices/$PF/sriov_numvfs"
 
+# dmesg slice the harness will start ignoring everything before, so
+# the post-test capture only contains kernel events from this run.
+# `dmesg --since` is not portable across distros so we record a
+# kernel-uptime mark and slice on it via timestamps in the saved
+# file. Set at script start (after WORKDIR exists) and used by the
+# cleanup trap.
+DMESG_SINCE_KTIME=
+record_dmesg_mark() {
+    DMESG_SINCE_KTIME="$(awk '{print $1}' /proc/uptime)"
+}
+
 cleanup() {
     local pid
     for pid in "$PIDFILE" "$RESTORED_PIDFILE"; do
@@ -76,9 +87,35 @@ cleanup() {
         [[ -n "$p" ]] || continue
         kill -KILL "$p" 2>/dev/null || true
     done
+    # Snapshot the kernel ring buffer slice from this run into the
+    # preserved workdir. Without this, the FW-error dmesg lines
+    # (e.g. CREATE_QP bad_parameter, DEALLOC_PD bad_resource) get
+    # rolled out of the kernel ring buffer by any subsequent RDMA
+    # activity, leaving you racing the ring to triage. -T prints
+    # human-readable timestamps; we filter to lines emitted at or
+    # after the ktime mark recorded in record_dmesg_mark().
+    if [[ -n "$DMESG_SINCE_KTIME" ]]; then
+        dmesg -T --time-format=ctime > "$WORKDIR/dmesg.full" 2>/dev/null || true
+        # Slice on the [seconds-since-boot] form (dmesg without -T)
+        # because that's what the kernel actually stamps lines with;
+        # awk-numeric compare against the recorded mark.
+        dmesg | awk -v mark="$DMESG_SINCE_KTIME" '
+            match($0, /^\[[ ]*([0-9]+\.[0-9]+)\]/, m) {
+                if (m[1]+0 >= mark+0) print
+            }' > "$WORKDIR/dmesg.run" 2>/dev/null || true
+        # Targeted slice: just the FW-error and infiniband lines
+        # most likely to be useful for PD-restore triage.
+        grep -E '^\[' "$WORKDIR/dmesg.run" 2>/dev/null \
+            | grep -E 'mlx5_core|infiniband mlx5|CREATE_|DEALLOC_|RESTORE_|create_qp|create_cq|create_mkey|alloc_pd|restore_pd|bad parameter|bad resource' \
+            > "$WORKDIR/dmesg.fw" 2>/dev/null || true
+    fi
     echo "(workdir preserved at $WORKDIR for triage)"
+    if [[ -s "$WORKDIR/dmesg.fw" ]]; then
+        echo "(FW-relevant dmesg lines: $WORKDIR/dmesg.fw -- $(wc -l < "$WORKDIR/dmesg.fw") lines)"
+    fi
 }
 trap cleanup EXIT
+record_dmesg_mark
 
 [[ "$EUID" -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 [[ -x "$PROG" ]]    || { echo "missing $PROG -- 'make -C $HERE'" >&2; exit 1; }
@@ -285,4 +322,19 @@ echo "--- dump log tail ---" >&2
 tail -120 "$DUMPDIR/dump.log" >&2 || true
 echo "--- restore log tail ---" >&2
 tail -120 "$DUMPDIR/restore.log" >&2 || true
+# Print the FW-relevant dmesg slice now (the cleanup trap also
+# saves it to $WORKDIR/dmesg.fw, but printing inline avoids the
+# user having to chase a temp dir to see the FW status code that
+# explains the failure -- e.g. "CREATE_QP bad parameter (0x3)
+# syndrome 0xec06a5" or "DEALLOC_PD bad resource (0x5) syndrome
+# 0x593117" tell the actual story behind a generic EINVAL).
+if [[ -n "$DMESG_SINCE_KTIME" ]]; then
+    echo "--- kernel dmesg (FW + infiniband, this run only) ---" >&2
+    dmesg | awk -v mark="$DMESG_SINCE_KTIME" '
+        match($0, /^\[[ ]*([0-9]+\.[0-9]+)\]/, m) {
+            if (m[1]+0 >= mark+0) print
+        }' \
+        | grep -E 'mlx5_core|infiniband mlx5|CREATE_|DEALLOC_|RESTORE_|create_qp|create_cq|create_mkey|alloc_pd|restore_pd|bad parameter|bad resource' \
+        | tail -60 >&2 || true
+fi
 exit 1
