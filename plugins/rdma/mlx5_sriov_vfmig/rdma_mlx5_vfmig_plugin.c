@@ -33,6 +33,7 @@
 
 #include "criu-log.h"
 #include "criu-plugin.h"
+#include "rdma_netlink.h"
 
 #include "images/rdma_criu.pb-c.h"
 #include "images/mlx5_vfmig.pb-c.h"
@@ -76,7 +77,36 @@ enum {
 enum {
 	MLX5_IB_ALLOC_UCTX_DEVX = 1 << 0,
 	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE = 1 << 1,
+	/*
+	 * Tells mlx5_ib_alloc_ucontext to skip its usual
+	 * mlx5_ib_devx_create() and adopt the caller-supplied
+	 * @adopt_devx_uid as context->devx_uid verbatim. The
+	 * subsequent ALLOC_TRANSPORT_DOMAIN doubles as a FW-
+	 * liveness probe -- a stale uid surfaces here and aborts
+	 * alloc_ucontext.
+	 *
+	 * Kernel-enforced consistency: requires VFMIG_RESTORE +
+	 * DEVX both set, and adopt_devx_uid in [1, U16_MAX].
+	 * Otherwise the kernel returns -EINVAL. Without the flag,
+	 * @adopt_devx_uid must be zero.
+	 *
+	 * UAPI value tracks
+	 * include/uapi/rdma/mlx5-abi.h::MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID
+	 * (kernel afb3b5614af3 "RDMA/mlx5: adopt source devx_uid on
+	 * VFMIG-restore ucontext alloc").
+	 */
+	MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID = 1 << 2,
 };
+/*
+ * mlx5_ib_alloc_ucontext_req_v2 with the post-afb3b5614af3 tail.
+ * The kernel ABI is "shorter input is OK -- ib_copy_from_udata
+ * zero-extends" (commit cdb1a2b30a1d), so emitting the longer
+ * struct against an older kernel is harmless: the trailing
+ * adopt_devx_uid + reserved3 bytes get truncated by udata->inlen.
+ * Conversely, emitting the shorter struct against the newer
+ * kernel implicitly sets adopt_devx_uid = 0 -- which is the
+ * required value when ADOPT_DEVX_UID is not set.
+ */
 struct mlx5_ib_alloc_ucontext_req_v2_local {
 	uint32_t total_num_bfregs;
 	uint32_t num_low_latency_bfregs;
@@ -87,6 +117,8 @@ struct mlx5_ib_alloc_ucontext_req_v2_local {
 	uint16_t reserved1;
 	uint32_t reserved2;
 	uint64_t lib_caps;
+	uint32_t adopt_devx_uid;
+	uint32_t reserved3;
 } __attribute__((aligned(8)));
 struct mlx5_ib_alloc_ucontext_resp_local {
 	uint32_t qp_tab_size;
@@ -334,6 +366,23 @@ struct vfmig_pending_ctx {
 
 	struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn_records;
 	size_t uctx_dyn_n;
+
+	/*
+	 * Per-ucontext source devx_uid (mlx5_ib_ucontext.devx_uid as
+	 * observed at dump time). 0 = non-DEVX ucontext, non-zero =
+	 * DEVX-opted-in (libmlx5 default lib_uar_dyn=true silently
+	 * sets this even with no explicit DEVX call). Computed by
+	 * the dump hook from a per-ucontext NLDEV PD walk: each PD's
+	 * "fw_uid" driver TLV (kernel d4acb54ebd3d) is the same uid,
+	 * and the dump hook validates uniqueness across the
+	 * ucontext's PDs (a mismatch would be a kernel bug).
+	 *
+	 * Persisted into mlx5_vfmig_state_entry.source_devx_uid so
+	 * the restore-side GET_CONTEXT can adopt it via
+	 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID + adopt_devx_uid; see
+	 * vfmig_send_get_context_v2 for the call shape.
+	 */
+	uint32_t source_devx_uid;
 };
 static struct vfmig_pending_ctx *vfmig_pending_head = NULL;
 
@@ -353,7 +402,8 @@ static int vfmig_pending_enqueue(uint32_t ctxn, const char *ibdev,
 				 uint32_t *uctx_uar_table, size_t uctx_uar_n,
 				 uint32_t *uctx_bfreg_count, size_t uctx_bfreg_n,
 				 struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn_records,
-				 size_t uctx_dyn_n)
+				 size_t uctx_dyn_n,
+				 uint32_t source_devx_uid)
 {
 	struct vfmig_pending_ctx *p = calloc(1, sizeof(*p));
 
@@ -373,6 +423,7 @@ static int vfmig_pending_enqueue(uint32_t ctxn, const char *ibdev,
 	p->uctx_bfreg_n = uctx_bfreg_n;
 	p->uctx_dyn_records = uctx_dyn_records;
 	p->uctx_dyn_n = uctx_dyn_n;
+	p->source_devx_uid = source_devx_uid;
 	p->next = vfmig_pending_head;
 	vfmig_pending_head = p;
 	return 0;
@@ -988,7 +1039,8 @@ static int vfmig_send_get_context_v2(int fd, uint32_t flags,
 				     uint64_t lib_caps,
 				     uint32_t total_bfregs,
 				     uint32_t ll_bfregs,
-				     uint8_t max_cqe_version)
+				     uint8_t max_cqe_version,
+				     uint32_t adopt_devx_uid)
 {
 	struct {
 		struct ib_uverbs_cmd_hdr hdr;
@@ -1010,6 +1062,15 @@ static int vfmig_send_get_context_v2(int fd, uint32_t flags,
 	cmd.req.flags = flags;
 	cmd.req.max_cqe_version = max_cqe_version;
 	cmd.req.lib_caps = lib_caps;
+	/*
+	 * Caller policy: if ADOPT_DEVX_UID is set in @flags, pass the
+	 * source ucontext's devx_uid here (validated by the kernel
+	 * to be in [1, U16_MAX] and to be paired with VFMIG_RESTORE +
+	 * DEVX in @flags). Otherwise pass 0 -- the kernel rejects
+	 * non-zero adopt_devx_uid without the flag set, to catch
+	 * residual / stack-leak bugs.
+	 */
+	cmd.req.adopt_devx_uid = adopt_devx_uid;
 
 	n = write(fd, &cmd, sizeof(cmd));
 	if (n < 0)
@@ -1575,7 +1636,8 @@ static int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
 				    const uint32_t *uctx_uar, size_t uctx_uar_n,
 				    const uint32_t *uctx_cnt, size_t uctx_cnt_n,
 				    const struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn,
-				    size_t uctx_dyn_n)
+				    size_t uctx_dyn_n,
+				    uint32_t source_devx_uid)
 {
 	Mlx5VfmigStateEntry e = MLX5_VFMIG_STATE_ENTRY__INIT;
 	int img_dir, fd;
@@ -1593,6 +1655,17 @@ static int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
 	e.blob_size = st->blob_size;
 	e.source_cdev_path = (char *)source_cdev_path;
 	/* blob_sha256 is optional; leave unset for v0. */
+
+	/*
+	 * source_devx_uid is mlx5_vfmig.proto's "did the source's
+	 * mlx5_ib_ucontext.devx_uid matter?" field. Emit only when
+	 * non-zero -- a missing field on read decodes back to 0,
+	 * which is exactly the right default for non-DEVX images.
+	 */
+	if (source_devx_uid) {
+		e.has_source_devx_uid = 1;
+		e.source_devx_uid = source_devx_uid;
+	}
 
 	/*
 	 * uctx snapshot. Stored as raw bytes (struct + arrays) for the
@@ -1722,6 +1795,173 @@ static int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
  * an open fd against the cdev for SAVE). They remain in the
  * hook ABI so future plugins that do need them have them.
  */
+/*
+ * Per-ucontext source devx_uid resolver. Walks NLDEV PDs filtered
+ * by ctxn, reads each PD's named "fw_uid" driver TLV (kernel
+ * d4acb54ebd3d), validates that all PDs of this ucontext share
+ * one value, and returns it.
+ *
+ * Why per-ucontext via NLDEV rather than a new mlx5-private ioctl
+ * on the lfd? mlx5 doesn't expose mlx5_ib_ucontext.devx_uid via
+ * uverbs today, but every PD allocated through a DEVX ucontext
+ * carries mpd->uid == ucontext->devx_uid by construction (mlx5_ib_
+ * alloc_pd's uid_offset path), and the kernel surfaces mpd->uid
+ * via the new "fw_uid" TLV. So one PD per ucontext is enough to
+ * pin down the value -- and the validation below ensures we
+ * notice if the kernel ever drifts that invariant.
+ *
+ * Returns:
+ *   0 on success. *@out_uid is the per-ucontext devx_uid (zero
+ *   for non-DEVX ucontexts and for ucontexts with no PDs).
+ *   -1 on a hard error (NLDEV walk failure, or the kernel emitted
+ *   inconsistent fw_uid across the same ucontext's PDs -- both
+ *   are CRIU-bug or kernel-bug territory and the dump must
+ *   abort).
+ *
+ * Quiet path: if the kernel pre-dates d4acb54ebd3d (no fw_uid
+ * TLVs), we leave *@out_uid = 0. Restore against a current kernel
+ * will then send adopt_devx_uid=0 and the kernel's mlx5_ib_
+ * restore_pd FW probe will reject any PD whose mpd->uid was
+ * non-zero -- with a clear pr_warn naming the missing adoption.
+ */
+struct vfmig_devx_uid_walk_ctx {
+	uint32_t target_ctxn;
+	uint32_t devx_uid;
+	bool seen_any;
+	bool inconsistent;
+	uint32_t first_seen;
+};
+
+struct vfmig_dev_index_lookup_ctx {
+	const char *target_ibdev;
+	uint32_t dev_index;
+	bool found;
+};
+
+static int vfmig_dev_index_lookup_cb(uint32_t dev_index, const char *ibdev,
+				     void *arg)
+{
+	struct vfmig_dev_index_lookup_ctx *ctx = arg;
+
+	if (!strcmp(ibdev, ctx->target_ibdev)) {
+		ctx->dev_index = dev_index;
+		ctx->found = true;
+		return 1;	/* short-circuit */
+	}
+	return 0;
+}
+
+static int vfmig_pd_devx_uid_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct vfmig_devx_uid_walk_ctx *w = arg;
+
+	/* Filter to PDs owned by this ucontext. */
+	if (!e->has_ctxn || e->ctxn != w->target_ctxn)
+		return 0;
+
+	/*
+	 * Pre-d4acb54ebd3d kernels emit no fw_uid; treat as 0
+	 * (non-DEVX) but log so the operator can correlate restore-
+	 * side FW-probe rejections against the missing kernel patch.
+	 * Continue walking (don't return early) so a mixed image
+	 * surfaces as "inconsistent" instead of silently picking up
+	 * the first PD's uid.
+	 */
+	if (!e->has_fw_uid) {
+		if (!w->seen_any) {
+			w->seen_any = true;
+			w->first_seen = 0;
+		} else if (w->first_seen != 0) {
+			w->inconsistent = true;
+		}
+		return 0;
+	}
+
+	if (!w->seen_any) {
+		w->seen_any = true;
+		w->first_seen = e->fw_uid;
+		w->devx_uid = e->fw_uid;
+	} else if (e->fw_uid != w->first_seen) {
+		w->inconsistent = true;
+	}
+	return 0;
+}
+
+static int vfmig_resolve_source_devx_uid(const char *ibdev, uint32_t ctxn,
+					 uint32_t *out_uid)
+{
+	struct vfmig_devx_uid_walk_ctx w = { .target_ctxn = ctxn };
+	struct vfmig_dev_index_lookup_ctx idx = { .target_ibdev = ibdev };
+	int rc;
+
+	/*
+	 * Resolve the kernel's per-ibdev dev_index first; the per-
+	 * resource NLDEV dump REQUIRES RDMA_NLDEV_ATTR_DEV_INDEX as
+	 * the ibdev filter (kernel res_get_common_dumpit() in
+	 * drivers/infiniband/core/nldev.c rejects without it).
+	 * Passing 0 silently filters to whatever ibdev happens to
+	 * have index 0, which on a multi-ibdev host is rarely the
+	 * VF we actually care about.
+	 */
+	rc = rdma_nl_for_each_ibdev(vfmig_dev_index_lookup_cb, &idx);
+	if (rc < 0) {
+		pr_err("vfmig: NLDEV ibdev enumeration to resolve "
+		       "dev_index for ibdev=%s failed: %d (%s)\n",
+		       ibdev, rc, strerror(-rc));
+		return -1;
+	}
+	if (!idx.found) {
+		pr_err("vfmig: NLDEV does not list ibdev=%s; cannot "
+		       "resolve source devx_uid\n", ibdev);
+		return -1;
+	}
+
+	rc = rdma_nl_for_each_resource(idx.dev_index, ibdev, RDMA_NL_RES_PD,
+				       vfmig_pd_devx_uid_cb, &w);
+	if (rc < 0) {
+		pr_err("vfmig: NLDEV PD walk on ibdev=%s (dev_index=%u) "
+		       "for source devx_uid resolution failed: %d (%s)\n",
+		       ibdev, idx.dev_index, rc, strerror(-rc));
+		return -1;
+	}
+
+	if (w.inconsistent) {
+		pr_err("vfmig: ibdev=%s ctxn=%u: PDs of one ucontext "
+		       "report different fw_uid values via NLDEV. This "
+		       "is either a kernel bug (mlx5_ib_alloc_pd should "
+		       "always set mpd->uid = ucontext->devx_uid) or a "
+		       "race with a sibling process modifying the "
+		       "ucontext's PDs concurrently. Aborting dump to "
+		       "avoid producing an unrestorable image.\n",
+		       ibdev, ctxn);
+		return -1;
+	}
+
+	if (!w.seen_any) {
+		/*
+		 * No PDs on this ucontext yet (newly-opened context
+		 * with no allocations). source_devx_uid stays 0; the
+		 * restore-side GET_CONTEXT will skip ADOPT_DEVX_UID.
+		 * If the user later allocates a PD that ends up DEVX-
+		 * uid'd, the restore would still install it with
+		 * uid=0 -- which the kernel's FW probe would reject
+		 * loud. v0 punts on this edge case (user code that
+		 * dumps an empty ucontext is unusual).
+		 */
+		pr_info("vfmig: ibdev=%s ctxn=%u: no PDs visible via "
+			"NLDEV; source_devx_uid := 0\n", ibdev, ctxn);
+		*out_uid = 0;
+		return 0;
+	}
+
+	*out_uid = w.devx_uid;
+	pr_info("vfmig: ibdev=%s ctxn=%u: resolved source_devx_uid="
+		"%u (from %sfw_uid driver TLV)\n",
+		ibdev, ctxn, w.devx_uid,
+		w.devx_uid ? "" : "absent or zero ");
+	return 0;
+}
+
 static int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 						      uint32_t kernel_driver_id,
 						      uint32_t ctxn,
@@ -1798,7 +2038,24 @@ static int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 		size_t uctx_uar_n = 0, uctx_cnt_n = 0;
 		struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn = NULL;
 		size_t uctx_dyn_n = 0;
+		uint32_t source_devx_uid = 0;
 		int rc;
+
+		/*
+		 * Resolve the source ucontext's devx_uid via NLDEV PD
+		 * walk + per-PD fw_uid TLV. Done before the
+		 * QUERY_UCONTEXT calls because the latter would also
+		 * fail loud on a kernel mismatch and we want to
+		 * surface the more-specific "inconsistent fw_uid"
+		 * diagnostic first if it triggers. Kernel pre-
+		 * d4acb54ebd3d returns 0 here; that's fine for non-
+		 * DEVX images (the common rxe-shape case) and gets
+		 * caught at restore-time on DEVX images by mlx5_ib_
+		 * restore_pd's FW probe.
+		 */
+		if (vfmig_resolve_source_devx_uid(ibdev, ctxn,
+						  &source_devx_uid))
+			return -1;
 
 		rc = vfmig_snapshot_uctx(lfd, &uctx_meta,
 					 &uctx_uar, &uctx_uar_n,
@@ -1844,7 +2101,8 @@ static int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 					  uctx_uar ? &uctx_meta : NULL,
 					  uctx_uar, uctx_uar_n,
 					  uctx_cnt, uctx_cnt_n,
-					  uctx_dyn, uctx_dyn_n)) {
+					  uctx_dyn, uctx_dyn_n,
+					  source_devx_uid)) {
 			pr_err("vfmig: enqueue(ctxn=%u, pf=%s, vf_id=%u, "
 			       "src_cdev=%s) OOM\n", ctxn, pf_bdf,
 			       vf_id, src_cdev);
@@ -1941,7 +2199,8 @@ static void vfmig_drain_pending_in_fini(void)
 					     p->uctx_bfreg_count,
 					     p->uctx_bfreg_n,
 					     p->uctx_dyn_records,
-					     p->uctx_dyn_n)) {
+					     p->uctx_dyn_n,
+					     p->source_devx_uid)) {
 			pr_err("vfmig: failed to append state entry for "
 			       "ctxn=%u (pf=%s vf_id=%u)\n",
 			       p->ctxn, p->pf_bdf, p->vf_id);
@@ -2157,6 +2416,19 @@ struct vfmig_restored_ctx {
 	/* Dyn (lib_uar_dyn=true) snapshot, valid iff is_dyn. */
 	struct mlx5_ib_vfmig_dyn_uar_record_local *dyn_records;
 	size_t dyn_n;
+
+	/*
+	 * Source-side mlx5_ib_ucontext.devx_uid (see
+	 * mlx5_vfmig.proto::source_devx_uid). 0 means non-DEVX
+	 * ucontext: GET_CONTEXT skips ADOPT_DEVX_UID. Non-zero
+	 * means GET_CONTEXT must set MLX5_IB_ALLOC_UCTX_DEVX |
+	 * ADOPT_DEVX_UID and pass adopt_devx_uid = source_devx_uid.
+	 *
+	 * Captured at vfmig_read_image() from the image entry,
+	 * consumed by vfmig_ensure_cdev_open()'s GET_CONTEXT call
+	 * (both static and dyn paths).
+	 */
+	uint32_t source_devx_uid;
 };
 static struct vfmig_restored_ctx *vfmig_restored_ctxs;
 
@@ -2661,16 +2933,62 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 		 * RESTORE_UCONTEXT enforces equality with -EINVAL.
 		 */
 		const struct mlx5_ib_vfmig_ucontext_meta_local *m = &c->meta;
+		uint32_t flags = MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE;
+		uint32_t adopt_uid = 0;
+
+		/*
+		 * If the source ucontext was DEVX-opted-in (libmlx5
+		 * default lib_uar_dyn=true silently sets this even
+		 * without an explicit mlx5dv_open_device call), the
+		 * source's PDs are owned by devx_uid != 0 in FW.
+		 * mlx5_ib_restore_pd's FW probe then requires
+		 * (req_pdn, ucontext->devx_uid) to match the source's
+		 * (mpd->pdn, mpd->uid). Adopt the source's devx_uid
+		 * verbatim so the destination ucontext owns the
+		 * inherited FW state.
+		 *
+		 * Static-mode ucontexts shouldn't normally have
+		 * source_devx_uid != 0 (DEVX-and-static is uncommon),
+		 * but we handle it uniformly here -- the kernel only
+		 * rejects (ADOPT_DEVX_UID set, adopt_devx_uid == 0).
+		 */
+		if (c->source_devx_uid) {
+			flags |= MLX5_IB_ALLOC_UCTX_DEVX |
+				 MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID;
+			adopt_uid = c->source_devx_uid;
+		}
 
 		rc = vfmig_send_get_context_v2(
-			fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+			fd, flags,
 			m->lib_caps, m->total_num_bfregs,
-			m->num_low_latency_bfregs, m->cqe_version);
+			m->num_low_latency_bfregs, m->cqe_version,
+			adopt_uid);
 		if (rc) {
-			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE, static) "
-			       "on %s ctxn=%u failed: %d (%s)\n",
+			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE%s, static) "
+			       "on %s ctxn=%u adopt_devx_uid=%u failed: "
+			       "%d (%s)%s\n",
+			       adopt_uid ? "|DEVX|ADOPT_DEVX_UID" : "",
 			       c->dest_cdev_path, c->source_ctxn,
-			       rc, strerror(-rc));
+			       adopt_uid, rc, strerror(-rc),
+			       rc == -EINVAL && adopt_uid
+			       ? " -- ADOPT_DEVX_UID consistency rejected. "
+			         "Kernel requires VFMIG_RESTORE + DEVX "
+			         "both set and adopt_devx_uid in [1, "
+			         "U16_MAX]; the legacy GET_CONTEXT path "
+			         "passes the longer mlx5_ib_alloc_ucontext_"
+			         "req_v2 (ABI tail added by kernel "
+			         "afb3b5614af3)"
+			       : rc == -EOPNOTSUPP && adopt_uid
+			       ? " -- kernel pre-dates afb3b5614af3 "
+			         "(adopt source devx_uid). Upgrade or "
+			         "dump source without DEVX (libmlx5 "
+			         "MLX5_LIB_CAP_DYN_UAR=0)"
+			       : adopt_uid
+			       ? " -- source devx_uid not live in dest "
+			         "VF: LOAD_VHCA_STATE may not have "
+			         "preserved the uid, or the dest VF is "
+			         "the wrong one"
+			       : "");
 			close(fd);
 			return -1;
 		}
@@ -2737,17 +3055,45 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 		 * uninitialized + UAR uobject list empty for
 		 * RESTORE_DYN_UARS to seed.
 		 */
+		uint32_t flags = MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE;
+		uint32_t adopt_uid = 0;
+
+		/*
+		 * Mirror the static path: adopt the source's devx_uid
+		 * if non-zero. lib_uar_dyn=true is the libmlx5 default
+		 * and (for the same internal reasons) tends to also
+		 * imply DEVX, so this is the common case in practice.
+		 * See the static path above for the kernel-side gating
+		 * details.
+		 */
+		if (c->source_devx_uid) {
+			flags |= MLX5_IB_ALLOC_UCTX_DEVX |
+				 MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID;
+			adopt_uid = c->source_devx_uid;
+		}
+
 		rc = vfmig_send_get_context_v2(
-			fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
+			fd, flags,
 			MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR,
 			/* total_num_bfregs */ 8,
 			/* num_low_latency_bfregs */ 0,
-			/* max_cqe_version */ 1);
+			/* max_cqe_version */ 1,
+			adopt_uid);
 		if (rc) {
-			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE | DYN_UAR) "
-			       "on %s ctxn=%u failed: %d (%s)\n",
+			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE|DYN_UAR%s) "
+			       "on %s ctxn=%u adopt_devx_uid=%u failed: "
+			       "%d (%s)%s\n",
+			       adopt_uid ? "|DEVX|ADOPT_DEVX_UID" : "",
 			       c->dest_cdev_path, c->source_ctxn,
-			       rc, strerror(-rc));
+			       adopt_uid, rc, strerror(-rc),
+			       rc == -EINVAL && adopt_uid
+			       ? " -- ADOPT_DEVX_UID consistency rejected "
+			         "(see static-path comment)"
+			       : rc == -EOPNOTSUPP && adopt_uid
+			       ? " -- kernel pre-dates afb3b5614af3"
+			       : adopt_uid
+			       ? " -- source devx_uid not live in dest VF"
+			       : "");
 			close(fd);
 			return -1;
 		}
@@ -3006,6 +3352,17 @@ static int vfmig_restore_init_all_vfs(void)
 		snprintf(c->dest_cdev_path, sizeof(c->dest_cdev_path),
 			 "%s", v->dest_cdev_path);
 		c->dest_cdev_fd = -1;
+		/*
+		 * source_devx_uid is optional on the wire (zero default
+		 * means "non-DEVX ucontext"). Pre-extension images
+		 * decode with has_source_devx_uid=0 and we leave
+		 * c->source_devx_uid at 0, which makes
+		 * vfmig_ensure_cdev_open's GET_CONTEXT skip
+		 * ADOPT_DEVX_UID -- equivalent to the legacy v0
+		 * behaviour and correct for non-DEVX images.
+		 */
+		c->source_devx_uid = e->has_source_devx_uid ?
+			e->source_devx_uid : 0;
 
 		if (e->has_uctx_meta) {
 			const struct mlx5_ib_vfmig_ucontext_meta_local *m =
@@ -3079,10 +3436,11 @@ static int vfmig_restore_init_all_vfs(void)
 		vfmig_restored_ctxs = c;
 		pr_info("vfmig: cached ctxn=%u source_ibdev=%s "
 			"source_cdev=%s dest_cdev=%s mode=%s "
-			"(snapshot deferred-open)\n",
+			"source_devx_uid=%u (snapshot deferred-open)\n",
 			c->source_ctxn, c->source_ibdev,
 			c->source_cdev_path, c->dest_cdev_path,
-			c->is_dyn ? "dyn-UAR" : "static");
+			c->is_dyn ? "dyn-UAR" : "static",
+			c->source_devx_uid);
 		continue;
 	}
 

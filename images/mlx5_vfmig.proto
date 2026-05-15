@@ -236,4 +236,52 @@ message mlx5_vfmig_state_entry {
 	 * round-trip property userspace cares about.
 	 */
 	optional bytes		uctx_dyn_uar_records	= 13;
+
+	/*
+	 * Source-side DEVX uid that owned the ucontext at dump time
+	 * (mlx5_ib_ucontext.devx_uid as observed by the source).
+	 * Values:
+	 *
+	 *   absent / 0  -- non-DEVX libibverbs ucontext (lib_uar_dyn=
+	 *                  false). Restore opens the destination
+	 *                  ucontext with the same shape -- no DEVX,
+	 *                  no UID adoption. adopt_devx_uid stays 0.
+	 *
+	 *   1..U16_MAX  -- DEVX-opted-in ucontext (modern libmlx5
+	 *                  default with lib_uar_dyn=true silently
+	 *                  opts in, even with no explicit
+	 *                  mlx5dv_open_device(MLX5DV_CONTEXT_FLAGS_
+	 *                  DEVX) call). At restore-time, the plugin
+	 *                  must open the destination ucontext with
+	 *                  flags = MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE
+	 *                        | MLX5_IB_ALLOC_UCTX_DEVX
+	 *                        | MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID
+	 *                  and adopt_devx_uid = source_devx_uid.
+	 *                  The kernel's mlx5_ib_alloc_ucontext()
+	 *                  skips devx_create() and adopts the
+	 *                  caller-supplied uid into context->
+	 *                  devx_uid. The subsequent ALLOC_TRANSPORT_
+	 *                  DOMAIN doubles as a FW-liveness probe:
+	 *                  a stale/wrong uid surfaces as -EINVAL or
+	 *                  similar up the alloc-ucontext path.
+	 *
+	 * Provenance: computed at dump-time by the plugin's
+	 * DUMP_UVERBS_CONTEXT hook from a per-ucontext NLDEV PD walk.
+	 * Each user-allocated PD on this ucontext carries an
+	 * "fw_uid" driver TLV (see rdma_uobj.proto::fw_uid); the
+	 * plugin validates that all of them share one value (a
+	 * mismatch would be a kernel bug, fail loud) and persists
+	 * it here. PD-less ucontexts have no observable fw_uid via
+	 * NLDEV today; if encountered, source_devx_uid is left
+	 * unset (treat as 0).
+	 *
+	 * Added by the same change that wires CRIU's RESTORE_PD
+	 * UHW to ship FW pdn (rather than restrack id). Both halves
+	 * are required against post-d4acb54ebd3d /
+	 * afb3b5614af3 kernels; the kernel's mlx5_ib_restore_pd
+	 * FW-probes (req_pdn, ucontext->devx_uid) and rejects
+	 * mismatched pairs with -ENOENT plus a pr_warn naming
+	 * either "stale pdn" or "did not adopt devx_uid".
+	 */
+	optional uint32		source_devx_uid		= 14;
 }

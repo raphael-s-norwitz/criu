@@ -507,6 +507,89 @@ static const struct res_type_info {
 };
 
 /*
+ * Walk the driver-TLV table nested under RDMA_NLDEV_ATTR_DRIVER on
+ * a RES_PD_ENTRY and pluck out the named u32 entries this consumer
+ * cares about (fw_pdn, fw_uid).
+ *
+ * Wire structure (drivers/infiniband/core/nldev.c::_rdma_nl_put_
+ * driver_u32 + put_driver_name_print_type): TLVs are emitted as
+ * a flat sequence of sibling attributes inside RDMA_NLDEV_ATTR_
+ * DRIVER, NOT wrapped in _ENTRY containers despite the kernel's
+ * nldev_policy listing _ENTRY as NLA_NESTED. Each named u32 TLV
+ * lays down 2-3 siblings in order:
+ *
+ *   RDMA_NLDEV_ATTR_DRIVER_STRING       NLA_STRING (the name)
+ *   [RDMA_NLDEV_ATTR_DRIVER_PRINT_TYPE] NLA_U8 (only emitted if HEX --
+ *                                       UNSPEC suppresses this attr)
+ *   RDMA_NLDEV_ATTR_DRIVER_U32          NLA_U32 (the value)
+ *
+ * Followed immediately by the next STRING / [PRINT_TYPE] / U32
+ * triple for the next named TLV. There is no enclosing per-TLV
+ * container, so we walk siblings sequentially and pair each
+ * STRING with the next-following U32 (skipping the optional
+ * PRINT_TYPE between them). _ENTRY (53), if it ever appears,
+ * is treated as transparent and walked into.
+ *
+ * Defensively scoped: PD-only for now (the only registered
+ * restrack hook is mlx5's fill_res_pd_entry). Other resource
+ * types silently skip; the caller in parse_res_entry() gates
+ * on e->type before calling us.
+ */
+static void parse_pd_driver_tlvs(struct nlattr *driver_table,
+				 struct rdma_nl_res_entry *e)
+{
+	struct nlattr *attr;
+	const char *pending_name = NULL;
+	int rem;
+
+	nla_for_each_nested(attr, driver_table, rem) {
+		uint16_t t = nla_type(attr);
+
+		if (t == RDMA_NLDEV_ATTR_DRIVER_STRING) {
+			pending_name = nla_data(attr);
+			continue;
+		}
+		if (t == RDMA_NLDEV_ATTR_DRIVER_PRINT_TYPE) {
+			/* Presentation hint between STRING and U32, ignore. */
+			continue;
+		}
+		if (t == RDMA_NLDEV_ATTR_DRIVER_U32 && pending_name) {
+			uint32_t value = nla_get_u32(attr);
+
+			if (!strcmp(pending_name, "fw_pdn")) {
+				e->has_fw_pdn = true;
+				e->fw_pdn = value;
+			} else if (!strcmp(pending_name, "fw_uid")) {
+				e->has_fw_uid = true;
+				e->fw_uid = value;
+			}
+			/*
+			 * Future named TLVs land here as additional name
+			 * comparisons. Unknown names are tolerated -- the
+			 * kernel may add diagnostic-only TLVs we have no
+			 * consumer for.
+			 */
+			pending_name = NULL;
+			continue;
+		}
+		/*
+		 * Other types (S32/U64/S64) or out-of-order attrs:
+		 * drop the pending pairing and keep walking. This
+		 * keeps the walk robust against future extensions
+		 * that introduce other value carriers under the
+		 * same DRIVER container -- v0 only consumes u32
+		 * named entries.
+		 */
+		pending_name = NULL;
+	}
+	pr_debug("driver TLVs: parsed fw_pdn=%s%u fw_uid=%s%u\n",
+		 e->has_fw_pdn ? "" : "?",
+		 e->has_fw_pdn ? e->fw_pdn : 0,
+		 e->has_fw_uid ? "" : "?",
+		 e->has_fw_uid ? e->fw_uid : 0);
+}
+
+/*
  * Parse one RES_<TYPE>_ENTRY nested attribute into @e. Reads
  * everything fill_res_<type>_entry currently emits per type; the
  * caller's switch on @e->type already determines which union arm
@@ -557,6 +640,16 @@ static int parse_res_entry(struct nlattr *entry,
 	case RDMA_NL_RES_PD:
 		if (tb[RDMA_NLDEV_ATTR_RES_USECNT])
 			e->pd.usecnt = nla_get_u64(tb[RDMA_NLDEV_ATTR_RES_USECNT]);
+		/*
+		 * mlx5-private TLVs nested under RDMA_NLDEV_ATTR_DRIVER:
+		 * fw_pdn (mpd->pdn) and fw_uid (mpd->uid). Absent on
+		 * non-mlx5 PDs, on kernel-internal restrack PDs that
+		 * skip user_attr emission, and on pre-d4acb54ebd3d
+		 * mlx5_ib. Callers that need fw_pdn (RESTORE_PD's
+		 * UHW) gate on has_fw_pdn and fail loud otherwise.
+		 */
+		if (tb[RDMA_NLDEV_ATTR_DRIVER])
+			parse_pd_driver_tlvs(tb[RDMA_NLDEV_ATTR_DRIVER], e);
 		break;
 	case RDMA_NL_RES_CQ:
 		if (tb[RDMA_NLDEV_ATTR_RES_CQE])

@@ -1699,6 +1699,26 @@ static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
 			       e->has_ufile_handle, e->ufile_handle);
 	rdma_pd_attrs__init(&attrs);
 	pe.pd = &attrs;
+
+	/*
+	 * mlx5-private FW identity. fw_pdn is the value RESTORE_PD's
+	 * UHW (mlx5_ib_restore_pd_req.pdn) must ship -- rdma_send_
+	 * restore_pd reads pe.fw_pdn at restore. fw_uid is recorded
+	 * for image-inspection symmetry and is sourced from the
+	 * same TLV; the per-ufile aggregate is captured separately
+	 * by the mlx5 plugin's DUMP_UVERBS_CONTEXT hook (which does
+	 * its own NLDEV PD walk). Absent on rxe and on pre-
+	 * d4acb54ebd3d kernels; restore-side guards that and fails
+	 * the dump as un-restorable on a re-dump-required diagnostic.
+	 */
+	if (e->has_fw_pdn) {
+		pe.has_fw_pdn = true;
+		pe.fw_pdn = e->fw_pdn;
+	}
+	if (e->has_fw_uid) {
+		pe.has_fw_uid = true;
+		pe.fw_uid = e->fw_uid;
+	}
 	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
 }
 
@@ -2343,8 +2363,17 @@ struct mlx5_ib_restore_pd_req_local {
  *     the only thing it cares about is the ufile target handle.
  *   - mlx5: UHW carries struct mlx5_ib_restore_pd_req with
  *     {pdn = source FW pdn, reserved = 0, reserved2 = 0}. The
- *     source pdn comes from the rdma-uobj.img PD entry's
- *     restrack_id (which NLDEV emits as RDMA_NLDEV_ATTR_RES_PDN).
+ *     source pdn comes from the rdma-uobj.img PD entry's fw_pdn
+ *     field, which the dump side sourced from the named
+ *     "fw_pdn" driver TLV that mlx5_ib's fill_res_pd_entry
+ *     emits under RDMA_NLDEV_ATTR_DRIVER (kernel
+ *     d4acb54ebd3d). Earlier CRIUs shipped the entry's
+ *     restrack_id here -- restrack_id is NLDEV's
+ *     RDMA_NLDEV_ATTR_RES_PDN, *not* mpd->pdn; the two values
+ *     coincide on freshly-booted hosts but diverge as the
+ *     restrack idr wraps. Sending restrack_id where mpd->pdn
+ *     was expected was the silent-correctness bug fixed in
+ *     d4acb54ebd3d.
  *
  * @has_src_pdn / @src_pdn carry the source FW pdn captured at dump
  * time. They are mandatory for RDMA_DRIVER_MLX5 (the verb is
@@ -2383,11 +2412,16 @@ static int rdma_send_restore_pd(int cmd_fd, uint32_t driver_id,
 	if (driver_id == RDMA_DRIVER_MLX5) {
 		if (!has_src_pdn) {
 			pr_err("RESTORE_PD on driver_id=%u (mlx5) requires "
-			       "the source FW pdn from rdma-uobj.img "
-			       "(restrack_id), but the entry has no "
-			       "restrack_id. Image was either dumped "
-			       "without K8a NLDEV emit, or the dump "
-			       "side dropped the field.\n",
+			       "the source FW pdn (mpd->pdn) from rdma-"
+			       "uobj.img, but the PD entry has no fw_pdn. "
+			       "The image was dumped against a kernel "
+			       "that pre-dates d4acb54ebd3d (RDMA/mlx5: "
+			       "fix CRIU PD restore by exposing FW pdn): "
+			       "re-dump against a current kernel and "
+			       "restore against the new image. Note that "
+			       "RES_PDN (== restrack_id) is NOT the FW "
+			       "pdn -- the two only coincided on freshly-"
+			       "booted hosts before this fix.\n",
 			       driver_id);
 			return -EINVAL;
 		}
@@ -2463,18 +2497,35 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 				n_pd_skipped++;
 				continue;
 			}
+			/*
+			 * Source the FW pdn from the per-PD fw_pdn field
+			 * (rdma_uobj.proto), which the dump side sourced
+			 * from the kernel's named "fw_pdn" driver TLV.
+			 * restrack_id is NOT the FW pdn -- it's
+			 * RDMA_NLDEV_ATTR_RES_PDN's per-ibdev restrack
+			 * counter -- and historically was passed here by
+			 * accident (silently correct on freshly-booted
+			 * hosts only). Falling back to restrack_id on
+			 * an old image keeps backward-compat for rxe
+			 * (which ignores UHW anyway), at the cost of
+			 * mlx5 images dumped against a pre-fix kernel
+			 * being rejected loudly by rdma_send_restore_pd.
+			 */
 			rc = rdma_send_restore_pd(cmd_fd, kernel_driver_id,
 						  e->ufile_handle,
-						  e->has_restrack_id,
-						  e->restrack_id);
+						  e->has_fw_pdn,
+						  e->fw_pdn);
 			if (rc) {
 				pr_err("uobj DAG: ufile_id=%#x RESTORE_PD"
 				       "(target_handle=%u, driver_id=%u, "
-				       "src_pdn=%s%u) failed: %d (%s)%s\n",
+				       "fw_pdn=%s%u, fw_uid=%s%u) failed: "
+				       "%d (%s)%s\n",
 				       ufile_id, e->ufile_handle,
 				       kernel_driver_id,
-				       e->has_restrack_id ? "" : "?",
-				       e->has_restrack_id ? e->restrack_id : 0,
+				       e->has_fw_pdn ? "" : "?",
+				       e->has_fw_pdn ? e->fw_pdn : 0,
+				       e->has_fw_uid ? "" : "?",
+				       e->has_fw_uid ? e->fw_uid : 0,
 				       rc, strerror(-rc),
 				       rc == -EOPNOTSUPP
 				       ? " -- kernel has no "
@@ -2494,12 +2545,29 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 				         "ufile slot; image is internally "
 				         "inconsistent or the kernel ufile "
 				         "is not pristine)"
+				       : rc == -ENOENT &&
+					 kernel_driver_id == RDMA_DRIVER_MLX5
+				       ? " -- mlx5_ib_restore_pd FW probe "
+				         "rejected (pdn, devx_uid). Either "
+				         "(a) the image's fw_pdn is stale "
+				         "(re-dump needed: kernel ABI for "
+				         "fw_pdn is the named driver TLV in "
+				         "RDMA_NLDEV_ATTR_DRIVER), or "
+				         "(b) the destination ucontext did "
+				         "not adopt the source's devx_uid "
+				         "(plugin's GET_CONTEXT must set "
+				         "MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID "
+				         "+ DEVX and pass adopt_devx_uid = "
+				         "source ucontext's devx_uid). See "
+				         "kernel pr_warn 'mlx5_ib_restore_pd: "
+				         "FW probe rejected'."
 				       : rc == -EINVAL &&
 					 kernel_driver_id == RDMA_DRIVER_MLX5
 				       ? " -- mlx5_ib_restore_pd rejected the "
-				         "UHW (pdn=0 is reserved, or the "
-				         "source pdn is no longer valid in "
-				         "destination FW after LOAD_VHCA_STATE)"
+				         "UHW (pdn=0 is reserved, reserved/"
+				         "reserved2 must be 0, or udata size "
+				         "mismatch -- check struct "
+				         "mlx5_ib_restore_pd_req packing)"
 				       : "");
 				return -1;
 			}

@@ -139,6 +139,40 @@ struct rdma_nl_res_entry {
 	bool			has_ufile_handle;
 	uint32_t		ufile_handle;	/* ib_uobject->id; needs K8a kernel */
 
+	/*
+	 * mlx5-private driver TLVs (PD entries only; emitted by
+	 * fill_res_pd_entry in drivers/infiniband/hw/mlx5/restrack.c
+	 * via rdma_nl_put_driver_u32{_hex}). Carried as nested
+	 * RDMA_NLDEV_ATTR_DRIVER_ENTRY tuples (DRIVER_STRING name +
+	 * DRIVER_U32 value). Decoded by parse_res_entry()'s
+	 * RDMA_NLDEV_ATTR_DRIVER walk; the `has_*` booleans tell
+	 * callers when the kernel didn't emit them (older mlx5_ib,
+	 * non-mlx5 driver, or PD entry that doesn't go through
+	 * mlx5's fill hook -- e.g. a kernel-internal restrack PD).
+	 *
+	 * fw_pdn:  the FW-side pdn (mpd->pdn). NOT res->id; res->id
+	 *          is what RDMA_NLDEV_ATTR_RES_PDN carries and is
+	 *          the per-ibdev restrack id. Until the kernel
+	 *          patch landing fw_pdn as a TLV, CRIU was passing
+	 *          restrack id where mlx5_ib_restore_pd expected
+	 *          mpd->pdn -- silently coincidental on freshly-
+	 *          booted hosts but diverges as the restrack idr
+	 *          wraps. fw_pdn is what RESTORE_PD's UHW must
+	 *          ship as mlx5_ib_restore_pd_req.pdn.
+	 *
+	 * fw_uid:  the PD's owning devx_uid (mpd->uid). Zero for
+	 *          non-DEVX libibverbs ucontexts; non-zero for
+	 *          DEVX-opted-in ucontexts (modern libmlx5 with
+	 *          lib_uar_dyn=true silently opts in). Aggregated
+	 *          per-ufile by callers; the mlx5 plugin uses the
+	 *          per-ufile common value as adopt_devx_uid in the
+	 *          destination ucontext's GET_CONTEXT.
+	 */
+	bool			has_fw_pdn;
+	uint32_t		fw_pdn;
+	bool			has_fw_uid;
+	uint32_t		fw_uid;
+
 	/* Per-type leaves -- read after switch on `type`. */
 	union {
 		struct {
