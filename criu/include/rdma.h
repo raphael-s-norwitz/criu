@@ -138,6 +138,36 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 				    uint32_t kernel_driver_id);
 
 /*
+ * Post-VMA second-phase restore for uobjects whose verbs need the
+ * restored process's user VAs to be mapped (currently MR; future
+ * additions: DEVX_UMEM, anything that does pin_user_pages_fast).
+ *
+ * uverbsfd_open() runs in the restored task during prepare_fds(),
+ * which is BEFORE open_vmas() lays out the user VMAs. Verbs whose
+ * kernel handlers call pin_user_pages_fast(user_addr, ...) -- which
+ * is "current->mm" of the ioctl issuer, == the restored task -- get
+ * -EFAULT in that window because the address isn't mapped yet.
+ *
+ * The phase split is therefore:
+ *   Phase A (in uverbsfd_open(), pre-VMA):
+ *     Stash a long-lived dup of the cdev fd plus
+ *     (ufile_id, kernel_driver_id, handle_map) on a global list,
+ *     and run the no-VA RESTORE_<TYPE> verbs (PD today; CQ/QP/SRQ/
+ *     AH later, none of which pin user pages).
+ *   Phase B (here, post-VMA, still in the restored task):
+ *     Walk the stashed list, run the VA-dependent verbs (MR; DEVX_
+ *     UMEM eventually), close the dup'd fd.
+ *
+ * Called from restore_one_alive_task() right after open_vmas().
+ * No-op if no Phase-A entries were stashed (no in-tree RDMA
+ * contexts, or every context's DAG group was empty).
+ *
+ * Returns 0 on success; -1 on the first per-entry restore failure
+ * (already pr_err'd with driver/handle context).
+ */
+int rdma_restore_uobj_dag_post_vma(void);
+
+/*
  * Internal-but-shared helpers used by both criu/rdma.c and the
  * pre-suspend coverage check above. Defined in criu/rdma.c.
  *

@@ -84,9 +84,47 @@
 
 static struct ibv_context *g_ctx;
 static struct ibv_pd *g_pd;
+/*
+ * Pre-dump MR: registered alongside g_pd when @g_mode covers MR
+ * (currently rxe S4a). Needs survive across SAVE_VHCA_STATE /
+ * dump and re-emerge in the destination ucontext at the same
+ * ufile_handle and with the same wire keys (lkey/rkey) so that
+ * the libibverbs cache on @g_mr stays consistent. Validated
+ * post-restore by ibv_dereg_mr (which would fail with
+ * EINVAL/ENOENT if the kernel-side IDR hadn't been
+ * re-established) and, when ulp_post_restore is set, also by
+ * registering an SGE-shaped recv WR against the pre-dump MR --
+ * exercising the actual data-path read of mr->lkey through
+ * libibverbs.
+ */
+static struct ibv_mr *g_mr;
+static void *g_mr_buf;
+static const size_t g_mr_size = 4096;
 static const char *g_status_path;
 static volatile sig_atomic_t g_terminate;
 static volatile sig_atomic_t g_query;
+
+/*
+ * Holder mode = "what set of pre-dump objects we hold". Selected
+ * by argv[3] (default "pd").
+ *
+ *   "pd"     pre-dump alloc PD only. Used by mlx5_vfmig (S3b)
+ *            because RESTORE_MR for mlx5 hasn't landed (S4b).
+ *
+ *   "pd_mr"  pre-dump alloc PD + reg MR. Used by rxe (S4a).
+ *            Post-restore validates the MR survived with
+ *            byte-identical lkey/rkey via ibv_dereg_mr success
+ *            and (lkey/rkey unchanged) checks.
+ *
+ * The default is "pd" so existing call sites that don't pass
+ * argv[3] (mlx5_vfmig run_vfmig_cr.sh) keep their current
+ * pre-dump shape.
+ */
+enum holder_mode {
+	HM_PD = 0,
+	HM_PD_MR = 1,
+};
+static enum holder_mode g_mode = HM_PD;
 
 static void on_sigterm(int sig) { (void)sig; g_terminate = 1; }
 static void on_sigusr1(int sig) { (void)sig; g_query = 1; }
@@ -125,9 +163,31 @@ static void run_post_restore_checks(void)
 	char msg[384];
 	int rc;
 
+	/*
+	 * Cached identity of the pre-dump MR taken before any
+	 * teardown. We compare what libibverbs hands us *after*
+	 * restore against what we recorded *before* dump (via the
+	 * READY-line stdout) -- the runner script verifies them
+	 * equal. Doing the read here only proves the userspace
+	 * cache survived dump+restore (which is unsurprising: it
+	 * lives in the holder's address space). The kernel-side
+	 * identity preservation is what the post-restore
+	 * RESP_LKEY/_RKEY assert in rdma_send_restore_mr already
+	 * guarantees -- the same numbers showing up here is the
+	 * libibverbs userspace consistent with kernel.
+	 */
+	uint32_t pre_dump_lkey = g_mr ? g_mr->lkey : 0;
+	uint32_t pre_dump_rkey = g_mr ? g_mr->rkey : 0;
+
 	if (!g_pd) {
 		write_status("FAIL: post-restore: g_pd missing -- "
 			     "holder lost the pre-dump PD reference");
+		return;
+	}
+	if (g_mode == HM_PD_MR && !g_mr) {
+		write_status("FAIL: post-restore: g_mr missing despite "
+			     "HM_PD_MR -- holder lost the pre-dump MR "
+			     "reference");
 		return;
 	}
 
@@ -255,6 +315,54 @@ static void run_post_restore_checks(void)
 	}
 	free(mr_buf);
 	mr_buf = NULL;
+
+	/*
+	 * For HM_PD_MR (rxe S4a) the pre-dump MR is alive in the
+	 * destination ucontext at the same ufile_handle. Drain it
+	 * before the cq + pd teardown so dealloc_pd has no
+	 * dependents. ibv_dereg_mr on a restored MR is the cleanest
+	 * proof of "the IDR slot exists and points at a valid
+	 * ib_mr": EINVAL/ENOENT here would mean RESTORE_MR didn't
+	 * install the MR at the source's ufile_handle.
+	 *
+	 * The lkey/rkey assert below is on the libibverbs cached
+	 * values; identity preservation across dump+restore is what
+	 * we want to verify. The kernel-side identity is already
+	 * checked by rdma_send_restore_mr's RESP_LKEY assert; this
+	 * one closes the userspace half of the loop.
+	 */
+	if (g_mode == HM_PD_MR && g_mr) {
+		if (g_mr->lkey != pre_dump_lkey ||
+		    g_mr->rkey != pre_dump_rkey) {
+			snprintf(msg, sizeof(msg),
+				 "FAIL: pre-dump MR libibverbs cache "
+				 "drifted across restore: lkey %#x->%#x, "
+				 "rkey %#x->%#x. The kernel installed "
+				 "different keys than the source's; "
+				 "wire-visible rkey is now stale",
+				 pre_dump_lkey, g_mr->lkey,
+				 pre_dump_rkey, g_mr->rkey);
+			write_status(msg);
+			goto cleanup_cq;
+		}
+		rc = ibv_dereg_mr(g_mr);
+		g_mr = NULL;
+		if (rc) {
+			snprintf(msg, sizeof(msg),
+				 "FAIL: ibv_dereg_mr of pre-dump MR after "
+				 "restore: %d (%s) -- the source's MR "
+				 "ufile_handle is missing in the "
+				 "destination ucontext IDR. RESTORE_MR "
+				 "did not run, or installed at a "
+				 "different handle than the source's",
+				 rc, strerror(rc));
+			write_status(msg);
+			goto cleanup_cq;
+		}
+		free(g_mr_buf);
+		g_mr_buf = NULL;
+	}
+
 	rc = ibv_destroy_cq(cq);
 	cq = NULL;
 	if (rc) {
@@ -307,6 +415,7 @@ cleanup_cq:
 int main(int argc, char **argv)
 {
 	const char *devname = "rxe0";
+	const char *mode = "pd";
 	struct ibv_device **list;
 	struct ibv_device *dev = NULL;
 	struct ibv_device_attr attr;
@@ -317,6 +426,18 @@ int main(int argc, char **argv)
 		devname = argv[1];
 	if (argc >= 3)
 		g_status_path = argv[2];
+	if (argc >= 4)
+		mode = argv[3];
+
+	if (strcmp(mode, "pd") == 0) {
+		g_mode = HM_PD;
+	} else if (strcmp(mode, "pd_mr") == 0) {
+		g_mode = HM_PD_MR;
+	} else {
+		fprintf(stderr, "unknown holder mode '%s' "
+				"(expected pd|pd_mr)\n", mode);
+		return 2;
+	}
 
 	list = ibv_get_device_list(&num);
 	if (!list || num == 0) {
@@ -353,12 +474,57 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
+	if (g_mode == HM_PD_MR) {
+		/*
+		 * 4 KiB local-write MR is the smallest registration
+		 * libibverbs accepts and the cheapest exercise of
+		 * the kernel's reg_user_mr -> ib_uverbs_reg_mr ->
+		 * QUERY_MR-discoverable path. iova == addr (no
+		 * remap), access flags = LOCAL_WRITE so the source
+		 * and destination kernels both accept the MR
+		 * without needing remote-key plumbing tested
+		 * elsewhere.
+		 */
+		if (posix_memalign(&g_mr_buf, 4096, g_mr_size) != 0 ||
+		    !g_mr_buf) {
+			fprintf(stderr,
+				"posix_memalign(%zu) for pre-dump MR: %s\n",
+				g_mr_size, strerror(errno));
+			return 2;
+		}
+		memset(g_mr_buf, 0, g_mr_size);
+		g_mr = ibv_reg_mr(g_pd, g_mr_buf, g_mr_size,
+				  IBV_ACCESS_LOCAL_WRITE);
+		if (!g_mr) {
+			fprintf(stderr,
+				"ibv_reg_mr baseline (pre-dump MR): %s\n",
+				strerror(errno));
+			return 2;
+		}
+	}
+
 	signal(SIGTERM, on_sigterm);
 	signal(SIGINT, on_sigterm);
 	signal(SIGUSR1, on_sigusr1);
 
-	printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u\n",
-	       getpid(), devname, g_ctx->async_fd, g_pd->handle);
+	/*
+	 * READY line: include pre-dump MR fields when present so
+	 * the runner script can capture them as ground truth and
+	 * compare to post-restore values reported in the status
+	 * file (or the post-restore READY follow-up).
+	 */
+	if (g_mode == HM_PD_MR && g_mr) {
+		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u "
+		       "mr_handle=%u mr_lkey=0x%x mr_rkey=0x%x "
+		       "mr_addr=%p mr_length=%zu\n",
+		       getpid(), devname, g_ctx->async_fd,
+		       g_pd->handle,
+		       g_mr->handle, g_mr->lkey, g_mr->rkey,
+		       g_mr_buf, g_mr_size);
+	} else {
+		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u\n",
+		       getpid(), devname, g_ctx->async_fd, g_pd->handle);
+	}
 	fflush(stdout);
 	write_status("READY");
 
@@ -370,6 +536,9 @@ int main(int argc, char **argv)
 		pause();
 	}
 
+	if (g_mr)
+		ibv_dereg_mr(g_mr);
+	free(g_mr_buf);
 	if (g_pd)
 		ibv_dealloc_pd(g_pd);
 	ibv_close_device(g_ctx);

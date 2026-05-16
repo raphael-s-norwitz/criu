@@ -657,6 +657,20 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (open_vmas(current))
 		return -1;
 
+	/*
+	 * Post-VMA second-phase RDMA uobj restore. Verbs that pin
+	 * user pages (UVERBS_METHOD_RESTORE_MR -> pin_user_pages_
+	 * fast(user_addr, ...)) need the restored task's user VMAs
+	 * to be live in current->mm; uverbsfd_open() (driving the
+	 * Phase-A restore) ran in prepare_fds() above, before
+	 * open_vmas, when none of the user VAs were mapped yet.
+	 * Phase B walks the per-ufile state stashed by Phase A and
+	 * runs the VA-dependent verbs now. No-op when no in-tree
+	 * RDMA contexts had MR (or future DEVX_UMEM) entries.
+	 */
+	if (rdma_restore_uobj_dag_post_vma())
+		return -1;
+
 	if (prepare_aios(current, ta))
 		return -1;
 

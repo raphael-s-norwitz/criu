@@ -83,8 +83,14 @@ ibv_devices
 # 2. Launch the holder, daemonised so it has its own session.
 #    setsid + & keeps it alive across this shell exit.
 #
-echo "launching holder..."
-setsid "$PROG" rxe0 "$STATUS" >"$LOG" 2>&1 &
+echo "launching holder (pd_mr mode: pre-dump PD + reg_mr)..."
+# pd_mr mode (S4a): rxe holder also registers a 4 KiB local-write
+# MR pre-dump alongside the PD. The destination kernel's RESTORE_MR
+# (with rxe LKEY/RKEY hint adoption, kernel f422e6ba6bdc) must
+# install the MR at the same per-ufile handle and same wire keys
+# for the libibverbs cache on the restored process to remain
+# consistent. The holder's post-restore acid test asserts both.
+setsid "$PROG" rxe0 "$STATUS" pd_mr >"$LOG" 2>&1 &
 HOLDER_PID=$!
 echo "$HOLDER_PID" >"$PIDFILE"
 
@@ -215,25 +221,44 @@ fi
 echo "rdma-uobj.img verify pass ran clean on restore" \
      "(per-uobj ufile_handle populated)"
 
-# S2 RESTORE_PD dispatch. uverbsfd_open() calls
-# rdma_restore_uobj_dag_for_ufile() right after the plugin hands
-# back the open cdev fd, which then issues UVERBS_METHOD_RESTORE_PD
-# per PD entry recorded in rdma-uobj.img. The dispatcher logs a
-# one-liner per-ufile when it actually issued any RESTORE_<TYPE>
-# verbs. The holder allocates exactly one PD before dump, so we
-# expect "restored 1 PD(s), skipped 0".
-if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ restored [1-9][0-9]* PD\(s\), skipped 0' \
+# S2 RESTORE_PD + S4a RESTORE_MR dispatch. The restore runs in two
+# phases: Phase A (in uverbsfd_open() during prepare_fds) issues
+# the VA-independent verbs (RESTORE_PD); Phase B (after open_vmas)
+# issues the VA-dependent verbs (RESTORE_MR -- needs the user VMAs
+# live in current->mm for pin_user_pages_fast). Each phase emits a
+# per-ufile summary line:
+#
+#   Phase A:  "ufile_id=... Phase A: restored 1 PD(s) [skipped 0]; 1 MR(s) deferred to post-VMA Phase B"
+#   Phase B:  "ufile_id=... Phase B: restored 1 MR(s) [skipped 0]"
+#
+# pd_mr mode: holder allocates exactly one PD + one MR pre-dump, so
+# Phase A must show 1 PD restored and 1 MR deferred, Phase B must
+# show 1 MR restored.
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; [1-9][0-9]* MR\(s\) deferred' \
 	"$DUMPDIR/restore.log"; then
-	echo "FAIL: restore.log shows no RESTORE_PD dispatch by" \
-	     "rdma_restore_uobj_dag_for_ufile() -- the per-ufile" \
-	     "S2 restore pass either didn't run, found no PD entry," \
-	     "or skipped the entry for missing ufile_handle." >&2
+	echo "FAIL: restore.log shows no RESTORE_PD Phase-A dispatch by" \
+	     "rdma_restore_uobj_dag_for_ufile() with deferred MRs --" \
+	     "the per-ufile restore pass either didn't run, found no" \
+	     "PD/MR entries, or skipped them for missing ufile_handle /" \
+	     "QUERY_MR fields." >&2
 	echo "--- restore log uobj DAG lines ---" >&2
 	grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
 		echo "(no uobj DAG lines at all)" >&2
 	exit 1
 fi
-echo "RESTORE_PD dispatched ok by rdma_restore_uobj_dag_for_ufile()"
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase B: restored [1-9][0-9]* MR\(s\) \[skipped 0\]' \
+	"$DUMPDIR/restore.log"; then
+	echo "FAIL: restore.log shows no RESTORE_MR Phase-B dispatch --" \
+	     "the post-VMA second-phase pass didn't run or every MR" \
+	     "was skipped/failed. Without Phase B firing, the libibverbs" \
+	     "MR cache in the restored process points at slots that" \
+	     "don't exist in the kernel ucontext." >&2
+	echo "--- restore log uobj DAG lines ---" >&2
+	grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+		echo "(no uobj DAG lines at all)" >&2
+	exit 1
+fi
+echo "RESTORE_PD (Phase A) + RESTORE_MR (Phase B) dispatched ok"
 
 #
 # 5. Verify post-restore context is functional.

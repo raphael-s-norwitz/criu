@@ -260,27 +260,32 @@ echo "=== Phase F: criu restore ==="
 RESTORED_PID="$(cat "$RESTORED_PIDFILE")"
 echo "restored pid=$RESTORED_PID"
 
-# Positive RESTORE_PD dispatch assertion. uverbsfd_open() runs
-# rdma_restore_uobj_dag_for_ufile() right after the plugin's
-# init(RESTORE) opens the dest cdev; it pr_info's
-# "restored N PD(s), skipped 0" iff it actually issued
-# UVERBS_METHOD_RESTORE_PD against the kernel. The source ucontext
-# allocates exactly one PD, so we expect N=1 here. If the
-# RESTORE_PD path ever stops firing (kernel rev pre-K3/K4, plugin
-# not opening cdev in restore mode, DAG-side dropping ufile_handle,
-# UHW dispatcher misbranding the driver_id) this catches it before
-# the holder's post-restore checks would also fail later.
-if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ restored [1-9][0-9]* PD\(s\), skipped 0' \
+# Positive RESTORE_PD dispatch assertion. Phase A of the per-ufile
+# dispatcher (in uverbsfd_open()) runs the VA-independent verbs
+# (RESTORE_PD here) and pr_info's:
+#
+#   "ufile_id=... Phase A: restored 1 PD(s) [skipped 0]; 0 MR(s) deferred"
+#
+# The source ucontext allocates exactly one PD, so 1 PD restored.
+# MR count must be 0 because the mlx5 holder uses the default "pd"
+# mode -- mlx5 RESTORE_MR is S4b and not landed yet; pre-dump MR
+# registration would just push the test into the v0 dealloc-
+# ordering tripwire (S3b). If RESTORE_PD ever stops firing (kernel
+# rev pre-K3/K4, plugin not opening cdev in restore mode, DAG-side
+# dropping ufile_handle, UHW dispatcher misbranding the driver_id)
+# this catches it before the holder's post-restore checks would
+# also fail later.
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; 0 MR\(s\) deferred' \
     "$DUMPDIR/restore.log"; then
-    echo "FAIL: restore.log shows no RESTORE_PD dispatch by" \
-         "rdma_restore_uobj_dag_for_ufile() -- the per-ufile S3b" \
-         "restore pass either didn't run, found no PD entry, or" \
-         "skipped the entry for missing ufile_handle." >&2
+    echo "FAIL: restore.log shows no Phase-A RESTORE_PD dispatch by" \
+         "rdma_restore_uobj_dag_for_ufile() with zero deferred MRs" \
+         "-- the per-ufile S3b restore pass either didn't run," \
+         "found no PD entry, or there were unexpected MR entries." >&2
     grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
         echo "(no uobj DAG lines at all)" >&2
     exit 1
 fi
-echo "RESTORE_PD dispatched ok (mlx5 UHW path)"
+echo "RESTORE_PD dispatched ok (mlx5 UHW path, Phase A)"
 
 # ---- Phase G: verify --------------------------------------------------
 echo "=== Phase G: post-restore checks ==="

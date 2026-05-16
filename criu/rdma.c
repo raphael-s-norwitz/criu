@@ -63,6 +63,21 @@ struct rdma_dumped_ufile {
 	uint32_t dev_index;	/* filled lazily in rdma_dump_uobj_dag */
 	bool has_dev_index;
 	char ibdev[64];
+	/*
+	 * Long-lived dup of the holder's uverbs cdev fd, captured in
+	 * dump_uverbsfile() and consumed by rdma_dump_uobj_dag()'s
+	 * per-MR QUERY_MR walk. Sharing the holder's struct file is
+	 * load-bearing: QUERY_MR resolves @handle through the per-
+	 * ucontext IDR, so the issuing fd MUST point at the same
+	 * ib_ucontext as the source. -1 means "not stashed" (the
+	 * dup failed, or this ufile pre-dates the stash logic), and
+	 * MR walks gracefully fall back to the NLDEV-only field set.
+	 *
+	 * Closed in rdma_dump_uobj_dag()'s cleanup path. The dup is
+	 * O_CLOEXEC so a criu fork-after-dump can't leak the FW-side
+	 * ucontext reference.
+	 */
+	int holder_uctx_fd;
 	struct list_head link;
 };
 static LIST_HEAD(rdma_dumped_ufiles);
@@ -71,19 +86,24 @@ static int rdma_record_dumped_ufile(pid_t pid, const char *ibdev,
 				    uint32_t kernel_driver_id,
 				    uint32_t criu_driver,
 				    uint32_t uvfe_id,
-				    bool has_ctxn, uint32_t ctxn)
+				    bool has_ctxn, uint32_t ctxn,
+				    int holder_uctx_fd)
 {
 	struct rdma_dumped_ufile *r;
 
 	r = xzalloc(sizeof(*r));
-	if (!r)
+	if (!r) {
+		if (holder_uctx_fd >= 0)
+			close(holder_uctx_fd);
 		return -1;
+	}
 	r->pid = pid;
 	r->ctxn = ctxn;
 	r->has_ctxn = has_ctxn;
 	r->uvfe_id = uvfe_id;
 	r->criu_driver = criu_driver;
 	r->kernel_driver_id = kernel_driver_id;
+	r->holder_uctx_fd = holder_uctx_fd;
 	snprintf(r->ibdev, sizeof(r->ibdev), "%.*s",
 		 (int)(sizeof(r->ibdev) - 1), ibdev);
 	list_add_tail(&r->link, &rdma_dumped_ufiles);
@@ -578,13 +598,34 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	 * the dump with the same atomicity guarantee as a write
 	 * failure -- partial uverbs records on disk without a
 	 * matching DAG entry would be confusing on inspection.
+	 *
+	 * Dup @lfd into a long-lived O_CLOEXEC fd before the record;
+	 * the dup shares the holder's struct file (and therefore
+	 * its ib_ucontext IDR) so rdma_dump_uobj_dag's per-MR
+	 * QUERY_MR walk can resolve handles in the right ucontext
+	 * scope. -1 means dup failed -- not fatal; the MR walk
+	 * gracefully falls back to NLDEV-only field capture, which
+	 * means user_addr / access_flags will be absent from the
+	 * image and downstream RESTORE_MR may fail. We log so this
+	 * is visible if it ever fires in practice.
 	 */
-	if (rdma_record_dumped_ufile(p->pid, ibdev, uve.driver_id,
-				     uve.criu_driver, uve.id,
-				     uve.has_ctxn, uve.ctxn)) {
-		pr_err("dump_uverbsfile: failed to record ufile id=%#x for "
-		       "post-dump uobj DAG walk\n", uve.id);
-		goto out;
+	{
+		int duped = fcntl(lfd, F_DUPFD_CLOEXEC, 0);
+		if (duped < 0) {
+			pr_warn("dump_uverbsfile: F_DUPFD_CLOEXEC of "
+				"holder uverbsfd (pid=%d uvfe=%#x) failed: "
+				"%s -- post-dump QUERY_MR walk will run "
+				"without user_addr/access_flags coverage\n",
+				p->pid, uve.id, strerror(errno));
+		}
+		if (rdma_record_dumped_ufile(p->pid, ibdev, uve.driver_id,
+					     uve.criu_driver, uve.id,
+					     uve.has_ctxn, uve.ctxn,
+					     duped)) {
+			pr_err("dump_uverbsfile: failed to record ufile id=%#x "
+			       "for post-dump uobj DAG walk\n", uve.id);
+			goto out;
+		}
 	}
 
 	img = img_from_set(glob_imgset, CR_FD_FILES);
@@ -1819,7 +1860,224 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
 }
 
-/* MR callback: PDN-join, NLDEV-derived MR identity hints. */
+/*
+ * UAPI lag shim for UVERBS_OBJECT_MR / UVERBS_METHOD_QUERY_MR /
+ * UVERBS_ATTR_QUERY_MR_*. Used by the dump-side R3 walk
+ * (uobj_mr_cb below) to harvest each MR's wire identity + shape +
+ * registration provenance from the kernel.
+ *
+ * Upstream kernel: include/uapi/rdma/ib_user_ioctl_cmds.h carries
+ *   UVERBS_OBJECT_MR                       = 7
+ *   UVERBS_METHOD_QUERY_MR                 = 3   (within OBJECT_MR)
+ *   UVERBS_ATTR_QUERY_MR_HANDLE            = 0
+ *   UVERBS_ATTR_QUERY_MR_RESP_LKEY         = 1
+ *   UVERBS_ATTR_QUERY_MR_RESP_RKEY         = 2
+ *   UVERBS_ATTR_QUERY_MR_RESP_LENGTH       = 3
+ *   UVERBS_ATTR_QUERY_MR_RESP_IOVA         = 4
+ *   UVERBS_ATTR_QUERY_MR_RESP_USER_ADDR    = 5  (kernel 35fb92467f68)
+ *   UVERBS_ATTR_QUERY_MR_RESP_ACCESS_FLAGS = 6  (kernel 35fb92467f68)
+ *
+ * Wire-format note: the OBJECT_MR / METHOD_QUERY_MR / four legacy
+ * attr ids have been stable upstream since 6c01e6b218ae ("IB/uverbs:
+ * Expose UAPI to query MR"). The two USER_ADDR / ACCESS_FLAGS attrs
+ * are CRIU-driven additions (35fb92467f68 "RDMA/uverbs: surface
+ * user_addr + access_flags via QUERY_MR"); a pre-35fb92 kernel
+ * that doesn't recognise these attr_ids will reject the ioctl
+ * outright (uverbs treats unknown attr ids as schema mismatch),
+ * which uobj_mr_cb surfaces as a fallback to NLDEV-only field
+ * capture.
+ *
+ * Drop the shim once the build's minimum rdma-core ships these
+ * symbols upstream.
+ */
+#ifndef UVERBS_OBJECT_MR
+#define UVERBS_OBJECT_MR			7
+#endif
+#ifndef UVERBS_METHOD_QUERY_MR
+#define UVERBS_METHOD_QUERY_MR			3
+#endif
+#ifndef UVERBS_ATTR_QUERY_MR_HANDLE
+#define UVERBS_ATTR_QUERY_MR_HANDLE		0
+#endif
+#ifndef UVERBS_ATTR_QUERY_MR_RESP_LKEY
+#define UVERBS_ATTR_QUERY_MR_RESP_LKEY		1
+#endif
+#ifndef UVERBS_ATTR_QUERY_MR_RESP_RKEY
+#define UVERBS_ATTR_QUERY_MR_RESP_RKEY		2
+#endif
+#ifndef UVERBS_ATTR_QUERY_MR_RESP_LENGTH
+#define UVERBS_ATTR_QUERY_MR_RESP_LENGTH	3
+#endif
+#ifndef UVERBS_ATTR_QUERY_MR_RESP_IOVA
+#define UVERBS_ATTR_QUERY_MR_RESP_IOVA		4
+#endif
+#ifndef UVERBS_ATTR_QUERY_MR_RESP_USER_ADDR
+#define UVERBS_ATTR_QUERY_MR_RESP_USER_ADDR	5
+#endif
+#ifndef UVERBS_ATTR_QUERY_MR_RESP_ACCESS_FLAGS
+#define UVERBS_ATTR_QUERY_MR_RESP_ACCESS_FLAGS	6
+#endif
+
+/*
+ * Six-OUT reply payload for rdma_send_query_mr. has_<field> is
+ * set on a successful ioctl: all six attrs are MANDATORY-from-
+ * userspace in our request, so a current kernel writes them all
+ * or the ioctl rejects entirely (no partial-write outcome).
+ */
+struct rdma_query_mr_resp {
+	uint32_t lkey;
+	uint32_t rkey;
+	uint64_t length;
+	uint64_t iova;
+	uint64_t user_addr;
+	uint32_t access_flags;
+	bool has_lkey;
+	bool has_rkey;
+	bool has_length;
+	bool has_iova;
+	bool has_user_addr;
+	bool has_access_flags;
+};
+
+/*
+ * Issue UVERBS_METHOD_QUERY_MR on @cmd_fd against the holder's
+ * ucontext for MR ufile-handle @handle. Used by the dump-side R3
+ * walk to harvest the MR's wire identity (lkey, rkey), shape
+ * (length, iova), and registration provenance (user VA,
+ * access_flags) so the destination's RESTORE_MR can replay them
+ * verbatim.
+ *
+ * @cmd_fd MUST be a dup of the holder's uverbs cdev fd so that
+ * the handle resolves in the right ucontext IDR. The per-IDR
+ * access check ('this MR belongs to that ucontext') is what pins
+ * down the security boundary -- see the commit message of
+ * 35fb92467f68 for the rationale, including why this is strictly
+ * tighter than NLDEV's CAP_NET_ADMIN gate.
+ *
+ * Returns 0 on success (with @resp populated); -errno on ioctl
+ * failure. -EPROTONOSUPPORT or -EOPNOTSUPP from a kernel that
+ * lacks the user_addr/access_flags attrs is the caller's signal
+ * to fall back to NLDEV-only field capture.
+ */
+static int rdma_send_query_mr(int cmd_fd, uint32_t driver_id,
+			      uint32_t handle,
+			      struct rdma_query_mr_resp *resp)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[7];
+	} cmd = {};
+	unsigned int n = 0;
+
+	memset(resp, 0, sizeof(*resp));
+
+	cmd.hdr.object_id = UVERBS_OBJECT_MR;
+	cmd.hdr.method_id = UVERBS_METHOD_QUERY_MR;
+	/*
+	 * QUERY_MR is a generic core uverb (no driver-id-keyed
+	 * dispatch on the kernel's UAPI side), but the ioctl
+	 * dispatcher still validates @driver_id against the per-
+	 * ucontext rdma_driver_id (uverbs_ioctl.c::ib_uverbs_run_
+	 * method): a mismatch returns -EINVAL. Pass the destination
+	 * ibdev's kernel driver id (RDMA_DRIVER_RXE / _MLX5 / ...)
+	 * so the validation succeeds.
+	 */
+	cmd.hdr.driver_id = driver_id;
+
+	/* HANDLE: IDR(MR_OBJECT) -- attr->data carries the per-ufile handle. */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_QUERY_MR_HANDLE;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = handle;
+	n++;
+
+	/* Four legacy mandatory OUT attrs (since kernel 6c01e6b218ae). */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_QUERY_MR_RESP_LKEY;
+	cmd.attrs[n].len = sizeof(resp->lkey);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp->lkey;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_QUERY_MR_RESP_RKEY;
+	cmd.attrs[n].len = sizeof(resp->rkey);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp->rkey;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_QUERY_MR_RESP_LENGTH;
+	cmd.attrs[n].len = sizeof(resp->length);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp->length;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_QUERY_MR_RESP_IOVA;
+	cmd.attrs[n].len = sizeof(resp->iova);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp->iova;
+	n++;
+
+	/*
+	 * Two CRIU-additions (kernel 35fb92467f68). Sent as
+	 * F_MANDATORY-from-userspace so uverbs_copy_to actually
+	 * writes them on a current kernel. On a pre-35fb92 kernel
+	 * the ioctl rejects with -EPROTONOSUPPORT and uobj_mr_cb
+	 * falls back to NLDEV-only emission.
+	 */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_QUERY_MR_RESP_USER_ADDR;
+	cmd.attrs[n].len = sizeof(resp->user_addr);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp->user_addr;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_QUERY_MR_RESP_ACCESS_FLAGS;
+	cmd.attrs[n].len = sizeof(resp->access_flags);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp->access_flags;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+
+	resp->has_lkey = true;
+	resp->has_rkey = true;
+	resp->has_length = true;
+	resp->has_iova = true;
+	resp->has_user_addr = true;
+	resp->has_access_flags = true;
+	return 0;
+}
+
+/*
+ * MR callback: PDN-join + per-MR QUERY_MR ioctl on the holder's
+ * stashed uverbsfd to harvest the full RESTORE_MR feed (lkey/rkey
+ * identity, shape (length, iova), and registration provenance
+ * (user_addr, access_flags)).
+ *
+ * QUERY_MR is the canonical source of all five fields on a current
+ * kernel (35fb92467f68 + 6c01e6b218ae). NLDEV's RES_MR_GET supplies
+ * the same lkey/rkey/length/iova subset gated by CAP_NET_ADMIN, but
+ * not user_addr or access_flags -- those live on the new
+ * core-owned struct ib_mr fields and are exposed exclusively
+ * through the per-ucontext-IDR-gated uverbs ioctl path. Using
+ * QUERY_MR for the entire field set (rather than NLDEV for some +
+ * QUERY_MR for the rest) keeps a single source of truth and avoids
+ * NLDEV-vs-uverbs skew when the MR was just rereg'd or when the
+ * dump straddles a state transition.
+ *
+ * Ufile-handle source: NLDEV K8a (RDMA_NLDEV_ATTR_RES_HANDLE),
+ * which is the same per-ufile id userspace and the kernel's QUERY_
+ * MR IDR resolver agree on. Without K8a we cannot issue QUERY_MR
+ * (no handle to feed it), so the entry is skipped.
+ *
+ * Fallback: if QUERY_MR fails (kernel pre-35fb92467f68, or the
+ * stashed fd dup wasn't captured), we still emit the entry with
+ * NLDEV-only fields. Restore-side rdma_send_restore_mr will then
+ * fail loudly on the missing user_addr/access_flags rather than
+ * silently registering the MR with sentinel values.
+ */
 static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 {
 	struct uobj_walk_ctx *w = arg;
@@ -1828,6 +2086,8 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	RdmaMrAttrs attrs;
 	RdmaUobjXref xref;
 	RdmaUobjXref *xref_arr[1];
+	struct rdma_query_mr_resp qresp = {};
+	bool query_ok = false;
 
 	if (!e->has_pdn) {
 		w->n_dropped++;
@@ -1843,20 +2103,80 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 			       e->has_restrack_id, e->restrack_id,
 			       e->has_ufile_handle, e->ufile_handle);
 	rdma_mr_attrs__init(&attrs);
-	attrs.has_length = true;
-	attrs.length = e->mr.mrlen;
-	if (e->mr.has_lkey) {
+
+	/*
+	 * Try QUERY_MR first when both the per-MR ufile_handle (K8a)
+	 * and the per-ufile holder fd dup are present. On a current
+	 * kernel this populates all five hw-agnostic fields plus the
+	 * new user_addr / access_flags pair in a single ioctl.
+	 */
+	if (e->has_ufile_handle && uf->holder_uctx_fd >= 0) {
+		int rc = rdma_send_query_mr(uf->holder_uctx_fd,
+					    uf->kernel_driver_id,
+					    e->ufile_handle, &qresp);
+		if (rc) {
+			pr_warn("uobj DAG: QUERY_MR(handle=%u) on "
+				"ibdev=%s ufile_id=%#x failed: %d (%s) "
+				"-- falling back to NLDEV-only fields, "
+				"user_addr/access_flags will be absent "
+				"and RESTORE_MR will refuse this entry "
+				"(kernel needs 35fb92467f68 'RDMA/uverbs: "
+				"surface user_addr + access_flags via "
+				"QUERY_MR')\n",
+				e->ufile_handle, uf->ibdev, uf->uvfe_id,
+				rc, strerror(-rc));
+		} else {
+			query_ok = true;
+		}
+	} else if (!e->has_ufile_handle) {
+		pr_debug("uobj DAG: MR pdn=%u on ibdev=%s has no "
+			 "ufile_handle (kernel pre-K8a / RES_HANDLE not "
+			 "emitted); skipping QUERY_MR, NLDEV-only "
+			 "emission\n", e->pdn, uf->ibdev);
+	} else {
+		pr_warn("uobj DAG: MR pdn=%u on ibdev=%s ufile_id=%#x "
+			"has no holder_uctx_fd dup; QUERY_MR skipped\n",
+			e->pdn, uf->ibdev, uf->uvfe_id);
+	}
+
+	if (query_ok) {
+		/* QUERY_MR is the canonical feed when available. */
 		attrs.has_lkey = true;
-		attrs.lkey = e->mr.lkey;
-	}
-	if (e->mr.has_rkey) {
+		attrs.lkey = qresp.lkey;
 		attrs.has_rkey = true;
-		attrs.rkey = e->mr.rkey;
-	}
-	if (e->mr.has_iova) {
+		attrs.rkey = qresp.rkey;
+		attrs.has_length = true;
+		attrs.length = qresp.length;
 		attrs.has_iova = true;
-		attrs.iova = e->mr.iova;
+		attrs.iova = qresp.iova;
+		attrs.has_virt_addr = true;
+		attrs.virt_addr = qresp.user_addr;
+		attrs.has_access_flags = true;
+		attrs.access_flags = qresp.access_flags;
+	} else {
+		/*
+		 * NLDEV-only fallback. lkey/rkey require CAP_NET_ADMIN
+		 * upstream; CRIU runs as root, so they're populated in
+		 * practice. virt_addr / access_flags stay unset --
+		 * restore-side will refuse such an entry with a clear
+		 * "needs QUERY_MR re-dump" message.
+		 */
+		attrs.has_length = true;
+		attrs.length = e->mr.mrlen;
+		if (e->mr.has_lkey) {
+			attrs.has_lkey = true;
+			attrs.lkey = e->mr.lkey;
+		}
+		if (e->mr.has_rkey) {
+			attrs.has_rkey = true;
+			attrs.rkey = e->mr.rkey;
+		}
+		if (e->mr.has_iova) {
+			attrs.has_iova = true;
+			attrs.iova = e->mr.iova;
+		}
 	}
+
 	pe.mr = &attrs;
 
 	uobj_attach_parent_pd(&pe, &xref, xref_arr, e->pdn);
@@ -2064,6 +2384,23 @@ out:
 		xfree(ib->ufiles);
 		xfree(ib->pdn_map);
 		xfree(ib);
+	}
+	/*
+	 * Drop the holder uverbsfd dups stashed by dump_uverbsfile. The
+	 * walk above is the only consumer; from this point on the holder
+	 * is being killed and the ucontext is gone anyway. Skipping
+	 * close() here would just leak fds into criu's own image-write
+	 * phase, which makes file-leak detectors angry on long-running
+	 * dumps.
+	 */
+	{
+		struct rdma_dumped_ufile *uf2;
+		list_for_each_entry(uf2, &rdma_dumped_ufiles, link) {
+			if (uf2->holder_uctx_fd >= 0) {
+				close(uf2->holder_uctx_fd);
+				uf2->holder_uctx_fd = -1;
+			}
+		}
 	}
 	return ret;
 }
@@ -2443,33 +2780,393 @@ static int rdma_send_restore_pd(int cmd_fd, uint32_t driver_id,
 }
 
 /*
- * Per-ufile restore dispatcher. Called from uverbsfd_open() right
- * after the plugin's RDMA_OPEN_UVERBS_CDEV hook returns the open
- * cdev fd. Walks the DAG group built by rdma_collect_uobj_dag()
- * for @ufile_id and issues the right RESTORE_<TYPE> verb per
- * entry.
+ * UAPI lag shim for UVERBS_METHOD_RESTORE_MR + its ten attrs
+ * (kernel uverbs_attrs_restore_mr in include/uapi/rdma/
+ * ib_user_ioctl_cmds.h). UVERBS_OBJECT_RESTORE / UHW are already
+ * shimmed above for RESTORE_PD; share those.
  *
- * S2 scope: PD only. CQ/QP/MR/SRQ/AH RESTORE_<TYPE> verbs land as
- * the kernel side gains the corresponding driver callbacks; until
- * then those entries are silently skipped (the post-restore
- * application sees the empty ucontext, which is the same situation
- * v0 has had).
+ * Wire-format note: RESTORE_MR sits inside UVERBS_OBJECT_RESTORE
+ * (== 18) because it's a generic core operation (not a per-driver
+ * uobject-class verb). UVERBS_METHOD_RESTORE_MR is method 1 within
+ * that object (RESTORE_PD is method 0). The attr ids are 0..9 in
+ * the order declared in the kernel's uverbs_attrs_restore_mr.
+ *
+ * Drop the shim once the build's minimum rdma-core ships these
+ * symbols upstream.
+ */
+#ifndef UVERBS_METHOD_RESTORE_MR
+#define UVERBS_METHOD_RESTORE_MR		1
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_HANDLE
+#define UVERBS_ATTR_RESTORE_MR_HANDLE		0
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_PD_HANDLE
+#define UVERBS_ATTR_RESTORE_MR_PD_HANDLE	1
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_ADDR
+#define UVERBS_ATTR_RESTORE_MR_ADDR		2
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_LENGTH
+#define UVERBS_ATTR_RESTORE_MR_LENGTH		3
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_IOVA
+#define UVERBS_ATTR_RESTORE_MR_IOVA		4
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_ACCESS_FLAGS
+#define UVERBS_ATTR_RESTORE_MR_ACCESS_FLAGS	5
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_LKEY_HINT
+#define UVERBS_ATTR_RESTORE_MR_LKEY_HINT	6
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_RKEY_HINT
+#define UVERBS_ATTR_RESTORE_MR_RKEY_HINT	7
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_RESP_LKEY
+#define UVERBS_ATTR_RESTORE_MR_RESP_LKEY	8
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_RESP_RKEY
+#define UVERBS_ATTR_RESTORE_MR_RESP_RKEY	9
+#endif
+
+/*
+ * Issue UVERBS_METHOD_RESTORE_MR on @cmd_fd, asking the kernel to
+ * mint an MR uobject at the caller-chosen ufile slot
+ * @target_handle, attached to the parent PD whose ufile slot is
+ * @parent_pd_handle, with shape and access flags taken from the
+ * source's QUERY_MR snapshot.
+ *
+ * @lkey_hint / @rkey_hint are the source's wire-visible identity.
+ * The kernel writes the actually-installed lkey/rkey into the
+ * caller-owned @resp_lkey / @resp_rkey OUT slots:
+ *   - rxe (kernel f422e6ba6bdc): hints are honoured verbatim via
+ *     __rxe_add_to_pool_at_index(); RESP_LKEY/_RKEY equal the
+ *     hints byte-for-byte. The verb returns -EBUSY if the rxe
+ *     pool slot is already occupied.
+ *   - mlx5: see future S4b. The S4a CRIU build only emits the
+ *     core (no UHW) attrs and so produces an MR usable on rxe;
+ *     mlx5 will need a UHW similar to RESTORE_PD's
+ *     mlx5_ib_restore_mr_req carrying the FW mkey index.
+ *
+ * @parent_pd_handle is the PD's destination-side ufile slot. With
+ * Model A handle preservation that equals the source's PD ufile
+ * slot, so the dump-side PD entry's ufile_handle can be looked up
+ * directly through the per-ufile handle map without a translation
+ * step.
+ *
+ * The wire shape (no UHW) intentionally mirrors mr_restore_probe_
+ * rxe.c::do_restore_mr in tools/testing/mlx5_vfmig/uobject_restore.
+ *
+ * Returns 0 on success (with @resp_lkey / @resp_rkey populated);
+ * -errno on ioctl failure.
+ */
+static int rdma_send_restore_mr(int cmd_fd, uint32_t driver_id,
+				uint32_t target_handle,
+				uint32_t parent_pd_handle,
+				uint64_t addr, uint64_t length,
+				uint64_t iova, uint32_t access_flags,
+				uint32_t lkey_hint, uint32_t rkey_hint,
+				uint32_t *resp_lkey, uint32_t *resp_rkey)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[10];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_MR;
+	cmd.hdr.driver_id = driver_id;
+
+	/*
+	 * Wire-format note for PTR_IN / FLAGS_IN attrs whose declared
+	 * size is <= sizeof(u64): the kernel takes the inline path
+	 * (uverbs_attr_ptr_is_inline()) and reads attr->ptr_attr.data
+	 * AS THE VALUE -- not as a pointer to it. We follow the
+	 * convention used by RESTORE_PD's HANDLE attr above:
+	 *   for PTR_IN(u32): data = value (low 32 bits), len = 4
+	 *   for PTR_IN(u64): data = value, len = 8
+	 *   for FLAGS_IN:    data = value, len = 4 (or 8)
+	 *   for IDR input:   data = handle value, len = 0
+	 *   for PTR_OUT:     data = (uintptr_t)&buffer, len = sizeof
+	 *                    (output ALWAYS uses a userspace pointer
+	 *                     via copy_to_user)
+	 * Passing `data = (uintptr_t)&local_var` for PTR_IN <= 8 was
+	 * a bug that surfaces as -EINVAL from FLAGS_IN bitmask checks
+	 * (the kernel sees the pointer's value as the flags) and
+	 * wildly-wrong addr/length on the driver side.
+	 */
+
+	/* HANDLE: PTR_IN(u32) -- inline. */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_HANDLE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = target_handle;
+	n++;
+
+	/* PD_HANDLE: IDR(OBJECT_PD) input -- attr->data carries the handle. */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_PD_HANDLE;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = parent_pd_handle;
+	n++;
+
+	/* ADDR / LENGTH / IOVA: PTR_IN(u64) -- inline. */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_ADDR;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = addr;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_LENGTH;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = length;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_IOVA;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = iova;
+	n++;
+
+	/* ACCESS_FLAGS: FLAGS_IN(u32) -- inline. */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_ACCESS_FLAGS;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = access_flags;
+	n++;
+
+	/* LKEY_HINT / RKEY_HINT: PTR_IN(u32) -- inline. */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_LKEY_HINT;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = lkey_hint;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RKEY_HINT;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = rkey_hint;
+	n++;
+
+	/* RESP_LKEY / RESP_RKEY: PTR_OUT(u32) -- pointer to user buffer. */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RESP_LKEY;
+	cmd.attrs[n].len = sizeof(*resp_lkey);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)resp_lkey;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RESP_RKEY;
+	cmd.attrs[n].len = sizeof(*resp_rkey);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)resp_rkey;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Per-ufile handle map entry. Built up as we restore each uobject
+ * in topological order; consumed by children that need to resolve
+ * a parent xref ((target_type, target_restrack_id)) to the
+ * parent's destination-side ufile_handle.
+ *
+ * Model A (handle preservation) means the destination handle
+ * always equals the source's recorded ufile_handle, so
+ * "destination handle" == "source's RdmaUobjEntry.ufile_handle"
+ * and the map is really just a (type, restrack_id) -> uint32_t
+ * table populated from each successfully-installed parent's image
+ * entry. Doing the lookup the long way (via this map) keeps the
+ * design symmetric with future drivers that may not preserve
+ * handles -- the lookup interface stays the same; only the way we
+ * populate the map changes.
+ */
+struct uobj_handle_map_entry {
+	R3UobjType type;
+	uint32_t restrack_id;
+	uint32_t ufile_handle;
+};
+
+struct uobj_handle_map {
+	struct uobj_handle_map_entry *e;
+	size_t n;
+	size_t cap;
+};
+
+static int uobj_handle_map_add(struct uobj_handle_map *m,
+			       R3UobjType type, uint32_t restrack_id,
+			       uint32_t ufile_handle)
+{
+	if (m->n == m->cap) {
+		size_t newcap = m->cap ? m->cap * 2 : 8;
+		void *p = xrealloc(m->e, newcap * sizeof(*m->e));
+		if (!p)
+			return -1;
+		m->e = p;
+		m->cap = newcap;
+	}
+	m->e[m->n].type = type;
+	m->e[m->n].restrack_id = restrack_id;
+	m->e[m->n].ufile_handle = ufile_handle;
+	m->n++;
+	return 0;
+}
+
+static bool uobj_handle_map_lookup(const struct uobj_handle_map *m,
+				   R3UobjType type, uint32_t restrack_id,
+				   uint32_t *ufile_handle)
+{
+	for (size_t i = 0; i < m->n; i++) {
+		if (m->e[i].type == type &&
+		    m->e[i].restrack_id == restrack_id) {
+			*ufile_handle = m->e[i].ufile_handle;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Look up the @role-typed parent reference on @e and return its
+ * destination-side ufile_handle via @out. Returns false if the xref
+ * is missing, the target's restrack_id was missing, or the target
+ * hasn't been added to the map yet (i.e. wasn't restored in an
+ * earlier topo pass).
+ */
+static bool uobj_resolve_parent(const RdmaUobjEntry *e,
+				R3XrefRole role,
+				const struct uobj_handle_map *m,
+				uint32_t *out)
+{
+	for (size_t i = 0; i < e->n_xref; i++) {
+		const RdmaUobjXref *xr = e->xref[i];
+
+		if (xr->role != role)
+			continue;
+		if (uobj_handle_map_lookup(m, xr->target_type,
+					   xr->target_restrack_id, out))
+			return true;
+		return false;
+	}
+	return false;
+}
+
+/*
+ * Phase-B pending list: per-ufile restore state stashed by
+ * rdma_restore_uobj_dag_for_ufile() (Phase A, pre-VMA) and consumed
+ * by rdma_restore_uobj_dag_post_vma() (Phase B, post-VMA).
+ *
+ * Why split: verbs that pin user pages
+ * (UVERBS_METHOD_RESTORE_MR -> pin_user_pages_fast(user_addr, ...))
+ * need the restored task's user VMAs to already be mapped, but
+ * uverbsfd_open() runs during prepare_fds() which is BEFORE
+ * open_vmas(). Phase A handles VA-independent verbs (PD today;
+ * CQ/QP/SRQ/AH later, none of which pin user pages) inline,
+ * stashes the rest, and Phase B runs once after open_vmas() in
+ * the same restored task.
+ *
+ * Held state per pending ufile:
+ *   cmd_fd_dup       O_CLOEXEC dup of the plugin's open cdev fd.
+ *                    Phase A's @cmd_fd is a transient passed-in
+ *                    parameter; Phase B needs its own long-lived
+ *                    handle on the same struct file because the
+ *                    kernel ucontext IDR resolves through it.
+ *                    Closed by Phase B at end-of-walk.
+ *   ufile_id /
+ *   kernel_driver_id Pass-through inputs to RESTORE_<TYPE>.
+ *   g                The DAG group from rdma_uobj_group_lookup --
+ *                    avoids a re-lookup; unchanged across phases.
+ *   handle_map       Built up in Phase A (one entry per PD
+ *                    successfully RESTORE_PD'd), consumed in
+ *                    Phase B (every R3UT_MR's PARENT_PD xref is
+ *                    resolved through it). Owned by this struct,
+ *                    freed at end-of-Phase-B.
+ */
+struct uobj_pending_post_vma {
+	int cmd_fd_dup;
+	uint32_t ufile_id;
+	uint32_t kernel_driver_id;
+	struct uobj_ufile_group *g;
+	struct uobj_handle_map handle_map;
+	struct list_head link;
+};
+static LIST_HEAD(rdma_pending_post_vma);
+
+static int rdma_pending_post_vma_add(int cmd_fd_dup, uint32_t ufile_id,
+				     uint32_t kernel_driver_id,
+				     struct uobj_ufile_group *g,
+				     struct uobj_handle_map *handle_map)
+{
+	struct uobj_pending_post_vma *p;
+
+	p = xzalloc(sizeof(*p));
+	if (!p) {
+		close(cmd_fd_dup);
+		xfree(handle_map->e);
+		return -1;
+	}
+	p->cmd_fd_dup = cmd_fd_dup;
+	p->ufile_id = ufile_id;
+	p->kernel_driver_id = kernel_driver_id;
+	p->g = g;
+	/* Move the handle_map -- caller no longer owns the storage. */
+	p->handle_map = *handle_map;
+	memset(handle_map, 0, sizeof(*handle_map));
+	INIT_LIST_HEAD(&p->link);
+	list_add_tail(&p->link, &rdma_pending_post_vma);
+	return 0;
+}
+
+/*
+ * Per-ufile restore dispatcher (Phase A, pre-VMA). Called from
+ * uverbsfd_open() right after the plugin's RDMA_OPEN_UVERBS_CDEV
+ * hook returns the open cdev fd. Walks the DAG group built by
+ * rdma_collect_uobj_dag() for @ufile_id and issues the VA-
+ * independent RESTORE_<TYPE> verbs (PD today; CQ/QP/SRQ/AH later)
+ * in topological order, building a (restrack_id -> ufile_handle)
+ * handle_map as it goes. VA-dependent verbs (MR; later DEVX_UMEM)
+ * are deferred to rdma_restore_uobj_dag_post_vma() because their
+ * kernel handlers pin_user_pages_fast() against current->mm and
+ * the restored task's VMAs aren't laid out yet at this point in
+ * the per-task restore flow (see rdma.h::rdma_restore_uobj_dag_
+ * post_vma).
+ *
+ * S2..S4a scope: PD pre-VMA + MR post-VMA (rxe). CQ / QP / SRQ /
+ * AH RESTORE_<TYPE> verbs land as the kernel side gains the
+ * corresponding driver callbacks; until then those entries are
+ * silently skipped (the post-restore application sees the empty-
+ * of-CQ/QP ucontext, which is the same situation pre-S2 had).
  *
  * Skips entries without ufile_handle (kernel pre-K8a / future
  * resource classes that aren't NLDEV-emitted) -- without a target
  * handle there's nothing to ask the kernel for.
  *
- * Returns 0 on success (including the no-DAG / no-PD-entries
- * cases); -1 on the first per-entry restore failure, with the
- * offending (ufile_id, type, ufile_handle) in the pr_err.
+ * On success Phase A stashes (cmd_fd_dup, ufile_id, kernel_driver_
+ * id, handle_map, group) onto the rdma_pending_post_vma list iff
+ * the group has any VA-dependent entries (MRs); the dup'd fd is
+ * O_CLOEXEC and is closed by Phase B. If the DAG has no VA-
+ * dependent entries we don't bother stashing -- there's nothing
+ * for Phase B to do for this ufile.
+ *
+ * Returns 0 on success (including the no-DAG case); -1 on the
+ * first per-entry Phase-A restore failure, with the offending
+ * (ufile_id, type, ufile_handle) in the pr_err.
  */
 int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 				    uint32_t kernel_driver_id)
 {
 	struct uobj_ufile_group *g;
 	struct uobj_collected *c;
+	struct uobj_handle_map handle_map = {};
 	int n_pd_restored = 0;
 	int n_pd_skipped = 0;
+	int n_mr_pending = 0;
+	int ret = -1;
 
 	g = rdma_uobj_group_lookup(ufile_id);
 	if (!g) {
@@ -2479,122 +3176,389 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 		return 0;
 	}
 
+	/*
+	 * Pass 1: PDs. PD has no parent xref so order within the
+	 * pass doesn't matter; doing PDs first ensures every MR's
+	 * parent_pd_handle is in handle_map for Phase B.
+	 */
 	list_for_each_entry(c, &g->entries, link) {
 		const RdmaUobjEntry *e = c->e;
 		int rc;
 
-		switch (e->type) {
-		case R3_UOBJ_TYPE__R3UT_PD:
-			if (!e->has_ufile_handle) {
-				/*
-				 * Pre-K8a image, or NLDEV walk lost the
-				 * field. Without target_handle we can't
-				 * ask the kernel to install at a
-				 * specific slot. Count + move on; the
-				 * test fixture asserts handles>0 on a
-				 * fresh image so this surfaces upstream.
-				 */
-				n_pd_skipped++;
-				continue;
-			}
+		if (e->type != R3_UOBJ_TYPE__R3UT_PD)
+			continue;
+		if (!e->has_ufile_handle) {
 			/*
-			 * Source the FW pdn from the per-PD fw_pdn field
-			 * (rdma_uobj.proto), which the dump side sourced
-			 * from the kernel's named "fw_pdn" driver TLV.
-			 * restrack_id is NOT the FW pdn -- it's
-			 * RDMA_NLDEV_ATTR_RES_PDN's per-ibdev restrack
-			 * counter -- and historically was passed here by
-			 * accident (silently correct on freshly-booted
-			 * hosts only). Falling back to restrack_id on
-			 * an old image keeps backward-compat for rxe
-			 * (which ignores UHW anyway), at the cost of
-			 * mlx5 images dumped against a pre-fix kernel
-			 * being rejected loudly by rdma_send_restore_pd.
+			 * Pre-K8a image, or NLDEV walk lost the
+			 * field. Without target_handle we can't
+			 * ask the kernel to install at a
+			 * specific slot. Count + move on; the
+			 * test fixture asserts handles>0 on a
+			 * fresh image so this surfaces upstream.
 			 */
-			rc = rdma_send_restore_pd(cmd_fd, kernel_driver_id,
-						  e->ufile_handle,
-						  e->has_fw_pdn,
-						  e->fw_pdn);
-			if (rc) {
-				pr_err("uobj DAG: ufile_id=%#x RESTORE_PD"
-				       "(target_handle=%u, driver_id=%u, "
-				       "fw_pdn=%s%u, fw_uid=%s%u) failed: "
-				       "%d (%s)%s\n",
-				       ufile_id, e->ufile_handle,
-				       kernel_driver_id,
-				       e->has_fw_pdn ? "" : "?",
-				       e->has_fw_pdn ? e->fw_pdn : 0,
-				       e->has_fw_uid ? "" : "?",
-				       e->has_fw_uid ? e->fw_uid : 0,
-				       rc, strerror(-rc),
-				       rc == -EOPNOTSUPP
-				       ? " -- kernel has no "
-				         "ib_device_ops.restore_pd for this "
-				         "driver (rxe needs the e06868342fce "
-				         "patch; mlx5 needs 4baa782ba0af)"
-				       : rc == -EPERM
-				       ? " -- ucontext not in restore mode "
-				         "(plugin's RDMA_OPEN_UVERBS_CDEV "
-				         "must use a per-driver restore-mode "
-				         "GET_CONTEXT: rxe needs "
-				         "RXE_ALLOC_UCTX_RESTORE_MODE, mlx5 "
-				         "needs MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE)"
-				       : rc == -EBUSY
-				       ? " -- target_handle collision "
-				         "(another uobject already at this "
-				         "ufile slot; image is internally "
-				         "inconsistent or the kernel ufile "
-				         "is not pristine)"
-				       : rc == -ENOENT &&
-					 kernel_driver_id == RDMA_DRIVER_MLX5
-				       ? " -- mlx5_ib_restore_pd FW probe "
-				         "rejected (pdn, devx_uid). v0 "
-				         "policy: dest ucontext is opened "
-				         "WITHOUT DEVX so devx_uid=0 is the "
-				         "expected probe lane; if -ENOENT "
-				         "still fires, the image's fw_pdn "
-				         "is stale (re-dump needed: kernel "
-				         "ABI for fw_pdn is the named "
-				         "driver TLV in RDMA_NLDEV_ATTR_"
-				         "DRIVER, kernel d4acb54ebd3d). "
-				         "DEVX-uid adoption is vestigial: "
-				         "LOAD_VHCA_STATE does not preserve "
-				         "the FW uctx registration table, "
-				         "so non-zero uids are unrecoverable "
-				         "(kernel 73c76f299c01, design "
-				         "uobject_restore.md S3b). See dmesg "
-				         "mlx5_ib_warn 'restore_pd: FW probe "
-				         "rejected'."
-				       : rc == -EINVAL &&
-					 kernel_driver_id == RDMA_DRIVER_MLX5
-				       ? " -- mlx5_ib_restore_pd rejected the "
-				         "UHW (pdn=0 is reserved, reserved/"
-				         "reserved2 must be 0, or udata size "
-				         "mismatch -- check struct "
-				         "mlx5_ib_restore_pd_req packing)"
-				       : "");
-				return -1;
+			n_pd_skipped++;
+			continue;
+		}
+		/*
+		 * Source the FW pdn from the per-PD fw_pdn field
+		 * (rdma_uobj.proto), which the dump side sourced
+		 * from the kernel's named "fw_pdn" driver TLV.
+		 * restrack_id is NOT the FW pdn -- it's
+		 * RDMA_NLDEV_ATTR_RES_PDN's per-ibdev restrack
+		 * counter -- and historically was passed here by
+		 * accident (silently correct on freshly-booted
+		 * hosts only). Falling back to restrack_id on
+		 * an old image keeps backward-compat for rxe
+		 * (which ignores UHW anyway), at the cost of
+		 * mlx5 images dumped against a pre-fix kernel
+		 * being rejected loudly by rdma_send_restore_pd.
+		 */
+		rc = rdma_send_restore_pd(cmd_fd, kernel_driver_id,
+					  e->ufile_handle,
+					  e->has_fw_pdn,
+					  e->fw_pdn);
+		if (rc) {
+			pr_err("uobj DAG: ufile_id=%#x RESTORE_PD"
+			       "(target_handle=%u, driver_id=%u, "
+			       "fw_pdn=%s%u, fw_uid=%s%u) failed: "
+			       "%d (%s)%s\n",
+			       ufile_id, e->ufile_handle,
+			       kernel_driver_id,
+			       e->has_fw_pdn ? "" : "?",
+			       e->has_fw_pdn ? e->fw_pdn : 0,
+			       e->has_fw_uid ? "" : "?",
+			       e->has_fw_uid ? e->fw_uid : 0,
+			       rc, strerror(-rc),
+			       rc == -EOPNOTSUPP
+			       ? " -- kernel has no "
+			         "ib_device_ops.restore_pd for this "
+			         "driver (rxe needs the e06868342fce "
+			         "patch; mlx5 needs 4baa782ba0af)"
+			       : rc == -EPERM
+			       ? " -- ucontext not in restore mode "
+			         "(plugin's RDMA_OPEN_UVERBS_CDEV "
+			         "must use a per-driver restore-mode "
+			         "GET_CONTEXT: rxe needs "
+			         "RXE_ALLOC_UCTX_RESTORE_MODE, mlx5 "
+			         "needs MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE)"
+			       : rc == -EBUSY
+			       ? " -- target_handle collision "
+			         "(another uobject already at this "
+			         "ufile slot; image is internally "
+			         "inconsistent or the kernel ufile "
+			         "is not pristine)"
+			       : rc == -ENOENT &&
+				 kernel_driver_id == RDMA_DRIVER_MLX5
+			       ? " -- mlx5_ib_restore_pd FW probe "
+			         "rejected (pdn, devx_uid). v0 "
+			         "policy: dest ucontext is opened "
+			         "WITHOUT DEVX so devx_uid=0 is the "
+			         "expected probe lane; if -ENOENT "
+			         "still fires, the image's fw_pdn "
+			         "is stale (re-dump needed: kernel "
+			         "ABI for fw_pdn is the named "
+			         "driver TLV in RDMA_NLDEV_ATTR_"
+			         "DRIVER, kernel d4acb54ebd3d). "
+			         "DEVX-uid adoption is vestigial: "
+			         "LOAD_VHCA_STATE does not preserve "
+			         "the FW uctx registration table, "
+			         "so non-zero uids are unrecoverable "
+			         "(kernel 73c76f299c01, design "
+			         "uobject_restore.md S3b). See dmesg "
+			         "mlx5_ib_warn 'restore_pd: FW probe "
+			         "rejected'."
+			       : rc == -EINVAL &&
+				 kernel_driver_id == RDMA_DRIVER_MLX5
+			       ? " -- mlx5_ib_restore_pd rejected the "
+			         "UHW (pdn=0 is reserved, reserved/"
+			         "reserved2 must be 0, or udata size "
+			         "mismatch -- check struct "
+			         "mlx5_ib_restore_pd_req packing)"
+			       : "");
+			goto out;
+		}
+		n_pd_restored++;
+
+		/*
+		 * Add to handle_map so MRs (and future CQ/QP/SRQ/AH)
+		 * in Pass 2+ can resolve PARENT_PD xrefs without
+		 * doing a list-walk on every dispatch.
+		 */
+		if (e->has_restrack_id) {
+			if (uobj_handle_map_add(&handle_map,
+						R3_UOBJ_TYPE__R3UT_PD,
+						e->restrack_id,
+						e->ufile_handle) < 0) {
+				pr_err("uobj DAG: ufile_id=%#x: handle_map "
+				       "OOM after RESTORE_PD(handle=%u)\n",
+				       ufile_id, e->ufile_handle);
+				goto out;
 			}
-			n_pd_restored++;
-			break;
-		default:
-			/*
-			 * S2: only PD has a restore verb upstream. CQ
-			 * and onwards land in S3+; until then the
-			 * entries pass through silently. Restored
-			 * application will fault on missing CQ/QP at
-			 * its first verb call -- exactly what the
-			 * pre-S2 baseline did.
-			 */
-			break;
+		} else {
+			pr_warn("uobj DAG: ufile_id=%#x: PD entry handle=%u "
+				"has no restrack_id; child MR/CQ/QP xrefs "
+				"to this PD won't resolve\n",
+				ufile_id, e->ufile_handle);
 		}
 	}
 
-	if (n_pd_restored || n_pd_skipped)
-		pr_info("uobj DAG: ufile_id=%#x restored %d PD(s), "
-			"skipped %d (no ufile_handle)\n",
-			ufile_id, n_pd_restored, n_pd_skipped);
-	return 0;
+	/*
+	 * Pass 2 (deferred): count VA-dependent entries (MRs) so we
+	 * know whether to stash this ufile for Phase B. We don't
+	 * issue RESTORE_MR here -- the kernel handler pins user
+	 * pages and the restored task's VMAs aren't mapped yet.
+	 */
+	list_for_each_entry(c, &g->entries, link) {
+		const RdmaUobjEntry *e = c->e;
+
+		if (e->type == R3_UOBJ_TYPE__R3UT_MR && e->has_ufile_handle)
+			n_mr_pending++;
+	}
+
+	if (n_mr_pending > 0) {
+		int dup;
+
+		/*
+		 * Dup high. CRIU's per-task file restorer reinstalls
+		 * source-side fds at their original numbers via
+		 * move_fd_from -> fcntl(F_DUPFD, want_fd) (see util.c::
+		 * reopen_fd_as_safe). Without allow_reuse_fd that's a
+		 * hard "lowest >= want_fd that's free" allocator: if
+		 * any of [0..want_fd) is occupied by a CRIU-internal
+		 * fd, F_DUPFD returns a *higher* number than want_fd
+		 * and CRIU errors with "fd N already in use". Our dup
+		 * lands here too; if we let it grab fd 3 (or whatever
+		 * the source's user-visible cdev fd was), the move-in
+		 * for cmd_fd to fle->fe->fd fails. Starting the dup at
+		 * a deliberately-high min keeps it out of the user-fd
+		 * range that the per-task restorer needs to assign,
+		 * while still being below CRIU's own service-fd range
+		 * (service_fd_base ~= rlimit-256). 1<<14 is well above
+		 * any plausible user-fd allocation in the restored
+		 * task and well below service_fd_base on any current
+		 * RLIMIT_NOFILE tuning.
+		 */
+		dup = fcntl(cmd_fd, F_DUPFD_CLOEXEC, 1 << 14);
+		if (dup < 0) {
+			pr_err("uobj DAG: ufile_id=%#x: F_DUPFD_CLOEXEC of "
+			       "cdev fd for Phase B failed: %s\n",
+			       ufile_id, strerror(errno));
+			goto out;
+		}
+		if (rdma_pending_post_vma_add(dup, ufile_id,
+					      kernel_driver_id, g,
+					      &handle_map) < 0) {
+			pr_err("uobj DAG: ufile_id=%#x: stashing Phase B "
+			       "state failed (OOM); MR restore won't "
+			       "run\n", ufile_id);
+			goto out;
+		}
+		/*
+		 * handle_map ownership was moved into the pending
+		 * entry; the local copy is now zero-initialised so
+		 * the cleanup path below is safe.
+		 */
+	}
+
+	ret = 0;
+out:
+	if (n_pd_restored || n_pd_skipped || n_mr_pending)
+		pr_info("uobj DAG: ufile_id=%#x Phase A: restored %d PD(s) "
+			"[skipped %d]; %d MR(s) deferred to post-VMA "
+			"Phase B\n",
+			ufile_id, n_pd_restored, n_pd_skipped,
+			n_mr_pending);
+	xfree(handle_map.e);
+	return ret;
+}
+
+int rdma_restore_uobj_dag_post_vma(void)
+{
+	struct uobj_pending_post_vma *p, *p_next;
+	int ret = 0;
+
+	if (list_empty(&rdma_pending_post_vma))
+		return 0;
+
+	list_for_each_entry_safe(p, p_next, &rdma_pending_post_vma, link) {
+		struct uobj_collected *c;
+		int n_mr_restored = 0;
+		int n_mr_skipped = 0;
+		int per_ret = 0;
+
+		list_for_each_entry(c, &p->g->entries, link) {
+			const RdmaUobjEntry *e = c->e;
+			uint32_t parent_pd_handle = 0;
+			uint32_t resp_lkey = 0, resp_rkey = 0;
+			const RdmaMrAttrs *attrs;
+			int rc;
+
+			if (e->type != R3_UOBJ_TYPE__R3UT_MR)
+				continue;
+			if (!e->has_ufile_handle) {
+				n_mr_skipped++;
+				continue;
+			}
+			attrs = e->mr;
+			if (!attrs ||
+			    !attrs->has_lkey || !attrs->has_rkey ||
+			    !attrs->has_length || !attrs->has_iova ||
+			    !attrs->has_virt_addr ||
+			    !attrs->has_access_flags) {
+				pr_err("uobj DAG: ufile_id=%#x MR"
+				       "(handle=%u, restrack_id=%s%u) "
+				       "is missing one or more RESTORE_"
+				       "MR feed fields (have lkey=%d "
+				       "rkey=%d length=%d iova=%d "
+				       "virt_addr=%d access_flags=%d). "
+				       "RESTORE_MR needs the full set; "
+				       "this image was dumped against a "
+				       "kernel without QUERY_MR's user_"
+				       "addr/access_flags attrs (kernel "
+				       "35fb92467f68 'RDMA/uverbs: "
+				       "surface user_addr + access_"
+				       "flags via QUERY_MR'). Re-dump "
+				       "against a current kernel.\n",
+				       p->ufile_id, e->ufile_handle,
+				       e->has_restrack_id ? "" : "?",
+				       e->has_restrack_id ?
+				       e->restrack_id : 0,
+				       attrs ? attrs->has_lkey : 0,
+				       attrs ? attrs->has_rkey : 0,
+				       attrs ? attrs->has_length : 0,
+				       attrs ? attrs->has_iova : 0,
+				       attrs ? attrs->has_virt_addr : 0,
+				       attrs ?
+				       attrs->has_access_flags : 0);
+				per_ret = -1;
+				break;
+			}
+			if (!uobj_resolve_parent(
+					e, R3_XREF_ROLE__R3XR_PARENT_PD,
+					&p->handle_map,
+					&parent_pd_handle)) {
+				pr_err("uobj DAG: ufile_id=%#x MR"
+				       "(handle=%u, restrack_id=%s%u) "
+				       "has no resolvable PARENT_PD "
+				       "xref (target PD missing from "
+				       "handle_map -- either Phase A "
+				       "didn't restore that PD, or the "
+				       "dump-side xref was lost). "
+				       "RESTORE_MR cannot proceed "
+				       "without a parent PD.\n",
+				       p->ufile_id, e->ufile_handle,
+				       e->has_restrack_id ? "" : "?",
+				       e->has_restrack_id ?
+				       e->restrack_id : 0);
+				per_ret = -1;
+				break;
+			}
+
+			rc = rdma_send_restore_mr(p->cmd_fd_dup,
+						  p->kernel_driver_id,
+						  e->ufile_handle,
+						  parent_pd_handle,
+						  attrs->virt_addr,
+						  attrs->length,
+						  attrs->iova,
+						  attrs->access_flags,
+						  attrs->lkey,
+						  attrs->rkey,
+						  &resp_lkey,
+						  &resp_rkey);
+			if (rc) {
+				pr_err("uobj DAG: ufile_id=%#x "
+				       "RESTORE_MR"
+				       "(target_handle=%u, "
+				       "parent_pd_handle=%u, "
+				       "addr=%#" PRIx64 ", "
+				       "length=%" PRIu64 ", "
+				       "iova=%#" PRIx64 ", "
+				       "access=%#x, lkey_hint=%#x, "
+				       "rkey_hint=%#x, driver_id=%u) "
+				       "failed: %d (%s)%s\n",
+				       p->ufile_id, e->ufile_handle,
+				       parent_pd_handle,
+				       attrs->virt_addr, attrs->length,
+				       attrs->iova,
+				       attrs->access_flags,
+				       attrs->lkey, attrs->rkey,
+				       p->kernel_driver_id,
+				       rc, strerror(-rc),
+				       rc == -EOPNOTSUPP
+				       ? " -- kernel has no ib_device_"
+				         "ops.restore_mr for this "
+				         "driver (rxe needs "
+				         "25f21678609e; mlx5 needs "
+				         "follow-on S4b)"
+				       : rc == -EFAULT
+				       ? " -- pin_user_pages_fast "
+				         "rejected the user_addr; "
+				         "either Phase B fired before "
+				         "open_vmas, or the dump's "
+				         "user_addr no longer maps "
+				         "the same kind of memory in "
+				         "the restored task (e.g. "
+				         "anonymous vs file-backed)"
+				       : rc == -EPERM
+				       ? " -- ucontext not in restore "
+				         "mode (see RESTORE_PD "
+				         "diagnostic)"
+				       : rc == -EBUSY
+				       ? " -- target_handle collision "
+				         "OR rxe lkey/rkey-hint pool "
+				         "slot is occupied (rxe MR "
+				         "pool keys by lkey >> 8; "
+				         "another MR with same prefix "
+				         "is live)"
+				       : "");
+				per_ret = -1;
+				break;
+			}
+
+			/*
+			 * Identity assertion. With f422e6ba6bdc rxe
+			 * honours lkey_hint/rkey_hint exactly; mlx5
+			 * via the FW mkey_index UHW (S4b). RESP_LKEY/
+			 * RKEY *should* equal the hints byte-for-byte.
+			 */
+			if (resp_lkey != attrs->lkey ||
+			    resp_rkey != attrs->rkey) {
+				pr_err("uobj DAG: ufile_id=%#x "
+				       "RESTORE_MR(target_handle=%u): "
+				       "kernel installed lkey/rkey "
+				       "(%#x/%#x) differs from hints "
+				       "(%#x/%#x). Identity hint not "
+				       "honoured -- wire-visible rkey "
+				       "is now stale on remote peers "
+				       "and the in-process libibverbs "
+				       "lkey/rkey caches will be "
+				       "wrong. Driver-side regression "
+				       "in restore_mr (rxe: "
+				       "f422e6ba6bdc; mlx5: pending "
+				       "S4b).\n",
+				       p->ufile_id, e->ufile_handle,
+				       resp_lkey, resp_rkey,
+				       attrs->lkey, attrs->rkey);
+				per_ret = -1;
+				break;
+			}
+			n_mr_restored++;
+		}
+
+		pr_info("uobj DAG: ufile_id=%#x Phase B: restored %d "
+			"MR(s) [skipped %d]\n",
+			p->ufile_id, n_mr_restored, n_mr_skipped);
+
+		close(p->cmd_fd_dup);
+		list_del(&p->link);
+		xfree(p->handle_map.e);
+		xfree(p);
+
+		if (per_ret < 0)
+			ret = -1;
+	}
+	return ret;
 }
 
 int rdma_collect_uobj_dag(void)
