@@ -658,17 +658,17 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 
 	/*
-	 * Post-VMA second-phase RDMA uobj restore. Verbs that pin
-	 * user pages (UVERBS_METHOD_RESTORE_MR -> pin_user_pages_
-	 * fast(user_addr, ...)) need the restored task's user VMAs
-	 * to be live in current->mm; uverbsfd_open() (driving the
-	 * Phase-A restore) ran in prepare_fds() above, before
-	 * open_vmas, when none of the user VAs were mapped yet.
-	 * Phase B walks the per-ufile state stashed by Phase A and
-	 * runs the VA-dependent verbs now. No-op when no in-tree
-	 * RDMA contexts had MR (or future DEVX_UMEM) entries.
+	 * Phase B-prep for RDMA uobj restore. Walks the per-ufile
+	 * state stashed by Phase A (in uverbsfd_open() during
+	 * prepare_fds) and serialises any VA-dependent verbs --
+	 * UVERBS_METHOD_RESTORE_MR today, future DEVX_UMEM -- into
+	 * ta->rdma_mrs (RM_PRIVATE) for the pie restorer blob to
+	 * issue post-VMA-placement. Restorer-blob dispatch is in
+	 * criu/pie/restorer.c::restore_rdma_mr; see rdma.h::
+	 * rdma_prepare_rdma_mrs for the full rationale. No-op when
+	 * no in-tree RDMA contexts had MR entries.
 	 */
-	if (rdma_restore_uobj_dag_post_vma())
+	if (rdma_prepare_rdma_mrs(ta))
 		return -1;
 
 	if (prepare_aios(current, ta))
@@ -3381,6 +3381,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	RST_MEM_FIXUP_PPTR(task_args->vmas);
 	RST_MEM_FIXUP_PPTR(task_args->rings);
+	RST_MEM_FIXUP_PPTR(task_args->rdma_mrs);
 	RST_MEM_FIXUP_PPTR(task_args->tcp_socks);
 	RST_MEM_FIXUP_PPTR(task_args->timerfd);
 	RST_MEM_FIXUP_PPTR(task_args->posix_timers);

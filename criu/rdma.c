@@ -25,6 +25,8 @@
 #include "rdma.h"
 #include "rdma_netlink.h"
 #include "fdinfo.h"
+#include "restorer.h"
+#include "rst-malloc.h"
 #include "xmalloc.h"
 
 #include "images/fdinfo.pb-c.h"
@@ -2780,195 +2782,15 @@ static int rdma_send_restore_pd(int cmd_fd, uint32_t driver_id,
 }
 
 /*
- * UAPI lag shim for UVERBS_METHOD_RESTORE_MR + its ten attrs
- * (kernel uverbs_attrs_restore_mr in include/uapi/rdma/
- * ib_user_ioctl_cmds.h). UVERBS_OBJECT_RESTORE / UHW are already
- * shimmed above for RESTORE_PD; share those.
- *
- * Wire-format note: RESTORE_MR sits inside UVERBS_OBJECT_RESTORE
- * (== 18) because it's a generic core operation (not a per-driver
- * uobject-class verb). UVERBS_METHOD_RESTORE_MR is method 1 within
- * that object (RESTORE_PD is method 0). The attr ids are 0..9 in
- * the order declared in the kernel's uverbs_attrs_restore_mr.
- *
- * Drop the shim once the build's minimum rdma-core ships these
- * symbols upstream.
+ * UVERBS_METHOD_RESTORE_MR is issued from the pie restorer blob,
+ * not from CRIU master -- see criu/pie/restorer.c::restore_rdma_mr
+ * for the encoder + the rationale (rxe pin_user_pages_fast needs the
+ * destination task's user mm laid out at its final VAs, which only
+ * happens inside the pie blob during sigreturn_restore). CRIU master
+ * just serialises the per-MR call args into ta->rdma_mrs via
+ * rdma_prepare_rdma_mrs() below, and the pie blob iterates and
+ * issues the ioctl.
  */
-#ifndef UVERBS_METHOD_RESTORE_MR
-#define UVERBS_METHOD_RESTORE_MR		1
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_HANDLE
-#define UVERBS_ATTR_RESTORE_MR_HANDLE		0
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_PD_HANDLE
-#define UVERBS_ATTR_RESTORE_MR_PD_HANDLE	1
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_ADDR
-#define UVERBS_ATTR_RESTORE_MR_ADDR		2
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_LENGTH
-#define UVERBS_ATTR_RESTORE_MR_LENGTH		3
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_IOVA
-#define UVERBS_ATTR_RESTORE_MR_IOVA		4
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_ACCESS_FLAGS
-#define UVERBS_ATTR_RESTORE_MR_ACCESS_FLAGS	5
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_LKEY_HINT
-#define UVERBS_ATTR_RESTORE_MR_LKEY_HINT	6
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_RKEY_HINT
-#define UVERBS_ATTR_RESTORE_MR_RKEY_HINT	7
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_RESP_LKEY
-#define UVERBS_ATTR_RESTORE_MR_RESP_LKEY	8
-#endif
-#ifndef UVERBS_ATTR_RESTORE_MR_RESP_RKEY
-#define UVERBS_ATTR_RESTORE_MR_RESP_RKEY	9
-#endif
-
-/*
- * Issue UVERBS_METHOD_RESTORE_MR on @cmd_fd, asking the kernel to
- * mint an MR uobject at the caller-chosen ufile slot
- * @target_handle, attached to the parent PD whose ufile slot is
- * @parent_pd_handle, with shape and access flags taken from the
- * source's QUERY_MR snapshot.
- *
- * @lkey_hint / @rkey_hint are the source's wire-visible identity.
- * The kernel writes the actually-installed lkey/rkey into the
- * caller-owned @resp_lkey / @resp_rkey OUT slots:
- *   - rxe (kernel f422e6ba6bdc): hints are honoured verbatim via
- *     __rxe_add_to_pool_at_index(); RESP_LKEY/_RKEY equal the
- *     hints byte-for-byte. The verb returns -EBUSY if the rxe
- *     pool slot is already occupied.
- *   - mlx5: see future S4b. The S4a CRIU build only emits the
- *     core (no UHW) attrs and so produces an MR usable on rxe;
- *     mlx5 will need a UHW similar to RESTORE_PD's
- *     mlx5_ib_restore_mr_req carrying the FW mkey index.
- *
- * @parent_pd_handle is the PD's destination-side ufile slot. With
- * Model A handle preservation that equals the source's PD ufile
- * slot, so the dump-side PD entry's ufile_handle can be looked up
- * directly through the per-ufile handle map without a translation
- * step.
- *
- * The wire shape (no UHW) intentionally mirrors mr_restore_probe_
- * rxe.c::do_restore_mr in tools/testing/mlx5_vfmig/uobject_restore.
- *
- * Returns 0 on success (with @resp_lkey / @resp_rkey populated);
- * -errno on ioctl failure.
- */
-static int rdma_send_restore_mr(int cmd_fd, uint32_t driver_id,
-				uint32_t target_handle,
-				uint32_t parent_pd_handle,
-				uint64_t addr, uint64_t length,
-				uint64_t iova, uint32_t access_flags,
-				uint32_t lkey_hint, uint32_t rkey_hint,
-				uint32_t *resp_lkey, uint32_t *resp_rkey)
-{
-	struct {
-		struct ib_uverbs_ioctl_hdr	hdr;
-		struct ib_uverbs_attr		attrs[10];
-	} cmd = {};
-	unsigned int n = 0;
-
-	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
-	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_MR;
-	cmd.hdr.driver_id = driver_id;
-
-	/*
-	 * Wire-format note for PTR_IN / FLAGS_IN attrs whose declared
-	 * size is <= sizeof(u64): the kernel takes the inline path
-	 * (uverbs_attr_ptr_is_inline()) and reads attr->ptr_attr.data
-	 * AS THE VALUE -- not as a pointer to it. We follow the
-	 * convention used by RESTORE_PD's HANDLE attr above:
-	 *   for PTR_IN(u32): data = value (low 32 bits), len = 4
-	 *   for PTR_IN(u64): data = value, len = 8
-	 *   for FLAGS_IN:    data = value, len = 4 (or 8)
-	 *   for IDR input:   data = handle value, len = 0
-	 *   for PTR_OUT:     data = (uintptr_t)&buffer, len = sizeof
-	 *                    (output ALWAYS uses a userspace pointer
-	 *                     via copy_to_user)
-	 * Passing `data = (uintptr_t)&local_var` for PTR_IN <= 8 was
-	 * a bug that surfaces as -EINVAL from FLAGS_IN bitmask checks
-	 * (the kernel sees the pointer's value as the flags) and
-	 * wildly-wrong addr/length on the driver side.
-	 */
-
-	/* HANDLE: PTR_IN(u32) -- inline. */
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_HANDLE;
-	cmd.attrs[n].len = sizeof(uint32_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = target_handle;
-	n++;
-
-	/* PD_HANDLE: IDR(OBJECT_PD) input -- attr->data carries the handle. */
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_PD_HANDLE;
-	cmd.attrs[n].len = 0;
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = parent_pd_handle;
-	n++;
-
-	/* ADDR / LENGTH / IOVA: PTR_IN(u64) -- inline. */
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_ADDR;
-	cmd.attrs[n].len = sizeof(uint64_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = addr;
-	n++;
-
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_LENGTH;
-	cmd.attrs[n].len = sizeof(uint64_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = length;
-	n++;
-
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_IOVA;
-	cmd.attrs[n].len = sizeof(uint64_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = iova;
-	n++;
-
-	/* ACCESS_FLAGS: FLAGS_IN(u32) -- inline. */
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_ACCESS_FLAGS;
-	cmd.attrs[n].len = sizeof(uint32_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = access_flags;
-	n++;
-
-	/* LKEY_HINT / RKEY_HINT: PTR_IN(u32) -- inline. */
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_LKEY_HINT;
-	cmd.attrs[n].len = sizeof(uint32_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = lkey_hint;
-	n++;
-
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RKEY_HINT;
-	cmd.attrs[n].len = sizeof(uint32_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = rkey_hint;
-	n++;
-
-	/* RESP_LKEY / RESP_RKEY: PTR_OUT(u32) -- pointer to user buffer. */
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RESP_LKEY;
-	cmd.attrs[n].len = sizeof(*resp_lkey);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = (uintptr_t)resp_lkey;
-	n++;
-
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RESP_RKEY;
-	cmd.attrs[n].len = sizeof(*resp_rkey);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = (uintptr_t)resp_rkey;
-	n++;
-
-	cmd.hdr.num_attrs = n;
-	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
-
-	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
-		return -errno;
-	return 0;
-}
 
 /*
  * Per-ufile handle map entry. Built up as we restore each uobject
@@ -3372,26 +3194,37 @@ out:
 	return ret;
 }
 
-int rdma_restore_uobj_dag_post_vma(void)
+int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 {
 	struct uobj_pending_post_vma *p, *p_next;
+	unsigned int n_total_serialised = 0;
 	int ret = 0;
+
+	/*
+	 * Always anchor ta->rdma_mrs at the current RM_PRIVATE cursor
+	 * before we know whether anything will land here -- that way
+	 * the cursor stays consistent with rst_mems[RM_PRIVATE].size
+	 * across the whole prepare_* sequence even on the no-RDMA
+	 * fast path.
+	 */
+	ta->rdma_mrs = (struct rst_rdma_mr *)rst_mem_align_cpos(RM_PRIVATE);
+	ta->rdma_mrs_n = 0;
 
 	if (list_empty(&rdma_pending_post_vma))
 		return 0;
 
 	list_for_each_entry_safe(p, p_next, &rdma_pending_post_vma, link) {
 		struct uobj_collected *c;
-		int n_mr_restored = 0;
-		int n_mr_skipped = 0;
+		unsigned int n_mr_serialised = 0;
+		unsigned int n_mr_skipped = 0;
 		int per_ret = 0;
 
 		list_for_each_entry(c, &p->g->entries, link) {
 			const RdmaUobjEntry *e = c->e;
 			uint32_t parent_pd_handle = 0;
-			uint32_t resp_lkey = 0, resp_rkey = 0;
 			const RdmaMrAttrs *attrs;
-			int rc;
+			struct rst_rdma_mr *r;
+			int dup_fd;
 
 			if (e->type != R3_UOBJ_TYPE__R3UT_MR)
 				continue;
@@ -3454,102 +3287,68 @@ int rdma_restore_uobj_dag_post_vma(void)
 				break;
 			}
 
-			rc = rdma_send_restore_mr(p->cmd_fd_dup,
-						  p->kernel_driver_id,
-						  e->ufile_handle,
-						  parent_pd_handle,
-						  attrs->virt_addr,
-						  attrs->length,
-						  attrs->iova,
-						  attrs->access_flags,
-						  attrs->lkey,
-						  attrs->rkey,
-						  &resp_lkey,
-						  &resp_rkey);
-			if (rc) {
-				pr_err("uobj DAG: ufile_id=%#x "
-				       "RESTORE_MR"
-				       "(target_handle=%u, "
-				       "parent_pd_handle=%u, "
-				       "addr=%#" PRIx64 ", "
-				       "length=%" PRIu64 ", "
-				       "iova=%#" PRIx64 ", "
-				       "access=%#x, lkey_hint=%#x, "
-				       "rkey_hint=%#x, driver_id=%u) "
-				       "failed: %d (%s)%s\n",
+			/*
+			 * Per-MR fresh dup of the cdev fd. Each
+			 * rst_rdma_mr owns its fd and the pie helper
+			 * closes it after the ioctl, so that one MR's
+			 * close doesn't poison a sibling MR's ioctl.
+			 * Same high-min as Phase A so we stay above
+			 * CRIU's user-fd reuse range.
+			 */
+			dup_fd = fcntl(p->cmd_fd_dup, F_DUPFD_CLOEXEC,
+				       1 << 14);
+			if (dup_fd < 0) {
+				pr_err("uobj DAG: ufile_id=%#x MR"
+				       "(handle=%u): F_DUPFD_CLOEXEC "
+				       "of cdev fd for pie restorer "
+				       "failed: %s\n",
 				       p->ufile_id, e->ufile_handle,
-				       parent_pd_handle,
-				       attrs->virt_addr, attrs->length,
-				       attrs->iova,
-				       attrs->access_flags,
-				       attrs->lkey, attrs->rkey,
-				       p->kernel_driver_id,
-				       rc, strerror(-rc),
-				       rc == -EOPNOTSUPP
-				       ? " -- kernel has no ib_device_"
-				         "ops.restore_mr for this "
-				         "driver (rxe needs "
-				         "25f21678609e; mlx5 needs "
-				         "follow-on S4b)"
-				       : rc == -EFAULT
-				       ? " -- pin_user_pages_fast "
-				         "rejected the user_addr; "
-				         "either Phase B fired before "
-				         "open_vmas, or the dump's "
-				         "user_addr no longer maps "
-				         "the same kind of memory in "
-				         "the restored task (e.g. "
-				         "anonymous vs file-backed)"
-				       : rc == -EPERM
-				       ? " -- ucontext not in restore "
-				         "mode (see RESTORE_PD "
-				         "diagnostic)"
-				       : rc == -EBUSY
-				       ? " -- target_handle collision "
-				         "OR rxe lkey/rkey-hint pool "
-				         "slot is occupied (rxe MR "
-				         "pool keys by lkey >> 8; "
-				         "another MR with same prefix "
-				         "is live)"
-				       : "");
+				       strerror(errno));
 				per_ret = -1;
 				break;
 			}
 
-			/*
-			 * Identity assertion. With f422e6ba6bdc rxe
-			 * honours lkey_hint/rkey_hint exactly; mlx5
-			 * via the FW mkey_index UHW (S4b). RESP_LKEY/
-			 * RKEY *should* equal the hints byte-for-byte.
-			 */
-			if (resp_lkey != attrs->lkey ||
-			    resp_rkey != attrs->rkey) {
-				pr_err("uobj DAG: ufile_id=%#x "
-				       "RESTORE_MR(target_handle=%u): "
-				       "kernel installed lkey/rkey "
-				       "(%#x/%#x) differs from hints "
-				       "(%#x/%#x). Identity hint not "
-				       "honoured -- wire-visible rkey "
-				       "is now stale on remote peers "
-				       "and the in-process libibverbs "
-				       "lkey/rkey caches will be "
-				       "wrong. Driver-side regression "
-				       "in restore_mr (rxe: "
-				       "f422e6ba6bdc; mlx5: pending "
-				       "S4b).\n",
+			r = rst_mem_alloc(sizeof(*r), RM_PRIVATE);
+			if (!r) {
+				pr_err("uobj DAG: ufile_id=%#x MR"
+				       "(handle=%u): rst_mem_alloc("
+				       "RM_PRIVATE, %zu) failed -- "
+				       "cannot serialise into pie "
+				       "restorer args\n",
 				       p->ufile_id, e->ufile_handle,
-				       resp_lkey, resp_rkey,
-				       attrs->lkey, attrs->rkey);
+				       sizeof(*r));
+				close(dup_fd);
 				per_ret = -1;
 				break;
 			}
-			n_mr_restored++;
+
+			r->cmd_fd = dup_fd;
+			r->ufile_id = p->ufile_id;
+			r->kernel_driver_id = p->kernel_driver_id;
+			r->target_handle = e->ufile_handle;
+			r->parent_pd_handle = parent_pd_handle;
+			r->addr = attrs->virt_addr;
+			r->length = attrs->length;
+			r->iova = attrs->iova;
+			r->access_flags = attrs->access_flags;
+			r->lkey_hint = attrs->lkey;
+			r->rkey_hint = attrs->rkey;
+
+			n_mr_serialised++;
+			ta->rdma_mrs_n++;
 		}
 
-		pr_info("uobj DAG: ufile_id=%#x Phase B: restored %d "
-			"MR(s) [skipped %d]\n",
-			p->ufile_id, n_mr_restored, n_mr_skipped);
+		pr_info("uobj DAG: ufile_id=%#x Phase B-prep: serialised "
+			"%u MR(s) [skipped %u] for pie restorer\n",
+			p->ufile_id, n_mr_serialised, n_mr_skipped);
+		n_total_serialised += n_mr_serialised;
 
+		/*
+		 * Phase A's cmd_fd_dup is finished with: every MR has
+		 * its own dup'd fd. The handle_map and group are pure
+		 * CRIU-side bookkeeping and don't need to survive into
+		 * the pie blob.
+		 */
 		close(p->cmd_fd_dup);
 		list_del(&p->link);
 		xfree(p->handle_map.e);
@@ -3558,6 +3357,10 @@ int rdma_restore_uobj_dag_post_vma(void)
 		if (per_ret < 0)
 			ret = -1;
 	}
+
+	if (ret == 0)
+		pr_info("uobj DAG: Phase B-prep: %u MR(s) total queued "
+			"for pie-restorer dispatch\n", n_total_serialised);
 	return ret;
 }
 

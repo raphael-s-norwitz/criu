@@ -141,6 +141,48 @@ struct restore_vma_io {
 
 #define RIO_SIZE(niovs) (sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec))
 
+/*
+ * Per-MR record consumed by the pie restorer to issue UVERBS_METHOD_
+ * RESTORE_MR after the user VMAs have been laid out at their original
+ * VAs by the restorer blob (see criu/pie/restorer.c::restore_rdma_mr).
+ *
+ * Why this can't run from criu/cr-restore.c: rxe's restore_mr ends up
+ * in ib_umem_get -> pin_user_pages_fast(addr, ...) against current->
+ * mm. Simple anon-private VMAs (vma->pvma == NULL && pieok &&
+ * !vma_force_premap; criu/mem.c) are NOT premapped at the original VA
+ * by prepare_mappings -- their content sits in vma_io until the pie
+ * blob mmaps them at sigreturn_restore time. Issuing RESTORE_MR
+ * earlier therefore returns -EFAULT for any rxe MR pinned against an
+ * aligned_alloc-style buffer. mlx5_vfmig MR restore re-attaches FW
+ * mkey identity without pinning user pages, so it does not have this
+ * constraint -- but the dispatch path is unified to keep the wire
+ * encoding in one place.
+ *
+ * Field semantics mirror the criu/rdma.c::rdma_send_restore_mr ioctl
+ * encoder; see that helper for the wire-format contract (notably:
+ * PTR_IN/FLAGS_IN attrs whose len <= sizeof(u64) pass values inline
+ * in attr->data, NOT pointers to them).
+ *
+ * @cmd_fd is the long-lived high-fd dup of the destination ucontext's
+ * uverbs cdev (Phase A reserves it via fcntl(F_DUPFD_CLOEXEC, 1<<14)
+ * to stay above the user-fd range CRIU's per-task file restorer needs
+ * and below service_fd_base). The pie helper closes it after the
+ * ioctl so it doesn't leak into the restored task's fd table.
+ */
+struct rst_rdma_mr {
+	int		cmd_fd;
+	u32		ufile_id;		/* diagnostics only */
+	u32		kernel_driver_id;
+	u32		target_handle;
+	u32		parent_pd_handle;
+	u64		addr;
+	u64		length;
+	u64		iova;
+	u32		access_flags;
+	u32		lkey_hint;
+	u32		rkey_hint;
+};
+
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
@@ -183,6 +225,9 @@ struct task_restore_args {
 
 	struct rst_aio_ring *rings;
 	unsigned int rings_n;
+
+	struct rst_rdma_mr *rdma_mrs;
+	unsigned int rdma_mrs_n;
 
 	struct rlimit64 *rlims;
 	unsigned int rlims_n;

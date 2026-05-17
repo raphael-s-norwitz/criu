@@ -83,6 +83,7 @@ ibv_devices
 # 2. Launch the holder, daemonised so it has its own session.
 #    setsid + & keeps it alive across this shell exit.
 #
+mkdir -p "$WORKDIR"
 echo "launching holder (pd_mr mode: pre-dump PD + reg_mr)..."
 # pd_mr mode (S4a): rxe holder also registers a 4 KiB local-write
 # MR pre-dump alongside the PD. The destination kernel's RESTORE_MR
@@ -221,19 +222,29 @@ fi
 echo "rdma-uobj.img verify pass ran clean on restore" \
      "(per-uobj ufile_handle populated)"
 
-# S2 RESTORE_PD + S4a RESTORE_MR dispatch. The restore runs in two
-# phases: Phase A (in uverbsfd_open() during prepare_fds) issues
-# the VA-independent verbs (RESTORE_PD); Phase B (after open_vmas)
-# issues the VA-dependent verbs (RESTORE_MR -- needs the user VMAs
-# live in current->mm for pin_user_pages_fast). Each phase emits a
-# per-ufile summary line:
+# S2 RESTORE_PD + S4a RESTORE_MR dispatch. The restore runs in
+# three stages:
+#   Phase A           (criu master, in uverbsfd_open() during
+#                      prepare_fds, pre-VMA): VA-independent verbs
+#                      -- RESTORE_PD today.
+#   Phase B-prep      (criu master, in restore_one_alive_task right
+#                      after open_vmas): walks Phase-A's stash and
+#                      serialises one rst_rdma_mr per MR into ta->
+#                      rdma_mrs (RM_PRIVATE) for the pie blob.
+#   Phase B (pie)     (criu/pie/restorer.c, post-VMA-placement):
+#                      iterates ta->rdma_mrs and issues UVERBS_
+#                      METHOD_RESTORE_MR ioctl. This stage runs in
+#                      the restored task with user VMAs live, which
+#                      is what rxe's pin_user_pages_fast needs.
 #
-#   Phase A:  "ufile_id=... Phase A: restored 1 PD(s) [skipped 0]; 1 MR(s) deferred to post-VMA Phase B"
-#   Phase B:  "ufile_id=... Phase B: restored 1 MR(s) [skipped 0]"
+# Per-ufile summary lines:
+#   Phase A           "ufile_id=... Phase A: restored 1 PD(s) [...]; 1 MR(s) deferred to post-VMA Phase B"
+#   Phase B-prep      "ufile_id=... Phase B-prep: serialised 1 MR(s) [skipped 0] for pie restorer"
+#   Phase B (pie)     "pie: PID: RDMA: ufile_id=... RESTORE_MR(target_handle=..., lkey=..., rkey=...) ok"
 #
 # pd_mr mode: holder allocates exactly one PD + one MR pre-dump, so
-# Phase A must show 1 PD restored and 1 MR deferred, Phase B must
-# show 1 MR restored.
+# Phase A must show 1 PD restored + 1 MR deferred, Phase B-prep must
+# show 1 MR serialised, and the pie blob must report 1 RESTORE_MR ok.
 if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; [1-9][0-9]* MR\(s\) deferred' \
 	"$DUMPDIR/restore.log"; then
 	echo "FAIL: restore.log shows no RESTORE_PD Phase-A dispatch by" \
@@ -246,19 +257,31 @@ if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[
 		echo "(no uobj DAG lines at all)" >&2
 	exit 1
 fi
-if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase B: restored [1-9][0-9]* MR\(s\) \[skipped 0\]' \
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase B-prep: serialised [1-9][0-9]* MR\(s\) \[skipped 0\] for pie restorer' \
 	"$DUMPDIR/restore.log"; then
-	echo "FAIL: restore.log shows no RESTORE_MR Phase-B dispatch --" \
-	     "the post-VMA second-phase pass didn't run or every MR" \
-	     "was skipped/failed. Without Phase B firing, the libibverbs" \
-	     "MR cache in the restored process points at slots that" \
-	     "don't exist in the kernel ucontext." >&2
+	echo "FAIL: restore.log shows no RESTORE_MR Phase-B-prep" \
+	     "serialisation in restore_one_alive_task -- the post-" \
+	     "VMA hand-off to the pie restorer didn't run or every" \
+	     "MR was skipped." >&2
 	echo "--- restore log uobj DAG lines ---" >&2
 	grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
 		echo "(no uobj DAG lines at all)" >&2
 	exit 1
 fi
-echo "RESTORE_PD (Phase A) + RESTORE_MR (Phase B) dispatched ok"
+if ! grep -qE 'pie: [0-9]+: RDMA: ufile_id=[^ ]+ RESTORE_MR\(target_handle=[0-9]+, lkey=[0-9a-fx]+, rkey=[0-9a-fx]+\) ok' \
+	"$DUMPDIR/restore.log"; then
+	echo "FAIL: restore.log shows no RESTORE_MR pie-restorer" \
+	     "dispatch -- the pie blob either didn't see the queued" \
+	     "MR(s) (rdma_mrs_n=0 / RST_MEM_FIXUP_PPTR misorder) or" \
+	     "the ioctl returned an error. Without Phase B firing," \
+	     "the libibverbs MR cache in the restored process points" \
+	     "at slots that don't exist in the kernel ucontext." >&2
+	echo "--- restore log pie RDMA lines ---" >&2
+	grep -E 'pie:.* RDMA:' "$DUMPDIR/restore.log" >&2 || \
+		echo "(no pie RDMA lines at all)" >&2
+	exit 1
+fi
+echo "RESTORE_PD (Phase A) + RESTORE_MR (pie Phase B) dispatched ok"
 
 #
 # 5. Verify post-restore context is functional.

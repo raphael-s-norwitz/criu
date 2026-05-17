@@ -6,6 +6,7 @@
 #include <sys/types.h>
 
 struct pstree_item;
+struct task_restore_args;
 
 extern const struct fdtype_ops uverbs_dump_ops;
 extern const struct fdtype_ops uverbs_async_eventfd_dump_ops;
@@ -138,34 +139,48 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 				    uint32_t kernel_driver_id);
 
 /*
- * Post-VMA second-phase restore for uobjects whose verbs need the
- * restored process's user VAs to be mapped (currently MR; future
- * additions: DEVX_UMEM, anything that does pin_user_pages_fast).
+ * Phase B: serialise VA-dependent uobject restore (MR; future
+ * DEVX_UMEM) into rst_mem(RM_PRIVATE) for the pie restorer blob to
+ * actually issue.
  *
- * uverbsfd_open() runs in the restored task during prepare_fds(),
- * which is BEFORE open_vmas() lays out the user VMAs. Verbs whose
- * kernel handlers call pin_user_pages_fast(user_addr, ...) -- which
- * is "current->mm" of the ioctl issuer, == the restored task -- get
- * -EFAULT in that window because the address isn't mapped yet.
+ * Why this lives in the pie blob, not here: rxe's restore_mr ends up
+ * in pin_user_pages_fast(addr, ...) on current->mm. Simple anon-
+ * private VMAs (vma->pvma == NULL && pieok && !vma_force_premap;
+ * criu/mem.c) are NOT premapped at the original VA by prepare_
+ * mappings -- their content sits in vma_io until the pie blob mmaps
+ * them at sigreturn_restore time. Issuing RESTORE_MR from
+ * restore_one_alive_task therefore returns -EFAULT for any rxe MR
+ * pinned against an aligned_alloc-style buffer. The restorer pie
+ * blob runs after VMA placement, in the restored task's mm, with
+ * user VAs live -- pin_user_pages_fast succeeds. mlx5_vfmig MR
+ * restore re-attaches FW mkey identity without pinning user pages
+ * and is unaffected, but goes through the same dispatch path to
+ * keep the wire encoding in one place.
  *
  * The phase split is therefore:
  *   Phase A (in uverbsfd_open(), pre-VMA):
- *     Stash a long-lived dup of the cdev fd plus
+ *     Stash a long-lived high-fd dup of the cdev plus
  *     (ufile_id, kernel_driver_id, handle_map) on a global list,
  *     and run the no-VA RESTORE_<TYPE> verbs (PD today; CQ/QP/SRQ/
  *     AH later, none of which pin user pages).
- *   Phase B (here, post-VMA, still in the restored task):
- *     Walk the stashed list, run the VA-dependent verbs (MR; DEVX_
- *     UMEM eventually), close the dup'd fd.
+ *   Phase B-prep (here, in restore_one_alive_task):
+ *     Walk the stashed list, resolve PARENT_PD xrefs through the
+ *     handle_map, append one struct rst_rdma_mr per MR entry into
+ *     ta->rdma_mrs via rst_mem_alloc(RM_PRIVATE). The pie blob
+ *     reads them post-VMA-placement and issues RESTORE_MR.
+ *   Phase B (criu/pie/restorer.c::restore_rdma_mr, post-VMA):
+ *     Issue UVERBS_METHOD_RESTORE_MR via sys_ioctl, close the dup
+ *     fd so it doesn't leak into the restored task.
  *
  * Called from restore_one_alive_task() right after open_vmas().
  * No-op if no Phase-A entries were stashed (no in-tree RDMA
  * contexts, or every context's DAG group was empty).
  *
- * Returns 0 on success; -1 on the first per-entry restore failure
- * (already pr_err'd with driver/handle context).
+ * Returns 0 on success; -1 on the first per-entry serialisation
+ * failure (rst_mem OOM, missing required attrs, unresolvable
+ * PARENT_PD xref).
  */
-int rdma_restore_uobj_dag_post_vma(void);
+int rdma_prepare_rdma_mrs(struct task_restore_args *ta);
 
 /*
  * Internal-but-shared helpers used by both criu/rdma.c and the
