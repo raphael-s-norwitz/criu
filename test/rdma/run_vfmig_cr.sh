@@ -35,16 +35,30 @@
 #        already reserved in firmware after LOAD_VHCA_STATE). See
 #        linux/tools/testing/mlx5_vfmig/design/uobject_restore.md
 #        §9.1 S3b.
-#     6. SIGUSR1 to the restored holder runs the §S3b incremental-
-#        coverage acid test: build a fresh CQ + QP + MR on top of
-#        the *adopted* PD (exercises FW CREATE_QP / CREATE_MKEY
-#        accepting the adopted pdn under the destination ucontext's
-#        uid -- the libibverbs version of pd_adopt's FW gate
-#        validation), then tear them down in dependency order
-#        ending in ibv_dealloc_pd(adopted PD). Avoids the v0
-#        dealloc-ordering tripwire because the source ucontext
-#        only holds a PD pre-dump -- no FW dependents to block
-#        DEALLOC_PD on the adopted PD.
+#     6. RESTORE_MR is deferred to the pie restorer because it
+#        depends on user VMAs (the MR's backing pages) being live
+#        in the destination task's mm. After open_vmas() lays
+#        them out, criu/pie/restorer.c::restore_rdma_mr issues
+#        UVERBS_METHOD_RESTORE_MR on each queued MR. For mlx5 the
+#        wire carries struct mlx5_ib_restore_mr_req in the UHW
+#        attribute (mkey_index = lkey_hint >> 8); the kernel
+#        handler adopts the source's FW mkey via mlx5_ib_restore
+#        _mr (Model A) and the Stage-3 D4 wrapper binds the dest
+#        process's pinned user pages onto the (KIND_MR, mkey_
+#        index) placeholder iova that LOAD_VHCA_STATE replayed.
+#        Linux 7c496744b43b + 7c6fb51f43f6 + 10fd8abeaaf0 +
+#        5b6f13a52c20. See linux design/uobject_restore.md §9.6
+#        and design/user_mr_dma.md §A.C.
+#     7. SIGUSR1 to the restored holder runs the §S3b/§S4b
+#        incremental-coverage acid test: confirm the restored MR's
+#        lkey/rkey survived round-trip (libibverbs cache vs the
+#        kernel-installed identity), then build a fresh CQ + QP
+#        on the *adopted* PD (exercises FW CREATE_QP/CREATE_MKEY
+#        accepting the adopted pdn under the destination
+#        ucontext's uid -- the libibverbs version of pd_adopt's
+#        FW gate validation), then tear them down in dependency
+#        order ending in ibv_dereg_mr + ibv_dealloc_pd of the
+#        pre-dump objects.
 #
 # Usage:
 #   sudo PF=0000:08:00.0 ./run_vfmig_cr.sh
@@ -205,12 +219,12 @@ provision_vf "Phase A"
 echo "=== Phase B: launch uverbs_ctx_holder against $VF_IBDEV ==="
 # systemd-run --scope to avoid inheriting the agent's unix sockets/fds.
 systemd-run --scope --quiet --unit="vfmig-holder-$$" \
-    bash -c "exec </dev/null >'$LOG' 2>&1; '$PROG' '$VF_IBDEV' '$STATUS'" &
+    bash -c "exec </dev/null >'$LOG' 2>&1; '$PROG' '$VF_IBDEV' '$STATUS' pd_mr" &
 SCOPE_PID=$!
 # Find the actual holder pid (child of the scope).
 HOLDER_PID=
 for _ in $(seq 1 50); do
-    HOLDER_PID="$(pgrep -fx "$PROG $VF_IBDEV $STATUS" || true)"
+    HOLDER_PID="$(pgrep -fx "$PROG $VF_IBDEV $STATUS pd_mr" || true)"
     [[ -n "$HOLDER_PID" ]] && break
     sleep 0.1
 done
@@ -260,32 +274,82 @@ echo "=== Phase F: criu restore ==="
 RESTORED_PID="$(cat "$RESTORED_PIDFILE")"
 echo "restored pid=$RESTORED_PID"
 
-# Positive RESTORE_PD dispatch assertion. Phase A of the per-ufile
-# dispatcher (in uverbsfd_open()) runs the VA-independent verbs
-# (RESTORE_PD here) and pr_info's:
+# Positive RESTORE_{PD,MR} dispatch assertions. Three log shapes
+# correspond to the three stages the post-VMA pie-restorer split
+# (criu/rdma.c::rdma_prepare_rdma_mrs + criu/pie/restorer.c::
+# restore_rdma_mr) introduced for rxe S4a and that mlx5 S4b reuses
+# verbatim:
 #
-#   "ufile_id=... Phase A: restored 1 PD(s) [skipped 0]; 0 MR(s) deferred"
+#   Phase A           (criu master, in uverbsfd_open() during the
+#                      uverbs-cdev open hook): VA-independent verbs.
+#                      RESTORE_PD here; MR(s) get deferred.
+#   Phase B-prep      (criu master, in restore_one_alive_task right
+#                      after open_vmas): walks the deferred MRs,
+#                      dups the cdev fd at high min, and serialises
+#                      struct rst_rdma_mr into RM_PRIVATE for the
+#                      pie blob to consume.
+#   Phase B (pie)     (criu/pie/restorer.c, post-VMA-placement):
+#                      iterates args->rdma_mrs and issues UVERBS_
+#                      METHOD_RESTORE_MR. For mlx5 the wire carries
+#                      struct mlx5_ib_restore_mr_req in the UHW
+#                      attribute (mkey_index = lkey_hint >> 8); the
+#                      kernel handler adopts the source's FW mkey
+#                      via mlx5_ib_restore_mr (Model A) and the
+#                      Stage-3 D4 wrapper binds dest user pages to
+#                      the placeholder iova.
 #
-# The source ucontext allocates exactly one PD, so 1 PD restored.
-# MR count must be 0 because the mlx5 holder uses the default "pd"
-# mode -- mlx5 RESTORE_MR is S4b and not landed yet; pre-dump MR
-# registration would just push the test into the v0 dealloc-
-# ordering tripwire (S3b). If RESTORE_PD ever stops firing (kernel
-# rev pre-K3/K4, plugin not opening cdev in restore mode, DAG-side
-# dropping ufile_handle, UHW dispatcher misbranding the driver_id)
-# this catches it before the holder's post-restore checks would
-# also fail later.
-if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; 0 MR\(s\) deferred' \
+# Per-ufile summary lines (all printed by criu/rdma.c):
+#   Phase A           "ufile_id=... Phase A: restored 1 PD(s) [...]; 1 MR(s) deferred to post-VMA Phase B"
+#   Phase B-prep      "ufile_id=... Phase B-prep: serialised 1 MR(s) [skipped 0] for pie restorer"
+#   Phase B (pie)     "pie: PID: RDMA: ufile_id=... RESTORE_MR(target_handle=..., lkey=..., rkey=..., mkey_index=...) ok"
+#
+# pd_mr mode: the mlx5_vfmig holder allocates exactly one PD + one
+# MR pre-dump. Phase A asserts >=1 PD restored + >=1 MR deferred,
+# Phase B-prep asserts >=1 MR serialised, and the pie blob asserts
+# >=1 RESTORE_MR ok with the mkey_index field present (the mlx5-
+# specific suffix). If the kernel-side identity check fails the pie
+# blob aborts before printing the "ok" line, so absence of this line
+# typically means the wire-format-vs-kernel mismatch (most often:
+# UHW not being shipped, lkey_hint != rkey_hint, or
+# (lkey_hint >> 8) != mkey_index).
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; [1-9][0-9]* MR\(s\) deferred' \
     "$DUMPDIR/restore.log"; then
     echo "FAIL: restore.log shows no Phase-A RESTORE_PD dispatch by" \
-         "rdma_restore_uobj_dag_for_ufile() with zero deferred MRs" \
-         "-- the per-ufile S3b restore pass either didn't run," \
-         "found no PD entry, or there were unexpected MR entries." >&2
+         "rdma_restore_uobj_dag_for_ufile() with deferred MRs --" \
+         "the per-ufile restore pass either didn't run, found no" \
+         "PD/MR entries, or skipped them for missing ufile_handle /" \
+         "QUERY_MR fields." >&2
     grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
         echo "(no uobj DAG lines at all)" >&2
     exit 1
 fi
-echo "RESTORE_PD dispatched ok (mlx5 UHW path, Phase A)"
+if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase B-prep: serialised [1-9][0-9]* MR\(s\) \[skipped 0\] for pie restorer' \
+    "$DUMPDIR/restore.log"; then
+    echo "FAIL: restore.log shows no RESTORE_MR Phase-B-prep" \
+         "serialisation in restore_one_alive_task -- the post-" \
+         "VMA hand-off to the pie restorer didn't run or every" \
+         "MR was skipped." >&2
+    grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+        echo "(no uobj DAG lines at all)" >&2
+    exit 1
+fi
+if ! grep -qE 'pie: [0-9]+: RDMA: ufile_id=[^ ]+ RESTORE_MR\(target_handle=[0-9]+, lkey=[0-9a-fx]+, rkey=[0-9a-fx]+, mkey_index=[0-9a-fx]+\) ok' \
+    "$DUMPDIR/restore.log"; then
+    echo "FAIL: restore.log shows no mlx5 RESTORE_MR pie-restorer" \
+         "dispatch -- either the pie blob never reached the queued" \
+         "MR(s) (rdma_mrs_n=0 / RST_MEM_FIXUP_PPTR misorder), or" \
+         "the ioctl returned an error (kernel handler -EINVAL on" \
+         "missing UHW / mkey_index mismatch / non-restore-mode" \
+         "ucontext, or stage-3 D4 -EFAULT / -ENOENT on placeholder" \
+         "miss). Without Phase B firing the libibverbs MR cache in" \
+         "the restored process points at slots that don't exist in" \
+         "the kernel ucontext." >&2
+    echo "--- restore log pie RDMA lines ---" >&2
+    grep -E 'pie:.* RDMA:' "$DUMPDIR/restore.log" >&2 || \
+        echo "(no pie RDMA lines at all)" >&2
+    exit 1
+fi
+echo "RESTORE_PD (Phase A) + RESTORE_MR (mlx5 UHW pie Phase B) dispatched ok"
 
 # ---- Phase G: verify --------------------------------------------------
 echo "=== Phase G: post-restore checks ==="

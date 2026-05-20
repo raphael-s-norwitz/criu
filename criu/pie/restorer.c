@@ -959,6 +959,7 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 
 #include <rdma/ib_user_verbs.h>
 #include <rdma/ib_user_ioctl_cmds.h>
+#include <rdma/ib_user_ioctl_verbs.h>		/* RDMA_DRIVER_MLX5 */
 #include <rdma/rdma_user_ioctl_cmds.h>
 
 #ifndef UVERBS_OBJECT_RESTORE
@@ -980,12 +981,62 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 #define UVERBS_ATTR_RESTORE_MR_RESP_RKEY	9
 #endif
 
+/*
+ * UHW is the generic driver-private blob attribute. attr_id 4096
+ * (== UVERBS_ID_DRIVER_NS = 1 << UVERBS_ID_NS_SHIFT) is the kernel's
+ * namespace boundary between core and driver attrs. Mirror the same
+ * shim criu/rdma.c uses for RESTORE_PD's UHW path.
+ */
+#ifndef UVERBS_ATTR_UHW_IN
+#define UVERBS_ATTR_UHW_IN			((uint16_t)4096)
+#endif
+
+/*
+ * Local copy of struct mlx5_ib_restore_mr_req (UAPI in
+ * include/uapi/rdma/mlx5-abi.h, kernel commit 87f2981ebea7). The
+ * pie blob compiles nostdlib + minimal include surface so we don't
+ * pull in mlx5-abi.h here; same approach as criu/rdma.c's local
+ * mlx5_ib_restore_pd_req shim. Wire shape matters:
+ *
+ *   - sizeof > sizeof(u64) is intentional. Kernel uverbs UHW
+ *     dispatch treats len <= 8 as INLINE (stuffs attr->data into a
+ *     kernel staging slot and rewrites udata->inbuf to a kernel
+ *     pointer); on x86_64 with masked-user-access enabled that
+ *     breaks ib_copy_from_udata's copy_from_user. The 8-byte
+ *     reserved2 field pads us above the threshold so the kernel
+ *     takes the ptr path and copy_from_user works. Same dodge as
+ *     mlx5_ib_restore_pd_req.
+ *   - reserved/reserved2 must be zero on send; mlx5_ib_restore_mr
+ *     validates this for forward-compat (-EINVAL otherwise).
+ *   - mkey_index is 24 bits significant; kernel rejects 0 and any
+ *     value with bits set above 0xffffff.
+ *
+ * Keep this in lock-step with struct mlx5_ib_restore_mr_req in
+ * include/uapi/rdma/mlx5-abi.h. Drop once host rdma-core ships the
+ * struct upstream.
+ */
+struct mlx5_ib_restore_mr_req_local {
+	uint32_t	mkey_index;	/* (lkey_hint >> 8) by mlx5
+					 * invariant: lkey == rkey ==
+					 * (mkey_index << 8) | variant_byte */
+	uint32_t	reserved;	/* must be 0 */
+	uint64_t	reserved2;	/* must be 0; pads above the
+					 * 8-byte inline-UHW threshold */
+};
+
 static int restore_rdma_mr(struct rst_rdma_mr *r)
 {
+	/*
+	 * 11 attrs: 10 core (handle, pd_handle, addr, length, iova,
+	 * access_flags, lkey_hint, rkey_hint, resp_lkey, resp_rkey)
+	 * + 1 optional UHW for mlx5. Sized for the worst case so the
+	 * mlx5 branch doesn't need a separate buffer.
+	 */
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
-		struct ib_uverbs_attr		attrs[10];
+		struct ib_uverbs_attr		attrs[11];
 	} cmd = {};
+	struct mlx5_ib_restore_mr_req_local mlx5_uhw = {};
 	uint32_t resp_lkey = 0, resp_rkey = 0;
 	unsigned int n = 0;
 	int ret;
@@ -1041,6 +1092,39 @@ static int restore_rdma_mr(struct rst_rdma_mr *r)
 	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data = r->rkey_hint;
 	n++;
+
+	/*
+	 * Driver-private UHW for mlx5. mlx5_ib_restore_mr requires the
+	 * source's FW mkey_index in struct mlx5_ib_restore_mr_req so it
+	 * can adopt the destination-side mkey that LOAD_VHCA_STATE
+	 * preserved (Model A, no FW round-trip on adoption -- see
+	 * Linux 85c651e7e4db). Without this UHW the kernel handler
+	 * fails with -EINVAL at the udata->inlen check before any
+	 * useful work happens.
+	 *
+	 * The mlx5 invariant is lkey == rkey == (mkey_index << 8) |
+	 * variant_byte, so mkey_index = lkey_hint >> 8. The kernel
+	 * cross-checks (lkey_hint >> 8) == req.mkey_index AND
+	 * lkey_hint == rkey_hint and rejects -EINVAL on mismatch --
+	 * defense-in-depth that catches a CRIU bug that would have
+	 * shipped a restrack id where the FW mkey_index was expected.
+	 *
+	 * rxe (and any other backend whose ib_dev->ops.restore_mr
+	 * doesn't read udata) sees this as an unexpected attr in a
+	 * UVERBS_ATTR_UHW() slot and ignores it -- but the dispatcher
+	 * doesn't even forward unknown UHW attrs to the driver if the
+	 * verb didn't declare them, so for cleanliness we just don't
+	 * emit it for non-mlx5 drivers. The wire stays minimal for rxe.
+	 */
+	if (r->kernel_driver_id == RDMA_DRIVER_MLX5) {
+		mlx5_uhw.mkey_index = r->lkey_hint >> 8;
+		/* reserved/reserved2 already zero from designated init */
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
+		cmd.attrs[n].len = sizeof(mlx5_uhw);
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)&mlx5_uhw;
+		n++;
+	}
 
 	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RESP_LKEY;
 	cmd.attrs[n].len = sizeof(resp_lkey);
@@ -1104,9 +1188,15 @@ static int restore_rdma_mr(struct rst_rdma_mr *r)
 		return -1;
 	}
 
-	pr_info("RDMA: ufile_id=%x RESTORE_MR(target_handle=%u, "
-		"lkey=%x, rkey=%x) ok\n",
-		r->ufile_id, r->target_handle, resp_lkey, resp_rkey);
+	if (r->kernel_driver_id == RDMA_DRIVER_MLX5)
+		pr_info("RDMA: ufile_id=%x RESTORE_MR(target_handle=%u, "
+			"lkey=%x, rkey=%x, mkey_index=%x) ok\n",
+			r->ufile_id, r->target_handle, resp_lkey, resp_rkey,
+			r->lkey_hint >> 8);
+	else
+		pr_info("RDMA: ufile_id=%x RESTORE_MR(target_handle=%u, "
+			"lkey=%x, rkey=%x) ok\n",
+			r->ufile_id, r->target_handle, resp_lkey, resp_rkey);
 	return 0;
 }
 
