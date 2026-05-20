@@ -144,6 +144,387 @@ static void write_status(const char *line)
 }
 
 /*
+ * Phase J -- RDMA-WRITE data-path test through the restored MR.
+ *
+ * Two distinct byte patterns identify which side of the wire was
+ * doing the move at any given subtest. We pick byte = (i ^ base)
+ * over a constant fill so a misaligned or short transfer surfaces
+ * as a localised mismatch rather than a "looks identical" zero
+ * region. Bases are chosen so neither pattern is all-zero and
+ * neither equals the other anywhere -- 0xa5 ^ 0x5a = 0xff.
+ */
+#define PHASE_J_RESTORED_BASE 0xa5u  /* stamped into g_mr_buf pre-dump */
+#define PHASE_J_PEER_BASE     0x5au  /* stamped into peer mr_buf pre-J2 */
+
+static void fill_pattern(void *buf, size_t len, uint8_t base)
+{
+	uint8_t *b = buf;
+	size_t i;
+	for (i = 0; i < len; i++)
+		b[i] = (uint8_t)(i ^ base);
+}
+
+/* Returns -1 on full match, else the index of the first mismatch. */
+static ssize_t verify_pattern(const void *buf, size_t len, uint8_t base)
+{
+	const uint8_t *b = buf;
+	size_t i;
+	for (i = 0; i < len; i++) {
+		if (b[i] != (uint8_t)(i ^ base))
+			return (ssize_t)i;
+	}
+	return -1;
+}
+
+struct phase_j_qp_info {
+	uint32_t qpn;
+	uint32_t psn;
+	union ibv_gid gid;
+	uint8_t port_num;
+	enum ibv_mtu mtu;
+};
+
+static int phase_j_modify_init(struct ibv_qp *qp, uint8_t port_num)
+{
+	struct ibv_qp_attr attr = {
+		.qp_state        = IBV_QPS_INIT,
+		.pkey_index      = 0,
+		.port_num        = port_num,
+		.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
+				   IBV_ACCESS_REMOTE_WRITE |
+				   IBV_ACCESS_REMOTE_READ,
+	};
+	int mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+		   IBV_QP_PORT  | IBV_QP_ACCESS_FLAGS;
+	return ibv_modify_qp(qp, &attr, mask);
+}
+
+static int phase_j_modify_rtr(struct ibv_qp *qp,
+			      const struct phase_j_qp_info *peer)
+{
+	struct ibv_qp_attr attr;
+	int mask;
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state              = IBV_QPS_RTR;
+	attr.path_mtu              = peer->mtu;
+	attr.dest_qp_num           = peer->qpn;
+	attr.rq_psn                = peer->psn;
+	attr.max_dest_rd_atomic    = 1;
+	attr.min_rnr_timer         = 12;
+	attr.ah_attr.is_global     = 1;
+	attr.ah_attr.dlid          = 0;
+	attr.ah_attr.sl            = 0;
+	attr.ah_attr.src_path_bits = 0;
+	attr.ah_attr.port_num      = peer->port_num;
+	attr.ah_attr.grh.dgid      = peer->gid;
+	attr.ah_attr.grh.sgid_index    = 0;
+	attr.ah_attr.grh.hop_limit     = 1;
+	attr.ah_attr.grh.traffic_class = 0;
+	mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+	       IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+	       IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+	return ibv_modify_qp(qp, &attr, mask);
+}
+
+static int phase_j_modify_rts(struct ibv_qp *qp, uint32_t sq_psn)
+{
+	struct ibv_qp_attr attr;
+	int mask;
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state      = IBV_QPS_RTS;
+	attr.timeout       = 14;
+	attr.retry_cnt     = 7;
+	attr.rnr_retry     = 7;
+	attr.sq_psn        = sq_psn;
+	attr.max_rd_atomic = 1;
+	mask = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+	       IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+	       IBV_QP_MAX_QP_RD_ATOMIC;
+	return ibv_modify_qp(qp, &attr, mask);
+}
+
+static int phase_j_post_write(struct ibv_qp *qp, uint64_t wr_id,
+			      void *laddr, uint32_t lkey,
+			      void *raddr, uint32_t rkey,
+			      uint32_t length)
+{
+	struct ibv_sge sge = {
+		.addr   = (uintptr_t)laddr,
+		.length = length,
+		.lkey   = lkey,
+	};
+	struct ibv_send_wr wr;
+	struct ibv_send_wr *bad = NULL;
+	memset(&wr, 0, sizeof(wr));
+	wr.wr_id      = wr_id;
+	wr.sg_list    = &sge;
+	wr.num_sge    = 1;
+	wr.opcode     = IBV_WR_RDMA_WRITE;
+	wr.send_flags = IBV_SEND_SIGNALED;
+	wr.wr.rdma.remote_addr = (uintptr_t)raddr;
+	wr.wr.rdma.rkey        = rkey;
+	return ibv_post_send(qp, &wr, &bad);
+}
+
+/*
+ * Poll a single signaled completion off @cq. Spins up to @max_polls
+ * iterations of 10ms each (~2s with the default of 200) -- a healthy
+ * RC loopback completes in microseconds; the long ceiling is for the
+ * pathological "FW silently dropped the WR" case where we want a clear
+ * timeout error rather than an indefinite hang.
+ */
+static int phase_j_poll_one(struct ibv_cq *cq, uint64_t expected_wr_id,
+			    int max_polls, struct ibv_wc *out_wc)
+{
+	int i;
+	for (i = 0; i < max_polls; i++) {
+		int n = ibv_poll_cq(cq, 1, out_wc);
+		if (n < 0)
+			return -EIO;
+		if (n == 1) {
+			if (out_wc->wr_id != expected_wr_id)
+				return -EBADE;
+			return 0;
+		}
+		usleep(10000);
+	}
+	return -ETIMEDOUT;
+}
+
+/*
+ * Phase J orchestrator. Builds qp_b on @pd (qp_a is supplied alive
+ * by the caller), connects qp_a <-> qp_b in self-loopback through
+ * port 1's GID 0, then runs two RDMA-WRITE subtests:
+ *
+ *   J1  WRITE laddr=g_mr_buf, lkey=g_mr->lkey  (restored MR)
+ *           raddr=mr_buf,    rkey=mr->rkey     (fresh peer MR)
+ *       Sender = qp_a, responder = qp_b. After WC_SUCCESS the
+ *       peer buffer must byte-equal the pre-dump pattern that
+ *       the source process stamped into g_mr_buf before SAVE.
+ *       This proves the kernel-side IOMMU binding installed by
+ *       Stage-3 D4 (mlx5) / rxe_restore_mr (rxe) actually points
+ *       at the pinned destination pages CRIU's mm replay seeded
+ *       with the source bytes.
+ *
+ *   J2  WRITE laddr=mr_buf,    lkey=mr->lkey   (fresh peer MR)
+ *           raddr=g_mr_buf,  rkey=g_mr->rkey   (restored MR)
+ *       Sender = qp_b, responder = qp_a. Inverse direction --
+ *       a peer-supplied pattern is written *into* the restored
+ *       MR. After WC_SUCCESS g_mr_buf must byte-equal the new
+ *       pattern. This proves the restored mr->rkey resolves on
+ *       the responder side too: the FW data path walks
+ *       rkey -> mkc -> iova -> IOMMU on responder, symmetric to
+ *       the lkey walk on requester.
+ *
+ * Returns NULL on success; an error description in @errbuf
+ * (also returned to the caller for convenience) on failure.
+ *
+ * qp_a stays alive on every exit path -- caller owns it. qp_b is
+ * created and torn down internally.
+ */
+static const char *run_phase_j(struct ibv_context *ctx, struct ibv_pd *pd,
+			       struct ibv_cq *cq, struct ibv_qp *qp_a,
+			       struct ibv_mr *restored_mr,
+			       void *restored_buf, size_t restored_len,
+			       struct ibv_mr *peer_mr,
+			       void *peer_buf, size_t peer_len,
+			       char *errbuf, size_t errbuf_len)
+{
+	struct ibv_port_attr port_attr;
+	struct phase_j_qp_info info_a;
+	struct phase_j_qp_info info_b;
+	struct ibv_qp *qp_b = NULL;
+	struct ibv_qp_init_attr qp_init;
+	struct ibv_wc wc;
+	const uint64_t WR_ID_J1 = 0xCAFE0001ull;
+	const uint64_t WR_ID_J2 = 0xCAFE0002ull;
+	const uint32_t length = (uint32_t)(restored_len < peer_len ?
+					   restored_len : peer_len);
+	const char *ret = NULL;
+	ssize_t miss;
+	int err;
+
+	if (length == 0) {
+		snprintf(errbuf, errbuf_len,
+			 "buffer length is zero (restored=%zu peer=%zu)",
+			 restored_len, peer_len);
+		return errbuf;
+	}
+
+	if (ibv_query_port(ctx, 1, &port_attr)) {
+		snprintf(errbuf, errbuf_len,
+			 "ibv_query_port(port=1): %s", strerror(errno));
+		return errbuf;
+	}
+	memset(&info_a, 0, sizeof(info_a));
+	memset(&info_b, 0, sizeof(info_b));
+	if (ibv_query_gid(ctx, 1, 0, &info_a.gid)) {
+		snprintf(errbuf, errbuf_len,
+			 "ibv_query_gid(port=1, idx=0): %s",
+			 strerror(errno));
+		return errbuf;
+	}
+	info_b.gid = info_a.gid; /* same port == same GID */
+	info_a.port_num = 1;
+	info_b.port_num = 1;
+	info_a.psn = 0;
+	info_b.psn = 0;
+	info_a.mtu = port_attr.active_mtu ? port_attr.active_mtu : IBV_MTU_1024;
+	info_b.mtu = info_a.mtu;
+	info_a.qpn = qp_a->qp_num;
+
+	memset(&qp_init, 0, sizeof(qp_init));
+	qp_init.qp_type = IBV_QPT_RC;
+	qp_init.send_cq = cq;
+	qp_init.recv_cq = cq;
+	qp_init.cap.max_send_wr  = 1;
+	qp_init.cap.max_recv_wr  = 1;
+	qp_init.cap.max_send_sge = 1;
+	qp_init.cap.max_recv_sge = 1;
+	qp_b = ibv_create_qp(pd, &qp_init);
+	if (!qp_b) {
+		snprintf(errbuf, errbuf_len,
+			 "ibv_create_qp(qp_b): %s", strerror(errno));
+		return errbuf;
+	}
+	info_b.qpn = qp_b->qp_num;
+
+	if ((err = phase_j_modify_init(qp_a, 1))) {
+		snprintf(errbuf, errbuf_len,
+			 "qp_a INIT: %d (%s)", err, strerror(err));
+		ret = errbuf; goto out;
+	}
+	if ((err = phase_j_modify_init(qp_b, 1))) {
+		snprintf(errbuf, errbuf_len,
+			 "qp_b INIT: %d (%s)", err, strerror(err));
+		ret = errbuf; goto out;
+	}
+	if ((err = phase_j_modify_rtr(qp_a, &info_b))) {
+		snprintf(errbuf, errbuf_len,
+			 "qp_a RTR (peer qpn=0x%x): %d (%s)",
+			 info_b.qpn, err, strerror(err));
+		ret = errbuf; goto out;
+	}
+	if ((err = phase_j_modify_rtr(qp_b, &info_a))) {
+		snprintf(errbuf, errbuf_len,
+			 "qp_b RTR (peer qpn=0x%x): %d (%s)",
+			 info_a.qpn, err, strerror(err));
+		ret = errbuf; goto out;
+	}
+	if ((err = phase_j_modify_rts(qp_a, info_a.psn))) {
+		snprintf(errbuf, errbuf_len,
+			 "qp_a RTS: %d (%s)", err, strerror(err));
+		ret = errbuf; goto out;
+	}
+	if ((err = phase_j_modify_rts(qp_b, info_b.psn))) {
+		snprintf(errbuf, errbuf_len,
+			 "qp_b RTS: %d (%s)", err, strerror(err));
+		ret = errbuf; goto out;
+	}
+
+	/*
+	 * J1: restored MR -> peer MR. Zero peer first so a no-op
+	 * "data path didn't move anything" is distinguishable from
+	 * a successful copy.
+	 */
+	memset(peer_buf, 0, peer_len);
+	err = phase_j_post_write(qp_a, WR_ID_J1,
+				 restored_buf, restored_mr->lkey,
+				 peer_buf, peer_mr->rkey, length);
+	if (err) {
+		snprintf(errbuf, errbuf_len,
+			 "J1 post_send (lkey=%#x rkey=%#x): %d (%s)",
+			 restored_mr->lkey, peer_mr->rkey, err,
+			 strerror(err));
+		ret = errbuf; goto out;
+	}
+	memset(&wc, 0, sizeof(wc));
+	err = phase_j_poll_one(cq, WR_ID_J1, 200, &wc);
+	if (err) {
+		snprintf(errbuf, errbuf_len,
+			 "J1 poll_cq: %d (%s)", err, strerror(-err));
+		ret = errbuf; goto out;
+	}
+	if (wc.status != IBV_WC_SUCCESS) {
+		snprintf(errbuf, errbuf_len,
+			 "J1 wc.status=%d (%s) opcode=%d "
+			 "(restored MR's lkey=%#x failed at requester FW "
+			 "data path -- mkey -> iova -> IOMMU walk broken)",
+			 wc.status, ibv_wc_status_str(wc.status),
+			 wc.opcode, restored_mr->lkey);
+		ret = errbuf; goto out;
+	}
+	miss = verify_pattern(peer_buf, length, PHASE_J_RESTORED_BASE);
+	if (miss >= 0) {
+		snprintf(errbuf, errbuf_len,
+			 "J1 byte verify: peer_buf[%zd]=0x%02x expected 0x%02x "
+			 "(restored MR's bytes did not survive WRITE end-to-end "
+			 "-- IOMMU map likely points at wrong pages)",
+			 miss, ((uint8_t *)peer_buf)[miss],
+			 (uint8_t)(((size_t)miss) ^ PHASE_J_RESTORED_BASE));
+		ret = errbuf; goto out;
+	}
+
+	/*
+	 * J2: peer MR -> restored MR. Stamp peer with the inverse
+	 * pattern so a successful round-trip (J1 then J2) demonstrably
+	 * shows two different byte vectors moving in opposite
+	 * directions; "still the J1 pattern" after J2 would mean the
+	 * write didn't reach the responder.
+	 */
+	fill_pattern(peer_buf, length, PHASE_J_PEER_BASE);
+	err = phase_j_post_write(qp_b, WR_ID_J2,
+				 peer_buf, peer_mr->lkey,
+				 restored_buf, restored_mr->rkey, length);
+	if (err) {
+		snprintf(errbuf, errbuf_len,
+			 "J2 post_send (lkey=%#x rkey=%#x): %d (%s)",
+			 peer_mr->lkey, restored_mr->rkey, err,
+			 strerror(err));
+		ret = errbuf; goto out;
+	}
+	memset(&wc, 0, sizeof(wc));
+	err = phase_j_poll_one(cq, WR_ID_J2, 200, &wc);
+	if (err) {
+		snprintf(errbuf, errbuf_len,
+			 "J2 poll_cq: %d (%s)", err, strerror(-err));
+		ret = errbuf; goto out;
+	}
+	if (wc.status != IBV_WC_SUCCESS) {
+		snprintf(errbuf, errbuf_len,
+			 "J2 wc.status=%d (%s) opcode=%d "
+			 "(restored MR's rkey=%#x failed at responder FW "
+			 "data path -- responder mkey/iova/IOMMU broken)",
+			 wc.status, ibv_wc_status_str(wc.status),
+			 wc.opcode, restored_mr->rkey);
+		ret = errbuf; goto out;
+	}
+	miss = verify_pattern(restored_buf, length, PHASE_J_PEER_BASE);
+	if (miss >= 0) {
+		snprintf(errbuf, errbuf_len,
+			 "J2 byte verify: restored_buf[%zd]=0x%02x "
+			 "expected 0x%02x (peer's bytes did not land in "
+			 "restored MR's pages -- responder IOMMU map broken)",
+			 miss, ((uint8_t *)restored_buf)[miss],
+			 (uint8_t)(((size_t)miss) ^ PHASE_J_PEER_BASE));
+		ret = errbuf; goto out;
+	}
+
+	printf("PHASE_J: ok qp_a=0x%x qp_b=0x%x len=%u "
+	       "restored_lkey=%#x restored_rkey=%#x "
+	       "peer_lkey=%#x peer_rkey=%#x\n",
+	       info_a.qpn, info_b.qpn, length,
+	       restored_mr->lkey, restored_mr->rkey,
+	       peer_mr->lkey, peer_mr->rkey);
+	fflush(stdout);
+
+out:
+	if (qp_b)
+		ibv_destroy_qp(qp_b);
+	return ret;
+}
+
+/*
  * Run the post-restore checks. Writes the first failure verbatim
  * to the status file and returns; if everything passes, writes "OK".
  *
@@ -241,7 +622,14 @@ static void run_post_restore_checks(void)
 		goto cleanup_cq;
 	}
 	memset(mr_buf, 0, mr_size);
-	mr = ibv_reg_mr(g_pd, mr_buf, mr_size, IBV_ACCESS_LOCAL_WRITE);
+	/*
+	 * LOCAL_WRITE | REMOTE_WRITE: peer MR plays both roles in
+	 * Phase J -- J1 raddr (needs REMOTE_WRITE) and J2 laddr (needs
+	 * LOCAL_WRITE). When @g_mode != HM_PD_MR Phase J is skipped
+	 * and the extra REMOTE_WRITE bit is benign.
+	 */
+	mr = ibv_reg_mr(g_pd, mr_buf, mr_size,
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 	if (!mr) {
 		snprintf(msg, sizeof(msg),
 			 "FAIL: ibv_reg_mr on pre-dump PD: %s "
@@ -285,6 +673,32 @@ static void run_post_restore_checks(void)
 			 strerror(errno));
 		write_status(msg);
 		goto cleanup_mr;
+	}
+
+	/*
+	 * Phase J -- data-path acid test for the restored MR.
+	 *
+	 * Only meaningful when we actually pre-dumped an MR (HM_PD_MR);
+	 * the HM_PD path stops at "PD adoption gate works" and Phase J
+	 * has no restored MR to drive. We splice it in after qp_a is
+	 * alive but before the dependency-ordered teardown so we can
+	 * reuse the existing CQ + qp_a + peer MR; run_phase_j builds a
+	 * second QP internally (qp_b) and tears it down before
+	 * returning, leaving the rest of the resource graph untouched.
+	 */
+	if (g_mode == HM_PD_MR) {
+		char j_err[256];
+		const char *j_ret = run_phase_j(g_ctx, g_pd, cq, qp,
+						g_mr, g_mr_buf, g_mr_size,
+						mr, mr_buf, mr_size,
+						j_err, sizeof(j_err));
+		if (j_ret) {
+			snprintf(msg, sizeof(msg),
+				 "FAIL: Phase J data-path test: %s",
+				 j_ret);
+			write_status(msg);
+			goto cleanup_mr;
+		}
 	}
 
 	/*
@@ -492,9 +906,26 @@ int main(int argc, char **argv)
 				g_mr_size, strerror(errno));
 			return 2;
 		}
-		memset(g_mr_buf, 0, g_mr_size);
+		/*
+		 * Stamp a pre-dump byte pattern (i ^ PHASE_J_RESTORED_BASE)
+		 * so Phase J's J1 subtest can later verify, byte-by-byte,
+		 * that the *source-time* contents of g_mr_buf survived
+		 * SAVE_VHCA_STATE -> CRIU mm replay -> Stage-3 D4 IOMMU
+		 * binding and showed up at the peer side of an RDMA WRITE
+		 * issued through the restored MR's lkey. An all-zero buffer
+		 * cannot distinguish "wrote zero bytes" from "wrote the
+		 * source bytes -- they happened to be zero".
+		 */
+		fill_pattern(g_mr_buf, g_mr_size, PHASE_J_RESTORED_BASE);
+		/*
+		 * LOCAL_WRITE | REMOTE_WRITE: the restored MR is used both
+		 * as J1 sender (laddr -> needs LOCAL_WRITE) and J2 receiver
+		 * (raddr -> needs REMOTE_WRITE). REMOTE_READ omitted on
+		 * purpose -- Phase J doesn't issue RDMA READ.
+		 */
 		g_mr = ibv_reg_mr(g_pd, g_mr_buf, g_mr_size,
-				  IBV_ACCESS_LOCAL_WRITE);
+				  IBV_ACCESS_LOCAL_WRITE |
+				  IBV_ACCESS_REMOTE_WRITE);
 		if (!g_mr) {
 			fprintf(stderr,
 				"ibv_reg_mr baseline (pre-dump MR): %s\n",

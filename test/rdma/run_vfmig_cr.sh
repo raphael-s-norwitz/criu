@@ -56,9 +56,25 @@
 #        on the *adopted* PD (exercises FW CREATE_QP/CREATE_MKEY
 #        accepting the adopted pdn under the destination
 #        ucontext's uid -- the libibverbs version of pd_adopt's
-#        FW gate validation), then tear them down in dependency
-#        order ending in ibv_dereg_mr + ibv_dealloc_pd of the
-#        pre-dump objects.
+#        FW gate validation).
+#     8. Phase J -- data-path acid test. With qp_a (the fresh QP
+#        from step 7) still alive, the holder builds qp_b on the
+#        adopted PD, connects qp_a <-> qp_b in self-loopback via
+#        port 1's GID 0, then runs two RDMA WRITE subtests:
+#          J1  WRITE laddr=g_mr_buf, lkey=restored.lkey
+#                  raddr=peer_buf,  rkey=peer.rkey
+#              Sender qp_a, responder qp_b. Verifies the source-
+#              time pattern stamped into g_mr_buf pre-dump arrived
+#              at peer_buf -- proves restored mr->lkey resolves
+#              on requester FW data path through the Stage-3 D4
+#              IOMMU binding installed by mlx5_ib_umem_restore_mr.
+#          J2  WRITE laddr=peer_buf, lkey=peer.lkey
+#                  raddr=g_mr_buf,  rkey=restored.rkey
+#              Sender qp_b, responder qp_a. Inverse direction --
+#              proves restored mr->rkey resolves on responder FW
+#              data path through the same binding.
+#        Then dependency-ordered teardown ending in ibv_dereg_mr +
+#        ibv_dealloc_pd of the pre-dump objects.
 #
 # Usage:
 #   sudo PF=0000:08:00.0 ./run_vfmig_cr.sh
@@ -364,6 +380,30 @@ RESULT="$(cat "$STATUS" 2>/dev/null || true)"
 echo "post-restore status: $RESULT"
 
 if [[ "$RESULT" == "OK" ]]; then
+    # Phase J -- data-path acid test through the restored MR.
+    #
+    # The holder writes status=OK only once Phase J's two subtests
+    # both produce WC_SUCCESS *and* the byte patterns matched, so
+    # the runner-side grep is strictly defense-in-depth: it surfaces
+    # the qp/key parameters in CI artefacts and fails loudly if a
+    # holder change ever drops the print without changing the status
+    # semantics. mlx5 path proves both:
+    #   (a) restored mr->lkey resolves on requester FW data path
+    #       through the Stage-3 D4 IOMMU binding;
+    #   (b) restored mr->rkey resolves on responder FW data path
+    #       through the same binding (J2 inverse direction).
+    if ! grep -qE 'PHASE_J: ok qp_a=0x[0-9a-f]+ qp_b=0x[0-9a-f]+ len=[1-9][0-9]* restored_lkey=0x[0-9a-f]+ restored_rkey=0x[0-9a-f]+ peer_lkey=0x[0-9a-f]+ peer_rkey=0x[0-9a-f]+' \
+        "$LOG"; then
+        echo "FAIL: holder reported OK but holder.log has no" \
+             "PHASE_J: ok line. The status-vs-log invariant is" \
+             "broken; either the holder dropped the print or" \
+             "run_phase_j was bypassed." >&2
+        echo "--- holder log tail ---" >&2
+        tail -40 "$LOG" >&2 || true
+        exit 1
+    fi
+    echo "Phase J data path:" \
+         "$(grep -E '^PHASE_J: ' "$LOG" | head -1)"
     kill -TERM "$RESTORED_PID" 2>/dev/null || true
     echo "PASS"
     exit 0

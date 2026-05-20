@@ -19,24 +19,29 @@ CRIU="${CRIU:-criu}"
 NETDEV="${1:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROG="$HERE/uverbs_ctx_holder"
-WORKDIR="/tmp/uverbs-cr-keep-aeypy7"
+WORKDIR="$(mktemp -d /tmp/uverbs-cr.XXXXXX)"
 PIDFILE="$WORKDIR/holder.pid"
 RESTORED_PIDFILE="$WORKDIR/restored.pid"
 STATUS="$WORKDIR/status"
 LOG="$WORKDIR/holder.log"
 DUMPDIR="$WORKDIR/img"
 
+# Best-effort sweep of any zombie holders from earlier runs that
+# would otherwise contend for /dev/infiniband/uverbsN. The pgrep
+# pattern matches the same argv shape we exec below.
+pkill -KILL -fx "$PROG rxe0 .* pd_mr" 2>/dev/null || true
+
 cleanup() {
-	local pid
+	local pid p
 	for pid in "$PIDFILE" "$RESTORED_PIDFILE"; do
 		[[ -f "$pid" ]] || continue
-		local p
 		p="$(cat "$pid" 2>/dev/null || true)"
 		[[ -n "$p" ]] || continue
 		kill -KILL "$p" 2>/dev/null || true
 	done
 	rm -rf "$WORKDIR"
 }
+trap cleanup EXIT
 
 
 require() {
@@ -295,6 +300,33 @@ for _ in $(seq 1 50); do
 done
 RESULT="$(cat "$STATUS" 2>/dev/null || true)"
 echo "post-restore status: $RESULT"
+
+if [[ "$RESULT" == "OK" ]]; then
+	#
+	# 5a. Phase J -- data-path acid test through the restored MR.
+	#
+	# The holder writes status=OK only once Phase J's two
+	# subtests have both produced WC_SUCCESS *and* the byte
+	# patterns matched, so a runner-side grep is strictly
+	# defense-in-depth. We still cross-check the holder.log line
+	# to surface, in CI artefacts, the qp/key parameters that
+	# went over the wire (qpns, lkeys, rkeys) and to fail
+	# loudly if a future holder change ever drops the print
+	# without changing the status semantics.
+	#
+	if ! grep -qE 'PHASE_J: ok qp_a=0x[0-9a-f]+ qp_b=0x[0-9a-f]+ len=[1-9][0-9]* restored_lkey=0x[0-9a-f]+ restored_rkey=0x[0-9a-f]+ peer_lkey=0x[0-9a-f]+ peer_rkey=0x[0-9a-f]+' \
+		"$LOG"; then
+		echo "FAIL: holder reported OK but holder.log has no" \
+		     "PHASE_J: ok line. The status-vs-log invariant" \
+		     "is broken; either the holder dropped the print" \
+		     "or run_phase_j was bypassed." >&2
+		echo "--- holder log tail ---" >&2
+		tail -40 "$LOG" >&2 || true
+		exit 1
+	fi
+	echo "Phase J data path:" \
+	     "$(grep -E '^PHASE_J: ' "$LOG" | head -1)"
+fi
 
 if [[ "$RESULT" != "OK" ]]; then
 	echo "FAIL"
