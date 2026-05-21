@@ -75,6 +75,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,8 +99,34 @@ static struct ibv_pd *g_pd;
  * libibverbs.
  */
 static struct ibv_mr *g_mr;
+/*
+ * @g_mr_buf is the address handed to ibv_reg_mr -- i.e. the start
+ * of the umem the kernel pins. @g_mr_alloc is the underlying
+ * allocation base returned by posix_memalign. They differ only in
+ * "unaligned" geometry mode (UVERBS_HOLDER_UNALIGNED_MR=1), where
+ * the underlying buffer is two pages and the MR is registered at
+ * offset 0x800 inside it -- forcing the umem to span two pages and
+ * therefore the source-side mlx5_vfmig retag path to stamp the
+ * same (KIND_MR, mkey_index) onto N>=2 sibling registry entries.
+ * The "aligned" geometry collapses to @g_mr_buf == @g_mr_alloc and
+ * is the historical default exercised by the Phase J baseline.
+ */
 static void *g_mr_buf;
-static const size_t g_mr_size = 4096;
+static void *g_mr_alloc;
+static size_t g_mr_size;
+static size_t g_mr_alloc_size;
+/*
+ * Geometry selector for the pre-dump MR. 0 = page-aligned 4 KiB
+ * (legacy baseline). 1 = non-page-aligned, 4 KiB MR registered at
+ * offset 0x800 inside an 8 KiB allocation (so umem covers second
+ * half of page 0 + first half of page 1 -- guaranteed >= 2 sg
+ * entries when the allocator hands back non-physically-contiguous
+ * pages, and therefore guaranteed coverage of the multi-page
+ * secondary-index path in mlx5/core/vfmig_iova.c regression-fixed
+ * by kernel commit "mlx5_vfmig: support multi-page user objects in
+ * the secondary index").
+ */
+static int g_mr_unaligned;
 static const char *g_status_path;
 static volatile sig_atomic_t g_terminate;
 static volatile sig_atomic_t g_query;
@@ -773,7 +800,8 @@ static void run_post_restore_checks(void)
 			write_status(msg);
 			goto cleanup_cq;
 		}
-		free(g_mr_buf);
+		free(g_mr_alloc);
+		g_mr_alloc = NULL;
 		g_mr_buf = NULL;
 	}
 
@@ -853,6 +881,17 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
+	/*
+	 * MR geometry switch. Only meaningful in pd_mr mode; ignored
+	 * (read but unused) in pd mode. Off by default so the legacy
+	 * Phase J baseline is unchanged; runners flip it on for the
+	 * post-fix multi-page regression pass.
+	 */
+	{
+		const char *unalign = getenv("UVERBS_HOLDER_UNALIGNED_MR");
+		g_mr_unaligned = (unalign && unalign[0] == '1') ? 1 : 0;
+	}
+
 	list = ibv_get_device_list(&num);
 	if (!list || num == 0) {
 		fprintf(stderr, "ibv_get_device_list: %s\n", strerror(errno));
@@ -893,19 +932,50 @@ int main(int argc, char **argv)
 		 * 4 KiB local-write MR is the smallest registration
 		 * libibverbs accepts and the cheapest exercise of
 		 * the kernel's reg_user_mr -> ib_uverbs_reg_mr ->
-		 * QUERY_MR-discoverable path. iova == addr (no
-		 * remap), access flags = LOCAL_WRITE so the source
-		 * and destination kernels both accept the MR
-		 * without needing remote-key plumbing tested
-		 * elsewhere.
+		 * QUERY_MR-discoverable path.
+		 *
+		 * Geometry depends on @g_mr_unaligned:
+		 *
+		 *   0 (legacy baseline): 4 KiB allocation, 4 KiB MR
+		 *     starting at the allocation base. iova == addr
+		 *     (no remap), umem fits in one page so the source
+		 *     side dom->pages registry holds a single sibling
+		 *     entry; this is the only shape the Phase J test
+		 *     baseline exercised pre-fix.
+		 *
+		 *   1 (multi-page regression coverage): 8 KiB allocation,
+		 *     4 KiB MR registered at offset 0x800 inside it. The
+		 *     registered umem covers the second half of page 0 +
+		 *     the first half of page 1, so ib_umem_get pins both
+		 *     pages and sg_alloc_append_table_from_pages produces
+		 *     >= 2 sg entries on a typical anonymous-page layout.
+		 *     vfmig_dma_ops.map_sg installs one external registry
+		 *     entry per sg, all sharing the same (KIND_MR,
+		 *     mkey_index) instance_key but at distinct iovas --
+		 *     the exact failure shape that pre-fix
+		 *     vfmig_iova_user_index_insert_locked rejected with
+		 *     -EEXIST on the second sibling. The replicates
+		 *     CRIU's swap_after_mr E2E failure, but inside our
+		 *     own holder so the regression is observable
+		 *     in-tree.
 		 */
-		if (posix_memalign(&g_mr_buf, 4096, g_mr_size) != 0 ||
-		    !g_mr_buf) {
+		if (g_mr_unaligned) {
+			g_mr_alloc_size = 2 * 4096;
+			g_mr_size = 4096;
+		} else {
+			g_mr_alloc_size = 4096;
+			g_mr_size = 4096;
+		}
+		if (posix_memalign(&g_mr_alloc, 4096, g_mr_alloc_size) != 0 ||
+		    !g_mr_alloc) {
 			fprintf(stderr,
 				"posix_memalign(%zu) for pre-dump MR: %s\n",
-				g_mr_size, strerror(errno));
+				g_mr_alloc_size, strerror(errno));
 			return 2;
 		}
+		g_mr_buf = g_mr_unaligned
+			? (void *)((uint8_t *)g_mr_alloc + 0x800)
+			: g_mr_alloc;
 		/*
 		 * Stamp a pre-dump byte pattern (i ^ PHASE_J_RESTORED_BASE)
 		 * so Phase J's J1 subtest can later verify, byte-by-byte,
@@ -915,6 +985,14 @@ int main(int argc, char **argv)
 		 * issued through the restored MR's lkey. An all-zero buffer
 		 * cannot distinguish "wrote zero bytes" from "wrote the
 		 * source bytes -- they happened to be zero".
+		 *
+		 * Pattern is filled across the registered range only;
+		 * the slack bytes outside the umem (when g_mr_unaligned
+		 * is set) stay untouched and are deliberately not
+		 * involved in Phase J's verify -- they don't belong to
+		 * the MR's pinned umem, so a transfer touching them
+		 * would mean kernel-side mr-out-of-bounds, not "patterns
+		 * differ".
 		 */
 		fill_pattern(g_mr_buf, g_mr_size, PHASE_J_RESTORED_BASE);
 		/*
@@ -945,13 +1023,24 @@ int main(int argc, char **argv)
 	 * file (or the post-restore READY follow-up).
 	 */
 	if (g_mode == HM_PD_MR && g_mr) {
+		/*
+		 * Expose @g_mr_unaligned, @g_mr_alloc, and @g_mr_alloc_size
+		 * on the READY line so the runner can confirm the holder
+		 * actually selected the requested geometry (and so a CI
+		 * artefact captures the umem layout that drove the rest of
+		 * the test). mr_addr == mr_alloc_base for the aligned
+		 * default; mr_addr == mr_alloc_base + 0x800 for the
+		 * multi-page regression mode.
+		 */
 		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u "
 		       "mr_handle=%u mr_lkey=0x%x mr_rkey=0x%x "
-		       "mr_addr=%p mr_length=%zu\n",
+		       "mr_addr=%p mr_length=%zu mr_unaligned=%d "
+		       "mr_alloc_base=%p mr_alloc_size=%zu\n",
 		       getpid(), devname, g_ctx->async_fd,
 		       g_pd->handle,
 		       g_mr->handle, g_mr->lkey, g_mr->rkey,
-		       g_mr_buf, g_mr_size);
+		       g_mr_buf, g_mr_size, g_mr_unaligned,
+		       g_mr_alloc, g_mr_alloc_size);
 	} else {
 		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u\n",
 		       getpid(), devname, g_ctx->async_fd, g_pd->handle);
@@ -969,7 +1058,9 @@ int main(int argc, char **argv)
 
 	if (g_mr)
 		ibv_dereg_mr(g_mr);
-	free(g_mr_buf);
+	free(g_mr_alloc);
+	g_mr_alloc = NULL;
+	g_mr_buf = NULL;
 	if (g_pd)
 		ibv_dealloc_pd(g_pd);
 	ibv_close_device(g_ctx);
