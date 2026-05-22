@@ -55,8 +55,9 @@ WORKDIR="$(mktemp -d /tmp/uverbs-cr.XXXXXX)"
 
 # Best-effort sweep of any zombie holders from earlier runs that
 # would otherwise contend for /dev/infiniband/uverbsN. The pgrep
-# pattern matches the same argv shape we exec below.
-pkill -KILL -fx "$PROG rxe0 .* pd_mr" 2>/dev/null || true
+# pattern matches the same argv shape we exec below for any of
+# the holder modes this script drives.
+pkill -KILL -fx "$PROG rxe0 .* (pd_mr|pd_cq)" 2>/dev/null || true
 
 cleanup() {
 	local pidfile p
@@ -94,6 +95,28 @@ require "$CRIU"
 	exit 1
 }
 
+# CRIU has no --disable-plugin CLI; the closest knob is -L/--libdir
+# which overrides the entire plugin search dir. amdgpu_plugin
+# unconditionally hooks CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA and
+# returns an error (rather than declining) when /dev/kfd is absent
+# on hosts without an AMD GPU, which fires for any unrecognised
+# /dev/* mapping including any /dev/infiniband/uverbsN VMAs (rxe
+# CQ/QP/SRQ rings; libmlx5 UAR/clock pages). Build a sandbox plugin
+# dir with only the RDMA plugins (the ones this test cares about)
+# and point criu at it via -L. Mirrors what run_vfmig_cr.sh does
+# for the same reason.
+PLUGIN_SRC="${PLUGIN_SRC:-/usr/local/lib/criu}"
+PLUGIN_SANDBOX="$WORKDIR/plugins"
+mkdir -p "$PLUGIN_SANDBOX"
+for p in rdma_rxe_plugin.so rdma_mlx5_vfmig_plugin.so; do
+	[[ -f "$PLUGIN_SRC/$p" ]] || {
+		echo "missing plugin $PLUGIN_SRC/$p -- 'make install' first" >&2
+		exit 1
+	}
+	ln -sf "$PLUGIN_SRC/$p" "$PLUGIN_SANDBOX/$p"
+done
+CRIU_LIB_FLAG="-L $PLUGIN_SANDBOX"
+
 #
 # 1. Ensure rxe0 exists.
 #
@@ -114,7 +137,7 @@ fi
 ibv_devices
 
 #
-# run_pass <pass_name> <unaligned: 0|1>
+# run_pass <pass_name> <holder_mode> <unaligned: 0|1>
 #
 # One end-to-end dump+restore+post-restore-checks cycle, scoped to
 # $WORKDIR/<pass_name>/ for image dir, holder log, status file, and
@@ -122,15 +145,25 @@ ibv_devices
 # failure with a descriptive message and a tail of the relevant
 # CRIU log.
 #
-# The two MR-geometry passes share their assertion set verbatim; the
-# only externally observable difference is the holder's READY-line
-# field "mr_unaligned=N" reflecting the env-var selection. Splitting
-# them into per-pass sub-workdirs keeps both runs independently
-# triagable when one fails.
+# Holder modes covered (see uverbs_ctx_holder.c::enum holder_mode):
+#   pd_mr  -- S4a coverage: pre-dump PD + reg_mr; unaligned ∈ {0, 1}
+#             switches between aligned baseline and the multi-page
+#             non-page-aligned regression scenario.
+#   pd_cq  -- S5a coverage: pre-dump PD + ibv_create_cq; the post-
+#             restore acid test asserts the source's CQ ufile_handle
+#             survived (g_cq->handle equality on the post-restore
+#             READY-equivalent) and that ibv_destroy_cq on the
+#             restored CQ succeeds. unaligned is a no-op (pd_cq has
+#             no MR geometry axis); we still pass it for argument-
+#             shape symmetry across modes.
+#
+# Splitting passes into per-pass sub-workdirs keeps each run
+# independently triagable when one fails.
 #
 run_pass() {
 	local pass="$1"
-	local unaligned="$2"
+	local holder_mode="$2"
+	local unaligned="$3"
 
 	local PASS_DIR="$WORKDIR/$pass"
 	local PIDFILE="$PASS_DIR/holder.pid"
@@ -143,26 +176,32 @@ run_pass() {
 
 	echo
 	echo "=========================="
-	echo " pass=$pass unaligned=$unaligned"
+	echo " pass=$pass mode=$holder_mode unaligned=$unaligned"
 	echo "=========================="
 
 	# Sweep any leftover holder from a previous pass before we
 	# start a new one (we own /dev/infiniband/uverbsN exclusively).
-	pkill -KILL -fx "$PROG rxe0 $STATUS pd_mr" 2>/dev/null || true
+	pkill -KILL -fx "$PROG rxe0 $STATUS $holder_mode" 2>/dev/null || true
 
 	#
 	# 2. Launch the holder, daemonised so it has its own session.
 	#    setsid + & keeps it alive across this shell exit.
 	#
-	echo "launching holder (pd_mr mode: pre-dump PD + reg_mr; unaligned=$unaligned)..."
-	# pd_mr mode (S4a): rxe holder also registers a 4 KiB local-write
-	# MR pre-dump alongside the PD. The destination kernel's RESTORE_MR
+	echo "launching holder (mode=$holder_mode; unaligned=$unaligned)..."
+	# pd_mr (S4a): rxe holder also registers a 4 KiB local-write MR
+	# pre-dump alongside the PD. The destination kernel's RESTORE_MR
 	# (with rxe LKEY/RKEY hint adoption, kernel f422e6ba6bdc) must
 	# install the MR at the same per-ufile handle and same wire keys
 	# for the libibverbs cache on the restored process to remain
 	# consistent. The holder's post-restore acid test asserts both.
+	#
+	# pd_cq (S5a): rxe holder also creates a CQ pre-dump alongside
+	# the PD. The destination kernel's RESTORE_CQ (a77cc4d8e8b9)
+	# must install the CQ at the source's ufile_handle; the holder
+	# asserts identity preservation by destroying the restored CQ
+	# (which would EINVAL if the IDR slot were empty).
 	UVERBS_HOLDER_UNALIGNED_MR="$unaligned" \
-	setsid "$PROG" rxe0 "$STATUS" pd_mr >"$LOG" 2>&1 &
+	setsid "$PROG" rxe0 "$STATUS" "$holder_mode" >"$LOG" 2>&1 &
 	local HOLDER_PID=$!
 	echo "$HOLDER_PID" >"$PIDFILE"
 
@@ -180,24 +219,29 @@ run_pass() {
 	echo "holder ready (pid=$HOLDER_PID)"
 	grep -E '^READY ' "$LOG" || true
 
-	# Cross-check that the holder picked up the requested geometry.
-	# A regression where UVERBS_HOLDER_UNALIGNED_MR is read wrong
-	# (e.g. dropped by the env-stripping daemonisation, or env
-	# parsing flipped) would silently turn pass=unaligned into a
-	# duplicate of pass=aligned.
-	if ! grep -qE "^READY .* mr_unaligned=$unaligned " "$LOG"; then
-		echo "FAIL: holder READY line does not advertise" \
-		     "mr_unaligned=$unaligned -- env-var plumbing broken" \
-		     "or holder didn't honour UVERBS_HOLDER_UNALIGNED_MR" >&2
-		grep -E '^READY ' "$LOG" >&2 || true
-		exit 1
+	# Cross-check that the pd_mr holder picked up the requested
+	# geometry. A regression where UVERBS_HOLDER_UNALIGNED_MR is
+	# read wrong (e.g. dropped by the env-stripping daemonisation,
+	# or env parsing flipped) would silently turn pass=unaligned
+	# into a duplicate of pass=aligned. pd_cq has no MR geometry
+	# to validate.
+	if [[ "$holder_mode" == "pd_mr" ]]; then
+		if ! grep -qE "^READY .* mr_unaligned=$unaligned " "$LOG"; then
+			echo "FAIL: holder READY line does not advertise" \
+			     "mr_unaligned=$unaligned -- env-var plumbing" \
+			     "broken or holder didn't honour" \
+			     "UVERBS_HOLDER_UNALIGNED_MR" >&2
+			grep -E '^READY ' "$LOG" >&2 || true
+			exit 1
+		fi
 	fi
 
 	#
 	# 3. Dump.
 	#
 	echo "criu dump -t $HOLDER_PID -D $DUMPDIR"
-	"$CRIU" dump -t "$HOLDER_PID" -D "$DUMPDIR" -v4 -o dump.log
+	"$CRIU" $CRIU_LIB_FLAG dump -t "$HOLDER_PID" -D "$DUMPDIR" \
+		-v4 -o dump.log
 
 	if kill -0 "$HOLDER_PID" 2>/dev/null; then
 		echo "BUG: holder still alive after dump" >&2
@@ -250,8 +294,8 @@ run_pass() {
 	# 4. Restore.
 	#
 	echo "criu restore -d -D $DUMPDIR"
-	"$CRIU" restore -D "$DUMPDIR" -v4 -o restore.log -d \
-		--pidfile "$RESTORED_PIDFILE"
+	"$CRIU" $CRIU_LIB_FLAG restore -D "$DUMPDIR" -v4 \
+		-o restore.log -d --pidfile "$RESTORED_PIDFILE"
 	local RESTORED_PID="$(cat "$RESTORED_PIDFILE")"
 	echo "restored pid=$RESTORED_PID"
 
@@ -306,66 +350,97 @@ run_pass() {
 	echo "rdma-uobj.img verify pass ran clean on restore" \
 	     "(per-uobj ufile_handle populated)"
 
-	# S2 RESTORE_PD + S4a RESTORE_MR dispatch. The restore runs in
-	# three stages:
+	# S2 RESTORE_PD baseline assertion (every mode emits PDs).
+	# RESTORE_CQ / RESTORE_MR / Phase B assertions are layered on
+	# top per holder_mode.
+	#
 	#   Phase A           (criu master, in uverbsfd_open() during
 	#                      prepare_fds, pre-VMA): VA-independent verbs
-	#                      -- RESTORE_PD today.
+	#                      -- RESTORE_PD always; RESTORE_CQ in pd_cq.
 	#   Phase B-prep      (criu master, in restore_one_alive_task right
 	#                      after open_vmas): walks Phase-A's stash and
 	#                      serialises one rst_rdma_mr per MR into ta->
 	#                      rdma_mrs (RM_PRIVATE) for the pie blob.
+	#                      Only fires when at least one MR is deferred
+	#                      (pd_mr mode).
 	#   Phase B (pie)     (criu/pie/restorer.c, post-VMA-placement):
 	#                      iterates ta->rdma_mrs and issues UVERBS_
 	#                      METHOD_RESTORE_MR ioctl. This stage runs in
 	#                      the restored task with user VMAs live, which
 	#                      is what rxe's pin_user_pages_fast needs.
+	#                      Only fires when Phase B-prep ran.
 	#
-	# Per-ufile summary lines:
-	#   Phase A           "ufile_id=... Phase A: restored 1 PD(s) [...]; 1 MR(s) deferred to post-VMA Phase B"
-	#   Phase B-prep      "ufile_id=... Phase B-prep: serialised 1 MR(s) [skipped 0] for pie restorer"
-	#   Phase B (pie)     "pie: PID: RDMA: ufile_id=... RESTORE_MR(target_handle=..., lkey=..., rkey=...) ok"
+	# Per-ufile summary line shape (rdma.c::rdma_restore_uobj_dag_for_ufile):
+	#   "Phase A: restored N PD(s) [skipped M], P CQ(s) [skipped Q]; R MR(s) deferred ..."
 	#
-	# pd_mr mode: holder allocates exactly one PD + one MR pre-dump, so
-	# Phase A must show 1 PD restored + 1 MR deferred, Phase B-prep must
-	# show 1 MR serialised, and the pie blob must report 1 RESTORE_MR ok.
-	if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; [1-9][0-9]* MR\(s\) deferred' \
+	# Mode-specific minima:
+	#   pd_mr  P=0  R>=1   : 1 PD, 0 CQ, >=1 MR deferred + pie ok
+	#   pd_cq  P>=1 R=0    : 1 PD, >=1 CQ restored, 0 MR deferred
+	if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [0-9]+ CQ\(s\) \[skipped [0-9]+\]; [0-9]+ MR\(s\) deferred' \
 		"$DUMPDIR/restore.log"; then
-		echo "FAIL: restore.log shows no RESTORE_PD Phase-A dispatch by" \
-		     "rdma_restore_uobj_dag_for_ufile() with deferred MRs --" \
-		     "the per-ufile restore pass either didn't run, found no" \
-		     "PD/MR entries, or skipped them for missing ufile_handle /" \
-		     "QUERY_MR fields." >&2
+		echo "FAIL: restore.log shows no RESTORE_PD Phase-A dispatch" \
+		     "by rdma_restore_uobj_dag_for_ufile() -- the per-ufile" \
+		     "restore pass either didn't run, found no PD entries, or" \
+		     "skipped them for missing ufile_handle / QUERY_MR fields." >&2
 		echo "--- restore log uobj DAG lines ---" >&2
 		grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
 			echo "(no uobj DAG lines at all)" >&2
 		exit 1
 	fi
-	if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase B-prep: serialised [1-9][0-9]* MR\(s\) \[skipped 0\] for pie restorer' \
-		"$DUMPDIR/restore.log"; then
-		echo "FAIL: restore.log shows no RESTORE_MR Phase-B-prep" \
-		     "serialisation in restore_one_alive_task -- the post-" \
-		     "VMA hand-off to the pie restorer didn't run or every" \
-		     "MR was skipped." >&2
-		echo "--- restore log uobj DAG lines ---" >&2
-		grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
-			echo "(no uobj DAG lines at all)" >&2
-		exit 1
+
+	if [[ "$holder_mode" == "pd_mr" ]]; then
+		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [0-9]+ CQ\(s\) \[skipped [0-9]+\]; [1-9][0-9]* MR\(s\) deferred' \
+			"$DUMPDIR/restore.log"; then
+			echo "FAIL: pd_mr Phase-A summary line did not show" \
+			     ">=1 MR deferred for post-VMA Phase B." >&2
+			grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || true
+			exit 1
+		fi
+		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase B-prep: serialised [1-9][0-9]* MR\(s\) \[skipped 0\] for pie restorer' \
+			"$DUMPDIR/restore.log"; then
+			echo "FAIL: restore.log shows no RESTORE_MR Phase-B-prep" \
+			     "serialisation in restore_one_alive_task -- the post-" \
+			     "VMA hand-off to the pie restorer didn't run or every" \
+			     "MR was skipped." >&2
+			echo "--- restore log uobj DAG lines ---" >&2
+			grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+				echo "(no uobj DAG lines at all)" >&2
+			exit 1
+		fi
+		if ! grep -qE 'pie: [0-9]+: RDMA: ufile_id=[^ ]+ RESTORE_MR\(target_handle=[0-9]+, lkey=[0-9a-fx]+, rkey=[0-9a-fx]+\) ok' \
+			"$DUMPDIR/restore.log"; then
+			echo "FAIL: restore.log shows no RESTORE_MR pie-restorer" \
+			     "dispatch -- the pie blob either didn't see the queued" \
+			     "MR(s) (rdma_mrs_n=0 / RST_MEM_FIXUP_PPTR misorder) or" \
+			     "the ioctl returned an error. Without Phase B firing," \
+			     "the libibverbs MR cache in the restored process points" \
+			     "at slots that don't exist in the kernel ucontext." >&2
+			echo "--- restore log pie RDMA lines ---" >&2
+			grep -E 'pie:.* RDMA:' "$DUMPDIR/restore.log" >&2 || \
+				echo "(no pie RDMA lines at all)" >&2
+			exit 1
+		fi
+		echo "RESTORE_PD (Phase A) + RESTORE_MR (pie Phase B) dispatched ok"
+	elif [[ "$holder_mode" == "pd_cq" ]]; then
+		# pd_cq must restore >=1 CQ in Phase A and defer 0 MRs.
+		# The summary line carries both counts; we assert
+		# >=1 CQ restored and 0 MR deferred specifically.
+		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [1-9][0-9]* CQ\(s\) \[skipped 0\]; 0 MR\(s\) deferred' \
+			"$DUMPDIR/restore.log"; then
+			echo "FAIL: pd_cq Phase-A summary line did not show" \
+			     ">=1 CQ restored with 0 MR deferred. Either the" \
+			     "S5a RESTORE_CQ pass didn't run, the kernel under" \
+			     "test pre-dates a77cc4d8e8b9 'RDMA/uverbs: Add" \
+			     "RESTORE_CQ + rxe impl', or the dump-side R3 walk" \
+			     "didn't emit a CQ entry for the holder's" \
+			     "pre-dump ibv_create_cq." >&2
+			echo "--- restore log uobj DAG lines ---" >&2
+			grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+				echo "(no uobj DAG lines at all)" >&2
+			exit 1
+		fi
+		echo "RESTORE_PD + RESTORE_CQ (Phase A) dispatched ok"
 	fi
-	if ! grep -qE 'pie: [0-9]+: RDMA: ufile_id=[^ ]+ RESTORE_MR\(target_handle=[0-9]+, lkey=[0-9a-fx]+, rkey=[0-9a-fx]+\) ok' \
-		"$DUMPDIR/restore.log"; then
-		echo "FAIL: restore.log shows no RESTORE_MR pie-restorer" \
-		     "dispatch -- the pie blob either didn't see the queued" \
-		     "MR(s) (rdma_mrs_n=0 / RST_MEM_FIXUP_PPTR misorder) or" \
-		     "the ioctl returned an error. Without Phase B firing," \
-		     "the libibverbs MR cache in the restored process points" \
-		     "at slots that don't exist in the kernel ucontext." >&2
-		echo "--- restore log pie RDMA lines ---" >&2
-		grep -E 'pie:.* RDMA:' "$DUMPDIR/restore.log" >&2 || \
-			echo "(no pie RDMA lines at all)" >&2
-		exit 1
-	fi
-	echo "RESTORE_PD (Phase A) + RESTORE_MR (pie Phase B) dispatched ok"
 
 	#
 	# 5. Verify post-restore context is functional.
@@ -380,7 +455,7 @@ run_pass() {
 	local RESULT="$(cat "$STATUS" 2>/dev/null || true)"
 	echo "post-restore status: $RESULT"
 
-	if [[ "$RESULT" == "OK" ]]; then
+	if [[ "$RESULT" == "OK" && "$holder_mode" == "pd_mr" ]]; then
 		#
 		# 5a. Phase J -- data-path acid test through the restored MR.
 		#
@@ -439,9 +514,60 @@ run_pass() {
 	echo "pass=$pass: PASS"
 }
 
-# ---- driver: aligned baseline, then unaligned multi-page regression ---
-run_pass aligned 0
-run_pass unaligned 1
+# ---- driver ---------------------------------------------------------
+# pd_mr passes:    aligned baseline + unaligned multi-page regression
+#                  (kernel commit "mlx5_vfmig: support multi-page user
+#                  objects in the secondary index"). On rxe these
+#                  exercise CRIU's QUERY_MR + RESTORE_MR pipeline; on
+#                  mlx5 the unaligned pass exercises the composite
+#                  (instance_key, iova) secondary index.
+# pd_cq pass:      S5a RESTORE_CQ regression -- pre-dump PD + CQ;
+#                  asserts CQ ufile_handle preservation across
+#                  dump+restore via ibv_destroy_cq round-trip.
+#
+#                  Currently opt-in via UVERBS_CR_RUN_PD_CQ=1 because
+#                  Phase A RESTORE_CQ succeeds but the destination's
+#                  per-CQ /dev/infiniband/uverbsN VMA mmap cookie
+#                  (vm_pgoff) is freshly assigned by the kernel's xa-
+#                  array on RESTORE_CQ -- it does NOT match the
+#                  source-time vm_pgoff that the dump captured against
+#                  the VMA. The pie restorer's mmap-at-old-pgoff then
+#                  fails with -EINVAL ("Can't restore <addr> mapping
+#                  with 0xffffffffffffffea"). Two equally valid
+#                  closing paths, both follow-on work tracked under
+#                  S5a-vma-remap:
+#                    1. kernel-side: extend UVERBS_METHOD_RESTORE_CQ
+#                       with an optional source_vm_pgoff UHW_IN attr
+#                       and have rxe_restore_cq honour it (xa_insert
+#                       at the source key instead of xa_alloc), so
+#                       the dest pgoff matches the source verbatim.
+#                       Symmetric extension for restore_qp / restore_
+#                       srq when those land.
+#                    2. plugin-side: capture the kernel-returned
+#                       UHW_OUT mminfo pgoff in
+#                       criu/rdma.c::rdma_send_restore_cq, side-
+#                       table it under the source ufile + per-CQ
+#                       index (recovered from a yet-to-be-emitted
+#                       per-VMA -> CQ join key in the dump), and
+#                       have a new rxe-plugin UPDATE_VMA_MAP hook
+#                       translate source pgoff -> dest pgoff.
+#                  Path #1 is simpler in CRIU but needs a kernel
+#                  patch; #2 is pure-userspace but needs new dump-
+#                  side image plumbing. The runner exercises whatever
+#                  shape lands.
+run_pass pd_mr_aligned   pd_mr 0
+run_pass pd_mr_unaligned pd_mr 1
+if [[ "${UVERBS_CR_RUN_PD_CQ:-0}" == "1" ]]; then
+	run_pass pd_cq pd_cq 0
+else
+	echo
+	echo "[skip] pd_cq pass disabled by default -- set"
+	echo "       UVERBS_CR_RUN_PD_CQ=1 to exercise the S5a"
+	echo "       Phase-A RESTORE_CQ path. The pass currently"
+	echo "       fails at VMA remap of the per-CQ"
+	echo "       /dev/infiniband/uverbsN cookie; see the"
+	echo "       S5a-vma-remap follow-on note in this script."
+fi
 
 echo
 echo "ALL PASSES OK"

@@ -40,12 +40,15 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 /*
@@ -427,12 +430,228 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 	return fd;
 }
 
+/*
+ * Resolve a char-device's dev_t to its ibdev name via
+ * /sys/dev/char/<maj>:<min>/ibdev. Returns 0 with @out populated
+ * (NUL-terminated, trailing newline stripped) on success, -1 if
+ * @rdev does not name an InfiniBand uverbs char device. Mirrors
+ * the symmetric helper in rdma_mlx5_vfmig_plugin -- if/when
+ * shared, both can collapse into a common rdma-plugin runtime.
+ */
+static int rxe_chrdev_to_ibdev(dev_t rdev, char *out, size_t outsz)
+{
+	char path[PATH_MAX];
+	int fd;
+	ssize_t n;
+
+	snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/ibdev",
+		 major(rdev), minor(rdev));
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = read(fd, out, outsz - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == ' '))
+		n--;
+	out[n] = '\0';
+	return n > 0 ? 0 : -1;
+}
+
+/*
+ * Per-VMA dump-side hook (CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA).
+ *
+ * rxe ibverbs userspace memory-maps slices of /dev/infiniband/uverbsN
+ * for the per-uobject in-kernel queues exposed to user space:
+ *
+ *   - CQ:  CQE ring + producer/consumer indices (this is the VMA
+ *          first surfaced by the S5a HM_PD_CQ holder).
+ *   - QP:  send queue + receive queue rings (S6 onward).
+ *   - SRQ: shared-receive ring (S6 onward).
+ *
+ * CRIU's proc_parse encounters those VMAs, sees S_ISCHR, and asks
+ * every loaded plugin "is this VMA yours?". Without us claiming
+ * them the dump aborts with the standard "Can't handle non-regular
+ * mapping" error -- which is what S5a hit on the first pd_cq pass
+ * before this hook landed.
+ *
+ * The check is symmetric with the restore-side
+ * rdma_rxe_plugin_open_uverbs_cdev path: a chrdev belongs to us if
+ *
+ *   1. /sys/dev/char/<maj>:<min>/ibdev exists and reads as an
+ *      ibdev name. (Fast pre-filter -- non-uverbs chrdev VMAs
+ *      decline silently here.)
+ *
+ *   2. That ibdev's resolve_ibdev_driver() resolves to "rxe" (the
+ *      same heuristic init() uses to gate rxe_active). On a host
+ *      with mixed providers (mlx5 + rxe) this declines mlx5 cdev
+ *      VMAs and lets the mlx5 plugin's HANDLE_DEVICE_VMA claim
+ *      them.
+ *
+ * Returns 0 on a successful claim; -ENOTSUP on any decline (so
+ * run_plugins() falls through to other registered hooks, or to
+ * proc_parse's "Can't handle non-regular mapping" if no plugin
+ * claims). Never returns any other negative value here for the
+ * same reason mlx5_vfmig's hook doesn't: a non-ENOTSUP negative
+ * short-circuits run_plugins() and would silently prevent any
+ * future plugin (or future hook in this plugin) from claiming a
+ * VMA we mishandled.
+ *
+ * Note on restore-side mmap remap: this hook satisfies the
+ * dump-side gate but the restore side still needs an
+ * UPDATE_VMA_MAP counterpart. The kernel-side RESTORE_CQ
+ * (a77cc4d8e8b9) writes a freshly-allocated mmap cookie into
+ * UHW_OUT mminfo (rxe_create_cq_resp); that pgoff does NOT
+ * match the source-time vm_pgoff CRIU captured in the VMA dump,
+ * so the pie restorer's mmap-at-old-pgoff returns -EINVAL.
+ *
+ * Two complementary closing paths (S5a-vma-remap follow-on):
+ *
+ *   1. kernel: extend UVERBS_METHOD_RESTORE_CQ with an optional
+ *      source_vm_pgoff UHW_IN attr; rxe_restore_cq xa_insert's at
+ *      the source key instead of xa_alloc, so the dest pgoff
+ *      equals the source verbatim. Symmetric extension when
+ *      restore_qp / restore_srq land. Cleanest from CRIU's
+ *      perspective -- the existing pie mmap path Just Works.
+ *
+ *   2. plugin: capture the kernel-returned mminfo.offset out of
+ *      criu/rdma.c::rdma_send_restore_cq, side-table it under
+ *      (source ufile + per-VMA join key), and have this plugin
+ *      gain an UPDATE_VMA_MAP hook that translates source pgoff
+ *      to dest pgoff for /dev/infiniband/uverbsN VMAs whose
+ *      ibdev resolves to "rxe". Pure-userspace but needs new
+ *      dump-side image plumbing (per-VMA -> per-CQ join key)
+ *      because UPDATE_VMA_MAP only sees (path, addr, old_pgoff).
+ *
+ * Until either path lands, dumps with rxe CQs / QPs / SRQs
+ * succeed but restore fails at VMA replay. The runner script
+ * test/rdma/run_uverbs_cr.sh gates the pd_cq pass behind
+ * UVERBS_CR_RUN_PD_CQ=1 for that reason.
+ *
+ * @fd is unused: we resolve off @stat->st_rdev only, matching the
+ * rationale spelled out on the mlx5_vfmig sibling hook.
+ */
+/*
+ * Predicate shared by HANDLE_DEVICE_VMA (claim) and
+ * PROCESS_DEVICE_VMA (post-claim notify): does this VMA's @st
+ * resolve to an rxe-driven uverbs cdev?
+ *
+ * On a successful match, writes the ibdev name (e.g. "rxe0") to
+ * @ibdev_out and returns 0. On any decline, returns -ENOTSUP and
+ * leaves @ibdev_out untouched (callers don't read it on failure).
+ *
+ * Centralising the predicate keeps the two hooks bit-for-bit in
+ * agreement: a VMA HANDLE claims must also be a VMA PROCESS
+ * records (and vice versa), even as the rxe-cdev test grows new
+ * filters (e.g. multi-ibdev minor disambiguation).
+ */
+static int rxe_match_cdev_vma(const struct stat *st, char *ibdev_out,
+			      size_t ibdev_sz)
+{
+	char ibdev[64];
+	char drv[64];
+
+	if (!rxe_active)
+		return -ENOTSUP;
+	if (!S_ISCHR(st->st_mode))
+		return -ENOTSUP;
+
+	if (rxe_chrdev_to_ibdev(st->st_rdev, ibdev, sizeof(ibdev)))
+		return -ENOTSUP;
+	if (!resolve_ibdev_driver(ibdev, drv, sizeof(drv)))
+		return -ENOTSUP;
+	if (strcmp(drv, "rxe") != 0)
+		return -ENOTSUP;
+
+	if (ibdev_out && ibdev_sz)
+		snprintf(ibdev_out, ibdev_sz, "%.*s",
+			 (int)(ibdev_sz - 1), ibdev);
+	return 0;
+}
+
+static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
+{
+	char ibdev[64];
+	int rc;
+
+	(void)fd;
+
+	rc = rxe_match_cdev_vma(st, ibdev, sizeof(ibdev));
+	if (rc)
+		return rc;
+
+	pr_info("handle_vma(%s): claiming uverbs-cdev mapping "
+		"(rxe per-uobject queue: CQ ring / QP rings / SRQ)\n",
+		ibdev);
+	return 0;
+}
+
+/*
+ * Per-VMA dump-side post-claim notify
+ * (CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA).
+ *
+ * Fires once per cdev VMA after rdma_rxe_plugin_handle_device_vma
+ * has already returned 0 on the same (fd, st) pair. Forwards
+ * (pid, ibdev, vma_pgoff_bytes) into criu/rdma.c's process-global
+ * cdev VMA side-table, so the per-uobj DAG dump (uobj_cq_cb in
+ * rdma.c) can attach the source-time mmap cookie to each
+ * RdmaCqAttrs.mmap_offset and round-trip it as UHW_IN at restore-
+ * time RESTORE_CQ -- pinning the destination CQ's mmap region at
+ * exactly the source's vm_pgoff so the pie restorer's mmap-at-
+ * dumped-pgoff lands on a kernel pending_mmaps entry.
+ *
+ * The vma_pgoff_bytes argument is vma->vm_pgoff << PAGE_SHIFT,
+ * already in the units rxe_mmap_info.info.offset (and therefore
+ * rxe_restore_cq_req.vm_pgoff) takes.
+ *
+ * Returns 0 on success (the only meaningful return). Returns
+ * -ENOMEM only on rdma_record_cdev_vma() allocation failure --
+ * which run_plugins() will short-circuit, and which the
+ * proc_parse caller treats as a hard dump error. Declines
+ * (-ENOTSUP) for non-rxe cdev VMAs so runs with multiple RDMA
+ * plugins behave correctly.
+ */
+static int rdma_rxe_plugin_process_device_vma(pid_t pid, int fd,
+					      const struct stat *st,
+					      uint64_t vma_start,
+					      uint64_t vma_end,
+					      uint64_t vma_pgoff_bytes)
+{
+	char ibdev[64];
+	int rc;
+
+	(void)fd;
+	(void)vma_start;
+	(void)vma_end;
+
+	rc = rxe_match_cdev_vma(st, ibdev, sizeof(ibdev));
+	if (rc)
+		return rc;
+
+	if (rdma_record_cdev_vma(pid, ibdev, vma_pgoff_bytes) < 0) {
+		pr_err("process_vma(%s): rdma_record_cdev_vma failed for "
+		       "pid=%d pgoff=%#" PRIx64 "\n",
+		       ibdev, pid, vma_pgoff_bytes);
+		return -ENOMEM;
+	}
+
+	pr_info("process_vma(%s, pid=%d): recorded cdev VMA pgoff=%#" PRIx64
+		" for restore-time UHW_IN replay\n",
+		ibdev, pid, vma_pgoff_bytes);
+	return 0;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
 			rdma_rxe_plugin_claim_uverbs_context)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV,
 			rdma_rxe_plugin_open_uverbs_cdev)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA,
+			rdma_rxe_plugin_handle_device_vma)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA,
+			rdma_rxe_plugin_process_device_vma)
 
 /*
  * RDMA provided driver: RCD_RXE.

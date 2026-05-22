@@ -109,13 +109,39 @@ bool is_vma_range_fmt(char *line)
 	return __is_vma_range_fmt(line);
 }
 
-bool handle_vma_plugin(int *fd, struct stat *stat)
+bool handle_vma_plugin(pid_t pid, int *fd, struct stat *stat,
+		       uint64_t vma_start, uint64_t vma_end,
+		       uint64_t vma_pgoff_bytes)
 {
 	int ret;
 
 	ret = run_plugins(HANDLE_DEVICE_VMA, *fd, stat);
 	if (ret < 0) {
 		pr_perror("handle_device_vma plugin failed");
+		return false;
+	}
+
+	/*
+	 * Optional second-stage notify. Plugins that registered a
+	 * cr_plugin_process_device_vma symbol get the VMA bounds and
+	 * pgoff alongside (pid, fd, stat) so they can build per-cdev
+	 * side tables for downstream dump-time consumers (e.g. the
+	 * rxe RDMA plugin uses this to record the source CQ's mmap
+	 * cookie before the per-uobj DAG dump executes -- see
+	 * criu/rdma.c).
+	 *
+	 * run_plugins() returns -ENOTSUP when *no* loaded plugin
+	 * registered the hook (or every plugin in the chain returned
+	 * ENOTSUP). For HANDLE_DEVICE_VMA that's a real error -- the
+	 * VMA can't be dumped without an owning plugin. For
+	 * PROCESS_DEVICE_VMA it just means "no plugin needs per-VMA
+	 * metadata", which is the common case (amdgpu_plugin doesn't,
+	 * mlx5_vfmig doesn't either). Treat it as success and continue.
+	 */
+	ret = run_plugins(PROCESS_DEVICE_VMA, pid, *fd, stat, vma_start,
+			  vma_end, vma_pgoff_bytes);
+	if (ret < 0 && ret != -ENOTSUP) {
+		pr_perror("process_device_vma plugin failed");
 		return false;
 	}
 
@@ -655,7 +681,10 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 		} else if (S_ISCHR(st_buf->st_mode) && (st_buf->st_rdev == DEVZERO)) {
 			/* devzero mapping -- also makes sense */;
 			pr_debug("Found devzero mapping, OK\n");
-		} else if (handle_vma_plugin(vm_file_fd, st_buf)) {
+		} else if (handle_vma_plugin(pid, vm_file_fd, st_buf,
+					     vma_area->e->start,
+					     vma_area->e->end,
+					     vma_area->e->pgoff)) {
 			pr_info("Found device file mapping, plugin is available\n");
 			vma_area->e->status |= VMA_EXT_PLUGIN;
 		} else {

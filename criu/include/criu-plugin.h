@@ -182,6 +182,66 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT = 18,
 
+	/*
+	 * Per-VMA dump-side post-claim notification. Invoked at dump
+	 * time by criu/proc_parse.c::handle_vma_plugin AFTER one of
+	 * the loaded plugins has already returned 0 from
+	 * CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA -- i.e. after the binary
+	 * "is this device VMA yours" decision has been made and the
+	 * VMA has been admitted to the dump with VMA_EXT_PLUGIN.
+	 *
+	 * Distinct from HANDLE_DEVICE_VMA because:
+	 *   - HANDLE is a *gate* (binary; first claimer wins), and
+	 *     to keep its contract minimal it only sees (fd, stat).
+	 *     Adding fields there would change the existing ABI for
+	 *     amdgpu_plugin and any other consumer that registered
+	 *     the cr_plugin_handle_device_vma symbol against the
+	 *     historical signature.
+	 *   - PROCESS is a *capture*: optional, runs after a
+	 *     successful claim, and gets the VMA's bounds and
+	 *     pgoff (in bytes) in addition to (fd, stat). Plugins
+	 *     that don't need per-VMA metadata simply don't register
+	 *     a cr_plugin_process_device_vma symbol -- the loader
+	 *     treats absence as "no-op" rather than as a load
+	 *     failure (mirrors the optional CHECKPOINT_DEVICES /
+	 *     RDMA_DUMP_UVERBS_CONTEXT pattern).
+	 *
+	 * Concrete consumer (S5a CQ restore):
+	 *   The rxe plugin uses PROCESS_DEVICE_VMA to record the
+	 *   per-cdev-VMA mmap cookie (vma_pgoff_bytes == vma->vm_pgoff
+	 *   << PAGE_SHIFT, equal to the kernel-allocated rxe_mmap_info.
+	 *   info.offset returned at source-time CMD_CREATE_CQ) into a
+	 *   small criu-side side-table keyed by (pid, ibdev). The
+	 *   per-uobj DAG dump (rdma_dump_uobj_dag's CQ callback) then
+	 *   queries the side-table and ships the source offset back
+	 *   to the kernel as UHW_IN at restore time, so the dest's
+	 *   rxe_create_mmap_info pins the new CQ's mmap region at
+	 *   exactly the same offset the pie restorer's mmap is
+	 *   targeting (linux kernel d3a79140ed26 +
+	 *   rxe_restore_cq_req.vm_pgoff). Without PROCESS the dump
+	 *   side has no reasonable join key between vm_pgoff and
+	 *   the per-uobj DAG.
+	 *
+	 * Args:  pid -- host pid of the dumpee task (the owner of the
+	 *               VMA). Indispensable in pstree dumps where
+	 *               multiple tasks share the same cdev (same
+	 *               st_rdev, same ibdev) -- the pid disambiguates
+	 *               which dumpee a recorded vma_pgoff belongs to.
+	 *        fd  -- the source dumpee's mapped-file fd, same as
+	 *               HANDLE_DEVICE_VMA.
+	 *        stat -- ditto.
+	 *        vma_start, vma_end -- VMA bounds in source process
+	 *               address space, bytes.
+	 *        vma_pgoff_bytes -- vma->vm_pgoff << PAGE_SHIFT;
+	 *               matches the file offset for fd-backed
+	 *               mappings, which for /dev/infiniband/uverbsN
+	 *               is the kernel-allocated mmap cookie.
+	 * Return: 0 on success (the only meaningful return today;
+	 *         any non-zero short-circuits run_plugins(), as with
+	 *         the other CRIU per-VMA hooks).
+	 */
+	CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA = 19,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -195,6 +255,9 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__DUMP_EXT_MOUNT, char *mountpoint, int i
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RESTORE_EXT_MOUNT, int id, char *mountpoint, char *old_root, int *is_file);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__DUMP_EXT_LINK, int index, int type, char *kind);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA, int fd, const struct stat *stat);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA, pid_t pid, int fd,
+			 const struct stat *stat, uint64_t vma_start,
+			 uint64_t vma_end, uint64_t vma_pgoff_bytes);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, const char *path, const uint64_t addr,
 			 const uint64_t old_pgoff, uint64_t *new_pgoff, int *plugin_fd);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, int pid);
@@ -369,6 +432,38 @@ extern int criu_get_image_dir(void);
  * entry. Returns 0 on success or -errno on ioctl failure.
  */
 extern int criu_ib_uverbs_get_context(int fd, uint32_t driver_id);
+
+/*
+ * Record a source-side cdev-mapped VMA's pgoff (in bytes) into
+ * criu's process-global RDMA cdev VMA side-table, keyed by
+ * (@pid, @ibdev).
+ *
+ * Intended caller: an RDMA-class plugin's
+ * CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA implementation, once it has
+ * determined the just-claimed VMA backs an ibdev the plugin owns.
+ * The plugin is responsible for resolving the VMA's @stat->st_rdev
+ * to an ibdev name (e.g. "rxe0", "mlx5_2") via the kernel's
+ * /sys/dev/char/<maj>:<min>/ibdev attribute -- criu/rdma.c keeps
+ * that resolution in the plugin layer rather than in core because
+ * each driver decides for itself which cdev VMAs it cares about
+ * (rxe records all of them; mlx5 may filter UAR vs blueflame vs
+ * CQ-ring, etc.).
+ *
+ * Insertion order matters: the per-uobj DAG dump
+ * (criu/rdma.c::rdma_dump_uobj_dag, downstream of every per-task
+ * VMA walk) pops entries FIFO via rdma_pop_cdev_vma_offset(); for
+ * rxe each new mmap_info uses a monotonically growing vm_pgoff
+ * and userspace mmap()s in CMD_CREATE_<TYPE> order, so insertion-
+ * order pop matches NLDEV's per-class enumeration order against
+ * the source's creation order. Plugins should call this hook once
+ * per VMA, in the order /proc/<pid>/smaps emits them (which is
+ * what the CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA dispatcher provides
+ * naturally).
+ *
+ * Returns 0 on success, -1 on allocation failure.
+ */
+extern int rdma_record_cdev_vma(pid_t pid, const char *ibdev,
+				uint64_t pgoff_bytes);
 
 /*
  * Deprecated, will be removed in next version.

@@ -86,6 +86,19 @@
 static struct ibv_context *g_ctx;
 static struct ibv_pd *g_pd;
 /*
+ * Pre-dump CQ: created alongside g_pd when @g_mode covers CQ
+ * (currently rxe S5a). Needs to survive across CRIU dump+restore
+ * and re-emerge in the destination ucontext at the same
+ * ufile_handle so libibverbs's cached g_cq->handle stays consistent.
+ * The kernel-side wire identity (cqn) is FW-private and not
+ * user-visible on rxe; the only user-visible identity to assert
+ * is the ufile_handle (validated post-restore by
+ * ibv_destroy_cq() succeeding -- if the IDR slot is missing the
+ * kernel returns -EINVAL on destroy).
+ */
+static struct ibv_cq *g_cq;
+static const int G_CQ_CQE = 16;
+/*
  * Pre-dump MR: registered alongside g_pd when @g_mode covers MR
  * (currently rxe S4a). Needs survive across SAVE_VHCA_STATE /
  * dump and re-emerge in the destination ucontext at the same
@@ -143,6 +156,16 @@ static volatile sig_atomic_t g_query;
  *            byte-identical lkey/rkey via ibv_dereg_mr success
  *            and (lkey/rkey unchanged) checks.
  *
+ *   "pd_cq"  pre-dump alloc PD + create CQ. Used by rxe (S5a).
+ *            Post-restore validates the CQ survived at the
+ *            source's ufile_handle by destroying it cleanly --
+ *            ibv_destroy_cq returns -EINVAL on a missing IDR
+ *            slot, so a successful destroy is the smoking gun
+ *            that RESTORE_CQ installed at the right slot. CQ has
+ *            no wire-spec identifier (cqn is internal driver/FW
+ *            metadata), so libibverbs's cq->handle is the only
+ *            user-visible identity to assert.
+ *
  * The default is "pd" so existing call sites that don't pass
  * argv[3] (mlx5_vfmig run_vfmig_cr.sh) keep their current
  * pre-dump shape.
@@ -150,6 +173,7 @@ static volatile sig_atomic_t g_query;
 enum holder_mode {
 	HM_PD = 0,
 	HM_PD_MR = 1,
+	HM_PD_CQ = 2,
 };
 static enum holder_mode g_mode = HM_PD;
 
@@ -559,6 +583,75 @@ out:
  * was reinstalled by RESTORE_PD); the test is meaningless without
  * it, so a missing g_pd is treated as a hard fail.
  */
+/*
+ * Post-restore checks for HM_PD_CQ (rxe S5a). Asserts that the
+ * pre-dump CQ:
+ *
+ *   1. survived restore at the same libibverbs ufile_handle (the
+ *      runner cross-checks pre-dump and post-restore READY lines
+ *      for cq_handle equality; the holder's only job here is to
+ *      hold a valid g_cq pointer and prove it's usable);
+ *
+ *   2. is destroyable cleanly via ibv_destroy_cq -- the smoking
+ *      gun for the kernel-side IDR slot existing at the source's
+ *      ufile_handle. ibv_destroy_cq returns -EINVAL if the slot
+ *      is missing or points at a stale uobject.
+ *
+ * Then ibv_dealloc_pd(g_pd) closes the loop on PD adoption +
+ * dependency-ordered teardown.
+ *
+ * Intentionally minimal: no fresh CQ/QP/MR build-up, no Phase J.
+ * Those are pd_mr's job; pd_cq exists to localise CQ-restore
+ * regressions to a tiny, fast-running pass without the rest of
+ * the resource-graph noise.
+ */
+static void run_post_restore_checks_pd_cq(void)
+{
+	char msg[256];
+	int rc;
+
+	if (!g_pd) {
+		write_status("FAIL: post-restore: g_pd missing -- "
+			     "holder lost the pre-dump PD reference");
+		return;
+	}
+	if (!g_cq) {
+		write_status("FAIL: post-restore: g_cq missing despite "
+			     "HM_PD_CQ -- holder lost the pre-dump CQ "
+			     "reference");
+		return;
+	}
+
+	rc = ibv_destroy_cq(g_cq);
+	g_cq = NULL;
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: ibv_destroy_cq of pre-dump CQ after "
+			 "restore: %d (%s) -- the source's CQ "
+			 "ufile_handle is missing in the destination "
+			 "ucontext IDR. RESTORE_CQ did not run, or "
+			 "installed at a different handle than the "
+			 "source's", rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+
+	rc = ibv_dealloc_pd(g_pd);
+	g_pd = NULL;
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: ibv_dealloc_pd of pre-dump PD after "
+			 "tearing down the restored CQ: %d (%s) -- "
+			 "kernel uobj cleanup leaked a dependent or "
+			 "the adopted PD identity drifted",
+			 rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+
+	write_status("OK");
+}
+
 static void run_post_restore_checks(void)
 {
 	struct ibv_device_attr dev_attr;
@@ -875,9 +968,11 @@ int main(int argc, char **argv)
 		g_mode = HM_PD;
 	} else if (strcmp(mode, "pd_mr") == 0) {
 		g_mode = HM_PD_MR;
+	} else if (strcmp(mode, "pd_cq") == 0) {
+		g_mode = HM_PD_CQ;
 	} else {
 		fprintf(stderr, "unknown holder mode '%s' "
-				"(expected pd|pd_mr)\n", mode);
+				"(expected pd|pd_mr|pd_cq)\n", mode);
 		return 2;
 	}
 
@@ -925,6 +1020,25 @@ int main(int argc, char **argv)
 	if (!g_pd) {
 		fprintf(stderr, "ibv_alloc_pd baseline: %s\n", strerror(errno));
 		return 2;
+	}
+
+	if (g_mode == HM_PD_CQ) {
+		/*
+		 * Pre-dump CQ for S5a regression coverage. cqe=16 is
+		 * the same size run_post_restore_checks's fresh-CQ
+		 * uses; comp_channel=NULL (v0 RESTORE_CQ rejects
+		 * comp_channel anyway), cq_context=NULL (so
+		 * user_handle is 0 -- matches the v0 "user_handle
+		 * isn't NLDEV-emitted" gap documented in
+		 * rdma_uobj.proto::rdma_cq_attrs), comp_vector=0.
+		 */
+		g_cq = ibv_create_cq(g_ctx, G_CQ_CQE, NULL, NULL, 0);
+		if (!g_cq) {
+			fprintf(stderr,
+				"ibv_create_cq baseline (pre-dump CQ): %s\n",
+				strerror(errno));
+			return 2;
+		}
 	}
 
 	if (g_mode == HM_PD_MR) {
@@ -1041,6 +1155,18 @@ int main(int argc, char **argv)
 		       g_mr->handle, g_mr->lkey, g_mr->rkey,
 		       g_mr_buf, g_mr_size, g_mr_unaligned,
 		       g_mr_alloc, g_mr_alloc_size);
+	} else if (g_mode == HM_PD_CQ && g_cq) {
+		/*
+		 * Expose pre-dump CQ ufile_handle + cqe_count so the
+		 * runner can cross-check a post-restore READY-equivalent
+		 * report (or just assert the value is what the source
+		 * advertised, which is enough to catch a regression in
+		 * the K8a ufile_handle plumbing).
+		 */
+		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u "
+		       "cq_handle=%u cq_cqe=%d\n",
+		       getpid(), devname, g_ctx->async_fd,
+		       g_pd->handle, g_cq->handle, g_cq->cqe);
 	} else {
 		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u\n",
 		       getpid(), devname, g_ctx->async_fd, g_pd->handle);
@@ -1051,7 +1177,10 @@ int main(int argc, char **argv)
 	while (!g_terminate) {
 		if (g_query) {
 			g_query = 0;
-			run_post_restore_checks();
+			if (g_mode == HM_PD_CQ)
+				run_post_restore_checks_pd_cq();
+			else
+				run_post_restore_checks();
 		}
 		pause();
 	}
@@ -1061,6 +1190,9 @@ int main(int argc, char **argv)
 	free(g_mr_alloc);
 	g_mr_alloc = NULL;
 	g_mr_buf = NULL;
+	if (g_cq)
+		ibv_destroy_cq(g_cq);
+	g_cq = NULL;
 	if (g_pd)
 		ibv_dealloc_pd(g_pd);
 	ibv_close_device(g_ctx);

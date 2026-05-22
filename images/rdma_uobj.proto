@@ -133,16 +133,44 @@ message rdma_pd_attrs {
  * uniformly.
  *
  * Field provenance:
- *   cqe_count    NLDEV RES_CQE (always present from S1.b dump).
- *   comp_vector  not in NLDEV; comes from plugin-private query
- *                (FW comp-vector binding) at S3+. Optional.
- *   flags        not in NLDEV; mirrors `enum ib_create_cq_flags`,
- *                filled from plugin blob at S3+. Optional.
+ *   cqe_count     NLDEV RES_CQE (always present from S1.b dump).
+ *   comp_vector   not in NLDEV; comes from plugin-private query
+ *                 (FW comp-vector binding) at S3+. Optional.
+ *   flags         not in NLDEV; mirrors `enum ib_create_cq_flags`,
+ *                 filled from plugin blob at S3+. Optional.
+ *   mmap_offset   the source-side mmap cookie the kernel returned
+ *                 from CMD_CREATE_CQ (rxe: rxe_create_cq_resp.mi.offset
+ *                 == rxe_mmap_info.info.offset; equals
+ *                 vma->vm_pgoff << PAGE_SHIFT for the matching VMA
+ *                 in /proc/<pid>/maps). Replayed at restore via
+ *                 UVERBS_METHOD_RESTORE_CQ's UHW_IN tail
+ *                 (struct rxe_restore_cq_req.vm_pgoff) so the dest
+ *                 ibdev binds the new CQ's mmap region at the same
+ *                 offset the pie restorer's mmap() will hit. Without
+ *                 this, the dest's monotonic mmap_offset counter
+ *                 desyncs from the source's, the dumped vm_pgoff
+ *                 doesn't match any pending_mmaps entry, and
+ *                 rxe_mmap returns -EINVAL. Captured at dump time
+ *                 by the RDMA-class plugin's
+ *                 CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA hook (see
+ *                 plugins/rdma/rxe/rdma_rxe_plugin.c::rdma_rxe_plugin_process_device_vma);
+ *                 the plugin records each cdev VMA's pgoff into
+ *                 criu/rdma.c's process-global side-table via
+ *                 rdma_record_cdev_vma(), and uobj_cq_cb pops one
+ *                 entry per CQ. Absent on degenerate dumps (multi-
+ *                 CQ ufiles where the dumper can't tell which VMA
+ *                 belongs to which CQ -- see uobj_cq_cb for the
+ *                 join key TODO). Bytes, not pages: matches the
+ *                 kernel's rxe_restore_cq_req.vm_pgoff which is
+ *                 also a byte-offset despite its name (it's
+ *                 compared against vma->vm_pgoff << PAGE_SHIFT in
+ *                 rxe_mmap).
  */
 message rdma_cq_attrs {
 	optional uint32		cqe_count		= 1;
 	optional uint32		comp_vector		= 2;
 	optional uint32		flags			= 3;
+	optional uint64		mmap_offset		= 4;
 };
 
 /*
