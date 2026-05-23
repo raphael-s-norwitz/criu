@@ -69,7 +69,15 @@ cleanup() {
 		[[ -n "$p" ]] || continue
 		kill -KILL "$p" 2>/dev/null || true
 	done
-	rm -rf "$WORKDIR"
+	# UVERBS_CR_KEEP_WORKDIR=1 preserves the per-pass image dir + logs
+	# on FAIL exit, so the operator can post-mortem the dump.log /
+	# restore.log / holder.log without racing the cleanup trap. The
+	# default removes the workdir after a green run to keep /tmp tidy.
+	if [[ "${UVERBS_CR_KEEP_WORKDIR:-0}" == "1" ]]; then
+		echo "preserving WORKDIR=$WORKDIR (UVERBS_CR_KEEP_WORKDIR=1)"
+	else
+		rm -rf "$WORKDIR"
+	fi
 }
 trap cleanup EXIT
 
