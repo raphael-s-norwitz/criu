@@ -531,50 +531,40 @@ run_pass() {
 #                  (instance_key, iova) secondary index.
 # pd_cq pass:      S5a RESTORE_CQ regression -- pre-dump PD + CQ;
 #                  asserts CQ ufile_handle preservation across
-#                  dump+restore via ibv_destroy_cq round-trip.
-#
-#                  Currently opt-in via UVERBS_CR_RUN_PD_CQ=1 because
-#                  Phase A RESTORE_CQ succeeds but the destination's
-#                  per-CQ /dev/infiniband/uverbsN VMA mmap cookie
-#                  (vm_pgoff) is freshly assigned by the kernel's xa-
-#                  array on RESTORE_CQ -- it does NOT match the
-#                  source-time vm_pgoff that the dump captured against
-#                  the VMA. The pie restorer's mmap-at-old-pgoff then
-#                  fails with -EINVAL ("Can't restore <addr> mapping
-#                  with 0xffffffffffffffea"). Two equally valid
-#                  closing paths, both follow-on work tracked under
-#                  S5a-vma-remap:
-#                    1. kernel-side: extend UVERBS_METHOD_RESTORE_CQ
-#                       with an optional source_vm_pgoff UHW_IN attr
-#                       and have rxe_restore_cq honour it (xa_insert
-#                       at the source key instead of xa_alloc), so
-#                       the dest pgoff matches the source verbatim.
-#                       Symmetric extension for restore_qp / restore_
-#                       srq when those land.
-#                    2. plugin-side: capture the kernel-returned
-#                       UHW_OUT mminfo pgoff in
-#                       criu/rdma.c::rdma_send_restore_cq, side-
-#                       table it under the source ufile + per-CQ
-#                       index (recovered from a yet-to-be-emitted
-#                       per-VMA -> CQ join key in the dump), and
-#                       have a new rxe-plugin UPDATE_VMA_MAP hook
-#                       translate source pgoff -> dest pgoff.
-#                  Path #1 is simpler in CRIU but needs a kernel
-#                  patch; #2 is pure-userspace but needs new dump-
-#                  side image plumbing. The runner exercises whatever
-#                  shape lands.
+#                  dump+restore via ibv_destroy_cq round-trip, and
+#                  exercises the full S5a-vma-remap path:
+#                    1. kernel: rxe_restore_cq honours an UHW_IN
+#                       source vm_pgoff, binding the new CQ's mmap
+#                       region at the dumped offset (rxe_create_
+#                       mmap_info(forced_offset)). The req struct
+#                       is sized > 8 bytes to escape the uverbs
+#                       inline-attr trap.
+#                    2. CRIU: rdma_record_cdev_vma() (rxe plugin
+#                       PROCESS_DEVICE_VMA) feeds the dump-side
+#                       vm_pgoff into a side-table that
+#                       rdma_send_restore_cq replays as UHW_IN at
+#                       restore time.
+#                    3. CRIU: the rxe plugin's UPDATE_VMA_MAP hook
+#                       hands open_filemap a dup of the cdev fd
+#                       open_uverbs_cdev minted with GET_CONTEXT
+#                       (RESTORE_MODE), so the pie restorer's
+#                       mmap lands on the *same struct file* that
+#                       has the ucontext attached -- without the
+#                       dup, ib_uverbs_mmap rejects via
+#                       ib_uverbs_get_ucontext_file -EINVAL.
+#                  UVERBS_CR_RUN_PD_CQ=0 still works as a kill
+#                  switch for kernels missing the rxe forced-pgoff
+#                  patch.
 run_pass pd_mr_aligned   pd_mr 0
 run_pass pd_mr_unaligned pd_mr 1
-if [[ "${UVERBS_CR_RUN_PD_CQ:-0}" == "1" ]]; then
+if [[ "${UVERBS_CR_RUN_PD_CQ:-1}" == "1" ]]; then
 	run_pass pd_cq pd_cq 0
 else
 	echo
-	echo "[skip] pd_cq pass disabled by default -- set"
-	echo "       UVERBS_CR_RUN_PD_CQ=1 to exercise the S5a"
-	echo "       Phase-A RESTORE_CQ path. The pass currently"
-	echo "       fails at VMA remap of the per-CQ"
-	echo "       /dev/infiniband/uverbsN cookie; see the"
-	echo "       S5a-vma-remap follow-on note in this script."
+	echo "[skip] pd_cq pass disabled by UVERBS_CR_RUN_PD_CQ=0."
+	echo "       Default is to run; this switch exists for"
+	echo "       kernels that pre-date the rxe forced-vm_pgoff"
+	echo "       support in rxe_restore_cq (S5a-vma-remap)."
 fi
 
 echo

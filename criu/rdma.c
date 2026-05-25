@@ -2940,10 +2940,14 @@ struct rxe_create_cq_resp_local {
 /*
  * struct rxe_restore_cq_req -- driver-private UHW_IN payload for
  * rxe_restore_cq's "honor source vm_pgoff" mode (linux kernel
- * commit d3a79140ed26).
+ * commit d3a79140ed26 + the inline-attr-trap fix that grew the
+ * struct above 8 bytes).
  *
  * Source-of-truth: include/uapi/rdma/rdma_user_rxe.h
- *   struct rxe_restore_cq_req { __aligned_u64 vm_pgoff; };
+ *   struct rxe_restore_cq_req {
+ *       __aligned_u64 vm_pgoff;
+ *       __aligned_u64 reserved;
+ *   };
  *
  * Despite the name, the field is a *byte* offset matching the
  * source-side rxe_create_cq_resp::mi.offset (which the kernel
@@ -2951,6 +2955,17 @@ struct rxe_create_cq_resp_local {
  * non-zero the kernel binds the new CQ's mmap region at exactly
  * this offset; -EEXIST on collision; on success the UHW_OUT
  * mi.offset returned to userspace equals this value verbatim.
+ *
+ * @reserved must be zero on send (kernel rejects -EINVAL otherwise
+ * for forward-compat). Its sole purpose is making the struct
+ * strictly larger than sizeof(__u64) so the uverbs ioctl bundle
+ * takes the pointer (not inline-attr) path through
+ * uverbs_fill_udata: with len <= 8 the dispatcher reuses
+ * &user_attrs[i].data as inbuf, and ib_copy_from_udata then reads
+ * the literal pointer-shaped value CRIU put in attr.data instead
+ * of the buffer it points at. See the matching size note in
+ * include/uapi/rdma/rdma_user_rxe.h. Same trap, same mitigation
+ * as struct mlx5_ib_restore_pd_req_local below.
  *
  * Sent only when we have a captured source offset (RdmaCqAttrs::
  * mmap_offset present in the image). Absent UHW_IN -> kernel
@@ -2960,6 +2975,7 @@ struct rxe_create_cq_resp_local {
  */
 struct rxe_restore_cq_req_local {
 	uint64_t	vm_pgoff;
+	uint64_t	reserved;
 };
 
 /*
