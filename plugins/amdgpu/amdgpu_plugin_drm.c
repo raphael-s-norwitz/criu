@@ -136,10 +136,17 @@ int amdgpu_plugin_drm_handle_device_vma(int fd, const struct stat *st)
 	int ret = 0;
 
 	snprintf(path, sizeof(path), AMDGPU_DRM_DEVICE, DRM_FIRST_RENDER_NODE);
+	/*
+	 * Render node absent => no AMD GPU on this host. Decline so
+	 * the HANDLE_DEVICE_VMA chain in proc_parse.c keeps walking
+	 * to the next plugin instead of failing the dump. Mirrors the
+	 * st_rdev-mismatch branch below, which already returns
+	 * -ENOTSUP for the same reason.
+	 */
 	ret = stat(path, &drm);
 	if (ret == -1) {
-		pr_err("Error in getting stat for: %s\n", path);
-		return ret;
+		pr_debug("amdgpu_plugin: %s absent, declining VMA\n", path);
+		return -ENOTSUP;
 	}
 
 	if ((major(st->st_rdev) != major(drm.st_rdev)) ||
