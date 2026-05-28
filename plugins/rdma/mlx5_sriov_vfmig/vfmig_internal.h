@@ -28,4 +28,46 @@ int vfmig_resolve_pf_vf_quiet(const char *ibdev,
 			      uint32_t *vf_id);
 int vfmig_chrdev_to_ibdev(dev_t rdev, char *out, size_t outsz);
 
+/*
+ * vfmig_uverbs.c -- mlx5 ucontext ioctl wrappers (legacy
+ * IB_USER_VERBS_CMD_GET_CONTEXT write() path + RDMA_VERBS_IOCTL
+ * MLX5_IB_OBJECT_VFMIG methods). Pure marshaling -- no plugin
+ * state, no /sys or /dev side effects.
+ *
+ * vfmig_query_uctx and vfmig_query_dyn_uars are file-private to
+ * vfmig_uverbs.c (only used by their snapshot wrappers); the
+ * rest are reachable from the dump and restore paths.
+ *
+ * Forward-declared rather than including mlx5_uapi.h to keep
+ * this header lightweight for callers that only need the PCI
+ * helpers above.
+ */
+struct mlx5_ib_vfmig_ucontext_meta_local;
+struct mlx5_ib_vfmig_dyn_uar_record_local;
+
+int vfmig_send_get_context_v2(int fd, uint32_t flags,
+			      uint64_t lib_caps,
+			      uint32_t total_bfregs,
+			      uint32_t ll_bfregs,
+			      uint8_t max_cqe_version,
+			      uint32_t adopt_devx_uid);
+
+int vfmig_restore_uctx(int fd,
+		       const uint32_t *uar_table, size_t uar_n,
+		       const uint32_t *bfreg_count, size_t bfreg_n,
+		       const struct mlx5_ib_vfmig_ucontext_meta_local *meta);
+
+int vfmig_snapshot_uctx(int fd,
+			struct mlx5_ib_vfmig_ucontext_meta_local *meta_out,
+			uint32_t **uar_out, size_t *uar_n_out,
+			uint32_t **cnt_out, size_t *cnt_n_out);
+
+int vfmig_restore_dyn_uars(int fd,
+			   const struct mlx5_ib_vfmig_dyn_uar_record_local *records,
+			   size_t n_records);
+
+int vfmig_snapshot_dyn_uars(int fd,
+			    struct mlx5_ib_vfmig_dyn_uar_record_local **records_out,
+			    size_t *n_out);
+
 #endif /* __CR_VFMIG_INTERNAL_H__ */
