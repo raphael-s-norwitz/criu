@@ -54,12 +54,20 @@ PLUGIN_CFLAGS := -g -Wall -Werror -shared -nostartfiles -fPIC
 PLUGIN_PB_C := ../../../images/mlx5_vfmig.pb-c.c
 PLUGIN_LDFLAGS += $(shell pkg-config --libs libprotobuf-c)
 
+#
+# Plugin source list. Single-pass compile (one $(CC) invocation
+# over every .c) preserves -Werror's whole-program reach and keeps
+# the rule trivial. Add new modules here as the file is split.
+#
+PLUGIN_SRCS := rdma_mlx5_vfmig_plugin.c
+PLUGIN_SRCS += vfmig_pci.c
+
 __nmk_dir ?= ../../../scripts/nmk/scripts/
 include $(__nmk_dir)msg.mk
 
 all: $(DEPS_RDMA_MLX5_VFMIG)
 
-rdma_mlx5_vfmig_plugin.so: rdma_mlx5_vfmig_plugin.c $(PLUGIN_PB_C)
+rdma_mlx5_vfmig_plugin.so: $(PLUGIN_SRCS) $(PLUGIN_PB_C)
 	$(call msg-gen, $@)
 	$(Q) $(CC) $(PLUGIN_CFLAGS) $(DEFINES) $(shell $(COMPEL) includes) $^ -o $@ $(PLUGIN_INCLUDE) $(PLUGIN_LDFLAGS)
 
