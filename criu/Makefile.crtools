@@ -62,6 +62,7 @@ obj-y			+= rbtree.o
 obj-y			+= rdma/driver.o
 obj-y			+= rdma/plugin_api.o
 obj-y			+= rdma/precheck.o
+obj-y			+= rdma/uverbsfd.o
 obj-y			+= rdma/rdma.o
 obj-y			+= rdma/netlink.o
 obj-y			+= rst-malloc.o
