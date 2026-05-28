@@ -64,6 +64,7 @@ PLUGIN_SRCS += vfmig_pci.c
 PLUGIN_SRCS += vfmig_uverbs.c
 PLUGIN_SRCS += vf_image.c
 PLUGIN_SRCS += vfmig_dump.c
+PLUGIN_SRCS += vfmig_restore.c
 
 __nmk_dir ?= ../../../scripts/nmk/scripts/
 include $(__nmk_dir)msg.mk

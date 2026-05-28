@@ -13,6 +13,7 @@
 #include <sys/types.h>
 
 #include "images/mlx5_vfmig.pb-c.h"
+#include "images/uverbsfd.pb-c.h"
 
 /*
  * vfmig_pci.c -- PCI / sysfs / per-PF cdev probe + resolution
@@ -147,6 +148,28 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 struct stat;
 int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd,
 					     const struct stat *st);
+
+/*
+ * vfmig_restore.c -- restore-side eager-init + the two
+ * restore hooks. Caches one cdev fd per dumpee uverbs
+ * context (already armed with GET_CONTEXT(VFMIG_RESTORE) +
+ * RESTORE_{UCONTEXT,DYN_UARS}) so UPDATE_VMA_MAP and
+ * RDMA_OPEN_UVERBS_CDEV can dup() out of it.
+ *
+ * The two init/fini-time entries are called from plugin.c
+ * lifecycle code; the two hook entries are referenced by
+ * plugin.c's CR_PLUGIN_REGISTER_HOOK macros.
+ */
+int vfmig_restore_init_all_vfs(void);
+void vfmig_restore_fini_close_all(void);
+
+int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path,
+					  const uint64_t addr,
+					  const uint64_t old_pgoff,
+					  uint64_t *new_pgoff,
+					  int *plugin_fd);
+
+int rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe);
 
 /*
  * Per-PF char-device directory. The plugin's init() walks this
