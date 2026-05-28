@@ -1,69 +1,80 @@
-#include <dlfcn.h>
-#include <inttypes.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+/*
+ * R3 restore-side: per-uobject DAG dispatch + Phase A/B
+ * orchestration.
+ *
+ * Public surface (declared in criu/include/rdma.h):
+ *
+ *   rdma_collect_uobj_dag()             read+verify pass on
+ *                                       rdma-uobj.img, called once
+ *                                       early in restore.
+ *   rdma_restore_uobj_dag_for_ufile()   per-cdev-fd Phase A
+ *                                       dispatcher; called from
+ *                                       uverbsfd_open() in
+ *                                       uverbsfd.c after the
+ *                                       claiming plugin hands back
+ *                                       an open cdev fd. Drives
+ *                                       PD/CQ restore + queues MRs
+ *                                       for Phase B.
+ *   rdma_prepare_rdma_mrs()             Phase B serialiser; called
+ *                                       once at end-of-restore to
+ *                                       walk the per-ufile pending
+ *                                       MR list and pack the
+ *                                       restore_args view that the
+ *                                       pie-restorer will later
+ *                                       replay against per-task VMAs.
+ *
+ * File-private state owned by this file:
+ *
+ *   rdma_uobj_groups        LIST_HEAD of per-ufile groups, built
+ *                           by rdma_collect_uobj_dag() and read by
+ *                           rdma_restore_uobj_dag_for_ufile() +
+ *                           rdma_prepare_rdma_mrs(). Lifetime is
+ *                           the rest of the restore (free is at
+ *                           process exit by design).
+ *   rdma_pending_post_vma   LIST_HEAD of MR groups that need to
+ *                           wait until per-task VMAs are mapped
+ *                           (Phase B). Built incrementally by
+ *                           Phase A, consumed once by
+ *                           rdma_prepare_rdma_mrs().
+ *
+ * Reads but does not own:
+ *
+ *   uobj_handle_map         per-ufile (kernel-handle -> ufile_handle)
+ *                           mapping built lazily during dispatch
+ *                           by uverbs RESTORE_<TYPE> ioctls.
+ */
+
+#include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include <rdma/rdma_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_verbs.h>
 
 #include "common/compiler.h"
 #include "common/list.h"
-#include "imgset.h"
 #include "image.h"
-#include "files.h"
-#include "files-reg.h"
+#include "imgset.h"
 #include "int.h"
 #include "log.h"
-#include "plugin.h"
 #include "protobuf.h"
-#include "pstree.h"
 #include "rdma.h"
-#include "rdma/internal.h"
-#include "rdma_netlink.h"
-#include "fdinfo.h"
 #include "restorer.h"
 #include "rst-malloc.h"
 #include "xmalloc.h"
 
-#include "images/fdinfo.pb-c.h"
 #include "images/rdma_criu.pb-c.h"
 #include "images/rdma_uobj.pb-c.h"
-#include "images/uverbsfd.pb-c.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "rdma: "
-
-/*
- * uverbs cdev fd dump/restore, async-event evfd dump/restore,
- * and the plugin-claim arbitration + dispatch helpers shared
- * with the pre-suspend coverage path have moved to
- * criu/rdma/uverbsfd.c. The shared rdma_dumped_ufiles list +
- * struct rdma_dumped_ufile definition live in
- * criu/include/rdma/internal.h so the R3 dump-side DAG walker
- * (rdma_dump_uobj_dag, still in this file) can read the list.
- */
-
-/* Pre-suspend coverage + cross-tree exclusivity checks have
- * moved to criu/rdma/precheck.c. The two public entry points
- * (rdma_check_dump_coverage, rdma_check_cross_tree_exclusivity)
- * remain declared in criu/include/rdma.h; the rest of the
- * implementation -- including the dump_cov_ctx and
- * cross_tree_collect_ctx walk-state structs -- now lives over
- * there.
- */
-
-/*
- * R3 dump-side: per-ucontext uobject DAG walker has moved
- * to criu/rdma/uobj_dump.c. The public entry point
- * (rdma_dump_uobj_dag) remains declared in
- * criu/include/rdma.h.
- */
 
 /*
  * R3 restore-side: read+verify pass on rdma-uobj.img.
