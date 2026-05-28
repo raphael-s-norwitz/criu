@@ -7,6 +7,7 @@
  * lives next to the .c files that use it, never installed.
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -108,5 +109,52 @@ int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
 			     uint32_t source_devx_uid);
 
 int vfmig_read_image(Mlx5VfmigStateEntry ***out_arr, size_t *out_n);
+
+/*
+ * Process-global activation flag. Set true by init() iff at
+ * least one tracked VF was found across the host's PF cdevs.
+ * Read by every dump+restore hook to short-circuit when no
+ * mlx5_vfmig work is in flight, so a stray hook call on a
+ * host that doesn't have the cdevs at all is a cheap decline.
+ */
+extern bool vfmig_active;
+
+/*
+ * vfmig_dump.c -- dump-side state lists, capture orchestration,
+ * source devx_uid resolver, dump+VMA hooks, fini-time drain.
+ *
+ * The four entries below are reachable from plugin.c (the
+ * lifecycle file): vfmig_*_clear() are called from init()
+ * (so a CRIU re-invocation starts fresh) and fini() (so we
+ * release per-dump state regardless of which path tore down
+ * the dump). vfmig_drain_pending_in_fini() is the SAVE-time
+ * drain the fini() handler invokes after all DUMP_UVERBS_
+ * CONTEXT hooks have queued.
+ *
+ * The two hook entries are reachable from plugin.c's
+ * CR_PLUGIN_REGISTER_HOOK macros.
+ */
+void vfmig_saved_clear(void);
+void vfmig_pending_clear(void);
+void vfmig_failed_clear(void);
+void vfmig_drain_pending_in_fini(void);
+
+int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
+					       uint32_t kernel_driver_id,
+					       uint32_t ctxn,
+					       int lfd, pid_t pid);
+
+struct stat;
+int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd,
+					     const struct stat *st);
+
+/*
+ * Per-PF char-device directory. The plugin's init() walks this
+ * directory and opens every entry as a candidate cdev; both the
+ * dump path (capture, HANDLE_DEVICE_VMA) and the restore path
+ * (load, ensure_cdev_open) construct per-PF cdev paths under it.
+ * Defined here so all three .c files agree.
+ */
+#define MLX5_VFMIG_DEV_DIR "/dev/mlx5_vfmig"
 
 #endif /* __CR_VFMIG_INTERNAL_H__ */
