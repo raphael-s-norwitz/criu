@@ -23,4 +23,14 @@ int rdma_pop_cdev_vma_offset(pid_t pid, const char *ibdev,
 			     uint64_t *out);
 void rdma_cdev_vma_recs_free(void);
 
+/*
+ * driver.c: chrdev (major,minor) -> ibdev name resolver. Used
+ * by rdma.c's dump_uverbsfile() to identify the source-side
+ * uverbs cdev a held fd refers to. The two driver-name helpers
+ * this calls into (rdma_driver_name_from_ibdev,
+ * rdma_driver_name_to_id) are public and live in rdma.h.
+ */
+int rdma_ibdev_from_chrdev(unsigned int maj, unsigned int min,
+			   char *out, size_t outsz);
+
 #endif /* __CR_RDMA_INTERNAL_H__ */
