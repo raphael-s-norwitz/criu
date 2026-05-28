@@ -11,6 +11,8 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include "images/mlx5_vfmig.pb-c.h"
+
 /*
  * vfmig_pci.c -- PCI / sysfs / per-PF cdev probe + resolution
  * helpers. Pure name resolution, no plugin state shared with
@@ -69,5 +71,42 @@ int vfmig_restore_dyn_uars(int fd,
 int vfmig_snapshot_dyn_uars(int fd,
 			    struct mlx5_ib_vfmig_dyn_uar_record_local **records_out,
 			    size_t *n_out);
+
+/*
+ * vf_image.c -- on-disk format for the plugin's per-dump
+ * sidecar image (mlx5_vfmig.img + per-VF SAVE_VHCA_STATE blob
+ * files). Pure proto pack/unpack + flat-file I/O against
+ * criu_get_image_dir(); no plugin state.
+ *
+ * vfmig_drain_save_fd_to_blob() writes the blob, given the
+ * SAVE fd from MLX5_VFMIG_IOC_SAVE_VHCA_STATE and a caller-
+ * chosen blob path under the image dir.
+ *
+ * vfmig_append_state_entry() takes primitives + buffers (no
+ * dependency on dump.c-private aggregate types) and appends
+ * one Mlx5VfmigStateEntry length-prefixed record to
+ * mlx5_vfmig.img.
+ *
+ * vfmig_read_image() walks the file on restore and returns
+ * an in-memory array of unpacked entries (caller frees with
+ * mlx5_vfmig_state_entry__free_unpacked + free()).
+ */
+int vfmig_drain_save_fd_to_blob(int save_fd,
+				const char *blob_path,
+				uint64_t *out_size);
+
+int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
+			     const char *source_cdev_path,
+			     const char *pf_bdf, uint32_t vf_id,
+			     uint32_t vhca_id,
+			     const char *blob_path, uint64_t blob_size,
+			     const struct mlx5_ib_vfmig_ucontext_meta_local *uctx_meta,
+			     const uint32_t *uctx_uar, size_t uctx_uar_n,
+			     const uint32_t *uctx_cnt, size_t uctx_cnt_n,
+			     const struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn,
+			     size_t uctx_dyn_n,
+			     uint32_t source_devx_uid);
+
+int vfmig_read_image(Mlx5VfmigStateEntry ***out_arr, size_t *out_n);
 
 #endif /* __CR_VFMIG_INTERNAL_H__ */
