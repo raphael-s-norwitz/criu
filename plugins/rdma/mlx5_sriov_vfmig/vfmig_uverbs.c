@@ -500,10 +500,19 @@ int vfmig_query_cq(int fd,
 	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_CQ_LOCAL;
 	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
 
+	/*
+	 * HANDLE is an UVERBS_ATTR_IDR(UVERBS_OBJECT_CQ) attribute on
+	 * the kernel side: uverbs_ioctl.c::uverbs_process_attr enforces
+	 * len == 0 for the IDR class and reads the uobject handle
+	 * directly from attrs[].data. Setting len = sizeof(u32) the way
+	 * a PTR_IN(u32) attr does trips the dispatcher's `if (uattr->len
+	 * != 0) return -EINVAL` guard before our handler runs. The
+	 * matching probe is tools/testing/mlx5_vfmig/.../cq_query_probe.
+	 */
 	cmd.attrs[0].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL;
-	cmd.attrs[0].len = sizeof(cq_handle);
+	cmd.attrs[0].len = 0;
 	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[0].data = (uintptr_t)&cq_handle;
+	cmd.attrs[0].data = cq_handle;
 
 	cmd.attrs[1].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB_LOCAL;
 	cmd.attrs[1].len = sizeof(*blob_out);
