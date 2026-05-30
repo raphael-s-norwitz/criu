@@ -863,6 +863,17 @@ struct uobj_pending_post_vma {
 	int cmd_fd_dup;
 	uint32_t ufile_id;
 	uint32_t kernel_driver_id;
+	/*
+	 * Cached at Phase A close (rdma_pending_post_vma_add) -- mirrors
+	 * the CLAIM-time plugin caching on the dump side. Phase B-prep
+	 * (rdma_prepare_rdma_mrs) reads @plugin->d->hooks[...] to invoke
+	 * RDMA_RESTORE_UOBJ_MR_UHW_PACK without a per-MR plugin walk.
+	 * NULL is legal: the per-class hook is optional, and the master
+	 * may not have resolved a plugin (e.g. dump under a non-RDMA
+	 * plugin set). The PACK-call site treats NULL as "no UHW" and
+	 * emits no UHW_IN attr.
+	 */
+	plugin_desc_t *plugin;
 	struct uobj_ufile_group *g;
 	struct uobj_handle_map handle_map;
 	struct list_head link;
@@ -871,6 +882,7 @@ static LIST_HEAD(rdma_pending_post_vma);
 
 static int rdma_pending_post_vma_add(int cmd_fd_dup, uint32_t ufile_id,
 				     uint32_t kernel_driver_id,
+				     plugin_desc_t *plugin,
 				     struct uobj_ufile_group *g,
 				     struct uobj_handle_map *handle_map)
 {
@@ -885,6 +897,7 @@ static int rdma_pending_post_vma_add(int cmd_fd_dup, uint32_t ufile_id,
 	p->cmd_fd_dup = cmd_fd_dup;
 	p->ufile_id = ufile_id;
 	p->kernel_driver_id = kernel_driver_id;
+	p->plugin = plugin;
 	p->g = g;
 	/* Move the handle_map -- caller no longer owns the storage. */
 	p->handle_map = *handle_map;
@@ -1342,7 +1355,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			goto out;
 		}
 		if (rdma_pending_post_vma_add(dup, ufile_id,
-					      kernel_driver_id, g,
+					      kernel_driver_id, plugin, g,
 					      &handle_map) < 0) {
 			pr_err("uobj DAG: ufile_id=%#x: stashing Phase B "
 			       "state failed (OOM); MR restore won't "
@@ -1399,7 +1412,9 @@ int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 			uint32_t parent_pd_handle = 0;
 			const RdmaMrAttrs *attrs;
 			struct rst_rdma_mr *r;
+			struct rdma_uhw_spec uhw = {};
 			int dup_fd;
+			int pack_rc = 0;
 
 			if (e->type != R3_UOBJ_TYPE__R3UT_MR)
 				continue;
@@ -1508,6 +1523,87 @@ int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 			r->access_flags = attrs->access_flags;
 			r->lkey_hint = attrs->lkey;
 			r->rkey_hint = attrs->rkey;
+			r->uhw_in_len = 0;
+			r->uhw_out_expected_len = 0;
+
+			/*
+			 * Driver-private UHW: the cached plugin owns the
+			 * wire shape. The hook is optional -- rxe MR
+			 * registers neither PACK nor VERIFY (RXE
+			 * RESTORE_MR doesn't read UHW), mlx5 registers
+			 * PACK only (16B mlx5_ib_restore_mr_req carrying
+			 * the FW mkey_index). See criu-plugin.h for the
+			 * pie-can't-call-plugins contract that motivates
+			 * this master-side pack-into-static-buf path.
+			 */
+			if (p->plugin && p->plugin->d->hooks[
+				CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK]) {
+				CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK_t *fn =
+					p->plugin->d->hooks[
+					CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK];
+				pack_rc = fn(e, &uhw);
+				if (pack_rc) {
+					pr_err("uobj DAG: ufile_id=%#x MR"
+					       "(handle=%u): plugin '%s' "
+					       "RESTORE_UOBJ_MR_UHW_PACK "
+					       "failed: %d (%s)\n",
+					       p->ufile_id, e->ufile_handle,
+					       p->plugin->d->name, pack_rc,
+					       strerror(-pack_rc));
+					close(dup_fd);
+					per_ret = -1;
+					break;
+				}
+			}
+			if (uhw.in_len > sizeof(r->uhw_in_buf)) {
+				pr_err("uobj DAG: ufile_id=%#x MR"
+				       "(handle=%u): plugin '%s' UHW_IN "
+				       "size %zu exceeds rst_rdma_mr "
+				       "static buffer (%zu); bump "
+				       "RST_RDMA_MR_UHW_IN_MAX in "
+				       "criu/include/restorer.h\n",
+				       p->ufile_id, e->ufile_handle,
+				       p->plugin ? p->plugin->d->name :
+				       "(none)",
+				       uhw.in_len,
+				       sizeof(r->uhw_in_buf));
+				free(uhw.in_buf);
+				free(uhw.out_buf);
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+			if (uhw.out_len > sizeof(r->uhw_out_expected)) {
+				pr_err("uobj DAG: ufile_id=%#x MR"
+				       "(handle=%u): plugin '%s' UHW_OUT "
+				       "expected size %zu exceeds "
+				       "rst_rdma_mr static buffer (%zu); "
+				       "bump RST_RDMA_MR_UHW_OUT_MAX in "
+				       "criu/include/restorer.h\n",
+				       p->ufile_id, e->ufile_handle,
+				       p->plugin ? p->plugin->d->name :
+				       "(none)",
+				       uhw.out_len,
+				       sizeof(r->uhw_out_expected));
+				free(uhw.in_buf);
+				free(uhw.out_buf);
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+			if (uhw.in_len) {
+				memcpy(r->uhw_in_buf, uhw.in_buf,
+				       uhw.in_len);
+				r->uhw_in_len = (uint16_t)uhw.in_len;
+			}
+			if (uhw.out_len) {
+				memcpy(r->uhw_out_expected, uhw.out_buf,
+				       uhw.out_len);
+				r->uhw_out_expected_len =
+					(uint16_t)uhw.out_len;
+			}
+			free(uhw.in_buf);
+			free(uhw.out_buf);
 
 			n_mr_serialised++;
 			ta->rdma_mrs_n++;

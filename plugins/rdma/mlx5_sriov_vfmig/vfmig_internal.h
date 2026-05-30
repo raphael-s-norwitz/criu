@@ -173,6 +173,8 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev,
 struct rdma_uhw_spec;
 int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
 						    struct rdma_uhw_spec *uhw);
+int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw);
 
 struct stat;
 int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd,

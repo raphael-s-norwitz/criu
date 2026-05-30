@@ -508,7 +508,15 @@ run_pass() {
                 echo "(no uobj DAG lines at all)" >&2
             pass_fail "no Phase B-prep MR serialisation"
         fi
-        if ! grep -qE 'pie: [0-9]+: RDMA: ufile_id=[^ ]+ RESTORE_MR\(target_handle=[0-9]+, lkey=[0-9a-fx]+, rkey=[0-9a-fx]+, mkey_index=[0-9a-fx]+\) ok' \
+        # Post-MR-refactor log shape (commit "criu/rdma: plugin-shape
+        # UHW for RESTORE_MR via PACK/VERIFY hooks"): the pie restorer
+        # no longer hard-codes mlx5 mkey_index in its OK line. The
+        # driver-private UHW_IN is now plugin-shaped and shipped through
+        # rst_rdma_mr.uhw_in_buf, so the OK line carries the generic
+        # (driver_id, uhw_in_len) tuple instead. For mlx5 we expect
+        # uhw_in=16 (size of struct mlx5_ib_restore_mr_req); for rxe
+        # uhw_in=0.
+        if ! grep -qE 'pie: [0-9]+: RDMA: ufile_id=[^ ]+ RESTORE_MR\(target_handle=[0-9]+, lkey=[0-9a-fx]+, rkey=[0-9a-fx]+, driver_id=[0-9]+, uhw_in=[0-9]+\) ok' \
             "$DUMPDIR/restore.log"; then
             echo "missing pie-restorer RESTORE_MR ok line. The pie blob" \
                  "either didn't see the queued MR(s) (rdma_mrs_n=0 /" \
@@ -521,7 +529,7 @@ run_pass() {
                 echo "(no pie RDMA lines at all)" >&2
             pass_fail "no RESTORE_MR pie-restorer dispatch"
         fi
-        echo "RESTORE_PD (Phase A) + RESTORE_MR (mlx5 UHW pie Phase B) dispatched ok"
+        echo "RESTORE_PD (Phase A) + RESTORE_MR (plugin UHW pie Phase B) dispatched ok"
     elif [[ "$holder_mode" == "pd_cq" || "$holder_mode" == "pd_2cq" ]]; then
         # pd_cq:  exactly 1 CQ restored.
         # pd_2cq: exactly 2 CQs restored (multi-CQ-per-ufile dispatch

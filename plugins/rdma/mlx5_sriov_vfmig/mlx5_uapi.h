@@ -301,4 +301,38 @@ struct mlx5_ib_restore_cq_req_local {
 	uint32_t reserved2;
 } __attribute__((aligned(8)));
 
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_MR on mlx5,
+ * carrying the source's FW mkey_index so mlx5_ib_restore_mr can
+ * adopt the destination-side mkey that LOAD_VHCA_STATE preserved
+ * (Model A, no FW round-trip on adoption -- see Linux 85c651e7e4db).
+ *
+ * Layout MUST match include/uapi/rdma/mlx5-abi.h::mlx5_ib_restore_mr_req
+ * exactly: 16 bytes, u32 mkey_index + u32 reserved + u64 reserved2.
+ *
+ * Wire-shape gotchas the criu plugin packer must respect:
+ *
+ *   - sizeof > sizeof(u64) is intentional. Kernel uverbs UHW dispatch
+ *     treats len <= 8 as INLINE (stuffs attr->data into a kernel
+ *     staging slot and rewrites udata->inbuf to a kernel pointer);
+ *     on x86_64 with masked-user-access enabled that breaks
+ *     ib_copy_from_udata's copy_from_user. The 8-byte reserved2
+ *     pads us above the threshold so the kernel takes the ptr path
+ *     and copy_from_user works. Same dodge as the PD/CQ shims.
+ *   - reserved/reserved2 must be zero on send; the kernel handler
+ *     validates this for forward-compat (-EINVAL otherwise).
+ *   - mkey_index is 24 bits significant; the kernel rejects 0 and
+ *     any value with bits set above 0xffffff. CRIU derives it from
+ *     the source's lkey via the mlx5 invariant
+ *     lkey == rkey == (mkey_index << 8) | variant_byte
+ *     so mkey_index = lkey_hint >> 8.
+ *
+ * Drop once host rdma-core ships the struct upstream.
+ */
+struct mlx5_ib_restore_mr_req_local {
+	uint32_t mkey_index;
+	uint32_t reserved;
+	uint64_t reserved2;
+} __attribute__((aligned(8)));
+
 #endif /* __CR_MLX5_VFMIG_UAPI_H__ */

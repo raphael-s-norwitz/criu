@@ -169,6 +169,26 @@ struct restore_vma_io {
  * and below service_fd_base). The pie helper closes it after the
  * ioctl so it doesn't leak into the restored task's fd table.
  */
+/*
+ * Driver-private UHW carried verbatim from the per-driver RDMA plugin's
+ * RDMA_RESTORE_UOBJ_MR_UHW_PACK hook (invoked in CRIU master at
+ * rdma_prepare_rdma_mrs time -- see the criu-plugin.h block on the
+ * pie-can't-call-plugins contract). The pie blob attaches @uhw_in_buf
+ * as UVERBS_ATTR_UHW_IN when @uhw_in_len > 0, and after the ioctl
+ * memcmp's the kernel's UHW_OUT echo against @uhw_out_expected when
+ * @uhw_out_expected_len > 0. Both lengths are zero for drivers that
+ * register neither hook (rxe MR today).
+ *
+ * Static array sizing: the largest current-tree plugin UHW_IN is
+ * mlx5's struct mlx5_ib_restore_mr_req at 16 bytes (4-byte mkey_index
+ * + 4 reserved + 8 reserved2). UHW_OUT is unused by all in-tree MR
+ * providers today. The 24/16 split leaves a few bytes of slack on
+ * each side without burning RM_PRIVATE per MR; bump if a future
+ * driver's UAPI grows past these.
+ */
+#define RST_RDMA_MR_UHW_IN_MAX	24
+#define RST_RDMA_MR_UHW_OUT_MAX	16
+
 struct rst_rdma_mr {
 	int		cmd_fd;
 	u32		ufile_id;		/* diagnostics only */
@@ -181,6 +201,10 @@ struct rst_rdma_mr {
 	u32		access_flags;
 	u32		lkey_hint;
 	u32		rkey_hint;
+	u16		uhw_in_len;
+	u16		uhw_out_expected_len;
+	u8		uhw_in_buf[RST_RDMA_MR_UHW_IN_MAX];
+	u8		uhw_out_expected[RST_RDMA_MR_UHW_OUT_MAX];
 };
 
 struct task_restore_args {

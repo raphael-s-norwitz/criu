@@ -1272,3 +1272,73 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
 	uhw->out_len = 0;
 	return 0;
 }
+
+/*
+ * Driver-private UHW for UVERBS_METHOD_RESTORE_MR (mlx5).
+ * mlx5_ib_restore_mr requires a struct mlx5_ib_restore_mr_req
+ * carrying the source's FW mkey_index so it can adopt the
+ * destination-side mkey that LOAD_VHCA_STATE preserved (Model A,
+ * no FW round-trip). Without this UHW the kernel handler fails at
+ * its udata->inlen check before any useful work happens.
+ *
+ * The mlx5 invariant is lkey == rkey == (mkey_index << 8) |
+ * variant_byte. We derive mkey_index from the dumped lkey rather
+ * than carrying it through plugin_blob: the source lkey is already
+ * captured generically in e->mr->lkey by the dump-side per-MR
+ * walker (rxe and mlx5 both populate it). The kernel cross-checks
+ * (lkey_hint >> 8) == req.mkey_index AND lkey_hint == rkey_hint
+ * and rejects with -EINVAL on mismatch -- defense-in-depth that
+ * catches a CRIU bug shipping a restrack id where the FW
+ * mkey_index was expected.
+ *
+ * No UHW_OUT is needed (mlx5_ib_restore_mr writes nothing through
+ * udata); we leave uhw->out_buf NULL and don't register a VERIFY
+ * hook for MR.
+ *
+ * Pre-pie placement: this hook runs in CRIU master at
+ * rdma_prepare_rdma_mrs() time, NOT inside the pie restorer
+ * (plugins aren't available there -- see criu-plugin.h block on
+ * the contract). Core memcpy's the bytes we malloc here into the
+ * rst_rdma_mr.uhw_in_buf static buffer and free()s our copy
+ * before pie hand-off.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw)
+{
+	struct mlx5_ib_restore_mr_req_local req = {};
+	const RdmaMrAttrs *mr;
+
+	if (!e || !uhw)
+		return -EINVAL;
+	if (e->type != R3_UOBJ_TYPE__R3UT_MR) {
+		pr_err("vfmig: RESTORE_MR_UHW_PACK called for non-MR uobject "
+		       "(type=%d ufile_handle=%u); core dispatch bug\n",
+		       e->type,
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+	mr = e->mr;
+	if (!mr || !mr->has_lkey) {
+		pr_err("vfmig: RESTORE_MR_UHW_PACK plugin_blob missing lkey "
+		       "for ufile_handle=%u; image is missing the "
+		       "RES_LKEY captured at dump via NLDEV. Re-dump "
+		       "against a current kernel.\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+
+	req.mkey_index = mr->lkey >> 8;
+	/* reserved / reserved2 stay zero from designated init */
+
+	uhw->in_buf = malloc(sizeof(req));
+	if (!uhw->in_buf) {
+		pr_err("vfmig: RESTORE_MR_UHW_PACK out of memory "
+		       "(%zu bytes)\n", sizeof(req));
+		return -ENOMEM;
+	}
+	memcpy(uhw->in_buf, &req, sizeof(req));
+	uhw->in_len = sizeof(req);
+	uhw->out_buf = NULL;
+	uhw->out_len = 0;
+	return 0;
+}
