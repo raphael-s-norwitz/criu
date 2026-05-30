@@ -472,23 +472,25 @@ run_pass() {
 
     # Positive RESTORE_{PD,CQ,MR} dispatch assertions (per-ufile DAG
     # summary lines printed by criu/rdma/uobj_restore.c). The
-    # mode-agnostic Phase A line shape after the CQ-to-pie refactor
-    # (commit "criu/rdma: defer RESTORE_CQ to the pie blob") is:
-    #   "Phase A: restored N PD(s) [skipped M]; P CQ(s) [skipped Q] + R MR(s) deferred ..."
-    # PDs still restore from CRIU master (no user-page pinning); CQs
-    # and MRs are both pie-deferred now (mlx5_ib_restore_cq pins the
-    # CQ buffer / doorbell, rxe MR pins the user buffer).
+    # mode-agnostic Phase A line shape now has separate columns for
+    # master-restored CQs (rxe path) vs. pie-deferred CQs (mlx5
+    # path), driven by the plugin's RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE
+    # opt-in hook:
+    #   "Phase A: restored N PD(s) [skipped M], R CQ(s) [skipped Q]; D CQ(s) + S MR(s) deferred ..."
+    # On mlx5 (NEEDS_PIE registered) R=0 always; D = number of CQs.
+    # On rxe   (no hook)             D=0 always; R = number of CQs.
+    # MRs are always pie-deferred (S>=1 in pd_mr; S=0 in pd_cq).
     #
-    # Mode-specific minima:
-    #   pd_mr   P=0  R>=1 : 1 PD restored, 0 CQ deferred,  >=1 MR deferred + B-prep + pie ok + Phase J
-    #   pd_cq   P=1  R=0  : 1 PD restored, 1 CQ deferred,  0 MR deferred (pie issues RESTORE_CQ)
-    #   pd_2cq  P=2  R=0  : 1 PD restored, 2 CQs deferred, 0 MR deferred (pie issues RESTORE_CQ x2)
+    # Mode-specific minima for mlx5:
+    #   pd_mr   D=0 S>=1     : 1 PD,  0 CQ master, 0 deferred,  >=1 MR deferred + pie MR ok + Phase J
+    #   pd_cq   D=1 S=0      : 1 PD,  0 CQ master, 1 CQ deferred + pie CQ ok
+    #   pd_2cq  D=2 S=0      : 1 PD,  0 CQ master, 2 CQs deferred + pie CQ x2 ok
     #
     # Mode-agnostic gate first: at least one PD must have been
     # restored. Catches the regression where rdma_restore_uobj_dag_
     # for_ufile() didn't run at all (R3 walker missing, plugin
     # mismatch, ufile_handle dropout etc.).
-    if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; [0-9]+ CQ\(s\) \[skipped [0-9]+\] \+ [0-9]+ MR\(s\) deferred' \
+    if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [0-9]+ CQ\(s\) \[skipped [0-9]+\]; [0-9]+ CQ\(s\) \+ [0-9]+ MR\(s\) deferred' \
         "$DUMPDIR/restore.log"; then
         echo "missing Phase-A RESTORE_PD dispatch line" >&2
         grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
@@ -497,9 +499,8 @@ run_pass() {
     fi
 
     if [[ "$holder_mode" == "pd_mr" ]]; then
-        # pd_mr: P=0 (no CQs in this mode), R>=1 (the MR gets
-        # deferred to Phase B-prep + pie restorer).
-        if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; 0 CQ\(s\) \[skipped 0\] \+ [1-9][0-9]* MR\(s\) deferred' \
+        # pd_mr (mlx5): no CQs at all; >=1 MR deferred to pie.
+        if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], 0 CQ\(s\) \[skipped 0\]; 0 CQ\(s\) \+ [1-9][0-9]* MR\(s\) deferred' \
             "$DUMPDIR/restore.log"; then
             echo "missing Phase-A pd_mr summary (1+ MR deferred, 0 CQ)" >&2
             grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
@@ -547,7 +548,7 @@ run_pass() {
         # restored task's mm at sigreturn_restore time).
         local min_cq=1
         [[ "$holder_mode" == "pd_2cq" ]] && min_cq=2
-        if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; '"$min_cq"' CQ\(s\) \[skipped 0\] \+ 0 MR\(s\) deferred' \
+        if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], 0 CQ\(s\) \[skipped 0\]; '"$min_cq"' CQ\(s\) \+ 0 MR\(s\) deferred' \
             "$DUMPDIR/restore.log"; then
             echo "missing Phase-A pd_cq/pd_2cq summary ($min_cq CQ" \
                  "deferred, 0 MR deferred). Either Phase A failed" \

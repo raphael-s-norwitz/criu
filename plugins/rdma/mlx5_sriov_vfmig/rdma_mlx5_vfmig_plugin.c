@@ -317,6 +317,19 @@ static int rdma_mlx5_vfmig_plugin_claim_uverbs_context(const char *ibdev,
 	return RDMA_CRIU_DRIVER__RCD_MLX5_SRIOV_VFMIG;
 }
 
+/*
+ * mlx5_ib_restore_cq pins the source CQ ring + doorbell pages from
+ * current->mm via ib_umem_get(udata, src_va, len, ...). Calling that
+ * from CRIU master would pin master's mm, which is wrong; the ring
+ * pages don't exist in master's address space at all. The pie blob
+ * runs in the restored task's mm post-VMA-mmap, where the source
+ * VAs are populated with the dump-side anonymous pages. Opt in.
+ */
+static int rdma_mlx5_vfmig_plugin_restore_uobj_cq_needs_pie(void)
+{
+	return 1;
+}
+
 CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init,
 		   rdma_mlx5_vfmig_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
@@ -329,6 +342,8 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
 			rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK,
 			rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE,
+			rdma_mlx5_vfmig_plugin_restore_uobj_cq_needs_pie)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA,
 			rdma_mlx5_vfmig_plugin_handle_device_vma)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP,

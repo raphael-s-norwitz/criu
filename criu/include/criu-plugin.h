@@ -372,6 +372,45 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK = 22,
 
+	/*
+	 * Per-driver opt-in: this driver's RESTORE_CQ ioctl needs to
+	 * run from the pie blob (post-VMA-mmap, in the restored
+	 * task's mm) rather than from CRIU master Phase A.
+	 *
+	 * Background: drivers split into two camps for RESTORE_CQ:
+	 *   (a) "ring lives in user pages, kernel pins them at
+	 *       restore_cq time" -- e.g. mlx5_ib_restore_cq calls
+	 *       ib_umem_get(udata, src_va, len, ...) which pins
+	 *       current->mm pages. Calling this from CRIU master
+	 *       pins master's mm pages, which is wrong. Must run
+	 *       in pie, *after* the user VMA pass has laid the
+	 *       ring's pages at the source VAs.
+	 *   (b) "ring lives in kernel-allocated pages exposed via
+	 *       a vm_pgoff slot" -- e.g. rxe_restore_cq allocates
+	 *       a kernel buffer and registers a vm_pgoff entry on
+	 *       the uverbs cdev's mmap table. Calling this from
+	 *       CRIU master is fine (no pin), but it MUST run
+	 *       *before* the user VMA pass's mmap of the cdev fd
+	 *       at that vm_pgoff -- otherwise the mmap fails
+	 *       -EINVAL because the slot isn't registered yet.
+	 *       Pie runs after VMA mmap, so pie is wrong here.
+	 *
+	 * Camps (a) and (b) demand opposite orderings, so a single
+	 * dispatch site can't satisfy both. The plugin reports
+	 * which camp its driver is in via this hook; absent / 0 =
+	 * camp (b), master Phase A. Non-zero = camp (a), pie
+	 * Phase B (post-VMA).
+	 *
+	 * No args, no per-CQ context: this is a static driver
+	 * property, evaluated once per ufile_id at Phase A close
+	 * to decide where to dispatch all CQs in that ufile.
+	 *
+	 * Hook absence is the default; only plugins that need
+	 * pie-deferral register it. Keeps the sandbox cleanly
+	 * "rxe-style works without any extra hook".
+	 */
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE = 23,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -506,6 +545,8 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK,
 			 const RdmaUobjEntry *e,
 			 struct rdma_uhw_spec *uhw);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE,
+			 void);
 
 /*
  * RDMA sharing policy.

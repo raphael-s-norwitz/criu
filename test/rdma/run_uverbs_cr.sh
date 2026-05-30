@@ -364,27 +364,36 @@ run_pass() {
 	#
 	#   Phase A           (criu master, in uverbsfd_open() during
 	#                      prepare_fds, pre-VMA): VA-independent verbs
-	#                      -- RESTORE_PD always; RESTORE_CQ in pd_cq.
+	#                      -- RESTORE_PD only. CQs and MRs are both
+	#                      pin-sensitive (rxe / mlx5_ib pin user pages
+	#                      via pin_user_pages_fast against current->mm)
+	#                      so they're deferred to the pie blob below.
 	#   Phase B-prep      (criu master, in restore_one_alive_task right
-	#                      after open_vmas): walks Phase-A's stash and
-	#                      serialises one rst_rdma_mr per MR into ta->
-	#                      rdma_mrs (RM_PRIVATE) for the pie blob.
-	#                      Only fires when at least one MR is deferred
-	#                      (pd_mr mode).
+	#                      after open_vmas): walks Phase-A's pending
+	#                      list and serialises one rst_rdma_{cq,mr}
+	#                      per CQ / MR into ta->rdma_{cqs,mrs}
+	#                      (RM_PRIVATE) for the pie blob, invoking the
+	#                      plugin's UHW_PACK hook to stage driver-
+	#                      opaque UHW_IN bytes + a verify-template
+	#                      for UHW_OUT.
 	#   Phase B (pie)     (criu/pie/restorer.c, post-VMA-placement):
-	#                      iterates ta->rdma_mrs and issues UVERBS_
-	#                      METHOD_RESTORE_MR ioctl. This stage runs in
-	#                      the restored task with user VMAs live, which
-	#                      is what rxe's pin_user_pages_fast needs.
-	#                      Only fires when Phase B-prep ran.
+	#                      iterates ta->rdma_cqs then ta->rdma_mrs and
+	#                      issues UVERBS_METHOD_RESTORE_{CQ,MR} ioctls.
+	#                      Runs in the restored task with user VMAs
+	#                      live, which is what rxe's
+	#                      pin_user_pages_fast needs.
 	#
-	# Per-ufile summary line shape (rdma.c::rdma_restore_uobj_dag_for_ufile):
-	#   "Phase A: restored N PD(s) [skipped M], P CQ(s) [skipped Q]; R MR(s) deferred ..."
+	# Per-ufile summary line shape (uobj_restore.c::rdma_restore_uobj_dag_for_ufile):
+	#   "Phase A: restored N PD(s) [skipped M], R CQ(s) [skipped Q]; D CQ(s) + S MR(s) deferred ..."
+	# where R = master-restored CQs (rxe path) and D = pie-deferred
+	# CQs (mlx5 path). Their split is per-driver-plugin via the
+	# RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE hook (default: master).
 	#
 	# Mode-specific minima:
-	#   pd_mr  P=0  R>=1   : 1 PD, 0 CQ, >=1 MR deferred + pie ok
-	#   pd_cq  P>=1 R=0    : 1 PD, >=1 CQ restored, 0 MR deferred
-	if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [0-9]+ CQ\(s\) \[skipped [0-9]+\]; [0-9]+ MR\(s\) deferred' \
+	#   pd_mr  R=0  D=0  S>=1 : 1 PD,  0 CQ,        >=1 MR deferred + pie MR ok
+	#   pd_cq (rxe)  R>=1 D=0 S=0 : 1 PD, >=1 CQ master-restored, 0 deferred
+	#   pd_cq (mlx5) R=0 D>=1 S=0 : 1 PD, 0 master, >=1 CQ pie-deferred + pie CQ ok
+	if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [0-9]+ CQ\(s\) \[skipped [0-9]+\]; [0-9]+ CQ\(s\) \+ [0-9]+ MR\(s\) deferred' \
 		"$DUMPDIR/restore.log"; then
 		echo "FAIL: restore.log shows no RESTORE_PD Phase-A dispatch" \
 		     "by rdma_restore_uobj_dag_for_ufile() -- the per-ufile" \
@@ -397,7 +406,7 @@ run_pass() {
 	fi
 
 	if [[ "$holder_mode" == "pd_mr" ]]; then
-		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [0-9]+ CQ\(s\) \[skipped [0-9]+\]; [1-9][0-9]* MR\(s\) deferred' \
+		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], 0 CQ\(s\) \[skipped 0\]; 0 CQ\(s\) \+ [1-9][0-9]* MR\(s\) deferred' \
 			"$DUMPDIR/restore.log"; then
 			echo "FAIL: pd_mr Phase-A summary line did not show" \
 			     ">=1 MR deferred for post-VMA Phase B." >&2
@@ -415,7 +424,13 @@ run_pass() {
 				echo "(no uobj DAG lines at all)" >&2
 			exit 1
 		fi
-		if ! grep -qE 'pie: [0-9]+: RDMA: ufile_id=[^ ]+ RESTORE_MR\(target_handle=[0-9]+, lkey=[0-9a-fx]+, rkey=[0-9a-fx]+\) ok' \
+		# Post-MR-refactor log shape (commit "criu/rdma: plugin-shape
+		# UHW for RESTORE_MR via PACK/VERIFY hooks"): the pie restorer
+		# no longer hard-codes mlx5 mkey_index in its OK line. The
+		# generic shape is driver_id=%u + uhw_in=%u (the plugin-
+		# packed UHW_IN length, 0 when no plugin hook registered as
+		# is the case for rxe today).
+		if ! grep -qE 'pie: [0-9]+: RDMA: ufile_id=[^ ]+ RESTORE_MR\(target_handle=[0-9]+, lkey=[0-9a-fx]+, rkey=[0-9a-fx]+, driver_id=[0-9]+, uhw_in=[0-9]+\) ok' \
 			"$DUMPDIR/restore.log"; then
 			echo "FAIL: restore.log shows no RESTORE_MR pie-restorer" \
 			     "dispatch -- the pie blob either didn't see the queued" \
@@ -430,30 +445,32 @@ run_pass() {
 		fi
 		echo "RESTORE_PD (Phase A) + RESTORE_MR (pie Phase B) dispatched ok"
 	elif [[ "$holder_mode" == "pd_cq" || "$holder_mode" == "pd_2cq" ]]; then
-		# pd_cq  -- exactly 1 CQ restored.
-		# pd_2cq -- exactly 2 CQs restored (multi-CQ-per-ufile
-		#           dispatch coverage; comp_vector axis is the
-		#           holder's responsibility).
+		# pd_cq  -- exactly 1 CQ deferred + restored from pie.
+		# pd_2cq -- exactly 2 CQs deferred + restored from pie
+		#           (multi-CQ-per-ufile dispatch coverage;
+		#           comp_vector axis is the holder's responsibility).
 		# Both modes defer 0 MRs.
 		local min_cq=1
 		[[ "$holder_mode" == "pd_2cq" ]] && min_cq=2
-		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], '"$min_cq"' CQ\(s\) \[skipped 0\]; 0 MR\(s\) deferred' \
+		# rxe is in the master-restored camp (no NEEDS_PIE
+		# hook), so the Phase A line shows R=$min_cq master-
+		# restored CQs and 0 deferred. mlx5 is the inverse;
+		# the mlx5 runner (run_vfmig_cr.sh) asserts that shape.
+		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], '"$min_cq"' CQ\(s\) \[skipped 0\]; 0 CQ\(s\) \+ 0 MR\(s\) deferred' \
 			"$DUMPDIR/restore.log"; then
 			echo "FAIL: $holder_mode Phase-A summary line did" \
-			     "not show $min_cq CQ(s) restored with 0 MR" \
-			     "deferred. Either the S5a RESTORE_CQ pass" \
-			     "didn't run, the kernel under test pre-dates" \
-			     "a77cc4d8e8b9 'RDMA/uverbs: Add RESTORE_CQ +" \
-			     "rxe impl', or the dump-side R3 walk lost a" \
-			     "CQ entry (per-CQ dispatcher mis-keyed on the" \
-			     "ufile_handle? plugin's hook returned ENXIO" \
-			     "spuriously?)." >&2
+			     "not show $min_cq CQ(s) master-restored with" \
+			     "0 deferred / 0 MR deferred. Either Phase A" \
+			     "failed before the CQ loop, the kernel pre-" \
+			     "dates a77cc4d8e8b9 'RDMA/uverbs: Add" \
+			     "RESTORE_CQ + rxe impl', or the dump-side R3" \
+			     "walk lost a CQ entry." >&2
 			echo "--- restore log uobj DAG lines ---" >&2
 			grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
 				echo "(no uobj DAG lines at all)" >&2
 			exit 1
 		fi
-		echo "RESTORE_PD + RESTORE_CQ x$min_cq (Phase A) dispatched ok"
+		echo "RESTORE_PD + RESTORE_CQ x$min_cq (Phase A master) dispatched ok"
 	fi
 
 	#
@@ -585,12 +602,18 @@ else
 	echo "       kernels that pre-date the rxe forced-vm_pgoff"
 	echo "       support in rxe_restore_cq (S5a-vma-remap)."
 fi
-# pd_2cq is opt-in (UVERBS_CR_RUN_PD_2CQ=1) because rxe's typical
-# num_comp_vectors=1 collapses comp_vector=1 to comp_vector=0, which
-# limits the pass to multi-CQ-per-ufile dispatcher coverage rather
-# than the full multi-vector matrix. The mlx5 vfmig E2E in
-# run_vfmig_cr.sh adopts this same holder mode for the genuine
-# multi-vector test once num_comp_vectors >= 2 is reachable.
+# pd_2cq is opt-in (UVERBS_CR_RUN_PD_2CQ=1) and EXPECTED-FAIL on
+# rxe today: the rxe plugin's open_uverbs_cdev / update_vma_map
+# pair re-uses one cdev fd per VMA, which combined with two
+# distinct vm_pgoff slots (one per CQ) trips an mmap -EINVAL on
+# the second CQ's ring (verified at commit 1ea44547a, pre-CQ-to-
+# pie refactor -- pre-existing rxe-side bug, see plugins/rdma/rxe
+# for the cdev fd lifecycle that needs untangling). pd_2cq's real
+# coverage target is mlx5 with num_comp_vectors >= 2, where the
+# pie-deferral path re-issues each RESTORE_CQ from the restored
+# task's mm via a freshly-dup'd cdev fd per CQ; that runs in
+# run_vfmig_cr.sh and is green there. Keep the rxe knob so a
+# future rxe plugin fix can re-enable.
 if [[ "${UVERBS_CR_RUN_PD_2CQ:-0}" == "1" ]]; then
 	run_pass pd_2cq pd_2cq 0
 fi

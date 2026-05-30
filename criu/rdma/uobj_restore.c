@@ -541,18 +541,205 @@ static int rdma_send_restore_pd(int cmd_fd, uint32_t driver_id,
 }
 
 /*
- * UVERBS_METHOD_RESTORE_CQ and RESTORE_MR are both issued from the
- * pie restorer blob, not from CRIU master -- see criu/pie/
- * restorer.c::restore_rdma_cq + restore_rdma_mr for the encoders +
- * the rationale (mlx5_ib_restore_cq pins the CQ buffer / doorbell
- * via ib_umem_pin -> pin_user_pages_fast against current->mm,
- * which is CRIU master's mm and doesn't have the dumpee's source
- * VAs mapped; ib_umem_get for MR has the same shape). Master just
- * serialises per-uobject ioctl args + plugin-shaped UHW into
- * ta->rdma_cqs / ta->rdma_mrs via rdma_prepare_rdma_cqs() /
- * rdma_prepare_rdma_mrs(), and the pie blob iterates and issues
- * the ioctls at sigreturn_restore time.
+ * RESTORE_MR is always issued from the pie blob (rxe + mlx5 both
+ * pin user pages from current->mm at restore_mr time). RESTORE_CQ
+ * is per-driver: the plugin reports its preferred dispatch site
+ * via CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE.
+ *
+ *   needs_pie != 0  : mlx5-style. mlx5_ib_restore_cq pins the CQ
+ *                     ring + doorbell pages via ib_umem_get from
+ *                     current->mm, so master can't issue the verb
+ *                     (master's mm doesn't have the source VAs).
+ *                     The verb is queued + serialised here in
+ *                     master via rdma_prepare_rdma_cqs() and
+ *                     dispatched from criu/pie/restorer.c::
+ *                     restore_rdma_cq() at sigreturn_restore time.
+ *   needs_pie == 0  : rxe-style. rxe_restore_cq registers a
+ *                     vm_pgoff slot on the cdev's mmap table for
+ *                     the kernel-allocated ring. Master MUST issue
+ *                     the verb here, before the pie's user-VMA
+ *                     pass mmaps the cdev fd at that vm_pgoff
+ *                     (which would otherwise -EINVAL because the
+ *                     slot doesn't exist yet). The driver doesn't
+ *                     pin user pages so master's mm is fine. The
+ *                     verb is issued by rdma_send_restore_cq()
+ *                     directly from rdma_restore_uobj_dag_for_ufile.
+ *
+ * The two camps demand opposite orderings vs the user VMA mmap
+ * pass; a single dispatch site can't satisfy both, hence the
+ * plugin opt-in.
  */
+
+/*
+ * Issue UVERBS_METHOD_RESTORE_CQ on @cmd_fd from CRIU master.
+ * Driver-agnostic core (HANDLE / CQE / USER_HANDLE / COMP_VECTOR /
+ * FLAGS / RESP_CQE) + plugin-shaped UHW_IN/UHW_OUT through @plugin's
+ * CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK. The PACK hook may
+ * also pre-stage an UHW_OUT byte template (uhw->verify_len > 0)
+ * that we memcmp the kernel echo against post-ioctl, replacing the
+ * old UHW_VERIFY callback.
+ *
+ * Used by drivers in the "ring lives in kernel pages, exposed via
+ * vm_pgoff" camp (rxe today). Drivers in the "ring lives in user
+ * pages, kernel pins them" camp (mlx5) opt into pie deferral via
+ * RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE and use the pie path instead.
+ *
+ * @resp_cqe_out, when non-NULL, receives the actual installed cqe
+ * count the kernel returned (rxe rounds up to a power of two; mlx5
+ * doesn't round but uses the pie path anyway). Pass NULL to ignore;
+ * we always wire a u32 sink because RESP_CQE is MANDATORY out.
+ *
+ * Returns 0 on success, -errno on ioctl failure, -EPROTO if the
+ * plugin's UHW_OUT byte-template verify rejected the kernel echo.
+ */
+static int rdma_send_restore_cq(int cmd_fd, plugin_desc_t *plugin,
+				uint32_t kernel_driver_id,
+				uint32_t target_handle,
+				const RdmaUobjEntry *e,
+				uint32_t *resp_cqe_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[8];
+	} cmd = {};
+	struct rdma_uhw_spec uhw = {};
+	const RdmaCqAttrs *attrs = e ? e->cq : NULL;
+	uint32_t cqe = 0;
+	uint32_t comp_vector = 0;
+	uint32_t flags = 0;
+	uint64_t user_handle = 0;
+	uint32_t resp_cqe_sink = 0;
+	unsigned int n = 0;
+	int rc, ioctl_errno = 0;
+	void *uhw_out_actual = NULL;
+
+	if (attrs) {
+		if (attrs->has_cqe_count)
+			cqe = attrs->cqe_count;
+		if (attrs->has_comp_vector)
+			comp_vector = attrs->comp_vector;
+		if (attrs->has_flags)
+			flags = attrs->flags;
+	}
+
+	if (!resp_cqe_out)
+		resp_cqe_out = &resp_cqe_sink;
+
+	if (plugin && plugin->d->hooks[
+		CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK]) {
+		CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK_t *fn =
+			plugin->d->hooks[
+			CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK];
+		rc = fn(e, &uhw);
+		if (rc) {
+			pr_err("rdma_send_restore_cq: plugin '%s' UHW_PACK "
+			       "for ufile_handle=%u failed: %d (%s)\n",
+			       plugin->d->name, target_handle, rc,
+			       strerror(-rc));
+			return rc;
+		}
+	}
+
+	/*
+	 * UHW_OUT verification uses two buffers: the plugin staged a
+	 * pre-filled "expected" template in uhw.out_buf (for
+	 * memcmp-after-ioctl), but the ioctl needs a writeable
+	 * "actual" buffer the kernel can stamp. Allocate the actual
+	 * buffer separately and have the kernel write there; compare
+	 * against the template post-ioctl.
+	 */
+	if (uhw.out_len) {
+		uhw_out_actual = malloc(uhw.out_len);
+		if (!uhw_out_actual) {
+			rc = -ENOMEM;
+			goto out_free_uhw;
+		}
+		memset(uhw_out_actual, 0, uhw.out_len);
+	}
+
+	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_CQ;
+	cmd.hdr.driver_id = kernel_driver_id;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_HANDLE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = target_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_CQE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = cqe;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_USER_HANDLE;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = user_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = comp_vector;
+	n++;
+
+	if (flags) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_FLAGS;
+		cmd.attrs[n].len = sizeof(uint32_t);
+		cmd.attrs[n].flags = 0;
+		cmd.attrs[n].data = flags;
+		n++;
+	}
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_RESP_CQE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)resp_cqe_out;
+	n++;
+
+	if (uhw.out_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_OUT;
+		cmd.attrs[n].len = (uint16_t)uhw.out_len;
+		cmd.attrs[n].flags = 0;
+		cmd.attrs[n].data = (uintptr_t)uhw_out_actual;
+		n++;
+	}
+	if (uhw.in_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
+		cmd.attrs[n].len = (uint16_t)uhw.in_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)uhw.in_buf;
+		n++;
+	}
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0) {
+		ioctl_errno = errno;
+		rc = -ioctl_errno;
+		goto out_free_uhw;
+	}
+
+	if (uhw.verify_len > 0 && uhw.verify_len <= uhw.out_len &&
+	    memcmp(uhw_out_actual, uhw.out_buf, uhw.verify_len) != 0) {
+		pr_err("rdma_send_restore_cq: plugin '%s' UHW_OUT "
+		       "byte-template mismatch for ufile_handle=%u "
+		       "(verify_len=%zu)\n",
+		       plugin ? plugin->d->name : "(none)",
+		       target_handle, uhw.verify_len);
+		rc = -EPROTO;
+		goto out_free_uhw;
+	}
+	rc = 0;
+out_free_uhw:
+	free(uhw_out_actual);
+	free(uhw.in_buf);
+	free(uhw.out_buf);
+	return rc;
+}
 
 /*
  * Per-ufile handle map entry. Built up as we restore each uobject
@@ -763,9 +950,11 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	plugin_desc_t *plugin = NULL;
 	int n_pd_restored = 0;
 	int n_pd_skipped = 0;
+	int n_cq_restored = 0;
 	int n_cq_pending = 0;
 	int n_cq_skipped = 0;
 	int n_mr_pending = 0;
+	bool cq_in_pie = false;
 	int ret = -1;
 
 	g = rdma_uobj_group_lookup(ufile_id);
@@ -817,6 +1006,23 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			       ufile_id, g->hw_driver_id);
 			return -1;
 		}
+	}
+
+	/*
+	 * Per-driver dispatch site for RESTORE_CQ. See the long
+	 * comment above rdma_send_restore_cq() for the camp split:
+	 * mlx5 (NEEDS_PIE) needs current->mm to be the restoree's
+	 * during the verb (post-VMA-mmap), so it gets queued for
+	 * Phase B-prep -> pie. rxe (default, no hook) needs the
+	 * verb to run *before* the user-VMA pass mmaps the cdev fd
+	 * at the kernel-registered vm_pgoff slot, so it gets
+	 * dispatched here in Phase A by rdma_send_restore_cq.
+	 */
+	if (plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE]) {
+		CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE_t *fn =
+			plugin->d->hooks[
+			CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE];
+		cq_in_pie = (fn() != 0);
 	}
 
 	/*
@@ -1006,6 +1212,8 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	 */
 	list_for_each_entry(c, &g->entries, link) {
 		const RdmaUobjEntry *e = c->e;
+		uint32_t resp_cqe = 0;
+		int rc;
 
 		if (e->type != R3_UOBJ_TYPE__R3UT_CQ)
 			continue;
@@ -1013,7 +1221,41 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			n_cq_skipped++;
 			continue;
 		}
-		n_cq_pending++;
+
+		if (cq_in_pie) {
+			/*
+			 * Defer to Phase B-prep + pie restorer (mlx5).
+			 * rdma_prepare_rdma_cqs() walks
+			 * rdma_pending_post_vma post-VMA-mmap and
+			 * serialises into ta->rdma_cqs[].
+			 */
+			n_cq_pending++;
+		} else {
+			/*
+			 * Master-side dispatch (rxe). Must complete
+			 * before the user-VMA pass mmaps the cdev fd
+			 * at the kernel-registered vm_pgoff slot.
+			 */
+			rc = rdma_send_restore_cq(cmd_fd, plugin,
+						  kernel_driver_id,
+						  e->ufile_handle, e,
+						  &resp_cqe);
+			if (rc) {
+				pr_err("uobj DAG: ufile_id=%#x RESTORE_CQ"
+				       "(target_handle=%u, driver_id=%u, "
+				       "cqe=%u) failed: %d (%s)\n",
+				       ufile_id, e->ufile_handle,
+				       kernel_driver_id,
+				       e->cq && e->cq->has_cqe_count
+				       ? e->cq->cqe_count : 0,
+				       rc, strerror(-rc));
+				goto out;
+			}
+			n_cq_restored++;
+			pr_debug("uobj DAG: ufile_id=%#x RESTORE_CQ"
+				 "(target_handle=%u) ok: resp_cqe=%u\n",
+				 ufile_id, e->ufile_handle, resp_cqe);
+		}
 
 		if (e->has_restrack_id) {
 			if (uobj_handle_map_add(&handle_map,
@@ -1021,7 +1263,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 						e->restrack_id,
 						e->ufile_handle) < 0) {
 				pr_err("uobj DAG: ufile_id=%#x: handle_map "
-				       "OOM after CQ-defer(handle=%u)\n",
+				       "OOM after CQ(handle=%u)\n",
 				       ufile_id, e->ufile_handle);
 				goto out;
 			}
@@ -1091,13 +1333,14 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 
 	ret = 0;
 out:
-	if (n_pd_restored || n_pd_skipped || n_cq_pending ||
-	    n_cq_skipped || n_mr_pending)
+	if (n_pd_restored || n_pd_skipped || n_cq_restored ||
+	    n_cq_pending || n_cq_skipped || n_mr_pending)
 		pr_info("uobj DAG: ufile_id=%#x Phase A: restored %d PD(s) "
-			"[skipped %d]; %d CQ(s) [skipped %d] + %d MR(s) "
-			"deferred to post-VMA Phase B\n",
+			"[skipped %d], %d CQ(s) [skipped %d]; %d CQ(s) + "
+			"%d MR(s) deferred to post-VMA Phase B\n",
 			ufile_id, n_pd_restored, n_pd_skipped,
-			n_cq_pending, n_cq_skipped, n_mr_pending);
+			n_cq_restored, n_cq_skipped,
+			n_cq_pending, n_mr_pending);
 	xfree(handle_map.e);
 	return ret;
 }
