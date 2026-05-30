@@ -185,6 +185,25 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 int rdma_prepare_rdma_mrs(struct task_restore_args *ta);
 
 /*
+ * Phase B-prep for per-CQ pie-deferred restore. Same shape as
+ * rdma_prepare_rdma_mrs: walks rdma_pending_post_vma's groups,
+ * picks R3UT_CQ entries, invokes the cached plugin's
+ * RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook, and serialises the
+ * per-CQ ioctl args (HANDLE, CQE, COMP_VECTOR, FLAGS, USER_HANDLE)
+ * + plugin-shaped UHW into ta->rdma_cqs (RM_PRIVATE). The pie blob
+ * iterates and issues UVERBS_METHOD_RESTORE_CQ at sigreturn_restore
+ * time. Required because mlx5_ib_restore_cq pins user pages for
+ * the CQ buffer / doorbell from source-side VAs that only exist
+ * in the restored task's mm, not CRIU master's. See criu/pie/
+ * restorer.c::restore_rdma_cq for the per-uobject ioctl.
+ *
+ * Returns 0 on success; -1 on the first per-entry serialisation
+ * failure (rst_mem OOM, missing required attrs, plugin PACK
+ * failure).
+ */
+int rdma_prepare_rdma_cqs(struct task_restore_args *ta);
+
+/*
  * Internal-but-shared helpers used by both criu/rdma.c and the
  * pre-suspend coverage check above. Defined in criu/rdma.c.
  *

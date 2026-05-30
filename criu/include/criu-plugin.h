@@ -360,52 +360,17 @@ enum {
 	 * code.
 	 */
 	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK = 21,
-	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY = 22,
 
 	/*
-	 * Per-MR uobject restore-side UHW shape callbacks. Same
-	 * partitioning as the CQ pair above, applied to
-	 * UVERBS_METHOD_RESTORE_MR: criu core builds the driver-
-	 * agnostic ioctl skeleton (HANDLE, PD_HANDLE, ADDR, LENGTH,
-	 * IOVA, ACCESS_FLAGS, LKEY_HINT, RKEY_HINT, RESP_LKEY,
-	 * RESP_RKEY) from rdma_mr_attrs + the ufile handle map; the
-	 * per-driver RDMA plugin shapes UHW_IN/UHW_OUT around it.
-	 *
-	 * Pie-restorer constraint -- this differs from CQ today.
-	 * MR restore runs from the criu/pie/restorer.c blob (after
-	 * user VMAs are laid out so pin_user_pages_fast / ib_umem_pin
-	 * find them), where plugins are NOT loaded. So:
-	 *
-	 *   PACK   runs in CRIU master at rdma_prepare_rdma_mrs() time,
-	 *          before pie hand-off. Plugin malloc()s uhw->in_buf
-	 *          (and optional uhw->out_buf as the *expected* echo
-	 *          for VERIFY); core memcpy's the bytes into the
-	 *          rst_rdma_mr static buffer it ships into the pie's
-	 *          RM_PRIVATE arena, then frees the plugin's malloc'd
-	 *          copies. By dispatch time the pie has self-contained
-	 *          static bytes -- no plugin call from inside pie.
-	 *
-	 *   VERIFY also runs in CRIU master at PACK time, but only to
-	 *          the extent of producing an "expected UHW_OUT" byte
-	 *          template. The pie blob does the actual byte-equal
-	 *          compare between the kernel's UHW_OUT echo and the
-	 *          template after the ioctl. Plugins that need a
-	 *          richer post-ioctl assertion than memcmp aren't
-	 *          covered here; today no MR provider needs UHW_OUT
-	 *          (mlx5 has none, rxe MR has none) -- the hook is
-	 *          declared for symmetry with the CQ pair and for
-	 *          forward compatibility.
-	 *
-	 * Both hooks are optional. A plugin that registers neither
-	 * lets its MRs through with no UHW (rxe today). A plugin that
-	 * registers only PACK skips VERIFY (mlx5 today: emits
-	 * mkey_index UHW_IN, no UHW_OUT echo).
-	 *
-	 * Return: 0 on success, negative errno on failure. PACK
-	 * failures abort the whole MR restore for that ufile.
+	 * Per-MR uobject restore-side UHW shape callback. Same shape
+	 * as the CQ pack hook, applied to UVERBS_METHOD_RESTORE_MR:
+	 * criu core builds the driver-agnostic ioctl skeleton (HANDLE,
+	 * PD_HANDLE, ADDR, LENGTH, IOVA, ACCESS_FLAGS, LKEY_HINT,
+	 * RKEY_HINT, RESP_LKEY, RESP_RKEY) from rdma_mr_attrs + the
+	 * ufile handle map; the per-driver plugin shapes UHW_IN /
+	 * UHW_OUT around it through the rdma_uhw_spec.
 	 */
-	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK = 23,
-	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_VERIFY = 24,
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK = 22,
 
 	CR_PLUGIN_HOOK__MAX
 };
@@ -466,43 +431,81 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
 			 ProtobufCBinaryData *plugin_blob);
 
 /*
- * UHW pack/verify scratch for per-class restore-side UHW hooks.
+ * UHW pack scratch for per-class restore-side UHW hooks.
  *
  * Plugin malloc()'s in_buf / out_buf inside its UHW_PACK hook;
- * core attaches them as UHW_IN / UHW_OUT attrs on the
- * UVERBS_METHOD_RESTORE_<TYPE> ioctl, calls the optional
- * UHW_VERIFY hook to let the plugin assert kernel-echo
- * correctness, then free()s both buffers. Either side may be
- * left as {NULL, 0} if the driver shape doesn't use that
- * direction.
+ * core stages them through the per-class rst_rdma_<TYPE> static
+ * buffer (when the verb runs from the pie restorer -- CQ, MR,
+ * future QP) or attaches them directly as UHW_IN / UHW_OUT attrs
+ * on the UVERBS_METHOD_RESTORE_<TYPE> ioctl (when the verb runs
+ * from CRIU master -- PD today). Either direction may be left as
+ * {NULL, 0} if the driver shape doesn't use that direction.
+ *
+ * Output verification is byte-template-based (no per-class
+ * VERIFY callback): the plugin pre-fills @out_buf at PACK time
+ * with the bytes it expects the kernel to echo back, and
+ * @verify_len tells core how many of those bytes the post-ioctl
+ * memcmp must check. This keeps verification co-locatable with
+ * the byte template through the master->pie boundary and avoids
+ * a callback-from-pie design (plugins aren't loaded inside the
+ * pie blob).
+ *
+ *   in_buf / in_len     -- bytes the kernel should consume as
+ *                          UVERBS_ATTR_UHW_IN. Plugin malloc()'s,
+ *                          core free()'s.
+ *
+ *   out_buf / out_len   -- two-purpose buffer:
+ *                            (a) declares the size of the
+ *                                UVERBS_ATTR_UHW_OUT attr core
+ *                                attaches to the ioctl
+ *                                (out_len = sizeof(driver_resp))
+ *                            (b) carries the plugin's expected
+ *                                kernel echo bytes pre-filled
+ *                                into out_buf, used by core's
+ *                                post-ioctl byte-equal verify.
+ *                          Plugin malloc()'s, core free()'s.
+ *                          Set to {NULL, 0} if the verb has no
+ *                          UHW_OUT (mlx5 RESTORE_CQ, MR).
+ *
+ *   verify_len          -- size of the byte-equal subset to
+ *                          check post-ioctl. Must satisfy
+ *                          0 <= verify_len <= out_len. The first
+ *                          @verify_len bytes of the kernel's
+ *                          UHW_OUT echo must equal the first
+ *                          @verify_len bytes of the staged
+ *                          out_buf template. verify_len = 0
+ *                          means no verify (out_buf is just a
+ *                          receive area; common for kernel
+ *                          handlers that require a UHW_OUT slot
+ *                          but the plugin doesn't care about
+ *                          the contents). verify_len < out_len
+ *                          lets the plugin verify a leading
+ *                          subset of fields and ignore later
+ *                          ones (rxe RESTORE_CQ uses this:
+ *                          rxe_create_cq_resp.mi_offset is the
+ *                          8 leading bytes the plugin verifies;
+ *                          mi_size + mi_pad after it are
+ *                          kernel-determined and not checked).
  *
  * Lives at file scope (not inside any per-class block) because
- * follow-on per-class hooks (UHW_PACK for RESTORE_QP, _MR, ...)
- * will share the same shape -- the per-class differences live in
- * the surrounding hook signature, not in this scratch.
+ * the per-class hooks (UHW_PACK for RESTORE_CQ, _MR, ...) share
+ * the same shape -- the per-class differences live in the
+ * surrounding hook signature, not in this scratch.
  */
 struct rdma_uhw_spec {
 	void   *in_buf;
 	size_t  in_len;
 	void   *out_buf;
 	size_t  out_len;
+	size_t  verify_len;
 };
 
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
 			 const RdmaUobjEntry *e,
 			 struct rdma_uhw_spec *uhw);
-DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY,
-			 const RdmaUobjEntry *e,
-			 const struct rdma_uhw_spec *uhw,
-			 uint32_t resp_cqe);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK,
 			 const RdmaUobjEntry *e,
 			 struct rdma_uhw_spec *uhw);
-DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_VERIFY,
-			 const RdmaUobjEntry *e,
-			 const struct rdma_uhw_spec *uhw,
-			 uint32_t resp_lkey,
-			 uint32_t resp_rkey);
 
 /*
  * RDMA sharing policy.

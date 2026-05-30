@@ -472,18 +472,23 @@ run_pass() {
 
     # Positive RESTORE_{PD,CQ,MR} dispatch assertions (per-ufile DAG
     # summary lines printed by criu/rdma/uobj_restore.c). The
-    # mode-agnostic Phase A line shape is:
-    #   "Phase A: restored N PD(s) [skipped M], P CQ(s) [skipped Q]; R MR(s) deferred ..."
+    # mode-agnostic Phase A line shape after the CQ-to-pie refactor
+    # (commit "criu/rdma: defer RESTORE_CQ to the pie blob") is:
+    #   "Phase A: restored N PD(s) [skipped M]; P CQ(s) [skipped Q] + R MR(s) deferred ..."
+    # PDs still restore from CRIU master (no user-page pinning); CQs
+    # and MRs are both pie-deferred now (mlx5_ib_restore_cq pins the
+    # CQ buffer / doorbell, rxe MR pins the user buffer).
+    #
     # Mode-specific minima:
-    #   pd_mr   P=0  R>=1 : 1 PD,        0 CQ,           >=1 MR deferred + B-prep + pie ok + Phase J
-    #   pd_cq   P=1  R=0  : 1 PD,        1 CQ restored,  0 MR deferred
-    #   pd_2cq  P=2  R=0  : 1 PD,        2 CQs restored, 0 MR deferred
+    #   pd_mr   P=0  R>=1 : 1 PD restored, 0 CQ deferred,  >=1 MR deferred + B-prep + pie ok + Phase J
+    #   pd_cq   P=1  R=0  : 1 PD restored, 1 CQ deferred,  0 MR deferred (pie issues RESTORE_CQ)
+    #   pd_2cq  P=2  R=0  : 1 PD restored, 2 CQs deferred, 0 MR deferred (pie issues RESTORE_CQ x2)
     #
     # Mode-agnostic gate first: at least one PD must have been
     # restored. Catches the regression where rdma_restore_uobj_dag_
     # for_ufile() didn't run at all (R3 walker missing, plugin
     # mismatch, ufile_handle dropout etc.).
-    if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [0-9]+ CQ\(s\) \[skipped [0-9]+\]; [0-9]+ MR\(s\) deferred' \
+    if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; [0-9]+ CQ\(s\) \[skipped [0-9]+\] \+ [0-9]+ MR\(s\) deferred' \
         "$DUMPDIR/restore.log"; then
         echo "missing Phase-A RESTORE_PD dispatch line" >&2
         grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
@@ -494,7 +499,7 @@ run_pass() {
     if [[ "$holder_mode" == "pd_mr" ]]; then
         # pd_mr: P=0 (no CQs in this mode), R>=1 (the MR gets
         # deferred to Phase B-prep + pie restorer).
-        if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], 0 CQ\(s\) \[skipped 0\]; [1-9][0-9]* MR\(s\) deferred' \
+        if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; 0 CQ\(s\) \[skipped 0\] \+ [1-9][0-9]* MR\(s\) deferred' \
             "$DUMPDIR/restore.log"; then
             echo "missing Phase-A pd_mr summary (1+ MR deferred, 0 CQ)" >&2
             grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
@@ -531,32 +536,54 @@ run_pass() {
         fi
         echo "RESTORE_PD (Phase A) + RESTORE_MR (plugin UHW pie Phase B) dispatched ok"
     elif [[ "$holder_mode" == "pd_cq" || "$holder_mode" == "pd_2cq" ]]; then
-        # pd_cq:  exactly 1 CQ restored.
-        # pd_2cq: exactly 2 CQs restored (multi-CQ-per-ufile dispatch
+        # pd_cq:  exactly 1 CQ deferred.
+        # pd_2cq: exactly 2 CQs deferred (multi-CQ-per-ufile dispatch
         #         coverage; comp_vector axis is the holder's
         #         responsibility -- mlx5 hosts typically have
         #         num_comp_vectors >= 2 so the clamp is a no-op).
-        # Both modes defer 0 MRs.
+        # Both modes defer 0 MRs and dispatch RESTORE_CQ from the pie
+        # restorer (mlx5_ib_restore_cq pins the CQ buffer / doorbell
+        # via ib_umem_pin against current->mm; only valid in the
+        # restored task's mm at sigreturn_restore time).
         local min_cq=1
         [[ "$holder_mode" == "pd_2cq" ]] && min_cq=2
-        if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], '"$min_cq"' CQ\(s\) \[skipped 0\]; 0 MR\(s\) deferred' \
+        if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\]; '"$min_cq"' CQ\(s\) \[skipped 0\] \+ 0 MR\(s\) deferred' \
             "$DUMPDIR/restore.log"; then
             echo "missing Phase-A pd_cq/pd_2cq summary ($min_cq CQ" \
-                 "restored, 0 MR deferred). Either RESTORE_CQ" \
-                 "didn't run (kernel under test pre-dates" \
-                 "mlx5_ib_restore_cq registration in" \
-                 "ib_dev_ops, or the dispatcher hit -EOPNOTSUPP /" \
-                 "-EPERM / -EINVAL on the mlx5_ib_restore_cq_req" \
-                 "32B blob), or the per-CQ dispatcher mis-keyed" \
-                 "the plugin_blob between CQs (pd_2cq only), or" \
-                 "the dump-side VFMIG_QUERY_CQ failed silently" \
-                 "and emitted N-1 CQs to rdma-uobj.img." >&2
+                 "deferred, 0 MR deferred). Either Phase A failed" \
+                 "before the CQ count loop, or the dump-side" \
+                 "VFMIG_QUERY_CQ failed silently and emitted N-1" \
+                 "CQs to rdma-uobj.img." >&2
             echo "--- restore log uobj DAG lines ---" >&2
             grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
                 echo "(no uobj DAG lines at all)" >&2
             pass_fail "wrong pd_cq/pd_2cq Phase-A counts"
         fi
-        echo "RESTORE_PD + RESTORE_CQ x$min_cq (Phase A) dispatched ok"
+        if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase B-prep: serialised '"$min_cq"' CQ\(s\) \[skipped 0\] for pie restorer' \
+            "$DUMPDIR/restore.log"; then
+            echo "missing Phase B-prep CQ serialisation ($min_cq CQ)" >&2
+            grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+                echo "(no uobj DAG lines at all)" >&2
+            pass_fail "no Phase B-prep CQ serialisation"
+        fi
+        # Pie-side OK line: one per CQ. Catches the regression where
+        # the pie blob enters the dispatch loop but the kernel's
+        # RESTORE_CQ ioctl returns -EINVAL / -EFAULT / -EOPNOTSUPP
+        # (the wire-shape error class we'd want to catch loudly --
+        # mlx5_ib_restore_cq registration regression, mlx5_ib_
+        # restore_cq_req size mismatch from the plugin's UHW_PACK,
+        # or pin_user_pages_fast EFAULT against a non-restoree mm).
+        local cq_ok_lines
+        cq_ok_lines=$(grep -cE 'pie: [0-9]+: RDMA: ufile_id=[^ ]+ RESTORE_CQ\(target_handle=[0-9]+, cqe=[0-9]+, resp_cqe=[0-9]+, .*driver_id=[0-9]+, uhw_in=[0-9]+, uhw_out=[0-9]+\) ok' \
+            "$DUMPDIR/restore.log" || true)
+        if [[ "$cq_ok_lines" -lt "$min_cq" ]]; then
+            echo "missing pie-restorer RESTORE_CQ ok line(s); saw" \
+                 "$cq_ok_lines but expected $min_cq" >&2
+            grep -E 'pie:.* RDMA:' "$DUMPDIR/restore.log" >&2 || \
+                echo "(no pie RDMA lines at all)" >&2
+            pass_fail "no RESTORE_CQ pie-restorer dispatch"
+        fi
+        echo "RESTORE_PD (Phase A) + RESTORE_CQ x$min_cq (plugin UHW pie Phase B) dispatched ok"
     fi
 
     # ---- Phase G: verify ----------------------------------------------

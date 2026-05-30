@@ -202,9 +202,58 @@ struct rst_rdma_mr {
 	u32		lkey_hint;
 	u32		rkey_hint;
 	u16		uhw_in_len;
-	u16		uhw_out_expected_len;
+	u16		uhw_out_attr_len;
+	u16		uhw_out_verify_len;
 	u8		uhw_in_buf[RST_RDMA_MR_UHW_IN_MAX];
 	u8		uhw_out_expected[RST_RDMA_MR_UHW_OUT_MAX];
+};
+
+/*
+ * Per-CQ record consumed by the pie restorer to issue
+ * UVERBS_METHOD_RESTORE_CQ. Mirrors rst_rdma_mr in shape and motive:
+ * mlx5_ib_restore_cq calls mlx5_ib_umem_restore_cq -> ib_umem_pin ->
+ * pin_user_pages_fast against current->mm. CRIU master's mm doesn't
+ * have the dumpee's CQ buf_addr / db_addr mapped, so issuing
+ * RESTORE_CQ from there returns -EFAULT in the same way RESTORE_MR
+ * did pre-pie. The fix is identical: defer to the pie restorer
+ * blob, which runs in the restoree's mm at sigreturn_restore time
+ * after VMAs are laid out at their original VAs.
+ *
+ * Driver-private UHW comes from the per-driver RDMA plugin's
+ * RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook (invoked in CRIU master at
+ * rdma_prepare_rdma_cqs time -- see the criu-plugin.h block on the
+ * pie-can't-call-plugins contract). Verification of the kernel's
+ * UHW_OUT echo is byte-template-based: the plugin pre-fills the
+ * expected echo bytes into uhw->out_buf at PACK time, core stages
+ * the bytes into @uhw_out_expected, and pie memcmp's the first
+ * @uhw_out_verify_len bytes after the ioctl. @uhw_out_attr_len is
+ * the size of the UHW_OUT attr the pie blob declares to satisfy
+ * the kernel's udata->outlen requirement (rxe_restore_cq rejects
+ * udata->outlen < sizeof(struct rxe_create_cq_resp); mlx5
+ * RESTORE_CQ rejects any non-zero udata->outlen).
+ *
+ * Static array sizing: largest current-tree plugin UHW_IN is mlx5's
+ * struct mlx5_ib_restore_cq_req at 32 bytes; UHW_OUT is rxe's
+ * struct rxe_create_cq_resp at 16 bytes. Slack on each side leaves
+ * room for forward-compat fields without bumping the wire.
+ */
+#define RST_RDMA_CQ_UHW_IN_MAX	40
+#define RST_RDMA_CQ_UHW_OUT_MAX	24
+
+struct rst_rdma_cq {
+	int		cmd_fd;
+	u32		ufile_id;		/* diagnostics only */
+	u32		kernel_driver_id;
+	u32		target_handle;
+	u32		cqe;
+	u32		comp_vector;
+	u32		flags;
+	u64		user_handle;
+	u16		uhw_in_len;
+	u16		uhw_out_attr_len;
+	u16		uhw_out_verify_len;
+	u8		uhw_in_buf[RST_RDMA_CQ_UHW_IN_MAX];
+	u8		uhw_out_expected[RST_RDMA_CQ_UHW_OUT_MAX];
 };
 
 struct task_restore_args {
@@ -249,6 +298,9 @@ struct task_restore_args {
 
 	struct rst_aio_ring *rings;
 	unsigned int rings_n;
+
+	struct rst_rdma_cq *rdma_cqs;
+	unsigned int rdma_cqs_n;
 
 	struct rst_rdma_mr *rdma_mrs;
 	unsigned int rdma_mrs_n;

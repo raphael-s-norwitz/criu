@@ -660,14 +660,32 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	/*
 	 * Phase B-prep for RDMA uobj restore. Walks the per-ufile
 	 * state stashed by Phase A (in uverbsfd_open() during
-	 * prepare_fds) and serialises any VA-dependent verbs --
-	 * UVERBS_METHOD_RESTORE_MR today, future DEVX_UMEM -- into
-	 * ta->rdma_mrs (RM_PRIVATE) for the pie restorer blob to
-	 * issue post-VMA-placement. Restorer-blob dispatch is in
-	 * criu/pie/restorer.c::restore_rdma_mr; see rdma.h::
-	 * rdma_prepare_rdma_mrs for the full rationale. No-op when
-	 * no in-tree RDMA contexts had MR entries.
+	 * prepare_fds) and serialises VA-dependent verbs into the
+	 * pie restorer's RM_PRIVATE arena:
+	 *
+	 *   - rdma_prepare_rdma_cqs serialises ta->rdma_cqs[] for
+	 *     UVERBS_METHOD_RESTORE_CQ. mlx5_ib_restore_cq pins user
+	 *     pages for the CQ buffer + doorbell from the source-side
+	 *     VAs, so master-side issue would EFAULT against CRIU
+	 *     master's mm.
+	 *
+	 *   - rdma_prepare_rdma_mrs serialises ta->rdma_mrs[] for
+	 *     UVERBS_METHOD_RESTORE_MR. rxe's restore_mr pins via
+	 *     ib_umem_get for the MR's user buffer; mlx5 doesn't pin
+	 *     here but uses the same dispatch path for shape uniformity.
+	 *
+	 * Both run after open_vmas (so cdev mappings exist) but before
+	 * sigreturn_restore (so RM_PRIVATE is finalised). The pie blob
+	 * iterates ta->rdma_cqs[] then ta->rdma_mrs[] post-VMA. CQ-
+	 * before-MR ordering matches the kernel-side parent dependency
+	 * graph -- MR doesn't reference CQ, but a future QP_REC step
+	 * would, so issuing CQs first is forward-compat. Restorer-blob
+	 * dispatch lives in criu/pie/restorer.c::restore_rdma_cq /
+	 * restore_rdma_mr. No-op when no in-tree RDMA contexts had the
+	 * matching uobj entries.
 	 */
+	if (rdma_prepare_rdma_cqs(ta))
+		return -1;
 	if (rdma_prepare_rdma_mrs(ta))
 		return -1;
 
@@ -3381,6 +3399,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	RST_MEM_FIXUP_PPTR(task_args->vmas);
 	RST_MEM_FIXUP_PPTR(task_args->rings);
+	RST_MEM_FIXUP_PPTR(task_args->rdma_cqs);
 	RST_MEM_FIXUP_PPTR(task_args->rdma_mrs);
 	RST_MEM_FIXUP_PPTR(task_args->tcp_socks);
 	RST_MEM_FIXUP_PPTR(task_args->timerfd);

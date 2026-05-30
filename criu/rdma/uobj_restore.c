@@ -541,205 +541,17 @@ static int rdma_send_restore_pd(int cmd_fd, uint32_t driver_id,
 }
 
 /*
- * Issue UVERBS_METHOD_RESTORE_CQ on @cmd_fd, asking the kernel to
- * mint a CQ uobject at @target_handle. Driver-agnostic: core
- * builds the kernel-UAPI-defined skeleton (HANDLE, CQE, USER_HANDLE,
- * COMP_VECTOR, FLAGS, RESP_CQE) from @e->cq + @target_handle, and
- * @plugin's RDMA_RESTORE_UOBJ_CQ_UHW_PACK / UHW_VERIFY hooks own
- * the per-driver UHW_IN / UHW_OUT tail (see criu-plugin.h).
- *
- * Plugin contract for the UHW pair:
- *   PACK   - reads e->plugin_blob (its own packed schema, stuffed
- *            at dump time by the matching RDMA_DUMP_UOBJ_CQ hook),
- *            malloc()'s in_buf / out_buf into @uhw. Either side
- *            may be left NULL/0 (mlx5 has no UHW_OUT, rxe omits
- *            UHW_IN when the dumped vm_pgoff is zero, etc.).
- *   VERIFY - optional post-ioctl correctness check. rxe asserts
- *            mi_offset == requested vm_pgoff; mlx5 has no UHW_OUT
- *            and skips registering the hook.
- *
- * Core frees uhw.in_buf / uhw.out_buf via free() after the ioctl
- * + VERIFY round-trip regardless of outcome.
- *
- * @resp_cqe_out, when non-NULL, receives the actual installed cqe
- * count from RESP_CQE (rxe rounds up via roundup_pow_of_two; mlx5
- * may also round). Pass NULL to ignore the response (the kernel
- * still requires it as MANDATORY out, so we always wire a sink).
- *
- * Returns 0 on success, -errno on ioctl failure, -EPROTO if the
- * plugin's VERIFY hook rejected the kernel's UHW_OUT echo.
- *
- * Wire-format references:
- *   tools/testing/mlx5_vfmig/uobject_restore/cq_restore/
- *     cq_restore_probe_rxe.c::do_restore_cq (rxe shape)
- *   drivers/infiniband/core/uverbs_std_types_restore.c
- *     UVERBS_HANDLER(UVERBS_METHOD_RESTORE_CQ)
- */
-static int rdma_send_restore_cq(int cmd_fd, plugin_desc_t *plugin,
-				uint32_t kernel_driver_id,
-				uint32_t target_handle,
-				const RdmaUobjEntry *e,
-				uint32_t *resp_cqe_out)
-{
-	struct {
-		struct ib_uverbs_ioctl_hdr	hdr;
-		struct ib_uverbs_attr		attrs[8];
-	} cmd = {};
-	struct rdma_uhw_spec uhw = {};
-	const RdmaCqAttrs *attrs = e ? e->cq : NULL;
-	uint32_t cqe = 0;
-	uint32_t comp_vector = 0;
-	uint32_t flags = 0;
-	uint64_t user_handle = 0;
-	uint32_t resp_cqe_sink = 0;
-	unsigned int n = 0;
-	int rc, ioctl_errno = 0;
-
-	if (attrs) {
-		if (attrs->has_cqe_count)
-			cqe = attrs->cqe_count;
-		if (attrs->has_comp_vector)
-			comp_vector = attrs->comp_vector;
-		if (attrs->has_flags)
-			flags = attrs->flags;
-	}
-	/*
-	 * user_handle (== source's ibv_create_cq cq_context) isn't
-	 * NLDEV-emitted today; v0 callers (rxe holder, ib_write_bw)
-	 * all pass NULL so 0 is the right default. When a future
-	 * QUERY_CQ / NLDEV emission lands, plumb it through
-	 * rdma_cq_attrs and read it from there.
-	 */
-
-	if (!resp_cqe_out)
-		resp_cqe_out = &resp_cqe_sink;
-
-	/*
-	 * Plugin shapes UHW from e->plugin_blob. PACK is optional --
-	 * a plugin that doesn't register it sends RESTORE_CQ with no
-	 * UHW (the degenerate driver shape; no in-tree provider
-	 * currently uses it, but the API allows).
-	 */
-	if (plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK]) {
-		CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK_t *fn =
-			plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK];
-		rc = fn(e, &uhw);
-		if (rc) {
-			pr_err("rdma_send_restore_cq: plugin '%s' UHW_PACK "
-			       "for ufile_handle=%u failed: %d (%s)\n",
-			       plugin->d->name, target_handle, rc,
-			       strerror(-rc));
-			return rc;
-		}
-	}
-
-	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
-	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_CQ;
-	cmd.hdr.driver_id = kernel_driver_id;
-
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_HANDLE;
-	cmd.attrs[n].len = sizeof(uint32_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = target_handle;
-	n++;
-
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_CQE;
-	cmd.attrs[n].len = sizeof(uint32_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = cqe;
-	n++;
-
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_USER_HANDLE;
-	cmd.attrs[n].len = sizeof(uint64_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = user_handle;
-	n++;
-
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR;
-	cmd.attrs[n].len = sizeof(uint32_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = comp_vector;
-	n++;
-
-	/*
-	 * FLAGS_IN is optional; only emit when non-zero so we don't
-	 * spend a slot for the common "no special CQ flags" case.
-	 * Kernel uverbs_get_flags32 treats absent as zero already.
-	 */
-	if (flags) {
-		cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_FLAGS;
-		cmd.attrs[n].len = sizeof(uint32_t);
-		cmd.attrs[n].flags = 0;
-		cmd.attrs[n].data = flags;
-		n++;
-	}
-
-	/*
-	 * RESP_CQE is MANDATORY out at the kernel side (the dispatcher
-	 * uverbs_copy_to's cq->cqe through this attr after the driver
-	 * stamps it). We always wire a u32 sink.
-	 */
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_RESP_CQE;
-	cmd.attrs[n].len = sizeof(uint32_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = (uintptr_t)resp_cqe_out;
-	n++;
-
-	/* Plugin-shaped UHW: attach whatever PACK populated. */
-	if (uhw.out_len) {
-		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_OUT;
-		cmd.attrs[n].len = (uint16_t)uhw.out_len;
-		cmd.attrs[n].flags = 0;
-		cmd.attrs[n].data = (uintptr_t)uhw.out_buf;
-		n++;
-	}
-	if (uhw.in_len) {
-		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
-		cmd.attrs[n].len = (uint16_t)uhw.in_len;
-		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-		cmd.attrs[n].data = (uintptr_t)uhw.in_buf;
-		n++;
-	}
-
-	cmd.hdr.num_attrs = n;
-	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
-
-	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0) {
-		ioctl_errno = errno;
-		rc = -ioctl_errno;
-		goto out_free_uhw;
-	}
-
-	/*
-	 * Plugin verifies UHW_OUT echo (rxe asserts mi_offset ==
-	 * requested vm_pgoff). Optional. Surface a verify failure
-	 * as -EPROTO so the per-CQ caller's diagnostic table picks
-	 * it up uniformly.
-	 */
-	if (plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY]) {
-		CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY_t *fn =
-			plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY];
-		if (fn(e, &uhw, *resp_cqe_out)) {
-			rc = -EPROTO;
-			goto out_free_uhw;
-		}
-	}
-	rc = 0;
-out_free_uhw:
-	free(uhw.in_buf);
-	free(uhw.out_buf);
-	return rc;
-}
-
-/*
- * UVERBS_METHOD_RESTORE_MR is issued from the pie restorer blob,
- * not from CRIU master -- see criu/pie/restorer.c::restore_rdma_mr
- * for the encoder + the rationale (rxe pin_user_pages_fast needs the
- * destination task's user mm laid out at its final VAs, which only
- * happens inside the pie blob during sigreturn_restore). CRIU master
- * just serialises the per-MR call args into ta->rdma_mrs via
- * rdma_prepare_rdma_mrs() below, and the pie blob iterates and
- * issues the ioctl.
+ * UVERBS_METHOD_RESTORE_CQ and RESTORE_MR are both issued from the
+ * pie restorer blob, not from CRIU master -- see criu/pie/
+ * restorer.c::restore_rdma_cq + restore_rdma_mr for the encoders +
+ * the rationale (mlx5_ib_restore_cq pins the CQ buffer / doorbell
+ * via ib_umem_pin -> pin_user_pages_fast against current->mm,
+ * which is CRIU master's mm and doesn't have the dumpee's source
+ * VAs mapped; ib_umem_get for MR has the same shape). Master just
+ * serialises per-uobject ioctl args + plugin-shaped UHW into
+ * ta->rdma_cqs / ta->rdma_mrs via rdma_prepare_rdma_cqs() /
+ * rdma_prepare_rdma_mrs(), and the pie blob iterates and issues
+ * the ioctls at sigreturn_restore time.
  */
 
 /*
@@ -951,7 +763,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	plugin_desc_t *plugin = NULL;
 	int n_pd_restored = 0;
 	int n_pd_skipped = 0;
-	int n_cq_restored = 0;
+	int n_cq_pending = 0;
 	int n_cq_skipped = 0;
 	int n_mr_pending = 0;
 	int ret = -1;
@@ -1171,12 +983,29 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	 * failure of any one ufile) is a follow-up; v0 leaks them on
 	 * partial failure.
 	 */
+	/*
+	 * Pass 2 (deferred): CQ entries are pinned-page verbs (mlx5_ib_
+	 * restore_cq pins the CQ buffer + doorbell via ib_umem_pin from
+	 * source-side VAs that don't yet exist in CRIU master's mm) so
+	 * they get queued to the per-ufile pending list and dispatched
+	 * by the pie restorer at sigreturn_restore time. Same shape as
+	 * the MR Pass 3 below.
+	 *
+	 * We still walk CQ entries here because:
+	 *   - Their restrack_id -> ufile_handle mapping has to land in
+	 *     the per-ufile handle_map so child QPs / SRQs can resolve
+	 *     PARENT_CQ xrefs at Phase B-prep time. Model A guarantees
+	 *     destination handle == source ufile_handle, so adding the
+	 *     map entry pre-RESTORE is sound: the CQ either restores
+	 *     successfully at the queued ufile_handle or the whole
+	 *     ufile's restore fails (no partial-handle visibility).
+	 *   - The deferred count drives the Phase B-prep stash decision
+	 *     (alongside MRs). A ufile with only PDs and CQs (no MRs)
+	 *     still needs its cmd_fd_dup carried through to Phase B for
+	 *     the CQ ioctls, so we count CQs into the pending total.
+	 */
 	list_for_each_entry(c, &g->entries, link) {
 		const RdmaUobjEntry *e = c->e;
-		const RdmaCqAttrs *attrs;
-		uint32_t resp_cqe = 0;
-		uint32_t cqe = 0;
-		int rc;
 
 		if (e->type != R3_UOBJ_TYPE__R3UT_CQ)
 			continue;
@@ -1184,114 +1013,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			n_cq_skipped++;
 			continue;
 		}
-
-		attrs = e->cq;
-		if (attrs && attrs->has_cqe_count)
-			cqe = attrs->cqe_count;
-
-		/*
-		 * Driver-agnostic core: comp_vector / flags / cqe ride
-		 * the kernel-UAPI-defined attrs read from @attrs inside
-		 * the helper; per-driver UHW shape (rxe vm_pgoff,
-		 * mlx5 32B mlx5_ib_restore_cq_req) lives in
-		 * e->plugin_blob and is materialised by the cached
-		 * @plugin's RDMA_RESTORE_UOBJ_CQ_UHW_PACK / UHW_VERIFY
-		 * hooks. See criu-plugin.h for the contract.
-		 */
-		rc = rdma_send_restore_cq(cmd_fd, plugin, kernel_driver_id,
-					  e->ufile_handle, e, &resp_cqe);
-		if (rc) {
-			pr_err("uobj DAG: ufile_id=%#x RESTORE_CQ"
-			       "(target_handle=%u, driver_id=%u, cqe=%u) "
-			       "failed: %d (%s)%s\n",
-			       ufile_id, e->ufile_handle,
-			       kernel_driver_id, cqe,
-			       rc, strerror(-rc),
-			       rc == -EOPNOTSUPP
-			       ? " -- kernel has no "
-			         "ib_device_ops.restore_cq for this "
-			         "driver (rxe needs a77cc4d8e8b9; "
-			         "mlx5 needs the S5 B-series patch "
-			         "registering mlx5_ib_restore_cq in "
-			         "ib_dev_ops -- in-tree as of the "
-			         "vfmig kernel branch in this build)"
-			       : rc == -EPERM
-			       ? " -- ucontext not in restore mode "
-			         "(see RESTORE_PD's analogous error "
-			         "for the per-driver flag matrix)"
-			       : rc == -EBUSY
-			       ? " -- target_handle collision "
-			         "(another uobject already at this "
-			         "ufile slot; image is internally "
-			         "inconsistent or the kernel ufile "
-			         "is not pristine)"
-			       : rc == -EINVAL
-			       ? " -- dispatcher rejected core attrs "
-			         "(comp_vector >= dev->num_comp_vectors, "
-			         "invalid FLAGS bits, or driver UHW "
-			         "size mismatch from the plugin's "
-			         "UHW_PACK)"
-			       : rc == -EEXIST
-			       ? " -- requested mmap_offset collides "
-			         "with another pending mmap region on "
-			         "the dest cdev (concurrent restore on "
-			         "the same ibdev, or dump-side captured "
-			         "an offset another sibling uobj already "
-			         "claimed)"
-			       : rc == -EPROTO
-			       ? " -- plugin's UHW_VERIFY hook rejected "
-			         "the kernel-echo (e.g. rxe asserts "
-			         "mi_offset == requested vm_pgoff and "
-			         "saw a mismatch; check rxe is on the "
-			         "d3a79140ed26 patch or its successor)"
-			       : "");
-			goto out;
-		}
-		n_cq_restored++;
-		pr_debug("uobj DAG: ufile_id=%#x RESTORE_CQ"
-			 "(target_handle=%u) ok: requested cqe=%u, "
-			 "kernel installed resp_cqe=%u\n",
-			 ufile_id, e->ufile_handle, cqe, resp_cqe);
-
-		/*
-		 * Adoption-was-honored gate (mlx5 / Model A). For mlx5
-		 * the kernel's mlx5_ib_restore_cq adopts the source's
-		 * FW cqn from mlx5_ib_restore_cq_req.cqn and rejects
-		 * with -EILSEQ if it wasn't reserved at LOAD time, so a
-		 * successful ioctl above is itself the byte-equality
-		 * proof for cqn / cqe_size / buf_addr / db_addr (the
-		 * source values either round-tripped verbatim or the
-		 * kernel rejected the verb, no partial state). The
-		 * RESP_CQE echo must also match: a divergent
-		 * resp_cqe vs. source cqe would mean the destination
-		 * driver silently rounded the entry count, which would
-		 * desync the restored workload's WQ math from what
-		 * the source had at SAVE_VHCA_STATE. mlx5 doesn't
-		 * round; rxe rounds up to a power of two, so the
-		 * equality assert is mlx5-only. (Stronger NLDEV K8a
-		 * cross-walk -- find the new CQ entry by RES_HANDLE
-		 * and assert presence -- is a follow-up; the kernel-
-		 * side B4/B5 PROBE_CQN tests in
-		 * tools/testing/mlx5_vfmig/uobject_restore/cq_*
-		 * already cover end-to-end byte equality at a deeper
-		 * layer, so the verb-success gate here is sufficient
-		 * for v0.)
-		 */
-		if (kernel_driver_id == RDMA_DRIVER_MLX5 &&
-		    resp_cqe != cqe) {
-			pr_err("uobj DAG: ufile_id=%#x RESTORE_CQ"
-			       "(target_handle=%u) returned resp_cqe=%u "
-			       "but source recorded cqe=%u; mlx5 should "
-			       "round-trip CQE counts verbatim. Either "
-			       "the destination kernel is on a build "
-			       "that rounds cqe (regressed) or the "
-			       "image's RdmaCqAttrs.cqe_count was "
-			       "captured pre-NLDEV-RES_CQE; aborting "
-			       "restore.\n",
-			       ufile_id, e->ufile_handle, resp_cqe, cqe);
-			rc = -EPROTO;
-			goto out;
-		}
+		n_cq_pending++;
 
 		if (e->has_restrack_id) {
 			if (uobj_handle_map_add(&handle_map,
@@ -1299,7 +1021,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 						e->restrack_id,
 						e->ufile_handle) < 0) {
 				pr_err("uobj DAG: ufile_id=%#x: handle_map "
-				       "OOM after RESTORE_CQ(handle=%u)\n",
+				       "OOM after CQ-defer(handle=%u)\n",
 				       ufile_id, e->ufile_handle);
 				goto out;
 			}
@@ -1312,10 +1034,8 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	}
 
 	/*
-	 * Pass 3 (deferred): count VA-dependent entries (MRs) so we
-	 * know whether to stash this ufile for Phase B. We don't
-	 * issue RESTORE_MR here -- the kernel handler pins user
-	 * pages and the restored task's VMAs aren't mapped yet.
+	 * Pass 3 (deferred): count VA-dependent MR entries so we know
+	 * whether to stash this ufile for Phase B alongside the CQ count.
 	 */
 	list_for_each_entry(c, &g->entries, link) {
 		const RdmaUobjEntry *e = c->e;
@@ -1324,7 +1044,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			n_mr_pending++;
 	}
 
-	if (n_mr_pending > 0) {
+	if (n_cq_pending + n_mr_pending > 0) {
 		int dup;
 
 		/*
@@ -1371,14 +1091,237 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 
 	ret = 0;
 out:
-	if (n_pd_restored || n_pd_skipped || n_cq_restored ||
+	if (n_pd_restored || n_pd_skipped || n_cq_pending ||
 	    n_cq_skipped || n_mr_pending)
 		pr_info("uobj DAG: ufile_id=%#x Phase A: restored %d PD(s) "
-			"[skipped %d], %d CQ(s) [skipped %d]; %d MR(s) "
+			"[skipped %d]; %d CQ(s) [skipped %d] + %d MR(s) "
 			"deferred to post-VMA Phase B\n",
 			ufile_id, n_pd_restored, n_pd_skipped,
-			n_cq_restored, n_cq_skipped, n_mr_pending);
+			n_cq_pending, n_cq_skipped, n_mr_pending);
 	xfree(handle_map.e);
+	return ret;
+}
+
+/*
+ * Phase B-prep for per-CQ pie-deferred restore. Same shape as
+ * rdma_prepare_rdma_mrs below: walks rdma_pending_post_vma
+ * read-only (rdma_prepare_rdma_mrs deletes the entries when it
+ * runs after us), picks R3UT_CQ entries, invokes the cached
+ * plugin's RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook, and serialises the
+ * per-CQ ioctl args + plugin-shaped UHW into ta->rdma_cqs[]
+ * (RM_PRIVATE) for the pie restorer blob.
+ *
+ * Per-CQ cmd_fd is a fresh dup of p->cmd_fd_dup (matching the per-MR
+ * pattern): each rst_rdma_cq owns its fd and the pie helper closes
+ * it after the ioctl, so one CQ's close doesn't poison a sibling
+ * CQ's ioctl.
+ */
+int rdma_prepare_rdma_cqs(struct task_restore_args *ta)
+{
+	struct uobj_pending_post_vma *p;
+	unsigned int n_total_serialised = 0;
+	int ret = 0;
+
+	ta->rdma_cqs = (struct rst_rdma_cq *)rst_mem_align_cpos(RM_PRIVATE);
+	ta->rdma_cqs_n = 0;
+
+	if (list_empty(&rdma_pending_post_vma))
+		return 0;
+
+	list_for_each_entry(p, &rdma_pending_post_vma, link) {
+		struct uobj_collected *c;
+		unsigned int n_cq_serialised = 0;
+		unsigned int n_cq_skipped = 0;
+		int per_ret = 0;
+
+		list_for_each_entry(c, &p->g->entries, link) {
+			const RdmaUobjEntry *e = c->e;
+			const RdmaCqAttrs *attrs;
+			struct rst_rdma_cq *r;
+			struct rdma_uhw_spec uhw = {};
+			int dup_fd;
+			int pack_rc = 0;
+
+			if (e->type != R3_UOBJ_TYPE__R3UT_CQ)
+				continue;
+			if (!e->has_ufile_handle) {
+				n_cq_skipped++;
+				continue;
+			}
+			attrs = e->cq;
+			/*
+			 * cqe_count is the only mandatory CQ feed; the rest
+			 * (comp_vector, flags, user_handle) default to zero
+			 * via designated init when the dump-side didn't
+			 * capture them. mlx5_ib_restore_cq cross-checks cqe
+			 * against the source-side CQE count baked into the
+			 * driver UHW_IN, and rxe_restore_cq rounds cqe up to
+			 * a power of two; either way we forward the dumped
+			 * cqe_count verbatim and let the driver decide.
+			 */
+			if (!attrs || !attrs->has_cqe_count) {
+				pr_err("uobj DAG: ufile_id=%#x CQ"
+				       "(handle=%u, restrack_id=%s%u) "
+				       "is missing cqe_count; image "
+				       "dumped against a kernel without "
+				       "NLDEV RES_CQE coverage. Re-dump "
+				       "against a current kernel.\n",
+				       p->ufile_id, e->ufile_handle,
+				       e->has_restrack_id ? "" : "?",
+				       e->has_restrack_id ?
+				       e->restrack_id : 0);
+				per_ret = -1;
+				break;
+			}
+
+			dup_fd = fcntl(p->cmd_fd_dup, F_DUPFD_CLOEXEC,
+				       1 << 14);
+			if (dup_fd < 0) {
+				pr_err("uobj DAG: ufile_id=%#x CQ"
+				       "(handle=%u): F_DUPFD_CLOEXEC "
+				       "of cdev fd for pie restorer "
+				       "failed: %s\n",
+				       p->ufile_id, e->ufile_handle,
+				       strerror(errno));
+				per_ret = -1;
+				break;
+			}
+
+			r = rst_mem_alloc(sizeof(*r), RM_PRIVATE);
+			if (!r) {
+				pr_err("uobj DAG: ufile_id=%#x CQ"
+				       "(handle=%u): rst_mem_alloc("
+				       "RM_PRIVATE, %zu) failed -- "
+				       "cannot serialise into pie "
+				       "restorer args\n",
+				       p->ufile_id, e->ufile_handle,
+				       sizeof(*r));
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+
+			r->cmd_fd = dup_fd;
+			r->ufile_id = p->ufile_id;
+			r->kernel_driver_id = p->kernel_driver_id;
+			r->target_handle = e->ufile_handle;
+			r->cqe = attrs->cqe_count;
+			r->comp_vector = attrs->has_comp_vector ?
+					 attrs->comp_vector : 0;
+			r->flags = attrs->has_flags ? attrs->flags : 0;
+			/*
+			 * user_handle (== source's ibv_create_cq cq_context)
+			 * isn't NLDEV-emitted today; v0 holders all pass
+			 * NULL so 0 is the right default. Plumb through
+			 * RdmaCqAttrs when QUERY_CQ surfaces it.
+			 */
+			r->user_handle = 0;
+			r->uhw_in_len = 0;
+			r->uhw_out_attr_len = 0;
+			r->uhw_out_verify_len = 0;
+
+			if (p->plugin && p->plugin->d->hooks[
+				CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK]) {
+				CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK_t *fn =
+					p->plugin->d->hooks[
+					CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK];
+				pack_rc = fn(e, &uhw);
+				if (pack_rc) {
+					pr_err("uobj DAG: ufile_id=%#x CQ"
+					       "(handle=%u): plugin '%s' "
+					       "RESTORE_UOBJ_CQ_UHW_PACK "
+					       "failed: %d (%s)\n",
+					       p->ufile_id, e->ufile_handle,
+					       p->plugin->d->name, pack_rc,
+					       strerror(-pack_rc));
+					close(dup_fd);
+					per_ret = -1;
+					break;
+				}
+			}
+			if (uhw.in_len > sizeof(r->uhw_in_buf)) {
+				pr_err("uobj DAG: ufile_id=%#x CQ"
+				       "(handle=%u): plugin '%s' UHW_IN "
+				       "size %zu exceeds rst_rdma_cq "
+				       "static buffer (%zu); bump "
+				       "RST_RDMA_CQ_UHW_IN_MAX in "
+				       "criu/include/restorer.h\n",
+				       p->ufile_id, e->ufile_handle,
+				       p->plugin ? p->plugin->d->name :
+				       "(none)",
+				       uhw.in_len,
+				       sizeof(r->uhw_in_buf));
+				free(uhw.in_buf);
+				free(uhw.out_buf);
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+			if (uhw.out_len > sizeof(r->uhw_out_expected)) {
+				pr_err("uobj DAG: ufile_id=%#x CQ"
+				       "(handle=%u): plugin '%s' UHW_OUT "
+				       "expected size %zu exceeds "
+				       "rst_rdma_cq static buffer (%zu); "
+				       "bump RST_RDMA_CQ_UHW_OUT_MAX in "
+				       "criu/include/restorer.h\n",
+				       p->ufile_id, e->ufile_handle,
+				       p->plugin ? p->plugin->d->name :
+				       "(none)",
+				       uhw.out_len,
+				       sizeof(r->uhw_out_expected));
+				free(uhw.in_buf);
+				free(uhw.out_buf);
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+			if (uhw.verify_len > uhw.out_len) {
+				pr_err("uobj DAG: ufile_id=%#x CQ"
+				       "(handle=%u): plugin '%s' UHW "
+				       "verify_len %zu exceeds out_len "
+				       "%zu; PACK contract violation\n",
+				       p->ufile_id, e->ufile_handle,
+				       p->plugin ? p->plugin->d->name :
+				       "(none)",
+				       uhw.verify_len, uhw.out_len);
+				free(uhw.in_buf);
+				free(uhw.out_buf);
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+			if (uhw.in_len) {
+				memcpy(r->uhw_in_buf, uhw.in_buf,
+				       uhw.in_len);
+				r->uhw_in_len = (uint16_t)uhw.in_len;
+			}
+			if (uhw.out_len) {
+				memcpy(r->uhw_out_expected, uhw.out_buf,
+				       uhw.out_len);
+				r->uhw_out_attr_len =
+					(uint16_t)uhw.out_len;
+				r->uhw_out_verify_len =
+					(uint16_t)uhw.verify_len;
+			}
+			free(uhw.in_buf);
+			free(uhw.out_buf);
+
+			n_cq_serialised++;
+			ta->rdma_cqs_n++;
+		}
+
+		pr_info("uobj DAG: ufile_id=%#x Phase B-prep: serialised "
+			"%u CQ(s) [skipped %u] for pie restorer\n",
+			p->ufile_id, n_cq_serialised, n_cq_skipped);
+		n_total_serialised += n_cq_serialised;
+
+		if (per_ret < 0)
+			ret = -1;
+	}
+
+	if (ret == 0)
+		pr_info("uobj DAG: Phase B-prep: %u CQ(s) total queued "
+			"for pie-restorer dispatch\n", n_total_serialised);
 	return ret;
 }
 
@@ -1524,7 +1467,8 @@ int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 			r->lkey_hint = attrs->lkey;
 			r->rkey_hint = attrs->rkey;
 			r->uhw_in_len = 0;
-			r->uhw_out_expected_len = 0;
+			r->uhw_out_attr_len = 0;
+			r->uhw_out_verify_len = 0;
 
 			/*
 			 * Driver-private UHW: the cached plugin owns the
@@ -1591,6 +1535,21 @@ int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 				per_ret = -1;
 				break;
 			}
+			if (uhw.verify_len > uhw.out_len) {
+				pr_err("uobj DAG: ufile_id=%#x MR"
+				       "(handle=%u): plugin '%s' UHW "
+				       "verify_len %zu exceeds out_len "
+				       "%zu; PACK contract violation\n",
+				       p->ufile_id, e->ufile_handle,
+				       p->plugin ? p->plugin->d->name :
+				       "(none)",
+				       uhw.verify_len, uhw.out_len);
+				free(uhw.in_buf);
+				free(uhw.out_buf);
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
 			if (uhw.in_len) {
 				memcpy(r->uhw_in_buf, uhw.in_buf,
 				       uhw.in_len);
@@ -1599,8 +1558,10 @@ int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 			if (uhw.out_len) {
 				memcpy(r->uhw_out_expected, uhw.out_buf,
 				       uhw.out_len);
-				r->uhw_out_expected_len =
+				r->uhw_out_attr_len =
 					(uint16_t)uhw.out_len;
+				r->uhw_out_verify_len =
+					(uint16_t)uhw.verify_len;
 			}
 			free(uhw.in_buf);
 			free(uhw.out_buf);

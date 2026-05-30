@@ -967,6 +967,9 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 #ifndef UVERBS_METHOD_RESTORE_MR
 #define UVERBS_METHOD_RESTORE_MR		1
 #endif
+#ifndef UVERBS_METHOD_RESTORE_CQ
+#define UVERBS_METHOD_RESTORE_CQ		2
+#endif
 #ifndef UVERBS_ATTR_RESTORE_MR_HANDLE
 #define UVERBS_ATTR_RESTORE_MR_HANDLE		0
 #define UVERBS_ATTR_RESTORE_MR_PD_HANDLE	1
@@ -978,6 +981,16 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 #define UVERBS_ATTR_RESTORE_MR_RKEY_HINT	7
 #define UVERBS_ATTR_RESTORE_MR_RESP_LKEY	8
 #define UVERBS_ATTR_RESTORE_MR_RESP_RKEY	9
+#endif
+#ifndef UVERBS_ATTR_RESTORE_CQ_HANDLE
+#define UVERBS_ATTR_RESTORE_CQ_HANDLE		0
+#define UVERBS_ATTR_RESTORE_CQ_CQE		1
+#define UVERBS_ATTR_RESTORE_CQ_USER_HANDLE	2
+#define UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR	3
+#define UVERBS_ATTR_RESTORE_CQ_FLAGS		4
+#define UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL	5	/* unused; UA_OPTIONAL FD */
+#define UVERBS_ATTR_RESTORE_CQ_EVENT_FD		6	/* unused; UA_OPTIONAL FD */
+#define UVERBS_ATTR_RESTORE_CQ_RESP_CQE		7
 #endif
 
 /*
@@ -995,6 +1008,143 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 #ifndef UVERBS_ATTR_UHW_OUT
 #define UVERBS_ATTR_UHW_OUT			((uint16_t)4097)
 #endif
+
+/*
+ * Issue UVERBS_METHOD_RESTORE_CQ for one CQ queued by Phase B-prep
+ * (criu/rdma/uobj_restore.c::rdma_prepare_rdma_cqs). Runs from inside
+ * the pie blob after the user VMAs have been laid out at their
+ * original addresses, so mlx5_ib_umem_restore_cq's pin_user_pages_
+ * fast() against the CQ buffer + doorbell user-VAs succeeds against
+ * the destination task's mm. See criu/include/restorer.h::struct
+ * rst_rdma_cq for the timing rationale -- mirrors restore_rdma_mr's
+ * shape exactly, modulo the per-class attr id set.
+ */
+static int restore_rdma_cq(struct rst_rdma_cq *r)
+{
+	/*
+	 * 8 attrs: 6 core (handle, cqe, user_handle, comp_vector,
+	 * flags, resp_cqe) + up to 2 plugin-shaped UHW (UHW_IN,
+	 * UHW_OUT). Worst-case sizing so we don't need conditional
+	 * buffer math.
+	 */
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[8];
+	} cmd = {};
+	uint32_t resp_cqe = 0;
+	uint8_t  uhw_out_actual[RST_RDMA_CQ_UHW_OUT_MAX] = {};
+	unsigned int n = 0;
+	int ret;
+
+	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_CQ;
+	cmd.hdr.driver_id = r->kernel_driver_id;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_HANDLE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->target_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_CQE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->cqe;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_USER_HANDLE;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->user_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->comp_vector;
+	n++;
+
+	/*
+	 * FLAGS_IN is optional; only emit when non-zero so we don't
+	 * spend a slot for the common "no special CQ flags" case.
+	 * Kernel uverbs_get_flags32 treats absent as zero already.
+	 */
+	if (r->flags) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_FLAGS;
+		cmd.attrs[n].len = sizeof(uint32_t);
+		cmd.attrs[n].flags = 0;
+		cmd.attrs[n].data = r->flags;
+		n++;
+	}
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_RESP_CQE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp_cqe;
+	n++;
+
+	/*
+	 * Plugin-shaped UHW. PACK pre-staged the bytes into the
+	 * static rst_rdma_cq.uhw_in_buf / uhw_out_expected at master
+	 * time. We attach UHW_IN if uhw_in_len > 0 (mlx5 has 32B
+	 * mlx5_ib_restore_cq_req; rxe optionally has 16B
+	 * rxe_restore_cq_req when vm_pgoff != 0). We attach UHW_OUT
+	 * if uhw_out_attr_len > 0 (rxe always 16B for
+	 * rxe_create_cq_resp; mlx5 zero -- mlx5_ib_restore_cq
+	 * rejects any non-zero udata->outlen). The kernel writes its
+	 * echo into uhw_out_actual; we memcmp the first
+	 * uhw_out_verify_len bytes against uhw_out_expected post-
+	 * ioctl.
+	 */
+	if (r->uhw_in_len > 0) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
+		cmd.attrs[n].len = r->uhw_in_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)&r->uhw_in_buf;
+		n++;
+	}
+	if (r->uhw_out_attr_len > 0) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_OUT;
+		cmd.attrs[n].len = r->uhw_out_attr_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)uhw_out_actual;
+		n++;
+	}
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	ret = sys_ioctl(r->cmd_fd, RDMA_VERBS_IOCTL, (unsigned long)&cmd);
+	sys_close(r->cmd_fd);
+	if (ret < 0) {
+		pr_err("RDMA: ufile_id=%x RESTORE_CQ(target_handle=%u, "
+		       "cqe=%u, comp_vector=%u, flags=%x, "
+		       "driver_id=%u, uhw_in=%u, uhw_out=%u) failed: %d\n",
+		       r->ufile_id, r->target_handle, r->cqe,
+		       r->comp_vector, r->flags, r->kernel_driver_id,
+		       r->uhw_in_len, r->uhw_out_attr_len, ret);
+		return -1;
+	}
+
+	if (r->uhw_out_verify_len > 0 &&
+	    memcmp(uhw_out_actual, r->uhw_out_expected,
+		   r->uhw_out_verify_len) != 0) {
+		pr_err("RDMA: ufile_id=%x RESTORE_CQ(target_handle=%u): "
+		       "kernel UHW_OUT echo (verify %u of %u bytes) does "
+		       "not match plugin's expected bytes\n",
+		       r->ufile_id, r->target_handle,
+		       r->uhw_out_verify_len, r->uhw_out_attr_len);
+		return -1;
+	}
+
+	pr_info("RDMA: ufile_id=%x RESTORE_CQ(target_handle=%u, "
+		"cqe=%u, resp_cqe=%u, comp_vector=%u, "
+		"driver_id=%u, uhw_in=%u, uhw_out=%u) ok\n",
+		r->ufile_id, r->target_handle, r->cqe, resp_cqe,
+		r->comp_vector, r->kernel_driver_id,
+		r->uhw_in_len, r->uhw_out_attr_len);
+	return 0;
+}
 
 static int restore_rdma_mr(struct rst_rdma_mr *r)
 {
@@ -1083,9 +1233,9 @@ static int restore_rdma_mr(struct rst_rdma_mr *r)
 		cmd.attrs[n].data = (uintptr_t)&r->uhw_in_buf;
 		n++;
 	}
-	if (r->uhw_out_expected_len > 0) {
+	if (r->uhw_out_attr_len > 0) {
 		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_OUT;
-		cmd.attrs[n].len = r->uhw_out_expected_len;
+		cmd.attrs[n].len = r->uhw_out_attr_len;
 		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
 		cmd.attrs[n].data = (uintptr_t)uhw_out_actual;
 		n++;
@@ -1163,14 +1313,14 @@ static int restore_rdma_mr(struct rst_rdma_mr *r)
 	 * dormant in v0 and exists for forward compatibility with the
 	 * hook contract declared in criu-plugin.h.
 	 */
-	if (r->uhw_out_expected_len > 0 &&
+	if (r->uhw_out_verify_len > 0 &&
 	    memcmp(uhw_out_actual, r->uhw_out_expected,
-		   r->uhw_out_expected_len) != 0) {
+		   r->uhw_out_verify_len) != 0) {
 		pr_err("RDMA: ufile_id=%x RESTORE_MR(target_handle=%u): "
-		       "kernel UHW_OUT echo (%u bytes) does not match "
-		       "plugin's expected bytes\n",
+		       "kernel UHW_OUT echo (verify %u of %u bytes) does "
+		       "not match plugin's expected bytes\n",
 		       r->ufile_id, r->target_handle,
-		       r->uhw_out_expected_len);
+		       r->uhw_out_verify_len, r->uhw_out_attr_len);
 		return -1;
 	}
 
@@ -2250,15 +2400,28 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			goto core_restore_end;
 
 	/*
-	 * RDMA MR restore. Same "needs the user mm laid out at its
-	 * final VAs" rationale as AIO rings -- and a strictly stronger
-	 * one for rxe, where ib_umem_get -> pin_user_pages_fast
-	 * against current->mm only succeeds once anon-private VMAs
-	 * have actually been mmap'd at the source-side address (the
-	 * pie blob's job, just above this loop). Issued here so any
-	 * RESTORE_MR -EFAULT surfaces against a fully-laid-out mm and
-	 * is a real driver bug, not a CRIU ordering artefact.
+	 * RDMA per-uobject restore (CQs, MRs). Same "needs the user
+	 * mm laid out at its final VAs" rationale as AIO rings --
+	 * mlx5_ib_umem_restore_cq pins the CQ buffer / doorbell pages
+	 * via pin_user_pages_fast against current->mm, and rxe's
+	 * RESTORE_MR pins the MR's user buffer the same way. Both
+	 * only succeed once anon-private VMAs have actually been
+	 * mmap'd at the source-side addresses (the pie blob's job,
+	 * just above this loop). Issued here so any -EFAULT surfaces
+	 * against a fully-laid-out mm and is a real driver bug, not a
+	 * CRIU ordering artefact.
+	 *
+	 * CQ before MR: matches the kernel-side parent dependency
+	 * graph -- MR doesn't reference CQ but a future QP step would,
+	 * and issuing CQs first leaves the per-ufile handle space in a
+	 * forward-compatible order.
 	 */
+	if (args->rdma_cqs_n)
+		pr_info("RDMA: pie restorer: dispatching %u CQ(s)\n",
+			args->rdma_cqs_n);
+	for (i = 0; i < args->rdma_cqs_n; i++)
+		if (restore_rdma_cq(&args->rdma_cqs[i]) < 0)
+			goto core_restore_end;
 	if (args->rdma_mrs_n)
 		pr_info("RDMA: pie restorer: dispatching %u MR(s)\n",
 			args->rdma_mrs_n);
