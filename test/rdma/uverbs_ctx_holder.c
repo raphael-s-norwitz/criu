@@ -97,6 +97,8 @@ static struct ibv_pd *g_pd;
  * kernel returns -EINVAL on destroy).
  */
 static struct ibv_cq *g_cq;
+static struct ibv_cq *g_cq_b; /* HM_PD_2CQ second CQ, comp_vector=1 */
+static int g_cq_b_comp_vector;
 static const int G_CQ_CQE = 16;
 /*
  * Pre-dump MR: registered alongside g_pd when @g_mode covers MR
@@ -166,6 +168,39 @@ static volatile sig_atomic_t g_query;
  *            metadata), so libibverbs's cq->handle is the only
  *            user-visible identity to assert.
  *
+ *   "pd_2cq" pre-dump alloc PD + create 2 CQs with different
+ *            comp_vectors (cq_a: comp_vector=0, cq_b:
+ *            comp_vector=1 if dev_attr.num_comp_vectors >= 2,
+ *            else comp_vector=0 with a clear log line). Future
+ *            mlx5_vfmig E2E coverage of:
+ *              1. multi-CQ-per-ufile dispatching through the
+ *                 R3 uobj-walker (one MLX5_IB_METHOD_VFMIG_QUERY_
+ *                 CQ per CQ at dump, one UVERBS_METHOD_RESTORE_CQ
+ *                 per CQ at restore, both keyed off the per-CQ
+ *                 ufile_handle so CQ-to-CQ blob mixups surface).
+ *              2. comp_vector=1 round-trip: the kernel's
+ *                 mlx5_ib_create_cq stamps cq->mcq.vector at
+ *                 create time (post-symmetry-fix) so QUERY_CQ
+ *                 emits the source's vector verbatim and
+ *                 RESTORE_CQ rebinds the destination CQ to the
+ *                 same EQ slot. A pre-fix kernel would emit 0
+ *                 for both and only cq_a would survive the
+ *                 round-trip; a CRIU bug that drops the
+ *                 RESP_COMP_VECTOR attr would manifest the
+ *                 same way.
+ *            Post-restore destroys both CQs in reverse-creation
+ *            order (cq_b then cq_a) before the PD, exercising
+ *            the teardown-order invariant documented in
+ *            criu/rdma/uobj_restore.c (Pass-2 rollback comment)
+ *            and in mlx5_vfmig design doc S3b. This mode is
+ *            wired in the holder so the future mlx5 vfmig E2E
+ *            runner (test/rdma/run_vfmig_cr.sh) can adopt it
+ *            without another holder change; it is not yet on
+ *            the rxe runner's default pass list because rxe
+ *            num_comp_vectors typically caps at 1, which would
+ *            collapse pd_2cq's coverage to be no different than
+ *            pd_cq.
+ *
  * The default is "pd" so existing call sites that don't pass
  * argv[3] (mlx5_vfmig run_vfmig_cr.sh) keep their current
  * pre-dump shape.
@@ -174,6 +209,7 @@ enum holder_mode {
 	HM_PD = 0,
 	HM_PD_MR = 1,
 	HM_PD_CQ = 2,
+	HM_PD_2CQ = 3,
 };
 static enum holder_mode g_mode = HM_PD;
 
@@ -607,7 +643,7 @@ out:
  */
 static void run_post_restore_checks_pd_cq(void)
 {
-	char msg[256];
+	char msg[384];
 	int rc;
 
 	if (!g_pd) {
@@ -617,9 +653,49 @@ static void run_post_restore_checks_pd_cq(void)
 	}
 	if (!g_cq) {
 		write_status("FAIL: post-restore: g_cq missing despite "
-			     "HM_PD_CQ -- holder lost the pre-dump CQ "
-			     "reference");
+			     "HM_PD_CQ/HM_PD_2CQ -- holder lost the "
+			     "pre-dump CQ reference");
 		return;
+	}
+	if (g_mode == HM_PD_2CQ && !g_cq_b) {
+		write_status("FAIL: post-restore: g_cq_b missing despite "
+			     "HM_PD_2CQ -- holder lost the second "
+			     "pre-dump CQ reference");
+		return;
+	}
+
+	/*
+	 * Reverse-creation-order teardown so the source's
+	 * UVERBS_OBJECT_CQ uobjects fall in the same order
+	 * uverbs_destroy_ufile_hw would walk them on close. cq_b
+	 * was created last -> destroyed first; cq_a -> next; PD
+	 * last. This shape mirrors the rollback-order invariant
+	 * documented in criu/rdma/uobj_restore.c (Pass-2 rollback
+	 * comment): if any per-CQ destroy fails the chained PD
+	 * dealloc is also surfaced, so a v0 CQ-restore regression
+	 * that drops one of the two CQs (e.g. mlx5_blob keying bug)
+	 * would surface here as either ibv_destroy_cq -EINVAL or
+	 * ibv_dealloc_pd -EBUSY (FW BAD_RES_STATE on adopted
+	 * mpd->pdn while a dependent CQ is still alive in
+	 * firmware).
+	 */
+	if (g_mode == HM_PD_2CQ) {
+		rc = ibv_destroy_cq(g_cq_b);
+		g_cq_b = NULL;
+		if (rc) {
+			snprintf(msg, sizeof(msg),
+				 "FAIL: ibv_destroy_cq of pre-dump cq_b "
+				 "(comp_vector=%d) after restore: %d "
+				 "(%s) -- second CQ's ufile_handle is "
+				 "missing in the destination ucontext "
+				 "IDR. Per-CQ dispatcher mis-keyed the "
+				 "mlx5_blob, RESTORE_CQ ran with the "
+				 "wrong source bytes, or RESP_COMP_"
+				 "VECTOR didn't round-trip",
+				 g_cq_b_comp_vector, rc, strerror(rc));
+			write_status(msg);
+			return;
+		}
 	}
 
 	rc = ibv_destroy_cq(g_cq);
@@ -641,7 +717,7 @@ static void run_post_restore_checks_pd_cq(void)
 	if (rc) {
 		snprintf(msg, sizeof(msg),
 			 "FAIL: ibv_dealloc_pd of pre-dump PD after "
-			 "tearing down the restored CQ: %d (%s) -- "
+			 "tearing down the restored CQ(s): %d (%s) -- "
 			 "kernel uobj cleanup leaked a dependent or "
 			 "the adopted PD identity drifted",
 			 rc, strerror(rc));
@@ -970,9 +1046,11 @@ int main(int argc, char **argv)
 		g_mode = HM_PD_MR;
 	} else if (strcmp(mode, "pd_cq") == 0) {
 		g_mode = HM_PD_CQ;
+	} else if (strcmp(mode, "pd_2cq") == 0) {
+		g_mode = HM_PD_2CQ;
 	} else {
 		fprintf(stderr, "unknown holder mode '%s' "
-				"(expected pd|pd_mr|pd_cq)\n", mode);
+				"(expected pd|pd_mr|pd_cq|pd_2cq)\n", mode);
 		return 2;
 	}
 
@@ -1037,6 +1115,46 @@ int main(int argc, char **argv)
 			fprintf(stderr,
 				"ibv_create_cq baseline (pre-dump CQ): %s\n",
 				strerror(errno));
+			return 2;
+		}
+	} else if (g_mode == HM_PD_2CQ) {
+		/*
+		 * Two pre-dump CQs for the multi-CQ + comp_vector
+		 * coverage. cq_a is comp_vector=0 (matches HM_PD_CQ);
+		 * cq_b's comp_vector clamps to (num_comp_vectors - 1)
+		 * but typically lands at 1 -- mlx5 hosts usually report
+		 * num_comp_vectors == #cores, rxe defaults to 1 (so
+		 * cq_b collapses to comp_vector=0 with a clear log
+		 * line on rxe). The clamp keeps the ibv_create_cq
+		 * call legal across drivers without forcing the
+		 * caller to special-case num_comp_vectors==1.
+		 */
+		g_cq_b_comp_vector =
+			(g_ctx->num_comp_vectors >= 2) ? 1 : 0;
+		if (g_cq_b_comp_vector == 0) {
+			fprintf(stderr,
+				"pd_2cq: device %s reports "
+				"num_comp_vectors=%d; cq_b will run on "
+				"comp_vector=0, collapsing the multi-vector "
+				"coverage to a multi-CQ-per-ufile smoke "
+				"test (still useful for the per-CQ "
+				"dispatcher / mlx5_blob keying / teardown-"
+				"order invariant).\n",
+				devname, g_ctx->num_comp_vectors);
+		}
+		g_cq = ibv_create_cq(g_ctx, G_CQ_CQE, NULL, NULL, 0);
+		if (!g_cq) {
+			fprintf(stderr,
+				"ibv_create_cq baseline (cq_a, cv=0): "
+				"%s\n", strerror(errno));
+			return 2;
+		}
+		g_cq_b = ibv_create_cq(g_ctx, G_CQ_CQE, NULL, NULL,
+				       g_cq_b_comp_vector);
+		if (!g_cq_b) {
+			fprintf(stderr,
+				"ibv_create_cq (cq_b, cv=%d): %s\n",
+				g_cq_b_comp_vector, strerror(errno));
 			return 2;
 		}
 	}
@@ -1167,6 +1285,14 @@ int main(int argc, char **argv)
 		       "cq_handle=%u cq_cqe=%d\n",
 		       getpid(), devname, g_ctx->async_fd,
 		       g_pd->handle, g_cq->handle, g_cq->cqe);
+	} else if (g_mode == HM_PD_2CQ && g_cq && g_cq_b) {
+		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u "
+		       "cq_a_handle=%u cq_a_cqe=%d cq_a_cv=0 "
+		       "cq_b_handle=%u cq_b_cqe=%d cq_b_cv=%d\n",
+		       getpid(), devname, g_ctx->async_fd,
+		       g_pd->handle,
+		       g_cq->handle, g_cq->cqe,
+		       g_cq_b->handle, g_cq_b->cqe, g_cq_b_comp_vector);
 	} else {
 		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u\n",
 		       getpid(), devname, g_ctx->async_fd, g_pd->handle);
@@ -1177,7 +1303,7 @@ int main(int argc, char **argv)
 	while (!g_terminate) {
 		if (g_query) {
 			g_query = 0;
-			if (g_mode == HM_PD_CQ)
+			if (g_mode == HM_PD_CQ || g_mode == HM_PD_2CQ)
 				run_post_restore_checks_pd_cq();
 			else
 				run_post_restore_checks();
@@ -1190,6 +1316,12 @@ int main(int argc, char **argv)
 	free(g_mr_alloc);
 	g_mr_alloc = NULL;
 	g_mr_buf = NULL;
+	/* Reverse-creation-order CQ teardown so dependents fall before
+	 * the PD they were carved from. cq_b created last -> destroyed
+	 * first; cq_a likewise before the PD. */
+	if (g_cq_b)
+		ibv_destroy_cq(g_cq_b);
+	g_cq_b = NULL;
 	if (g_cq)
 		ibv_destroy_cq(g_cq);
 	g_cq = NULL;

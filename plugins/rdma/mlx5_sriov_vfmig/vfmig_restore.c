@@ -1212,3 +1212,63 @@ rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 		"cached fd=%d)\n", u->ctxn, dup_fd, c->dest_cdev_fd);
 	return dup_fd;
 }
+
+/*
+ * RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook (mlx5).
+ *
+ * Reads the source-side 32B mlx5_ib_restore_cq_req packed at dump
+ * time into e->plugin_blob (see rdma_mlx5_vfmig_plugin_dump_uobj_cq)
+ * and hands core a malloc()'d copy as UHW_IN. mlx5_ib_restore_cq
+ * is configured to require exactly sizeof(req) UHW_IN and reject
+ * any UHW_OUT (drivers/infiniband/hw/mlx5/main.c::mlx5_ib_restore_cq:
+ * udata->inlen < sizeof(req) || udata->outlen != 0 -> -EINVAL), so
+ * we leave uhw->out_buf NULL.
+ *
+ * Allocator contract: malloc() here, free() in core after the
+ * ioctl + (optional) UHW_VERIFY round-trip. We do not register
+ * UHW_VERIFY since UHW_OUT is empty -- the kernel adopts cqn /
+ * cqe_size / buf_addr / db_addr verbatim; a successful ioctl is
+ * itself the byte-equality witness for those fields, and the
+ * core RESP_CQE echo is verified by the criu/rdma per-CQ caller.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw)
+{
+	const ProtobufCBinaryData *blob;
+
+	if (!e || !uhw)
+		return -EINVAL;
+	if (!e->has_plugin_blob || e->plugin_blob.len == 0) {
+		pr_err("vfmig: RESTORE_CQ_UHW_PACK called for ufile_handle=%u "
+		       "with empty plugin_blob; image is missing the "
+		       "32B mlx5_ib_restore_cq_req captured at dump via "
+		       "MLX5_IB_METHOD_VFMIG_QUERY_CQ. Re-dump against a "
+		       "kernel that has the VFMIG_QUERY_CQ method and a "
+		       "CRIU plugin build that wires it.\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+
+	blob = &e->plugin_blob;
+	if (blob->len != sizeof(struct mlx5_ib_restore_cq_req_local)) {
+		pr_err("vfmig: RESTORE_CQ_UHW_PACK plugin_blob len=%zu "
+		       "ufile_handle=%u, expected %zu (mlx5_ib_restore_cq_req)\n",
+		       blob->len,
+		       e->has_ufile_handle ? e->ufile_handle : 0,
+		       sizeof(struct mlx5_ib_restore_cq_req_local));
+		return -EINVAL;
+	}
+
+	uhw->in_buf = malloc(blob->len);
+	if (!uhw->in_buf) {
+		pr_err("vfmig: RESTORE_CQ_UHW_PACK out of memory "
+		       "(%zu bytes)\n", blob->len);
+		return -ENOMEM;
+	}
+	memcpy(uhw->in_buf, blob->data, blob->len);
+	uhw->in_len = blob->len;
+	/* mlx5_ib_restore_cq rejects any UHW_OUT -- leave out_buf NULL. */
+	uhw->out_buf = NULL;
+	uhw->out_len = 0;
+	return 0;
+}

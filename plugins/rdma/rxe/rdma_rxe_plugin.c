@@ -852,6 +852,251 @@ static int rdma_rxe_plugin_process_device_vma(pid_t pid, int fd,
 	return 0;
 }
 
+/*
+ * Schema for the rxe-private CQ entry in the per-uobj
+ * RdmaUobjEntry.plugin_blob byte slice.
+ *
+ * Just an 8-byte source vm_pgoff (in BYTES, matching kernel UAPI's
+ * rxe_restore_cq_req::vm_pgoff which is byte-offset despite its
+ * name -- compared against vma->vm_pgoff << PAGE_SHIFT in rxe_mmap).
+ *
+ * Rationale for owning the schema in the plugin (not via a per-
+ * driver proto): the field is one fixed-size scalar; a protobuf
+ * sub-message would be overkill, and the plugin is the only
+ * producer + consumer. criu/rdma core treats the bytes as opaque.
+ */
+struct rxe_cq_plugin_blob_local {
+	uint64_t vm_pgoff;
+};
+
+/*
+ * UAPI lag shims for rxe's RESTORE_CQ UHW pair, mirrors of
+ *   include/uapi/rdma/rdma_user_rxe.h
+ *     struct rxe_create_cq_resp { struct mminfo mi; };
+ *     struct rxe_restore_cq_req {
+ *         __aligned_u64 vm_pgoff;
+ *         __aligned_u64 reserved;
+ *     };
+ *
+ * These used to live in criu/rdma/uobj_restore.c when core knew
+ * the rxe UHW shape; they moved here when the per-driver UHW
+ * pack/verify hooks took over (see
+ * RDMA_RESTORE_UOBJ_CQ_UHW_PACK/_VERIFY in criu-plugin.h). The
+ * @reserved tail on the IN side is the inline-attr-trap mitigation
+ * the kernel UAPI carries (uverbs_fill_udata's len <= sizeof(u64)
+ * inline path otherwise reads attr.data verbatim instead of
+ * copying from userspace; sizing strictly above 8 bytes takes the
+ * pointer path through ib_copy_from_udata). Keep in sync with the
+ * upstream UAPI; remove once host rdma-core ships these structs.
+ */
+struct rxe_create_cq_resp_local {
+	uint64_t	mi_offset;	/* mmap cookie (vm_pgoff << PAGE_SHIFT) */
+	uint32_t	mi_size;	/* mmap region size, bytes */
+	uint32_t	mi_pad;
+};
+
+struct rxe_restore_cq_req_local {
+	uint64_t	vm_pgoff;
+	uint64_t	reserved;	/* must be zero */
+};
+
+/*
+ * RDMA_DUMP_UOBJ_CQ hook (rxe). Drains one cdev-VMA pgoff cookie
+ * from the process-global side-table fed by
+ * rdma_rxe_plugin_process_device_vma() above, packs it as the
+ * 8-byte rxe_cq_plugin_blob into the entry-level plugin_blob the
+ * caller will attach onto RdmaUobjEntry.plugin_blob, and stamps
+ * comp_vector=0 / flags=0 (rxe has only one comp vector and no
+ * non-zero create-CQ flags in v0).
+ *
+ * If the side-table is empty -- pre-K8a kernel that didn't surface
+ * the matching cdev VMA, or a holder that never mmap'd this CQ's
+ * ring -- @plugin_blob is left as the caller staged it (NULL data,
+ * len 0) and the restore-side UHW PACK below treats that as
+ * "fall back to the kernel's monotonic counter at RESTORE_CQ".
+ *
+ * Allocates plugin_blob->data via malloc; criu/rdma/uobj_dump.c::
+ * uobj_cq_cb frees it after pb_write_one consumes the bytes
+ * (allocator contract identical to the mlx5 plugin's hook).
+ *
+ * @kernel_driver_id is unused -- the dispatcher already guaranteed
+ * we only get rxe CQs.
+ */
+static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev,
+					uint32_t kernel_driver_id,
+					int lfd, uint32_t ufile_handle,
+					pid_t pid,
+					RdmaCqAttrs *cq_attrs,
+					ProtobufCBinaryData *plugin_blob)
+{
+	struct rxe_cq_plugin_blob_local pb = {};
+	uint64_t pgoff_bytes = 0;
+	uint8_t *buf;
+	int rc;
+
+	(void)lfd;
+	(void)kernel_driver_id;
+
+	rc = rdma_pop_cdev_vma_offset(pid, ibdev, &pgoff_bytes);
+	if (rc == -ENOENT) {
+		pr_debug("rxe: dump_uobj_cq: no cdev VMA cookie left for "
+			 "ibdev=%s ufile_handle=%u (pre-K8a or non-mmap "
+			 "holder); leaving plugin_blob empty\n",
+			 ibdev, ufile_handle);
+		/* Leave plugin_blob empty; restore-side falls back. */
+	} else if (rc < 0) {
+		pr_err("rxe: dump_uobj_cq: rdma_pop_cdev_vma_offset "
+		       "ibdev=%s ufile_handle=%u failed: %d\n",
+		       ibdev, ufile_handle, rc);
+		return rc;
+	} else {
+		pb.vm_pgoff = pgoff_bytes;
+		buf = malloc(sizeof(pb));
+		if (!buf) {
+			pr_err("rxe: dump_uobj_cq: out of memory packing "
+			       "plugin_blob (%zu bytes) for ufile_handle=%u\n",
+			       sizeof(pb), ufile_handle);
+			return -ENOMEM;
+		}
+		memcpy(buf, &pb, sizeof(pb));
+		plugin_blob->data = buf;
+		plugin_blob->len = sizeof(pb);
+	}
+
+	cq_attrs->has_comp_vector = true;
+	cq_attrs->comp_vector = 0;
+	cq_attrs->has_flags = true;
+	cq_attrs->flags = 0;
+
+	pr_debug("rxe: dump_uobj_cq ibdev=%s ufile_handle=%u: "
+		 "vm_pgoff=%#" PRIx64 " (%s) comp_vector=0 flags=0\n",
+		 ibdev, ufile_handle, pb.vm_pgoff,
+		 plugin_blob->len ? "captured" : "absent");
+	return 0;
+}
+
+/*
+ * RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook (rxe).
+ *
+ * Reads the source vm_pgoff packed at dump time into
+ * e->plugin_blob and shapes the UHW pair for rxe's RESTORE_CQ:
+ *
+ *   - UHW_OUT is always present (sizeof rxe_create_cq_resp_local =
+ *     16). rxe_restore_cq rejects (udata->outlen < sizeof(*uresp))
+ *     before any of the actual restore work runs, so we always
+ *     wire the receive buffer even when we don't intend to inspect
+ *     it.
+ *   - UHW_IN is present only when the dumped vm_pgoff is non-zero.
+ *     Absent UHW_IN -> kernel falls back to its monotonic counter
+ *     (legal but typically misses the dumped vm_pgoff -- the
+ *     failure mode that motivated this whole UHW_IN dance, see
+ *     d3a79140ed26).
+ *
+ * The companion UHW_VERIFY hook below cross-checks
+ * uhw->out_buf->mi_offset against the requested vm_pgoff after
+ * the ioctl; UHW_VERIFY is skipped if UHW_IN was absent (we have
+ * nothing to compare against).
+ */
+static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw)
+{
+	struct rxe_restore_cq_req_local *in = NULL;
+	struct rxe_create_cq_resp_local *out = NULL;
+	const struct rxe_cq_plugin_blob_local *pb;
+	uint64_t vm_pgoff = 0;
+
+	if (!e || !uhw)
+		return -EINVAL;
+
+	if (e->has_plugin_blob && e->plugin_blob.len > 0) {
+		if (e->plugin_blob.len !=
+		    sizeof(struct rxe_cq_plugin_blob_local)) {
+			pr_err("rxe: RESTORE_CQ_UHW_PACK ufile_handle=%u "
+			       "plugin_blob len=%zu, expected %zu "
+			       "(rxe_cq_plugin_blob)\n",
+			       e->has_ufile_handle ? e->ufile_handle : 0,
+			       e->plugin_blob.len,
+			       sizeof(struct rxe_cq_plugin_blob_local));
+			return -EINVAL;
+		}
+		pb = (const struct rxe_cq_plugin_blob_local *)e->plugin_blob.data;
+		vm_pgoff = pb->vm_pgoff;
+	}
+
+	out = malloc(sizeof(*out));
+	if (!out) {
+		pr_err("rxe: RESTORE_CQ_UHW_PACK out of memory "
+		       "(out_buf %zu bytes)\n", sizeof(*out));
+		return -ENOMEM;
+	}
+	memset(out, 0, sizeof(*out));
+	uhw->out_buf = out;
+	uhw->out_len = sizeof(*out);
+
+	if (vm_pgoff) {
+		in = malloc(sizeof(*in));
+		if (!in) {
+			free(out);
+			uhw->out_buf = NULL;
+			uhw->out_len = 0;
+			pr_err("rxe: RESTORE_CQ_UHW_PACK out of memory "
+			       "(in_buf %zu bytes)\n", sizeof(*in));
+			return -ENOMEM;
+		}
+		in->vm_pgoff = vm_pgoff;
+		in->reserved = 0;
+		uhw->in_buf = in;
+		uhw->in_len = sizeof(*in);
+	} else {
+		uhw->in_buf = NULL;
+		uhw->in_len = 0;
+	}
+	return 0;
+}
+
+/*
+ * RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY hook (rxe).
+ *
+ * Defense-in-depth: when we asked the kernel to honour a specific
+ * source offset via UHW_IN, rxe_restore_cq guarantees mi.offset ==
+ * req.vm_pgoff on success (the patch's whole point). A mismatch
+ * means a rxe regression; we'd rather catch that loudly here than
+ * have the pie restorer's mmap silently fail with -EINVAL in a
+ * place that's much harder to diagnose. Caller surfaces our return
+ * as -EPROTO via the per-CQ helper.
+ *
+ * Skipped naturally when UHW_IN was absent (uhw->in_buf == NULL):
+ * we have nothing to compare mi_offset against in that case.
+ */
+static int rdma_rxe_plugin_restore_uobj_cq_uhw_verify(const RdmaUobjEntry *e,
+						      const struct rdma_uhw_spec *uhw,
+						      uint32_t resp_cqe)
+{
+	const struct rxe_create_cq_resp_local *out;
+	const struct rxe_restore_cq_req_local *in;
+
+	(void)resp_cqe;
+
+	if (!uhw || !uhw->out_buf || uhw->out_len < sizeof(*out))
+		return 0;
+	if (!uhw->in_buf || uhw->in_len < sizeof(*in))
+		return 0;
+
+	out = uhw->out_buf;
+	in = uhw->in_buf;
+	if (out->mi_offset != in->vm_pgoff) {
+		pr_err("rxe: RESTORE_CQ_UHW_VERIFY ufile_handle=%u: kernel "
+		       "returned mmap_offset=%#" PRIx64 " but caller asked "
+		       "for %#" PRIx64 " (kernel didn't honor UHW_IN; "
+		       "check rxe is on the d3a79140ed26 patch or its "
+		       "successor)\n",
+		       e && e->has_ufile_handle ? e->ufile_handle : 0,
+		       (uint64_t)out->mi_offset, (uint64_t)in->vm_pgoff);
+		return -1;
+	}
+	return 0;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
@@ -864,6 +1109,12 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA,
 			rdma_rxe_plugin_process_device_vma)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP,
 			rdma_rxe_plugin_update_vma_map)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
+			rdma_rxe_plugin_dump_uobj_cq)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
+			rdma_rxe_plugin_restore_uobj_cq_uhw_pack)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY,
+			rdma_rxe_plugin_restore_uobj_cq_uhw_verify)
 
 /*
  * RDMA provided driver: RCD_RXE.

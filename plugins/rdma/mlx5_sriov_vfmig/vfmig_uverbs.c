@@ -440,3 +440,96 @@ int vfmig_snapshot_dyn_uars(int fd,
 	*n_out = count;
 	return 0;
 }
+
+/*
+ * Issue MLX5_IB_METHOD_VFMIG_QUERY_CQ via RDMA_VERBS_IOCTL.
+ *
+ * Per-uobject (not per-ucontext): the HANDLE is an UVERBS_OBJECT_CQ
+ * IDR reference resolved through the calling fd's ufile-idr. The
+ * caller's ufile must own the CQ; the kernel pins it
+ * UVERBS_ACCESS_READ for the duration of the call. CRIU dumps with
+ * the dumpee's uverbsfd, so this is the same security boundary as
+ * INFO_HANDLES(UVERBS_OBJECT_CQ).
+ *
+ * The five outputs together carry everything UVERBS_METHOD_RESTORE_CQ
+ * consumes for an mlx5 user CQ:
+ *
+ *   @blob_out         32B byte-equal to mlx5_ib_restore_cq_req. CRIU
+ *                     stores this verbatim in protobuf at dump time
+ *                     and feeds it back into RESTORE_CQ's UHW.data
+ *                     at restore time -- no field-level marshaling.
+ *                     The kernel handler emits reserved/reserved2 = 0
+ *                     and the UAPI doc warns CRIU not to touch them.
+ *   @cqe_out          ibcq->cqe. Goes into UVERBS_ATTR_RESTORE_CQ_CQE.
+ *   @comp_vector_out  mcq->mcq.vector. The post-symmetry-fix kernel
+ *                     stamps this onto the create path; older kernels
+ *                     emit 0 unconditionally and break restore-side
+ *                     EQ continuity (the kernel's create-path fix is
+ *                     part of the same patchset as this verb).
+ *   @flags_out        cq->create_flags (IB_UVERBS_CQ_FLAGS_*).
+ *
+ * Kernel-mode CQs reject with -ENXIO (mcq->buf.umem == NULL or
+ * the doorbell is a kernel-mode db slot). CRIU shouldn't see
+ * those in INFO_HANDLES(CQ) anyway -- kernel CQs aren't in any
+ * user ufile's idr -- but the rejection is defense-in-depth.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+int vfmig_query_cq(int fd,
+		   uint32_t cq_handle,
+		   struct mlx5_ib_restore_cq_req_local *blob_out,
+		   uint32_t *cqe_out,
+		   uint32_t *comp_vector_out,
+		   uint32_t *flags_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[5];
+	} cmd = {};
+
+	/*
+	 * Lock in the byte-equal contract at the source-of-marshaling
+	 * site so any drift between this header and the kernel's
+	 * mlx5_ib_restore_cq_req surfaces at compile time, not as a
+	 * silent UHW corruption at restore.
+	 */
+	_Static_assert(sizeof(*blob_out) == 32,
+		"mlx5_ib_restore_cq_req_local must be 32 bytes (kernel UAPI)");
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_CQ_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[0].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL;
+	cmd.attrs[0].len = sizeof(cq_handle);
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = (uintptr_t)&cq_handle;
+
+	cmd.attrs[1].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB_LOCAL;
+	cmd.attrs[1].len = sizeof(*blob_out);
+	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].data = (uintptr_t)blob_out;
+
+	cmd.attrs[2].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE_LOCAL;
+	cmd.attrs[2].len = sizeof(*cqe_out);
+	cmd.attrs[2].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[2].data = (uintptr_t)cqe_out;
+
+	cmd.attrs[3].attr_id =
+		MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR_LOCAL;
+	cmd.attrs[3].len = sizeof(*comp_vector_out);
+	cmd.attrs[3].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[3].data = (uintptr_t)comp_vector_out;
+
+	cmd.attrs[4].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS_LOCAL;
+	cmd.attrs[4].len = sizeof(*flags_out);
+	cmd.attrs[4].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[4].data = (uintptr_t)flags_out;
+
+	cmd.hdr.num_attrs = 5;
+	cmd.hdr.length = sizeof(cmd.hdr) + 5 * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}

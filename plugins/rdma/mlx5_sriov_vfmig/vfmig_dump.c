@@ -901,6 +901,105 @@ void vfmig_drain_pending_in_fini(void)
 }
 
 /*
+ * Per-CQ dump hook (CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ). Issues
+ * MLX5_IB_METHOD_VFMIG_QUERY_CQ on @lfd against @ufile_handle, packs
+ * the 32-byte RESP_BLOB byte-equal to mlx5_ib_restore_cq_req into
+ * @plugin_blob (the entry-level opaque per-uobj container -- core
+ * never inspects these bytes, the schema is mlx5-private and the
+ * companion restore-side hook
+ * rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack reads them back
+ * verbatim). The companion outs (comp_vector, flags) go into the
+ * parallel hw-agnostic @cq_attrs fields. cqe_count was pre-filled
+ * by the dispatcher from NLDEV (RES_CQE) and is left untouched --
+ * the QUERY_CQ RESP_CQE is asserted for symmetry but not re-emitted.
+ *
+ * Allocates @plugin_blob->data via malloc; the caller
+ * (criu/rdma/uobj_dump.c::uobj_cq_cb -> uobj_emit -> pb_write_one)
+ * frees it after pb_write_one consumes the bytes.
+ *
+ * Kernel-mode CQ rejection (-ENXIO from QUERY_CQ) is propagated so
+ * the dispatcher can demote it to a per-uobject skip rather than a
+ * dump-fatal error -- the kernel handler returns -ENXIO when
+ * mcq->buf.umem == NULL, which CRIU shouldn't observe in practice
+ * (kernel CQs aren't in any user ufile's idr) but defending in
+ * depth is cheap.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev,
+					uint32_t kernel_driver_id,
+					int lfd, uint32_t ufile_handle,
+					pid_t pid,
+					RdmaCqAttrs *cq_attrs,
+					ProtobufCBinaryData *plugin_blob)
+{
+	struct mlx5_ib_restore_cq_req_local blob = {};
+	uint32_t resp_cqe = 0, comp_vector = 0, flags = 0;
+	uint8_t *blob_buf;
+	int rc;
+
+	(void)kernel_driver_id;	/* validated by the dispatcher */
+	(void)pid;		/* mlx5 sources its CQ state from QUERY_CQ on @lfd, no
+				 * (pid, ibdev) side-table consult; pid is the rxe plugin's
+				 * concern. */
+
+	rc = vfmig_query_cq(lfd, ufile_handle, &blob,
+			    &resp_cqe, &comp_vector, &flags);
+	if (rc) {
+		if (rc == -ENXIO) {
+			pr_debug("vfmig: QUERY_CQ(handle=%u) on ibdev=%s "
+				 "returned -ENXIO (kernel-mode CQ); "
+				 "skipping per-uobject capture\n",
+				 ufile_handle, ibdev);
+			return -ENXIO;
+		}
+		pr_err("vfmig: QUERY_CQ(handle=%u) on ibdev=%s failed: "
+		       "%d (%s)\n",
+		       ufile_handle, ibdev, rc, strerror(-rc));
+		return rc;
+	}
+
+	/*
+	 * Sanity belt: NLDEV's RES_CQE (which the dispatcher already
+	 * stamped onto cq_attrs->cqe_count) and QUERY_CQ's RESP_CQE
+	 * resolve through the same kernel field (ibcq->cqe). A
+	 * mismatch would mean the IDR walker and NLDEV are looking at
+	 * different objects, which is the kind of structural surprise
+	 * we want to surface rather than paper over.
+	 */
+	if (cq_attrs->has_cqe_count && cq_attrs->cqe_count != resp_cqe) {
+		pr_err("vfmig: CQ ufile_handle=%u on ibdev=%s: NLDEV "
+		       "RES_CQE=%u disagrees with QUERY_CQ RESP_CQE=%u; "
+		       "structural inconsistency, aborting dump\n",
+		       ufile_handle, ibdev, cq_attrs->cqe_count, resp_cqe);
+		return -EILSEQ;
+	}
+
+	blob_buf = malloc(sizeof(blob));
+	if (!blob_buf) {
+		pr_err("vfmig: out of memory packing CQ ufile_handle=%u "
+		       "plugin_blob (mlx5_ib_restore_cq_req, 32 bytes)\n",
+		       ufile_handle);
+		return -ENOMEM;
+	}
+	memcpy(blob_buf, &blob, sizeof(blob));
+	plugin_blob->data = blob_buf;
+	plugin_blob->len = sizeof(blob);
+
+	cq_attrs->has_comp_vector = true;
+	cq_attrs->comp_vector = comp_vector;
+	cq_attrs->has_flags = true;
+	cq_attrs->flags = flags;
+
+	pr_debug("vfmig: QUERY_CQ ibdev=%s ufile_handle=%u: cqn=%u "
+		 "cqe_size=%u buf_addr=0x%llx db_addr=0x%llx cqe=%u "
+		 "comp_vector=%u flags=0x%x\n",
+		 ibdev, ufile_handle, blob.cqn, blob.cqe_size,
+		 (unsigned long long)blob.buf_addr,
+		 (unsigned long long)blob.db_addr,
+		 resp_cqe, comp_vector, flags);
+	return 0;
+}
+
+/*
  * Per-VMA dump-side hook (CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA).
  *
  * mlx5 ibverbs userspace (libmlx5) memory-maps three or four pages

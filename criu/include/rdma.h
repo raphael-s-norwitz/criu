@@ -272,4 +272,33 @@ int rdma_dispatch_dump_uverbs_context(plugin_desc_t *plugin,
 				      uint32_t ctxn,
 				      int lfd, pid_t pid);
 
+/*
+ * Per-CQ dump-side dispatcher. Calls @plugin's
+ * CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ if registered.
+ *
+ * Splits the CQ payload across two caller-owned outputs. The
+ * plugin populates @cq_attrs with the hw-agnostic fields it can
+ * fill (comp_vector, flags), and packs its driver-private per-CQ
+ * schema into @plugin_blob (bytes that the caller attaches onto
+ * the entry-level RdmaUobjEntry.plugin_blob field). Either output
+ * may be left empty by a plugin that has nothing of that kind to
+ * persist for a particular CQ.
+ *
+ * Optional hook: a plugin that does not register the hook is a
+ * no-op success.
+ *
+ * No plugin-walk per call: @plugin is the pointer cached on
+ * struct rdma_dumped_ufile.plugin at CLAIM time. Must not be NULL.
+ *
+ * Returns 0 on success (including the no-op case), -1 on failure.
+ */
+#include "images/rdma_uobj.pb-c.h"
+int rdma_dispatch_dump_uobj_cq(plugin_desc_t *plugin,
+			       const char *ibdev,
+			       uint32_t kernel_driver_id,
+			       int lfd, uint32_t ufile_handle,
+			       pid_t pid,
+			       RdmaCqAttrs *cq_attrs,
+			       ProtobufCBinaryData *plugin_blob);
+
 #endif /* __CR_RDMA_H__ */

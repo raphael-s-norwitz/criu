@@ -87,10 +87,10 @@ LIST_HEAD(rdma_dumped_ufiles);
 static int rdma_record_dumped_ufile(pid_t pid, const char *ibdev,
 				    uint32_t kernel_driver_id,
 				    uint32_t criu_driver,
+				    plugin_desc_t *plugin,
 				    uint32_t uvfe_id,
 				    bool has_ctxn, uint32_t ctxn,
-				    int holder_uctx_fd,
-				    plugin_desc_t *plugin)
+				    int holder_uctx_fd)
 {
 	struct rdma_dumped_ufile *r;
 
@@ -344,13 +344,16 @@ int rdma_arbitrate_plugin_claim(const char *ibdev,
 	return winner;
 }
 
+static int dump_uverbsfile_cc_precheck(int lfd, uint32_t driver_id,
+				       const char *ibdev, uint32_t ctxn);
+
 static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 {
 	UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
 	FileEntry fe = FILE_ENTRY__INIT;
 	struct cr_img *img;
-	plugin_desc_t *plugin = NULL;
 	const char *claimer = NULL;
+	plugin_desc_t *plugin = NULL;
 	char ibdev[64];
 	char driver[64];
 	int rcd, ret = -1;
@@ -424,15 +427,27 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	uve.criu_driver = rcd;
 	uve.has_criu_driver = true;
 
+	pr_info("Dumping uverbs char device %d with id %#x ibdev=%s driver=%s "
+		"id=%u claimed by plugin '%s' rcd=%d",
+		lfd, id, ibdev, driver, uve.driver_id, claimer, rcd);
+	if (uve.has_ctxn)
+		pr_info(" ctxn %u", uve.ctxn);
+	pr_info("\n");
+
 	/*
-	 * Resolve the winning plugin once and stash on the dumped-
-	 * ufile record. Per-uobject dispatchers (DUMP_UVERBS_CONTEXT
-	 * here, future DUMP_UOBJ_CQ / _QP / _MR / ... hooks) read
-	 * uf->plugin->hooks[...] directly without re-walking the
-	 * plugin list per uobject. CLAIM has already enforced
-	 * exactly-one-plugin-per-ibdev; a miss/ambiguity here would
-	 * mean the plugin set changed mid-dump or a plugin lost its
-	 * CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER declaration.
+	 * Resolve the cached plugin pointer once for this ufile.
+	 * CLAIM arbitration just succeeded against this very
+	 * criu_driver, so a miss here means the operator's plugin
+	 * set is inconsistent (claim hook lives in plugin A,
+	 * provided-driver symbol lives in plugin B) -- hard fail
+	 * rather than re-walk per uobject.
+	 *
+	 * The cached pointer flows in two directions: synchronously
+	 * into rdma_dispatch_dump_uverbs_context() below (so the
+	 * dispatcher doesn't redo the lookup), and onto the
+	 * struct rdma_dumped_ufile recorded a few lines down (so
+	 * every per-uobject dump dispatcher in the post-walk
+	 * picks it up via uf->plugin without another walk).
 	 */
 	{
 		const char *first_name = NULL, *second_name = NULL;
@@ -462,13 +477,6 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 		}
 	}
 
-	pr_info("Dumping uverbs char device %d with id %#x ibdev=%s driver=%s "
-		"id=%u claimed by plugin '%s' rcd=%d",
-		lfd, id, ibdev, driver, uve.driver_id, claimer, rcd);
-	if (uve.has_ctxn)
-		pr_info(" ctxn %u", uve.ctxn);
-	pr_info("\n");
-
 	/*
 	 * Per-context dump-side state capture (e.g. mlx5
 	 * SAVE_VHCA_STATE). Optional: rxe and other plugins that have
@@ -489,6 +497,16 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 		       ibdev, uve.has_ctxn ? uve.ctxn : 0);
 		goto out;
 	}
+
+	/*
+	 * v0 pre-S8 limitation: any CC-attached CQ would dump fine
+	 * but fail at restore time. Refuse the dump now if the source
+	 * has any live comp_channel uobjects. Best-effort -- ioctl
+	 * failure downgrades to a warn (see helper).
+	 */
+	if (dump_uverbsfile_cc_precheck(lfd, uve.driver_id, ibdev,
+					uve.has_ctxn ? uve.ctxn : 0))
+		goto out;
 
 	fe.type = FD_TYPES__UVERBSFD;
 	fe.id = uve.id;
@@ -521,9 +539,10 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 				p->pid, uve.id, strerror(errno));
 		}
 		if (rdma_record_dumped_ufile(p->pid, ibdev, uve.driver_id,
-					     uve.criu_driver, uve.id,
+					     uve.criu_driver, plugin,
+					     uve.id,
 					     uve.has_ctxn, uve.ctxn,
-					     duped, plugin)) {
+					     duped)) {
 			pr_err("dump_uverbsfile: failed to record ufile id=%#x "
 			       "for post-dump uobj DAG walk\n", uve.id);
 			goto out;
@@ -695,6 +714,11 @@ static int uverbsfd_validate_claim(const UverbsFileEntry *uvfe)
  * plugin matches (caller decides whether to treat that as a hard
  * error). Used by both the dump-side and restore-side dispatchers
  * so the matching policy stays in one place.
+ *
+ * Cross-file callers (e.g. criu/rdma/uobj_restore.c) use this via
+ * the declaration in criu/include/rdma/internal.h to resolve their
+ * per-ufile plugin once at the top of the per-ufile restore loop,
+ * mirroring the dump-side caching on struct rdma_dumped_ufile.
  */
 plugin_desc_t *rdma_find_plugin_by_provided_driver(uint32_t criu_driver,
 						   bool *ambiguous,
@@ -738,13 +762,19 @@ plugin_desc_t *rdma_find_plugin_by_provided_driver(uint32_t criu_driver,
 }
 
 /*
- * Dump-side dispatcher for CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT.
+ * Dump-side dispatcher. Calls @plugin's
+ * CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT iff the plugin
+ * registered the hook.
  *
- * @plugin is the cached plugin pointer the caller resolved once at
- * CLAIM time via rdma_find_plugin_by_provided_driver(); the
- * dispatcher does NOT re-walk the plugin list. Optional hook: a
- * plugin that doesn't register it is a successful no-op (rxe has
- * no firmware blob to capture beyond UverbsFileEntry).
+ * @plugin is the pointer the caller cached at CLAIM time (see
+ * dump_uverbsfile()). The plugin-walk + ambiguity check + missing-
+ * provider-symbol diagnostics live at the cache site, not here --
+ * by the time we reach this dispatcher, the cache has already
+ * enforced exactly-one-plugin uniqueness.
+ *
+ * Optional hook semantics: rxe takes the no-op path -- it has no
+ * firmware blob to capture beyond what the generic UverbsFileEntry
+ * already records, so it doesn't bother registering the hook.
  */
 int rdma_dispatch_dump_uverbs_context(plugin_desc_t *plugin,
 				      const char *ibdev,
@@ -766,6 +796,162 @@ int rdma_dispatch_dump_uverbs_context(plugin_desc_t *plugin,
 		 "(ibdev=%s ctxn=%u pid=%d)\n",
 		 plugin->d->name, ibdev, ctxn, (int)pid);
 	return fn(ibdev, kernel_driver_id, ctxn, lfd, pid);
+}
+
+/*
+ * Pre-S8 comp-channel pre-check. v0 RDMA-class plugins do not yet
+ * support comp_channel save/restore (kernel UVERBS_METHOD_RESTORE_CQ
+ * declares COMP_CHANNEL UA_OPTIONAL but hard-rejects with
+ * -EOPNOTSUPP if any caller actually supplies one -- see kernel
+ * include/uapi/rdma/ib_user_ioctl_cmds.h). A source CQ bound to a
+ * comp_channel would dump cleanly and only surface as a failure at
+ * restore time. Bail at dump time instead so the operator sees a
+ * crisp diagnostic next to the dumpee, not a cryptic -EOPNOTSUPP
+ * after the dump has already been moved off-host.
+ *
+ * Fires UVERBS_METHOD_INFO_HANDLES on UVERBS_OBJECT_DEVICE asking
+ * for UVERBS_OBJECT_COMP_CHANNEL handles. Best-effort: any ioctl
+ * failure (older kernel, missing INFO_HANDLES support, transient
+ * EBUSY etc.) downgrades to a warn-and-continue. The kernel needs
+ * a non-empty HANDLES_LIST out buffer (see uverbs_std_types_device.c
+ * UVERBS_METHOD_INFO_HANDLES handler), so we pass a tiny one even
+ * though we only inspect the TOTAL_HANDLES out.
+ */
+#define RDMA_CC_PRECHECK_HANDLES_BUF 16
+static int dump_uverbsfile_cc_precheck(int lfd, uint32_t driver_id,
+				       const char *ibdev, uint32_t ctxn)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr      attrs[3];
+	} cmd = {};
+	uint32_t total = 0;
+	uint32_t handles[RDMA_CC_PRECHECK_HANDLES_BUF];
+
+	cmd.hdr.object_id = UVERBS_OBJECT_DEVICE;
+	cmd.hdr.method_id = UVERBS_METHOD_INFO_HANDLES;
+	/* The dispatcher validates @driver_id against the per-
+	 * ucontext rdma_driver_id (uverbs_ioctl.c::ib_uverbs_run_
+	 * method): a mismatch returns -EINVAL. Pass the kernel-
+	 * side driver id we received from CLAIM arbitration. */
+	cmd.hdr.driver_id = driver_id;
+
+	/* INFO_OBJECT_ID is UVERBS_ATTR_CONST_IN, which the kernel
+	 * declares with sizeof(u64) min/max len -- see
+	 * include/rdma/uverbs_ioctl.h::UVERBS_ATTR_CONST_IN. The
+	 * uverbs ioctl parser checks uattr->len == sizeof(u64) and
+	 * then takes the inline-attr fast path because
+	 * uverbs_attr_ptr_is_inline returns true (len <=
+	 * sizeof(attr->ptr_attr.data) == 8). The value -- here
+	 * UVERBS_OBJECT_COMP_CHANNEL from enum
+	 * uverbs_default_objects -- rides verbatim in attr.data. */
+	cmd.attrs[0].attr_id = UVERBS_ATTR_INFO_OBJECT_ID;
+	cmd.attrs[0].len = sizeof(uint64_t);
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = UVERBS_OBJECT_COMP_CHANNEL;
+
+	cmd.attrs[1].attr_id = UVERBS_ATTR_INFO_TOTAL_HANDLES;
+	cmd.attrs[1].len = sizeof(total);
+	cmd.attrs[1].flags = 0;
+	cmd.attrs[1].data = (uintptr_t)&total;
+
+	cmd.attrs[2].attr_id = UVERBS_ATTR_INFO_HANDLES_LIST;
+	cmd.attrs[2].len = sizeof(handles);
+	cmd.attrs[2].flags = 0;
+	cmd.attrs[2].data = (uintptr_t)handles;
+
+	cmd.hdr.num_attrs = 3;
+	cmd.hdr.length = sizeof(cmd.hdr) + 3 * sizeof(cmd.attrs[0]);
+
+	if (ioctl(lfd, RDMA_VERBS_IOCTL, &cmd) < 0) {
+		pr_warn("dump_uverbsfile: INFO_HANDLES(COMP_CHANNEL) on "
+			"ibdev=%s ctxn=%u failed: %s. Skipping CC "
+			"pre-check; CQs bound to a comp_channel (if any) "
+			"will surface as -EOPNOTSUPP at restore time.\n",
+			ibdev, ctxn, strerror(errno));
+		return 0;
+	}
+
+	if (total > 0) {
+		pr_err("dump_uverbsfile: ibdev=%s ctxn=%u has %u live "
+		       "UVERBS_OBJECT_COMP_CHANNEL uobject(s); v0 RDMA-"
+		       "class plugins do not yet support comp_channel "
+		       "save/restore. The dump would record per-CQ "
+		       "state without the CC binding, and "
+		       "UVERBS_METHOD_RESTORE_CQ on the destination "
+		       "would reject any CC-attached CQ with "
+		       "-EOPNOTSUPP. Aborting the dump now to surface "
+		       "the limitation explicitly. Track the kernel "
+		       "S8 RESTORE_COMP_CHANNEL work in "
+		       "tools/testing/mlx5_vfmig/design/uobject_restore.md "
+		       "?S8.\n", ibdev, ctxn, total);
+		return -1;
+	}
+
+	pr_debug("dump_uverbsfile: CC pre-check ok for ibdev=%s ctxn=%u "
+		 "(no live UVERBS_OBJECT_COMP_CHANNEL uobjects)\n",
+		 ibdev, ctxn);
+	return 0;
+}
+
+/*
+ * Per-CQ dump dispatcher. Calls @plugin's
+ * CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ if registered.
+ *
+ * @plugin is the pointer cached on struct rdma_dumped_ufile.plugin
+ * at CLAIM time (the caller in uobj_dump.c::uobj_cq_cb passes
+ * @uf->plugin). The dispatcher does NOT re-walk the plugin list
+ * per CQ; CLAIM has already enforced exactly-one-plugin uniqueness
+ * and the result has been cached.
+ *
+ * @cq_attrs is owned by the caller and pre-populated with NLDEV-
+ * derived fields (cqe_count). The plugin appends its driver-
+ * private fields (the entry-level plugin_blob carrying e.g. the
+ * mlx5 32B mlx5_ib_restore_cq_req, plus comp_vector + flags on the
+ * per-class proto) and returns 0. Plugin-side -ENXIO is treated as
+ * a per-uobject skip and surfaces as a successful dispatch with
+ * @cq_attrs left as the caller staged it (kernel CQs land here
+ * when the IDR walker mis-routes -- the kernel QUERY_CQ handler
+ * also returns -ENXIO in that case, so the shape is uniform).
+ *
+ * Optional hook: a plugin that doesn't register the hook is a
+ * no-op success (a future driver whose per-CQ state lives entirely
+ * in NLDEV-derived core fields would take this path).
+ */
+int rdma_dispatch_dump_uobj_cq(plugin_desc_t *plugin,
+			       const char *ibdev,
+			       uint32_t kernel_driver_id,
+			       int lfd, uint32_t ufile_handle,
+			       pid_t pid,
+			       RdmaCqAttrs *cq_attrs,
+			       ProtobufCBinaryData *plugin_blob)
+{
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ_t *fn;
+	int rc;
+
+	if (!plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ]) {
+		pr_debug("dump_uobj_cq: plugin '%s' (ibdev=%s) does not "
+			 "register the hook; skipping. ufile_handle=%u "
+			 "will be dumped with NLDEV-only RdmaCqAttrs.\n",
+			 plugin->d->name, ibdev, ufile_handle);
+		return 0;
+	}
+
+	fn = plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ];
+	pr_debug("dump_uobj_cq: dispatching to plugin '%s' "
+		 "(ibdev=%s ufile_handle=%u pid=%d)\n",
+		 plugin->d->name, ibdev, ufile_handle, (int)pid);
+	rc = fn(ibdev, kernel_driver_id, lfd, ufile_handle, pid, cq_attrs,
+		plugin_blob);
+	if (rc == -ENXIO) {
+		pr_warn("dump_uobj_cq: plugin '%s' rejected CQ "
+			"ufile_handle=%u on ibdev=%s with -ENXIO "
+			"(kernel-mode CQ or no source userspace state); "
+			"per-uobject driver-private fields will be absent\n",
+			plugin->d->name, ufile_handle, ibdev);
+		return 0;
+	}
+	return rc;
 }
 
 int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)

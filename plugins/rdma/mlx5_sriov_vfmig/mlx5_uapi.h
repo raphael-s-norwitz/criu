@@ -215,4 +215,90 @@ struct mlx5_ib_vfmig_dyn_uar_record_local {
 	uint8_t  reserved0[7];
 } __attribute__((aligned(8)));
 
+/*
+ * Per-uobject CQ dump-side discovery verb.
+ *
+ * MLX5_IB_METHOD_VFMIG_QUERY_CQ runs on the same MLX5_IB_OBJECT_VFMIG
+ * object as the ucontext / dyn-UAR verbs but is per-CQ-handle, not
+ * per-ucontext. The HANDLE attr is an UVERBS_OBJECT_CQ IDR reference:
+ * the caller's ufile-idr must own the CQ uobject, the kernel pins it
+ * UVERBS_ACCESS_READ for the duration of the call. Same security
+ * boundary as INFO_HANDLES(UVERBS_OBJECT_CQ): if you can see the
+ * ucontext, you can read its metadata.
+ *
+ * Dump-side companion of UVERBS_METHOD_RESTORE_CQ. Closes the
+ * cross-process gap that mlx5dv_init_obj() cannot: dvcq.{buf, dbrec}
+ * are the calling process's userspace VAs (CRIU's, not the dumpee's),
+ * and ibv_import_cq() does not exist in upstream rdma-core, so CRIU
+ * cannot manufacture an ibv_cq* in its own address space against the
+ * dumpee's underlying kernel CQ. The kernel handler reads its own
+ * cq->buf.umem->address + cq->db.u.user_page->user_virt directly --
+ * those are the dumpee's VAs, exactly what RESTORE_CQ's UHW expects.
+ *
+ * Outputs:
+ *   RESP_BLOB         32-byte payload byte-equal to struct
+ *                     mlx5_ib_restore_cq_req. CRIU memcpy's it into
+ *                     protobuf at dump time and back into RESTORE_CQ's
+ *                     UHW tail at restore time, no field-level
+ *                     marshaling. The kernel handler zeroes the two
+ *                     reserved u32s so the round-trip clears
+ *                     RESTORE_CQ's "must be 0" guards.
+ *   RESP_CQE          ibcq->cqe (entries-1 in verbs convention).
+ *                     Goes into UVERBS_ATTR_RESTORE_CQ_CQE.
+ *   RESP_COMP_VECTOR  mcq->mcq.vector (the source's comp_vector hint).
+ *                     Stamped on by the create path post-symmetry-fix
+ *                     -- earlier kernels returned 0 unconditionally
+ *                     and broke restore-side EQ continuity, which is
+ *                     the reason the create-path fix is part of the
+ *                     same kernel patchset that landed this verb.
+ *   RESP_FLAGS        cq->create_flags (IB_UVERBS_CQ_FLAGS_*).
+ *
+ * Method id slot is the next one in the VFMIG enum after
+ * RESTORE_DYN_UARS (=+3), so this is +4. If the kernel inserts new
+ * VFMIG methods between RESTORE_DYN_UARS and QUERY_CQ this header
+ * needs a corresponding bump -- same upkeep policy as the existing
+ * entries above.
+ */
+#define MLX5_IB_METHOD_VFMIG_QUERY_CQ_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 4)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 3)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 4)
+
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_CQ on mlx5,
+ * carried from dump to restore as QUERY_CQ's RESP_BLOB and the
+ * RESTORE_CQ UHW.data byte-for-byte.
+ *
+ * Layout MUST match include/uapi/rdma/mlx5-abi.h::mlx5_ib_restore_cq_req
+ * exactly: 32 bytes, __aligned_u64 on the leading two fields,
+ * trailing two u32 reserveds. The kernel QUERY_CQ handler emits
+ * reserved/reserved2 zero on its own; CRIU should not touch them.
+ * RESTORE_CQ's "must be 0" guard rejects any non-zero reserved bit
+ * on the inbound side, which is what makes a verbatim memcpy
+ * round-trip work without field-level marshaling.
+ *
+ * @cqn is 24 bits significant (0 reserved as sentinel by the
+ * RESTORE_CQ handler; QUERY_CQ never emits 0 because a live CQ
+ * always has a nonzero FW id). @cqe_size is 64 or 128 (RESTORE_CQ
+ * rejects anything else with -EINVAL). @buf_addr and @db_addr are
+ * the source userspace VAs; @db_addr is page-aligned (the byte
+ * offset within the page survives via FW cqc.dbr_addr).
+ */
+struct mlx5_ib_restore_cq_req_local {
+	uint64_t buf_addr;
+	uint64_t db_addr;
+	uint32_t cqn;
+	uint32_t cqe_size;
+	uint32_t reserved;
+	uint32_t reserved2;
+} __attribute__((aligned(8)));
+
 #endif /* __CR_MLX5_VFMIG_UAPI_H__ */

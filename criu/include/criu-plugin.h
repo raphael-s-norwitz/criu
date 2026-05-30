@@ -242,6 +242,126 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA = 19,
 
+	/*
+	 * Per-CQ uobject dump-side capture, dispatched by the
+	 * R3 uobj-walker (criu/rdma/uobj_dump.c::uobj_cq_cb)
+	 * once per CQ entry returned by NLDEV. Mirrors the
+	 * per-ucontext RDMA_DUMP_UVERBS_CONTEXT pattern but at
+	 * the per-uobject scope.
+	 *
+	 * Distinct from RDMA_DUMP_UVERBS_CONTEXT because the
+	 * per-CQ payload is per-uobject driver-private data,
+	 * not per-ucontext aggregate state.
+	 *
+	 * Args:
+	 *   ibdev             ibdev name of the source ucontext
+	 *                     (diagnostic context).
+	 *   kernel_driver_id  the dumpee's kernel-side driver id
+	 *                     (RDMA_DRIVER_MLX5 / _RXE / ...).
+	 *                     Plugins that handle multiple
+	 *                     drivers via one .so use this to
+	 *                     dispatch internally.
+	 *   lfd               criu's dup of the dumpee's
+	 *                     uverbs cdev fd. Same fd the
+	 *                     per-uobject dispatcher already
+	 *                     uses for QUERY_MR; the IDR
+	 *                     resolution for HANDLE goes
+	 *                     through this fd's ufile-idr.
+	 *   ufile_handle      the source ufile-idr handle of
+	 *                     the CQ uobject being dumped
+	 *                     (NLDEV K8a RES_HANDLE; the same
+	 *                     value RESTORE_CQ will install on
+	 *                     the destination via
+	 *                     UVERBS_ATTR_RESTORE_CQ_HANDLE).
+	 *   pid               source-process pid of the
+	 *                     dumpee. Join key for plugin-side
+	 *                     side-table lookups (e.g. rxe's
+	 *                     rdma_pop_cdev_vma_offset against
+	 *                     the per-(pid, ibdev) cdev-VMA
+	 *                     queue).
+	 *   cq_attrs          generated protobuf attrs the
+	 *                     plugin populates with the hw-
+	 *                     agnostic per-class fields it
+	 *                     can fill. The dispatcher pre-
+	 *                     fills cqe_count from NLDEV
+	 *                     (RES_CQE); the plugin SHOULD NOT
+	 *                     touch that field. The plugin
+	 *                     owns comp_vector and flags (not
+	 *                     in NLDEV).
+	 *   plugin_blob       caller-provided ProtobufCBinaryData
+	 *                     the plugin fills with its driver-
+	 *                     private per-CQ schema, malloc()'d
+	 *                     by the plugin. Caller (uobj_cq_cb)
+	 *                     attaches the bytes onto the
+	 *                     RdmaUobjEntry.plugin_blob field,
+	 *                     pb_write_one's into the image,
+	 *                     then free()s. Plugin SHOULD set
+	 *                     plugin_blob->data to NULL +
+	 *                     plugin_blob->len to 0 if it has
+	 *                     no driver-private state for this
+	 *                     particular CQ -- caller treats
+	 *                     that as "absent" and does not
+	 *                     attach.
+	 *
+	 * Return: 0 on success, negative errno on failure.
+	 *         A failed plugin call aborts the entire dump
+	 *         (the ufile would be partially captured and
+	 *         restore would not work). Plugins that don't
+	 *         support a particular CQ (e.g. kernel CQs that
+	 *         the dispatcher routed here by mistake) should
+	 *         return -ENXIO; the dispatcher logs and treats
+	 *         that as a per-uobject skip rather than a
+	 *         dump-fatal error.
+	 */
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ = 20,
+
+	/*
+	 * Per-CQ uobject restore-side UHW shape callbacks. The
+	 * pair partitions driver-private knowledge for
+	 * UVERBS_METHOD_RESTORE_CQ: criu core builds the driver-
+	 * agnostic ioctl skeleton (HANDLE, CQE, USER_HANDLE,
+	 * COMP_VECTOR, FLAGS, RESP_CQE) from rdma_cq_attrs +
+	 * the ufile handle map; the per-driver RDMA plugin
+	 * shapes UHW_IN/UHW_OUT around it from its own
+	 * plugin_blob schema.
+	 *
+	 * UHW_PACK runs once per CQ before the ioctl. The
+	 * plugin reads e->plugin_blob (its own packed schema --
+	 * mlx5 stuffs the 32B mlx5_ib_restore_cq_req there at
+	 * dump time, rxe stuffs an 8B vm_pgoff) and fills
+	 * @uhw with malloc()'d UHW_IN bytes + UHW_OUT receive
+	 * buffer. Either side may be empty (in_len=0 / out_len=0)
+	 * for drivers that need only one direction. Core frees
+	 * uhw->in_buf and uhw->out_buf after the ioctl + UHW_VERIFY
+	 * round-trip via free(); plugin allocator MUST be
+	 * malloc()-compatible.
+	 *
+	 * UHW_VERIFY is optional and runs once after the ioctl
+	 * succeeds, before core frees the buffers. The plugin
+	 * reads uhw->out_buf and asserts the kernel-echo matches
+	 * what its UHW_IN asked for (rxe uses this for
+	 * mi_offset == requested vm_pgoff defense in depth;
+	 * mlx5 has no UHW_OUT and skips registering the hook).
+	 * @resp_cqe is the kernel-stamped resp_cqe value the
+	 * dispatcher already received via the core RESP_CQE
+	 * attr, exposed here so the plugin can include it in any
+	 * cross-attr correctness check.
+	 *
+	 * Both hooks are optional. A plugin that registers
+	 * neither lets its CQs through with no UHW (the
+	 * degenerate driver shape; no in-tree provider currently
+	 * uses it). Plugins that need only PACK skip VERIFY.
+	 *
+	 * Return: 0 on success, negative errno on failure. PACK
+	 * failures abort the restore for that CQ. VERIFY
+	 * failures are surfaced as -EPROTO from the per-CQ
+	 * helper -- catch a kernel that didn't honor a
+	 * documented contract loudly, before returning to user
+	 * code.
+	 */
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK = 21,
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY = 22,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -284,6 +404,52 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const UverbsFile
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT,
 			 const char *ibdev, uint32_t kernel_driver_id,
 			 uint32_t ctxn, int lfd, pid_t pid);
+/*
+ * Per-CQ dump+restore hooks. The RdmaCqAttrs / RdmaUobjEntry
+ * typedefs and the ProtobufCBinaryData plugin-blob byteslice
+ * resolve through images/rdma_uobj.pb-c.h -- same forward-include
+ * style as UverbsFileEntry above for the OPEN_UVERBS_CDEV hook,
+ * and the same protoc-c naming-stability concern applies (only
+ * the typedef name is portable across generator versions).
+ */
+#include "images/rdma_uobj.pb-c.h"
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
+			 const char *ibdev, uint32_t kernel_driver_id,
+			 int lfd, uint32_t ufile_handle,
+			 pid_t pid,
+			 RdmaCqAttrs *cq_attrs,
+			 ProtobufCBinaryData *plugin_blob);
+
+/*
+ * UHW pack/verify scratch for per-class restore-side UHW hooks.
+ *
+ * Plugin malloc()'s in_buf / out_buf inside its UHW_PACK hook;
+ * core attaches them as UHW_IN / UHW_OUT attrs on the
+ * UVERBS_METHOD_RESTORE_<TYPE> ioctl, calls the optional
+ * UHW_VERIFY hook to let the plugin assert kernel-echo
+ * correctness, then free()s both buffers. Either side may be
+ * left as {NULL, 0} if the driver shape doesn't use that
+ * direction.
+ *
+ * Lives at file scope (not inside any per-class block) because
+ * follow-on per-class hooks (UHW_PACK for RESTORE_QP, _MR, ...)
+ * will share the same shape -- the per-class differences live in
+ * the surrounding hook signature, not in this scratch.
+ */
+struct rdma_uhw_spec {
+	void   *in_buf;
+	size_t  in_len;
+	void   *out_buf;
+	size_t  out_len;
+};
+
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
+			 const RdmaUobjEntry *e,
+			 struct rdma_uhw_spec *uhw);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY,
+			 const RdmaUobjEntry *e,
+			 const struct rdma_uhw_spec *uhw,
+			 uint32_t resp_cqe);
 
 /*
  * RDMA sharing policy.
@@ -464,6 +630,28 @@ extern int criu_ib_uverbs_get_context(int fd, uint32_t driver_id);
  */
 extern int rdma_record_cdev_vma(pid_t pid, const char *ibdev,
 				uint64_t pgoff_bytes);
+
+/*
+ * Companion FIFO pop for rdma_record_cdev_vma's process-global
+ * side-table. Intended caller: an RDMA-class plugin's
+ * CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ implementation, draining one
+ * cookie per CQ from the queue its PROCESS_DEVICE_VMA filled
+ * earlier. rxe is the canonical user: each rxe CQ has exactly one
+ * matching cdev VMA whose vm_pgoff the kernel will compare against
+ * UVERBS_METHOD_RESTORE_CQ's UHW_IN.vm_pgoff at restore-time, and
+ * /proc/<pid>/smaps emits VMAs in the same kernel-internal order
+ * NLDEV walks CQs, so a FIFO drain per CQ matches one-to-one.
+ *
+ * Out: writes the popped pgoff_bytes (vma->vm_pgoff << PAGE_SHIFT,
+ * matching rxe_mmap_info::offset / rxe_restore_cq_req::vm_pgoff)
+ * into *@out and returns 0 on a hit, -ENOENT if the queue has
+ * nothing left for the (pid, ibdev) join (which the plugin can
+ * treat as "no source VMA captured for this CQ" -- legitimate on
+ * pre-K8a kernels that didn't surface the matching VMA, or on
+ * holders that don't mmap the CQ ring).
+ */
+extern int rdma_pop_cdev_vma_offset(pid_t pid, const char *ibdev,
+				    uint64_t *out);
 
 /*
  * Deprecated, will be removed in next version.

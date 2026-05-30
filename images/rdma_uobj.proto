@@ -127,50 +127,35 @@ message rdma_pd_attrs {
 };
 
 /*
- * CQ hw-agnostic state: cqe count, completion vector, modern flags.
- * Comp-channel binding is encoded as an xref (R3XR_COMP_CHANNEL)
- * not as a field here, so the same shape covers "no channel"
- * uniformly.
+ * CQ hw-agnostic state. Driver-private CQ payload (rxe: source
+ * vm_pgoff; mlx5: 32B mlx5_ib_restore_cq_req) is NOT a field here
+ * -- it lives in the per-uobj entry-level @plugin_blob, packed and
+ * unpacked by the per-driver RDMA plugin. Comp-channel binding is
+ * encoded as an xref (R3XR_COMP_CHANNEL) not a field here, so the
+ * same shape covers "no channel" uniformly.
  *
  * Field provenance:
  *   cqe_count     NLDEV RES_CQE (always present from S1.b dump).
- *   comp_vector   not in NLDEV; comes from plugin-private query
- *                 (FW comp-vector binding) at S3+. Optional.
- *   flags         not in NLDEV; mirrors `enum ib_create_cq_flags`,
- *                 filled from plugin blob at S3+. Optional.
- *   mmap_offset   the source-side mmap cookie the kernel returned
- *                 from CMD_CREATE_CQ (rxe: rxe_create_cq_resp.mi.offset
- *                 == rxe_mmap_info.info.offset; equals
- *                 vma->vm_pgoff << PAGE_SHIFT for the matching VMA
- *                 in /proc/<pid>/maps). Replayed at restore via
- *                 UVERBS_METHOD_RESTORE_CQ's UHW_IN tail
- *                 (struct rxe_restore_cq_req.vm_pgoff) so the dest
- *                 ibdev binds the new CQ's mmap region at the same
- *                 offset the pie restorer's mmap() will hit. Without
- *                 this, the dest's monotonic mmap_offset counter
- *                 desyncs from the source's, the dumped vm_pgoff
- *                 doesn't match any pending_mmaps entry, and
- *                 rxe_mmap returns -EINVAL. Captured at dump time
- *                 by the RDMA-class plugin's
- *                 CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA hook (see
- *                 plugins/rdma/rxe/rdma_rxe_plugin.c::rdma_rxe_plugin_process_device_vma);
- *                 the plugin records each cdev VMA's pgoff into
- *                 criu/rdma.c's process-global side-table via
- *                 rdma_record_cdev_vma(), and uobj_cq_cb pops one
- *                 entry per CQ. Absent on degenerate dumps (multi-
- *                 CQ ufiles where the dumper can't tell which VMA
- *                 belongs to which CQ -- see uobj_cq_cb for the
- *                 join key TODO). Bytes, not pages: matches the
- *                 kernel's rxe_restore_cq_req.vm_pgoff which is
- *                 also a byte-offset despite its name (it's
- *                 compared against vma->vm_pgoff << PAGE_SHIFT in
- *                 rxe_mmap).
+ *   comp_vector   not in NLDEV; plugin fills via RDMA_DUMP_UOBJ_CQ
+ *                 from a driver-private query (mlx5:
+ *                 MLX5_IB_METHOD_VFMIG_QUERY_CQ.RESP_COMP_VECTOR;
+ *                 rxe: hard-zero, the rxe path has only one
+ *                 vector). Optional. The kernel verb takes
+ *                 comp_vector as a core MANDATORY attr at restore
+ *                 time, so absent here means "0".
+ *   flags         not in NLDEV; plugin fills via RDMA_DUMP_UOBJ_CQ.
+ *                 Mirrors `enum ib_create_cq_flags`. Optional.
+ *
+ * Driver-private fields that USED to live here (mmap_offset, the
+ * 32B mlx5_blob) moved into the entry-level plugin_blob in the v0
+ * series itself; older partial dumps with those fields populated
+ * are not restorable on this code base (and never will be -- v0
+ * is unreleased).
  */
 message rdma_cq_attrs {
 	optional uint32		cqe_count		= 1;
 	optional uint32		comp_vector		= 2;
 	optional uint32		flags			= 3;
-	optional uint64		mmap_offset		= 4;
 };
 
 /*

@@ -12,6 +12,7 @@
  * criu/include/rdma/internal.h.
  */
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -123,11 +124,13 @@ int rdma_record_cdev_vma(pid_t pid, const char *ibdev,
 
 /*
  * Pop the next-in-FIFO unconsumed cdev VMA offset for (pid, ibdev).
- * Returns 0 + sets *out on success; -1 if no unconsumed record
- * matches the key (the caller emits no mmap_offset attribute, and
- * the restore side falls back to the kernel's monotonic counter --
- * which on a clean dest will likely fail the pgoff match for any
- * pre-existing same-uverbs-cdev mappings).
+ * Returns 0 + sets *out on success; -ENOENT if no unconsumed
+ * record matches the key (caller -- typically the rxe plugin's
+ * dump-uobj-cq hook -- treats that as "no source VMA captured for
+ * this CQ" and packs an empty plugin_blob, so the restore side
+ * falls back to the kernel's monotonic counter; matches the
+ * source iff the source's counter was also fresh, which is true
+ * only for very simple holders).
  */
 int rdma_pop_cdev_vma_offset(pid_t pid, const char *ibdev,
 			     uint64_t *out)
@@ -145,7 +148,7 @@ int rdma_pop_cdev_vma_offset(pid_t pid, const char *ibdev,
 		*out = r->pgoff_bytes;
 		return 0;
 	}
-	return -1;
+	return -ENOENT;
 }
 
 /*

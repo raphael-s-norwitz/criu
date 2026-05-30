@@ -429,25 +429,31 @@ run_pass() {
 			exit 1
 		fi
 		echo "RESTORE_PD (Phase A) + RESTORE_MR (pie Phase B) dispatched ok"
-	elif [[ "$holder_mode" == "pd_cq" ]]; then
-		# pd_cq must restore >=1 CQ in Phase A and defer 0 MRs.
-		# The summary line carries both counts; we assert
-		# >=1 CQ restored and 0 MR deferred specifically.
-		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [1-9][0-9]* CQ\(s\) \[skipped 0\]; 0 MR\(s\) deferred' \
+	elif [[ "$holder_mode" == "pd_cq" || "$holder_mode" == "pd_2cq" ]]; then
+		# pd_cq  -- exactly 1 CQ restored.
+		# pd_2cq -- exactly 2 CQs restored (multi-CQ-per-ufile
+		#           dispatch coverage; comp_vector axis is the
+		#           holder's responsibility).
+		# Both modes defer 0 MRs.
+		local min_cq=1
+		[[ "$holder_mode" == "pd_2cq" ]] && min_cq=2
+		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], '"$min_cq"' CQ\(s\) \[skipped 0\]; 0 MR\(s\) deferred' \
 			"$DUMPDIR/restore.log"; then
-			echo "FAIL: pd_cq Phase-A summary line did not show" \
-			     ">=1 CQ restored with 0 MR deferred. Either the" \
-			     "S5a RESTORE_CQ pass didn't run, the kernel under" \
-			     "test pre-dates a77cc4d8e8b9 'RDMA/uverbs: Add" \
-			     "RESTORE_CQ + rxe impl', or the dump-side R3 walk" \
-			     "didn't emit a CQ entry for the holder's" \
-			     "pre-dump ibv_create_cq." >&2
+			echo "FAIL: $holder_mode Phase-A summary line did" \
+			     "not show $min_cq CQ(s) restored with 0 MR" \
+			     "deferred. Either the S5a RESTORE_CQ pass" \
+			     "didn't run, the kernel under test pre-dates" \
+			     "a77cc4d8e8b9 'RDMA/uverbs: Add RESTORE_CQ +" \
+			     "rxe impl', or the dump-side R3 walk lost a" \
+			     "CQ entry (per-CQ dispatcher mis-keyed on the" \
+			     "ufile_handle? plugin's hook returned ENXIO" \
+			     "spuriously?)." >&2
 			echo "--- restore log uobj DAG lines ---" >&2
 			grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
 				echo "(no uobj DAG lines at all)" >&2
 			exit 1
 		fi
-		echo "RESTORE_PD + RESTORE_CQ (Phase A) dispatched ok"
+		echo "RESTORE_PD + RESTORE_CQ x$min_cq (Phase A) dispatched ok"
 	fi
 
 	#
@@ -555,8 +561,21 @@ run_pass() {
 #                  UVERBS_CR_RUN_PD_CQ=0 still works as a kill
 #                  switch for kernels missing the rxe forced-pgoff
 #                  patch.
-run_pass pd_mr_aligned   pd_mr 0
-run_pass pd_mr_unaligned pd_mr 1
+if [[ "${UVERBS_CR_RUN_PD_MR:-1}" == "1" ]]; then
+	run_pass pd_mr_aligned   pd_mr 0
+	run_pass pd_mr_unaligned pd_mr 1
+else
+	echo
+	echo "[skip] pd_mr passes disabled by UVERBS_CR_RUN_PD_MR=0."
+	echo "       Default is to run; this switch exists for hosts"
+	echo "       where rxe's RDMA-WRITE data-path test (Phase J)"
+	echo "       can't run -- e.g. an rxe link layered on lo with"
+	echo "       no peer reachable for ibv_modify_qp(RTR), where"
+	echo "       the dump+restore itself works but the post-restore"
+	echo "       data-path verification fails environmentally. Pair"
+	echo "       with UVERBS_CR_RUN_PD_CQ=1 to localise S5a CQ-"
+	echo "       restore regression coverage on such hosts."
+fi
 if [[ "${UVERBS_CR_RUN_PD_CQ:-1}" == "1" ]]; then
 	run_pass pd_cq pd_cq 0
 else
@@ -565,6 +584,15 @@ else
 	echo "       Default is to run; this switch exists for"
 	echo "       kernels that pre-date the rxe forced-vm_pgoff"
 	echo "       support in rxe_restore_cq (S5a-vma-remap)."
+fi
+# pd_2cq is opt-in (UVERBS_CR_RUN_PD_2CQ=1) because rxe's typical
+# num_comp_vectors=1 collapses comp_vector=1 to comp_vector=0, which
+# limits the pass to multi-CQ-per-ufile dispatcher coverage rather
+# than the full multi-vector matrix. The mlx5 vfmig E2E in
+# run_vfmig_cr.sh adopts this same holder mode for the genuine
+# multi-vector test once num_comp_vectors >= 2 is reachable.
+if [[ "${UVERBS_CR_RUN_PD_2CQ:-0}" == "1" ]]; then
+	run_pass pd_2cq pd_2cq 0
 fi
 
 echo

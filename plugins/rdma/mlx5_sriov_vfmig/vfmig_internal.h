@@ -13,6 +13,7 @@
 #include <sys/types.h>
 
 #include "images/mlx5_vfmig.pb-c.h"
+#include "images/rdma_uobj.pb-c.h"
 #include "images/uverbsfd.pb-c.h"
 
 /*
@@ -48,6 +49,7 @@ int vfmig_chrdev_to_ibdev(dev_t rdev, char *out, size_t outsz);
  */
 struct mlx5_ib_vfmig_ucontext_meta_local;
 struct mlx5_ib_vfmig_dyn_uar_record_local;
+struct mlx5_ib_restore_cq_req_local;
 
 int vfmig_send_get_context_v2(int fd, uint32_t flags,
 			      uint64_t lib_caps,
@@ -73,6 +75,22 @@ int vfmig_restore_dyn_uars(int fd,
 int vfmig_snapshot_dyn_uars(int fd,
 			    struct mlx5_ib_vfmig_dyn_uar_record_local **records_out,
 			    size_t *n_out);
+
+/*
+ * Per-CQ dump-side discovery via MLX5_IB_METHOD_VFMIG_QUERY_CQ.
+ * @cq_handle is the source ufile-idr CQ handle from the R3 walk.
+ * On success @blob_out is byte-equal to the payload RESTORE_CQ's
+ * UHW.data will consume on the destination -- the dump path stores
+ * it in protobuf verbatim, no field-level marshaling. The companion
+ * outs (@cqe_out, @comp_vector_out, @flags_out) are the per-CQ
+ * inputs RESTORE_CQ takes as core attrs (not in the UHW blob).
+ */
+int vfmig_query_cq(int fd,
+		   uint32_t cq_handle,
+		   struct mlx5_ib_restore_cq_req_local *blob_out,
+		   uint32_t *cqe_out,
+		   uint32_t *comp_vector_out,
+		   uint32_t *flags_out);
 
 /*
  * vf_image.c -- on-disk format for the plugin's per-dump
@@ -144,6 +162,17 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 					       uint32_t kernel_driver_id,
 					       uint32_t ctxn,
 					       int lfd, pid_t pid);
+
+int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev,
+					uint32_t kernel_driver_id,
+					int lfd, uint32_t ufile_handle,
+					pid_t pid,
+					RdmaCqAttrs *cq_attrs,
+					ProtobufCBinaryData *plugin_blob);
+
+struct rdma_uhw_spec;
+int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw);
 
 struct stat;
 int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd,

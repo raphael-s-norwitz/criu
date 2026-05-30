@@ -317,39 +317,82 @@ static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
 	rdma_cq_attrs__init(&attrs);
 	attrs.has_cqe_count = true;
 	attrs.cqe_count = e->cq.cqe;
+
 	/*
-	 * Source-side mmap cookie. Required by post-d3a79140ed26
-	 * rxe kernels to honor the dumped vm_pgoff at restore time
-	 * (otherwise the pie restorer's mmap of the dumped offset
-	 * misses pending_mmaps and bails -EINVAL).
+	 * Per-driver per-CQ state. The dispatcher consults the
+	 * cached uf->plugin (resolved at CLAIM time, see
+	 * struct rdma_dumped_ufile.plugin) -- no plugin-walk per
+	 * CQ -- and calls its CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ.
 	 *
-	 * Pop the next-FIFO cookie out of the process-global side-
-	 * table fed by the RDMA-class plugin's
-	 * CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA implementation (see
-	 * plugins/rdma/rxe/rdma_rxe_plugin.c::rdma_rxe_plugin_process_device_vma).
-	 * Absence is not an error -- restore-side falls back to the
-	 * kernel's monotonic counter, which only matches if the
-	 * source's counter was untouched at dump time.
+	 * The hook splits the per-CQ payload across two outputs:
+	 *   - hw-agnostic per-class fields (comp_vector, flags)
+	 *     into @attrs;
+	 *   - driver-private bytes into @plugin_blob, which we
+	 *     attach onto the entry-level RdmaUobjEntry.plugin_blob
+	 *     field below. mlx5 packs the 32B mlx5_ib_restore_cq_req
+	 *     captured via MLX5_IB_METHOD_VFMIG_QUERY_CQ; rxe packs
+	 *     an 8B vm_pgoff popped from the side-table its
+	 *     PROCESS_DEVICE_VMA hook fed (see
+	 *     plugins/rdma/rxe/rdma_rxe_plugin.c).
+	 *
+	 * Skipped if @holder_uctx_fd is unavailable or if NLDEV
+	 * didn't surface a per-CQ ufile_handle (pre-K8a kernels):
+	 * the per-uobject ioctl needs both. Restore-side guards on
+	 * absent driver-private fields and surfaces a clear "image
+	 * needs a re-dump on a kernel that emits RES_HANDLE"
+	 * diagnostic.
 	 */
 	{
-		uint64_t mmap_offset;
-		if (rdma_pop_cdev_vma_offset(uf->pid, uf->ibdev,
-					     &mmap_offset) == 0) {
-			attrs.has_mmap_offset = true;
-			attrs.mmap_offset = mmap_offset;
+		ProtobufCBinaryData plugin_blob = {};
+
+		if (e->has_ufile_handle && uf->holder_uctx_fd >= 0) {
+			int rc = rdma_dispatch_dump_uobj_cq(
+					uf->plugin, uf->ibdev,
+					uf->kernel_driver_id,
+					uf->holder_uctx_fd,
+					e->ufile_handle, uf->pid,
+					&attrs, &plugin_blob);
+			if (rc) {
+				pr_err("uobj DAG: per-CQ dispatcher failed for "
+				       "ibdev=%s ufile_handle=%u (rc=%d, %s); "
+				       "aborting dump\n",
+				       uf->ibdev, e->ufile_handle, rc,
+				       strerror(rc < 0 ? -rc : rc));
+				free(plugin_blob.data);
+				return (w->err = -1);
+			}
+		} else if (!e->has_ufile_handle) {
+			pr_debug("uobj DAG: CQ on ibdev=%s ctxn=%u has no "
+				 "ufile_handle (kernel pre-K8a / RES_HANDLE not "
+				 "emitted); skipping per-driver QUERY_CQ\n",
+				 uf->ibdev, uf->ctxn);
 		} else {
-			pr_warn("uobj DAG: ufile pid=%d ibdev=%s ctxn=%u "
-				"has no recorded cdev VMA offset for CQ "
-				"restrack_id=%u; restore-side will fall "
-				"back to monotonic counter (likely vm_pgoff "
-				"mismatch on dest). Did the RDMA plugin "
-				"register CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA?\n",
-				uf->pid, uf->ibdev, uf->ctxn,
-				e->has_restrack_id ? e->restrack_id : 0);
+			pr_warn("uobj DAG: CQ on ibdev=%s ctxn=%u "
+				"ufile_handle=%u has no holder_uctx_fd dup; "
+				"per-driver QUERY_CQ skipped\n",
+				uf->ibdev, uf->ctxn, e->ufile_handle);
+		}
+
+		pe.cq = &attrs;
+		if (plugin_blob.data && plugin_blob.len > 0) {
+			pe.has_plugin_blob = true;
+			pe.plugin_blob = plugin_blob;
+		}
+
+		{
+			int rc = uobj_emit(w, &pe);
+
+			/*
+			 * Plugin-allocated bytes (DUMP_UOBJ_CQ contract:
+			 * malloc'd by the per-driver plugin's hook).
+			 * pb_write_one in uobj_emit already memcpy'd the
+			 * bytes into the image stream, so we free here
+			 * unconditionally regardless of attach status.
+			 */
+			free(plugin_blob.data);
+			return rc < 0 ? (w->err = -1) : 0;
 		}
 	}
-	pe.cq = &attrs;
-	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
 }
 
 /*
@@ -966,11 +1009,11 @@ out:
 	/*
 	 * Free the process-global cdev VMA side-table populated by
 	 * RDMA-class plugins' CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA
-	 * hooks. Entries were consumed (rdma_pop_cdev_vma_offset
-	 * marked each "consumed = true" once it was serialised into
-	 * a per-CQ RdmaCqAttrs.mmap_offset); we drop everything
-	 * unconditionally so a long-running criu service process
-	 * doesn't carry stale entries into its next dump cycle.
+	 * hooks. Entries were consumed by the rxe plugin's per-CQ
+	 * dump hook (rdma_pop_cdev_vma_offset, packed into the
+	 * per-uobj plugin_blob). We drop everything unconditionally
+	 * so a long-running criu service process doesn't carry stale
+	 * entries into its next dump cycle.
 	 */
 	rdma_cdev_vma_recs_free();
 	return ret;

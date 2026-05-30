@@ -66,6 +66,7 @@
 #include "log.h"
 #include "protobuf.h"
 #include "rdma.h"
+#include "rdma/internal.h"
 #include "restorer.h"
 #include "rst-malloc.h"
 #include "xmalloc.h"
@@ -405,70 +406,17 @@ static int uobj_ufile_group_check_xrefs(struct uobj_ufile_group *g)
 #endif
 
 /*
- * struct rxe_create_cq_resp -- driver-private UHW_OUT payload that
- * rxe_restore_cq writes (mirror of ibv_cmd_create_cq's resp shape).
- * Source-of-truth: include/uapi/rdma/rdma_user_rxe.h
- *   struct rxe_create_cq_resp { struct mminfo mi; };
- *   struct mminfo { __aligned_u64 offset; __u32 size; __u32 pad; };
+ * Per-driver RESTORE_CQ UHW (input + output) shape moved into the
+ * RDMA-class plugins themselves: see plugins/rdma/rxe/
+ * rdma_rxe_plugin.c (rxe_create_cq_resp_local +
+ * rxe_restore_cq_req_local + their UHW_PACK / UHW_VERIFY hooks)
+ * and plugins/rdma/mlx5_sriov_vfmig/vfmig_restore.c
+ * (rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack reading the
+ * 32B mlx5_ib_restore_cq_req out of the per-uobj plugin_blob).
+ * Core's rdma_send_restore_cq() is now driver-agnostic and gets
+ * the UHW pair from the plugin via
+ * CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_{PACK,VERIFY}.
  *
- * We don't dereference @offset / @size at v0 (the restore-side
- * mmap remap is the next slice -- kernel needs to either preserve
- * the source vm_pgoff or provide a way for the rxe plugin's
- * UPDATE_VMA_MAP to translate source -> dest pgoff). What we need
- * here is a response buffer sized to the kernel's expectation
- * (sizeof(struct rxe_create_cq_resp) == 16): without an
- * UHW_OUT attr of that size, rxe_restore_cq returns -EINVAL on
- * the (udata->outlen < sizeof(*uresp)) check before any of the
- * actual restore work runs.
- */
-struct rxe_create_cq_resp_local {
-	uint64_t	mi_offset;	/* mmap cookie (vm_pgoff << PAGE_SHIFT) */
-	uint32_t	mi_size;	/* mmap region size, bytes */
-	uint32_t	mi_pad;
-};
-
-/*
- * struct rxe_restore_cq_req -- driver-private UHW_IN payload for
- * rxe_restore_cq's "honor source vm_pgoff" mode (linux kernel
- * commit d3a79140ed26 + the inline-attr-trap fix that grew the
- * struct above 8 bytes).
- *
- * Source-of-truth: include/uapi/rdma/rdma_user_rxe.h
- *   struct rxe_restore_cq_req {
- *       __aligned_u64 vm_pgoff;
- *       __aligned_u64 reserved;
- *   };
- *
- * Despite the name, the field is a *byte* offset matching the
- * source-side rxe_create_cq_resp::mi.offset (which the kernel
- * compares against vma->vm_pgoff << PAGE_SHIFT in rxe_mmap). When
- * non-zero the kernel binds the new CQ's mmap region at exactly
- * this offset; -EEXIST on collision; on success the UHW_OUT
- * mi.offset returned to userspace equals this value verbatim.
- *
- * @reserved must be zero on send (kernel rejects -EINVAL otherwise
- * for forward-compat). Its sole purpose is making the struct
- * strictly larger than sizeof(__u64) so the uverbs ioctl bundle
- * takes the pointer (not inline-attr) path through
- * uverbs_fill_udata: with len <= 8 the dispatcher reuses
- * &user_attrs[i].data as inbuf, and ib_copy_from_udata then reads
- * the literal pointer-shaped value CRIU put in attr.data instead
- * of the buffer it points at. See the matching size note in
- * include/uapi/rdma/rdma_user_rxe.h. Same trap, same mitigation
- * as struct mlx5_ib_restore_pd_req_local below.
- *
- * Sent only when we have a captured source offset (RdmaCqAttrs::
- * mmap_offset present in the image). Absent UHW_IN -> kernel
- * falls back to the monotonic counter (legal, but typically
- * misses the dumped vm_pgoff -- the failure mode that motivated
- * this whole UHW_IN dance).
- */
-struct rxe_restore_cq_req_local {
-	uint64_t	vm_pgoff;
-	uint64_t	reserved;
-};
-
-/*
  * UAPI lag shim for include/uapi/rdma/mlx5-abi.h's
  * struct mlx5_ib_restore_pd_req. Driver-private UHW payload for
  * UVERBS_METHOD_RESTORE_PD on mlx5; carries the source's FW pdn so
@@ -594,65 +542,100 @@ static int rdma_send_restore_pd(int cmd_fd, uint32_t driver_id,
 
 /*
  * Issue UVERBS_METHOD_RESTORE_CQ on @cmd_fd, asking the kernel to
- * mint a CQ uobject at the caller-chosen ufile handle
- * @target_handle.
+ * mint a CQ uobject at @target_handle. Driver-agnostic: core
+ * builds the kernel-UAPI-defined skeleton (HANDLE, CQE, USER_HANDLE,
+ * COMP_VECTOR, FLAGS, RESP_CQE) from @e->cq + @target_handle, and
+ * @plugin's RDMA_RESTORE_UOBJ_CQ_UHW_PACK / UHW_VERIFY hooks own
+ * the per-driver UHW_IN / UHW_OUT tail (see criu-plugin.h).
  *
- * Per-driver UHW shape:
- *   - rxe: no UHW. rxe_restore_cq is a pure kernel-side wrapper;
- *     it ignores @target_handle for hw-id purposes (rxe CQs have
- *     no wire-spec cqn -- the rxe_pool elem index is internal
- *     restrack metadata only) and reuses rxe_cq_chk_attr +
- *     rxe_add_to_pool + rxe_cq_from_init exactly the way
- *     rxe_create_cq does.
- *   - mlx5: UHW will carry struct mlx5_ib_restore_cq_req with the
- *     source's FW cqn so mlx5_ib_restore_cq can adopt it via
- *     "Model A". The mlx5 ops.restore_cq landing is S5 B-series
- *     in the kernel; this helper's mlx5 branch is added when that
- *     lands. For now mlx5 callers will hit -EOPNOTSUPP from the
- *     dispatcher's !ib_dev->ops.restore_cq guard, which is the
- *     right backstop (the rxe-only drive-by uses the rxe path).
+ * Plugin contract for the UHW pair:
+ *   PACK   - reads e->plugin_blob (its own packed schema, stuffed
+ *            at dump time by the matching RDMA_DUMP_UOBJ_CQ hook),
+ *            malloc()'s in_buf / out_buf into @uhw. Either side
+ *            may be left NULL/0 (mlx5 has no UHW_OUT, rxe omits
+ *            UHW_IN when the dumped vm_pgoff is zero, etc.).
+ *   VERIFY - optional post-ioctl correctness check. rxe asserts
+ *            mi_offset == requested vm_pgoff; mlx5 has no UHW_OUT
+ *            and skips registering the hook.
  *
- * @cqe / @comp_vector are mandatory inputs to the kernel verb.
- * @user_handle is the source-time ibv_create_cq() cq_context tag
- * (zero in the v0 holders / ib_write_bw, since those pass NULL).
- * @flags is the optional ib_uverbs_ex_create_cq_flags subset; pass
- * 0 (the common case) to omit the FLAGS attr entirely.
+ * Core frees uhw.in_buf / uhw.out_buf via free() after the ioctl
+ * + VERIFY round-trip regardless of outcome.
  *
  * @resp_cqe_out, when non-NULL, receives the actual installed cqe
- * count from the dispatcher's RESP_CQE post-callback (rxe rounds
- * up via roundup_pow_of_two; mlx5 may also round). Pass NULL to
- * ignore the response (the kernel still requires it as MANDATORY
- * out, so we always wire a sink even if the caller doesn't care).
+ * count from RESP_CQE (rxe rounds up via roundup_pow_of_two; mlx5
+ * may also round). Pass NULL to ignore the response (the kernel
+ * still requires it as MANDATORY out, so we always wire a sink).
  *
- * Returns 0 on success, -errno on ioctl failure.
+ * Returns 0 on success, -errno on ioctl failure, -EPROTO if the
+ * plugin's VERIFY hook rejected the kernel's UHW_OUT echo.
  *
  * Wire-format references:
  *   tools/testing/mlx5_vfmig/uobject_restore/cq_restore/
- *     cq_restore_probe_rxe.c::do_restore_cq (rxe shape; no UHW)
+ *     cq_restore_probe_rxe.c::do_restore_cq (rxe shape)
  *   drivers/infiniband/core/uverbs_std_types_restore.c
  *     UVERBS_HANDLER(UVERBS_METHOD_RESTORE_CQ)
  */
-static int rdma_send_restore_cq(int cmd_fd, uint32_t driver_id,
-				uint32_t target_handle, uint32_t cqe,
-				uint64_t user_handle, uint32_t comp_vector,
-				uint32_t flags, uint64_t source_mmap_offset,
+static int rdma_send_restore_cq(int cmd_fd, plugin_desc_t *plugin,
+				uint32_t kernel_driver_id,
+				uint32_t target_handle,
+				const RdmaUobjEntry *e,
 				uint32_t *resp_cqe_out)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
 		struct ib_uverbs_attr		attrs[8];
 	} cmd = {};
-	struct rxe_create_cq_resp_local rxe_uhw_out = {};
-	struct rxe_restore_cq_req_local rxe_uhw_in = {};
+	struct rdma_uhw_spec uhw = {};
+	const RdmaCqAttrs *attrs = e ? e->cq : NULL;
+	uint32_t cqe = 0;
+	uint32_t comp_vector = 0;
+	uint32_t flags = 0;
+	uint64_t user_handle = 0;
 	uint32_t resp_cqe_sink = 0;
 	unsigned int n = 0;
+	int rc, ioctl_errno = 0;
+
+	if (attrs) {
+		if (attrs->has_cqe_count)
+			cqe = attrs->cqe_count;
+		if (attrs->has_comp_vector)
+			comp_vector = attrs->comp_vector;
+		if (attrs->has_flags)
+			flags = attrs->flags;
+	}
+	/*
+	 * user_handle (== source's ibv_create_cq cq_context) isn't
+	 * NLDEV-emitted today; v0 callers (rxe holder, ib_write_bw)
+	 * all pass NULL so 0 is the right default. When a future
+	 * QUERY_CQ / NLDEV emission lands, plumb it through
+	 * rdma_cq_attrs and read it from there.
+	 */
 
 	if (!resp_cqe_out)
 		resp_cqe_out = &resp_cqe_sink;
 
+	/*
+	 * Plugin shapes UHW from e->plugin_blob. PACK is optional --
+	 * a plugin that doesn't register it sends RESTORE_CQ with no
+	 * UHW (the degenerate driver shape; no in-tree provider
+	 * currently uses it, but the API allows).
+	 */
+	if (plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK]) {
+		CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK_t *fn =
+			plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK];
+		rc = fn(e, &uhw);
+		if (rc) {
+			pr_err("rdma_send_restore_cq: plugin '%s' UHW_PACK "
+			       "for ufile_handle=%u failed: %d (%s)\n",
+			       plugin->d->name, target_handle, rc,
+			       strerror(-rc));
+			return rc;
+		}
+	}
+
 	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
 	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_CQ;
-	cmd.hdr.driver_id = driver_id;
+	cmd.hdr.driver_id = kernel_driver_id;
 
 	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_HANDLE;
 	cmd.attrs[n].len = sizeof(uint32_t);
@@ -702,83 +685,50 @@ static int rdma_send_restore_cq(int cmd_fd, uint32_t driver_id,
 	cmd.attrs[n].data = (uintptr_t)resp_cqe_out;
 	n++;
 
-	/*
-	 * Driver UHW_OUT buffer. rxe's rxe_restore_cq insists on an
-	 * outbuf of at least sizeof(struct rxe_create_cq_resp) bytes
-	 * (== 16, struct mminfo) and writes the mmap cookie + size
-	 * for the in-kernel CQ queue into it. Without an UHW_OUT
-	 * attr the kernel returns -EINVAL before any of the actual
-	 * restore work runs (see the (udata->outlen < sizeof(*uresp))
-	 * guard at the top of rxe_restore_cq).
-	 *
-	 * For mlx5 the future ops.restore_cq will likely need its
-	 * own UHW_IN (source FW cqn for adoption) and possibly its
-	 * own UHW_OUT for any mlx5-side mmap cookies; that's S5 B-
-	 * series in the kernel and the helper grows a per-driver
-	 * branch when it lands. Until then the rxe-shaped UHW_OUT
-	 * is sent unconditionally: it's a no-op for any driver
-	 * whose ops.restore_cq doesn't read driver_udata->outbuf,
-	 * and the kernel is happy to accept a larger-than-needed
-	 * UHW_OUT.
-	 */
-	cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_OUT;
-	cmd.attrs[n].len = sizeof(rxe_uhw_out);
-	cmd.attrs[n].flags = 0;
-	cmd.attrs[n].data = (uintptr_t)&rxe_uhw_out;
-	n++;
-
-	/*
-	 * Driver UHW_IN: the source-side vm_pgoff (byte offset) we
-	 * captured from /proc/<pid>/maps at dump time. Sent only when
-	 * non-zero -- the kernel reads inlen and treats inlen == 0 as
-	 * "legacy / pgoff-agnostic restore" (falls back to monotonic
-	 * counter). Sending an explicit zero would also fall back
-	 * (req.vm_pgoff == 0 is a no-op in rxe_create_mmap_info), but
-	 * we omit the attr entirely on the !source_mmap_offset path
-	 * to keep wire shape identical to pre-d3a79140ed26 callers
-	 * (forward-compatibility: if this CRIU runs against an older
-	 * kernel that still has UVERBS_METHOD_RESTORE_CQ but lacks
-	 * the UHW_IN handling, the older kernel's strict inlen check
-	 * -- inlen != 0 && < sizeof(req) -- would EINVAL us).
-	 *
-	 * For mlx5 the future ops.restore_cq's UHW_IN payload is
-	 * different shape (FW cqn for adoption); when that lands the
-	 * helper grows a per-driver branch keyed off driver_id.
-	 */
-	if (source_mmap_offset) {
-		rxe_uhw_in.vm_pgoff = source_mmap_offset;
-		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
-		cmd.attrs[n].len = sizeof(rxe_uhw_in);
+	/* Plugin-shaped UHW: attach whatever PACK populated. */
+	if (uhw.out_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_OUT;
+		cmd.attrs[n].len = (uint16_t)uhw.out_len;
 		cmd.attrs[n].flags = 0;
-		cmd.attrs[n].data = (uintptr_t)&rxe_uhw_in;
+		cmd.attrs[n].data = (uintptr_t)uhw.out_buf;
+		n++;
+	}
+	if (uhw.in_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
+		cmd.attrs[n].len = (uint16_t)uhw.in_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)uhw.in_buf;
 		n++;
 	}
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
 
-	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
-		return -errno;
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0) {
+		ioctl_errno = errno;
+		rc = -ioctl_errno;
+		goto out_free_uhw;
+	}
 
 	/*
-	 * Defense-in-depth: when we asked the kernel to honour a
-	 * specific source offset, verify the kernel echoed it back
-	 * via UHW_OUT. A mismatch would mean a kernel bug (the patch
-	 * promises mi.offset == req.vm_pgoff on success); we'd
-	 * rather catch that loudly here than have the pie restorer's
-	 * mmap silently fail with -EINVAL in a place that's much
-	 * harder to diagnose.
+	 * Plugin verifies UHW_OUT echo (rxe asserts mi_offset ==
+	 * requested vm_pgoff). Optional. Surface a verify failure
+	 * as -EPROTO so the per-CQ caller's diagnostic table picks
+	 * it up uniformly.
 	 */
-	if (source_mmap_offset && rxe_uhw_out.mi_offset != source_mmap_offset) {
-		pr_err("rdma_send_restore_cq: kernel returned mmap_offset=%#"
-		       PRIx64 " but caller asked for %#" PRIx64
-		       " (kernel didn't honor UHW_IN; check rxe is on the "
-		       "d3a79140ed26 patch or its successor)\n",
-		       (uint64_t)rxe_uhw_out.mi_offset,
-		       (uint64_t)source_mmap_offset);
-		return -EPROTO;
+	if (plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY]) {
+		CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY_t *fn =
+			plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_VERIFY];
+		if (fn(e, &uhw, *resp_cqe_out)) {
+			rc = -EPROTO;
+			goto out_free_uhw;
+		}
 	}
-	return 0;
+	rc = 0;
+out_free_uhw:
+	free(uhw.in_buf);
+	free(uhw.out_buf);
+	return rc;
 }
 
 /*
@@ -985,6 +935,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	struct uobj_ufile_group *g;
 	struct uobj_collected *c;
 	struct uobj_handle_map handle_map = {};
+	plugin_desc_t *plugin = NULL;
 	int n_pd_restored = 0;
 	int n_pd_skipped = 0;
 	int n_cq_restored = 0;
@@ -998,6 +949,49 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			 "(no rdma-uobj.img coverage); nothing to restore\n",
 			 ufile_id);
 		return 0;
+	}
+
+	/*
+	 * Resolve the cached plugin pointer once for this ufile,
+	 * mirroring the dump-side caching on struct rdma_dumped_ufile.
+	 * Per-class restore senders below (rdma_send_restore_cq, and
+	 * future _qp / _mr / ...) consult @plugin->d->hooks[...] for
+	 * their per-driver UHW pack/verify hooks without re-walking
+	 * the plugin list per uobject.
+	 *
+	 * Hard-fail on miss/ambiguity here: the same exactly-one
+	 * invariant the dump-side CLAIM enforced must hold on the
+	 * destination, otherwise we couldn't have opened the cdev
+	 * via rdma_dispatch_open_uverbs_cdev() in the first place.
+	 */
+	{
+		const char *first_name = NULL, *second_name = NULL;
+		bool ambiguous = false;
+
+		plugin = rdma_find_plugin_by_provided_driver(g->hw_driver_id,
+							     &ambiguous,
+							     &first_name,
+							     &second_name);
+		if (ambiguous) {
+			pr_err("uobj DAG: ufile_id=%#x: multiple plugins "
+			       "declare cr_rdma_provided_driver=%u "
+			       "('%s' and '%s'); operator's plugin set is "
+			       "inconsistent.\n",
+			       ufile_id, g->hw_driver_id,
+			       first_name, second_name);
+			return -1;
+		}
+		if (!plugin) {
+			pr_err("uobj DAG: ufile_id=%#x: no loaded RDMA "
+			       "plugin exports cr_rdma_provided_driver=%u; "
+			       "the cdev open just succeeded against this "
+			       "very driver, so the plugin list changed "
+			       "mid-restore or the winning plugin is "
+			       "missing its CR_PLUGIN_DECLARE_RDMA_PROVIDED"
+			       "_DRIVER declaration.\n",
+			       ufile_id, g->hw_driver_id);
+			return -1;
+		}
 	}
 
 	/*
@@ -1140,16 +1134,35 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	 * side rdma_cq_attrs absent-field handling: cqe_count defaults
 	 * to 0 only on degenerate dumps; current dumpers always
 	 * populate it from NLDEV's RES_CQE.
+	 *
+	 * Teardown-order on Pass-2 rollback failure (v0 limitation,
+	 * documented for Step 6 of the CRIU plumbing patch series):
+	 * if RESTORE_CQ on the K-th CQ fails with anything other than
+	 * a per-image inconsistency (e.g. -ENOMEM, FW gating), the K-1
+	 * CQs already installed on this ufile are leaked (their
+	 * ufile_handles stay claimed in the destination ucontext IDR)
+	 * and the Pass-1 PDs they would have hosted child uobjects on
+	 * remain alive too. Rolling back cleanly requires destroying
+	 * the K-1 CQs *before* the PDs (kernel uobj-tree teardown
+	 * already enforces dependency order on close, so the goto out
+	 * path's ucontext destruction is correct -- but in pstree
+	 * dumps where multiple ufiles share a tracked VF the *other*
+	 * ufiles' Pass-1 work also has to be rolled back in CQ-then-PD
+	 * order, which the current goto-out path doesn't orchestrate
+	 * across ufiles). v0 leaves the destination ucontext closed
+	 * via close(cmd_fd) on goto out, which the kernel resolves
+	 * via uverbs_destroy_ufile_hw -> walks ufile->uobjects in
+	 * reverse-creation order, so per-ufile teardown is correct
+	 * by construction. Cross-ufile rollback orchestration (drain
+	 * pre-restored PDs for other ufiles in the same tree on Pass-2
+	 * failure of any one ufile) is a follow-up; v0 leaks them on
+	 * partial failure.
 	 */
 	list_for_each_entry(c, &g->entries, link) {
 		const RdmaUobjEntry *e = c->e;
 		const RdmaCqAttrs *attrs;
 		uint32_t resp_cqe = 0;
 		uint32_t cqe = 0;
-		uint32_t comp_vector = 0;
-		uint32_t flags = 0;
-		uint64_t user_handle = 0;
-		uint64_t mmap_offset = 0;
 		int rc;
 
 		if (e->type != R3_UOBJ_TYPE__R3UT_CQ)
@@ -1160,53 +1173,27 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 		}
 
 		attrs = e->cq;
-		if (attrs) {
-			if (attrs->has_cqe_count)
-				cqe = attrs->cqe_count;
-			if (attrs->has_comp_vector)
-				comp_vector = attrs->comp_vector;
-			if (attrs->has_flags)
-				flags = attrs->flags;
-			if (attrs->has_mmap_offset)
-				mmap_offset = attrs->mmap_offset;
-		}
+		if (attrs && attrs->has_cqe_count)
+			cqe = attrs->cqe_count;
+
 		/*
-		 * user_handle (== source's ibv_create_cq cq_context)
-		 * isn't NLDEV-emitted today; v0 callers (rxe holder,
-		 * ib_write_bw) all pass NULL so 0 is the right default.
-		 * When a future QUERY_CQ / NLDEV emission lands, plumb
-		 * it through rdma_cq_attrs and feed it here. Documented
-		 * in rdma_uobj.proto::rdma_cq_attrs.
-		 *
-		 * mmap_offset, when non-zero, instructs the kernel to
-		 * pin the new CQ's mmap region at exactly this byte
-		 * offset (see rxe_restore_cq_req in rdma_user_rxe.h).
-		 * Captured at dump time by the RDMA-class plugin's
-		 * CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA hook, which feeds
-		 * each per-(pid, ibdev) cdev VMA's pgoff (in bytes)
-		 * into criu/rdma.c's process-global side-table via
-		 * rdma_record_cdev_vma(); uobj_cq_cb pops one entry
-		 * per CQ at NLDEV-walk time. Zero means the plugin
-		 * didn't register PROCESS_DEVICE_VMA, the side-table
-		 * was exhausted (multi-uobj ufile w/o per-class join
-		 * key), or the snapshot pre-dated CQ creation. Zero
-		 * falls back to the kernel's monotonic counter --
-		 * matches the source iff the source's counter was
-		 * also fresh, which is true only for very simple
-		 * holders.
+		 * Driver-agnostic core: comp_vector / flags / cqe ride
+		 * the kernel-UAPI-defined attrs read from @attrs inside
+		 * the helper; per-driver UHW shape (rxe vm_pgoff,
+		 * mlx5 32B mlx5_ib_restore_cq_req) lives in
+		 * e->plugin_blob and is materialised by the cached
+		 * @plugin's RDMA_RESTORE_UOBJ_CQ_UHW_PACK / UHW_VERIFY
+		 * hooks. See criu-plugin.h for the contract.
 		 */
-		rc = rdma_send_restore_cq(cmd_fd, kernel_driver_id,
-					  e->ufile_handle, cqe,
-					  user_handle, comp_vector,
-					  flags, mmap_offset, &resp_cqe);
+		rc = rdma_send_restore_cq(cmd_fd, plugin, kernel_driver_id,
+					  e->ufile_handle, e, &resp_cqe);
 		if (rc) {
 			pr_err("uobj DAG: ufile_id=%#x RESTORE_CQ"
-			       "(target_handle=%u, driver_id=%u, "
-			       "cqe=%u, comp_vector=%u, flags=0x%x) "
+			       "(target_handle=%u, driver_id=%u, cqe=%u) "
 			       "failed: %d (%s)%s\n",
 			       ufile_id, e->ufile_handle,
-			       kernel_driver_id, cqe, comp_vector,
-			       flags, rc, strerror(-rc),
+			       kernel_driver_id, cqe,
+			       rc, strerror(-rc),
 			       rc == -EOPNOTSUPP
 			       ? " -- kernel has no "
 			         "ib_device_ops.restore_cq for this "
@@ -1226,9 +1213,9 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			       : rc == -EINVAL
 			       ? " -- dispatcher rejected core attrs "
 			         "(comp_vector >= dev->num_comp_vectors, "
-			         "or invalid FLAGS bits, or driver UHW "
-			         "size mismatch -- including a truncated "
-			         "rxe_restore_cq_req UHW_IN)"
+			         "invalid FLAGS bits, or driver UHW "
+			         "size mismatch from the plugin's "
+			         "UHW_PACK)"
 			       : rc == -EEXIST
 			       ? " -- requested mmap_offset collides "
 			         "with another pending mmap region on "
@@ -1236,16 +1223,60 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			         "the same ibdev, or dump-side captured "
 			         "an offset another sibling uobj already "
 			         "claimed)"
+			       : rc == -EPROTO
+			       ? " -- plugin's UHW_VERIFY hook rejected "
+			         "the kernel-echo (e.g. rxe asserts "
+			         "mi_offset == requested vm_pgoff and "
+			         "saw a mismatch; check rxe is on the "
+			         "d3a79140ed26 patch or its successor)"
 			       : "");
 			goto out;
 		}
 		n_cq_restored++;
 		pr_debug("uobj DAG: ufile_id=%#x RESTORE_CQ"
 			 "(target_handle=%u) ok: requested cqe=%u, "
-			 "kernel installed resp_cqe=%u, mmap_offset=%#"
-			 PRIx64 "\n",
-			 ufile_id, e->ufile_handle, cqe, resp_cqe,
-			 mmap_offset);
+			 "kernel installed resp_cqe=%u\n",
+			 ufile_id, e->ufile_handle, cqe, resp_cqe);
+
+		/*
+		 * Adoption-was-honored gate (mlx5 / Model A). For mlx5
+		 * the kernel's mlx5_ib_restore_cq adopts the source's
+		 * FW cqn from mlx5_ib_restore_cq_req.cqn and rejects
+		 * with -EILSEQ if it wasn't reserved at LOAD time, so a
+		 * successful ioctl above is itself the byte-equality
+		 * proof for cqn / cqe_size / buf_addr / db_addr (the
+		 * source values either round-tripped verbatim or the
+		 * kernel rejected the verb, no partial state). The
+		 * RESP_CQE echo must also match: a divergent
+		 * resp_cqe vs. source cqe would mean the destination
+		 * driver silently rounded the entry count, which would
+		 * desync the restored workload's WQ math from what
+		 * the source had at SAVE_VHCA_STATE. mlx5 doesn't
+		 * round; rxe rounds up to a power of two, so the
+		 * equality assert is mlx5-only. (Stronger NLDEV K8a
+		 * cross-walk -- find the new CQ entry by RES_HANDLE
+		 * and assert presence -- is a follow-up; the kernel-
+		 * side B4/B5 PROBE_CQN tests in
+		 * tools/testing/mlx5_vfmig/uobject_restore/cq_*
+		 * already cover end-to-end byte equality at a deeper
+		 * layer, so the verb-success gate here is sufficient
+		 * for v0.)
+		 */
+		if (kernel_driver_id == RDMA_DRIVER_MLX5 &&
+		    resp_cqe != cqe) {
+			pr_err("uobj DAG: ufile_id=%#x RESTORE_CQ"
+			       "(target_handle=%u) returned resp_cqe=%u "
+			       "but source recorded cqe=%u; mlx5 should "
+			       "round-trip CQE counts verbatim. Either "
+			       "the destination kernel is on a build "
+			       "that rounds cqe (regressed) or the "
+			       "image's RdmaCqAttrs.cqe_count was "
+			       "captured pre-NLDEV-RES_CQE; aborting "
+			       "restore.\n",
+			       ufile_id, e->ufile_handle, resp_cqe, cqe);
+			rc = -EPROTO;
+			goto out;
+		}
 
 		if (e->has_restrack_id) {
 			if (uobj_handle_map_add(&handle_map,
