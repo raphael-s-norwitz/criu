@@ -1198,8 +1198,10 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			       ? " -- kernel has no "
 			         "ib_device_ops.restore_cq for this "
 			         "driver (rxe needs a77cc4d8e8b9; "
-			         "mlx5 ops.restore_cq is S5 B-series, "
-			         "not yet in tree)"
+			         "mlx5 needs the S5 B-series patch "
+			         "registering mlx5_ib_restore_cq in "
+			         "ib_dev_ops -- in-tree as of the "
+			         "vfmig kernel branch in this build)"
 			       : rc == -EPERM
 			       ? " -- ucontext not in restore mode "
 			         "(see RESTORE_PD's analogous error "
