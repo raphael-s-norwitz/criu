@@ -190,6 +190,21 @@ enum {
 	 * "is this device VMA yours" decision has been made and the
 	 * VMA has been admitted to the dump with VMA_EXT_PLUGIN.
 	 *
+	 * Per-VMA, not per-(struct file). Critically, this hook
+	 * fires once per smaps entry, which means it ALSO fires for
+	 * file-borrowed VMAs (back-to-back smaps entries that share
+	 * the same (dev, ino) and inherit VMA_EXT_PLUGIN from their
+	 * predecessor without re-running HANDLE_DEVICE_VMA). The
+	 * payload (vma_start / vma_end / vma_pgoff_bytes) belongs to
+	 * the current VMA, not the donor; plugins building per-VMA
+	 * side tables can rely on a 1:1 record-per-smaps-entry
+	 * dispatch contract. (Multi-CQ rxe holders -- the canonical
+	 * perftest pattern with separate send_cq + recv_cq on one
+	 * ibv_context -- emit N back-to-back uverbs cdev VMAs that
+	 * exercise this borrowed-VFI path; missing them silently
+	 * desynchronises the rxe cdev_vma_offset queue and breaks
+	 * RESTORE_CQ.UHW_IN replay.)
+	 *
 	 * Distinct from HANDLE_DEVICE_VMA because:
 	 *   - HANDLE is a *gate* (binary; first claimer wins), and
 	 *     to keep its contract minimal it only sees (fd, stat).

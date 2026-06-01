@@ -602,19 +602,17 @@ else
 	echo "       kernels that pre-date the rxe forced-vm_pgoff"
 	echo "       support in rxe_restore_cq (S5a-vma-remap)."
 fi
-# pd_2cq is opt-in (UVERBS_CR_RUN_PD_2CQ=1) and EXPECTED-FAIL on
-# rxe today: the rxe plugin's open_uverbs_cdev / update_vma_map
-# pair re-uses one cdev fd per VMA, which combined with two
-# distinct vm_pgoff slots (one per CQ) trips an mmap -EINVAL on
-# the second CQ's ring (verified at commit 1ea44547a, pre-CQ-to-
-# pie refactor -- pre-existing rxe-side bug, see plugins/rdma/rxe
-# for the cdev fd lifecycle that needs untangling). pd_2cq's real
-# coverage target is mlx5 with num_comp_vectors >= 2, where the
-# pie-deferral path re-issues each RESTORE_CQ from the restored
-# task's mm via a freshly-dup'd cdev fd per CQ; that runs in
-# run_vfmig_cr.sh and is green there. Keep the rxe knob so a
-# future rxe plugin fix can re-enable.
-if [[ "${UVERBS_CR_RUN_PD_2CQ:-0}" == "1" ]]; then
+# pd_2cq -- two CQs on one ibv_context, the canonical perftest
+# multi-CQ pattern (separate send_cq + recv_cq). Default-on as of
+# the borrowed-VFI PROCESS_DEVICE_VMA fix in proc_parse.c: holders
+# with N back-to-back uverbs cdev VMAs now feed N entries into the
+# rxe plugin's cdev_vma_offset queue (instead of just one),
+# preserving the 1:1 join between vm_pgoff and per-CQ uobject
+# that RESTORE_CQ.UHW_IN replay needs. Pre-fix this regressed
+# silently inside rxe_mmap's pending_mmaps lookup at pie restore
+# time. Switch retained so we can selectively skip on older
+# CRIU/proc_parse builds.
+if [[ "${UVERBS_CR_RUN_PD_2CQ:-1}" == "1" ]]; then
 	run_pass pd_2cq pd_2cq 0
 fi
 

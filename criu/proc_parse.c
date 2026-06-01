@@ -109,6 +109,43 @@ bool is_vma_range_fmt(char *line)
 	return __is_vma_range_fmt(line);
 }
 
+/*
+ * Per-VMA dump-side post-claim notification. Split out of
+ * handle_vma_plugin so the borrowed-VFI path in handle_vma() can
+ * dispatch it without re-running the HANDLE_DEVICE_VMA claim gate
+ * (which is binary "is this device VMA mine?" and intentionally
+ * runs only once per [device, struct file]).
+ *
+ * Run the hook for every VMA whose owning struct file already has
+ * a plugin claim, fresh-open or borrowed. PROCESS_DEVICE_VMA's
+ * payload (vma_start/vma_end/vma_pgoff_bytes) is per-VMA, not
+ * per-(struct file); the rxe RDMA plugin's cdev side-table relies
+ * on receiving exactly one record per smaps VMA so its FIFO
+ * pop-by-CQ-creation-order can pair up vm_pgoffs with CQ uobjects.
+ *
+ * run_plugins() returns -ENOTSUP when no loaded plugin registered
+ * the hook (or every plugin in the chain returned ENOTSUP), which
+ * just means "no plugin needs per-VMA metadata"; treat that as
+ * success.
+ */
+static bool process_device_vma_post_claim(pid_t pid, int *fd,
+					  struct stat *stat,
+					  uint64_t vma_start,
+					  uint64_t vma_end,
+					  uint64_t vma_pgoff_bytes)
+{
+	int ret;
+
+	ret = run_plugins(PROCESS_DEVICE_VMA, pid, *fd, stat, vma_start,
+			  vma_end, vma_pgoff_bytes);
+	if (ret < 0 && ret != -ENOTSUP) {
+		pr_perror("process_device_vma plugin failed");
+		return false;
+	}
+
+	return true;
+}
+
 bool handle_vma_plugin(pid_t pid, int *fd, struct stat *stat,
 		       uint64_t vma_start, uint64_t vma_end,
 		       uint64_t vma_pgoff_bytes)
@@ -121,31 +158,8 @@ bool handle_vma_plugin(pid_t pid, int *fd, struct stat *stat,
 		return false;
 	}
 
-	/*
-	 * Optional second-stage notify. Plugins that registered a
-	 * cr_plugin_process_device_vma symbol get the VMA bounds and
-	 * pgoff alongside (pid, fd, stat) so they can build per-cdev
-	 * side tables for downstream dump-time consumers (e.g. the
-	 * rxe RDMA plugin uses this to record the source CQ's mmap
-	 * cookie before the per-uobj DAG dump executes -- see
-	 * criu/rdma.c).
-	 *
-	 * run_plugins() returns -ENOTSUP when *no* loaded plugin
-	 * registered the hook (or every plugin in the chain returned
-	 * ENOTSUP). For HANDLE_DEVICE_VMA that's a real error -- the
-	 * VMA can't be dumped without an owning plugin. For
-	 * PROCESS_DEVICE_VMA it just means "no plugin needs per-VMA
-	 * metadata", which is the common case (amdgpu_plugin doesn't,
-	 * mlx5_vfmig doesn't either). Treat it as success and continue.
-	 */
-	ret = run_plugins(PROCESS_DEVICE_VMA, pid, *fd, stat, vma_start,
-			  vma_end, vma_pgoff_bytes);
-	if (ret < 0 && ret != -ENOTSUP) {
-		pr_perror("process_device_vma plugin failed");
-		return false;
-	}
-
-	return true;
+	return process_device_vma_post_claim(pid, fd, stat, vma_start,
+					     vma_end, vma_pgoff_bytes);
 }
 
 static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf,
@@ -671,6 +685,48 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 			else
 				vma_area->e->status |= VMA_FILE_SHARED;
 		}
+
+		/*
+		 * Re-dispatch CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA for
+		 * borrowed VMAs whose owning struct file was already
+		 * claimed by a plugin (VMA_EXT_PLUGIN, inherited from
+		 * @prev above). The HANDLE_DEVICE_VMA claim gate is
+		 * intentionally NOT re-run -- claim is binary and is
+		 * inherited via VMA_EXT_PLUGIN -- but per-VMA metadata
+		 * (vma_start/end/pgoff_bytes) belongs to *this* VMA,
+		 * not to @prev, and plugins building per-VMA side
+		 * tables (e.g. the rxe plugin's cdev_vma_offset queue
+		 * keyed by [pid, ibdev]) need one record per smaps
+		 * entry to maintain a 1:1 join with downstream uobjects.
+		 *
+		 * Skipping it here regressed multi-CQ rxe restore: a
+		 * holder with N CQs on one ibv_context surfaces N
+		 * back-to-back cdev VMAs in smaps; only the first one
+		 * is fresh-VFI (and gets the full handle_vma_plugin
+		 * call), the rest borrow the VFI and silently dropped
+		 * their pgoff. Per-CQ dump then ran out of side-table
+		 * cookies after the first CQ, the remaining CQs
+		 * RESTORE_CQ'd with no UHW_IN, and the kernel's
+		 * monotonic mmap-offset counter picked offsets that
+		 * didn't match the dumped vma->vm_pgoff -- pie's
+		 * mmap() of the user CQ ring then -EINVAL'd inside
+		 * rxe_mmap's pending_mmaps lookup. Same pattern would
+		 * affect any future RDMA plugin (or any plugin at all)
+		 * that wants per-VMA metadata across borrowed VMAs.
+		 *
+		 * vma_get_mapfile_borrow() leaves *vm_file_fd open on
+		 * the borrow path specifically so downstream consumers
+		 * like this one can call into plugins without
+		 * re-opening the source file.
+		 */
+		if ((vma_area->e->status & VMA_EXT_PLUGIN) &&
+		    *vm_file_fd >= 0 && vma_area->vmst &&
+		    !process_device_vma_post_claim(pid, vm_file_fd,
+						   vma_area->vmst,
+						   vma_area->e->start,
+						   vma_area->e->end,
+						   vma_area->e->pgoff))
+			goto err;
 	} else if (*vm_file_fd >= 0) {
 		struct stat *st_buf = vma_area->vmst;
 		int hugetlb_flag = 0;
