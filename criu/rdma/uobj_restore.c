@@ -1376,6 +1376,34 @@ int rdma_prepare_rdma_cqs(struct task_restore_args *ta)
 		unsigned int n_cq_serialised = 0;
 		unsigned int n_cq_skipped = 0;
 		int per_ret = 0;
+		bool cq_in_pie = false;
+
+		/*
+		 * Per-driver dispatch site for RESTORE_CQ; mirrors the
+		 * gate in rdma_restore_uobj_dag_for_ufile() (see the long
+		 * comment above rdma_send_restore_cq() for the camp
+		 * split). Plugins without the NEEDS_PIE hook restored
+		 * their CQs back in Phase A via rdma_send_restore_cq();
+		 * those CQs MUST NOT be re-queued here or the pie path
+		 * will -EBUSY at the now-occupied target_handle when it
+		 * re-issues RESTORE_CQ. Silent regression caught by rxe
+		 * end-to-end where Phase A succeeded but Phase B's pie
+		 * dispatch hit -EBUSY trying to install the same handle
+		 * a second time.
+		 *
+		 * The pending list still gets walked because MR entries
+		 * for the same ufile are always pie-deferred and need
+		 * their own Phase B-prep below in rdma_prepare_rdma_mrs.
+		 */
+		if (p->plugin && p->plugin->d->hooks[
+			CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE]) {
+			CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE_t *fn =
+				p->plugin->d->hooks[
+				CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE];
+			cq_in_pie = (fn() != 0);
+		}
+		if (!cq_in_pie)
+			continue;
 
 		list_for_each_entry(c, &p->g->entries, link) {
 			const RdmaUobjEntry *e = c->e;
