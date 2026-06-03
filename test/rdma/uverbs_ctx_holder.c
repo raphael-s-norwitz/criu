@@ -100,6 +100,18 @@ static struct ibv_cq *g_cq;
 static struct ibv_cq *g_cq_b; /* HM_PD_2CQ second CQ, comp_vector=1 */
 static int g_cq_b_comp_vector;
 static const int G_CQ_CQE = 16;
+
+/*
+ * Pre-dump QP for HM_PD_CQ_QP. Created alongside g_pd / g_cq when
+ * the mode is selected, modified through INIT -> RTR -> RTS via
+ * self-loopback before READY so the dump captures a fully-connected
+ * QP in RTS state (the most aggressive v0 RESTORE_QP-accepted
+ * state). Post-restore the libibverbs cached qp->qp_num must equal
+ * @g_qp_num (recorded pre-dump) -- the smoking gun for FW qpn
+ * adoption surviving SAVE/LOAD_VHCA_STATE on the destination side.
+ */
+static struct ibv_qp *g_qp;
+static uint32_t g_qp_num;
 /*
  * Pre-dump MR: registered alongside g_pd when @g_mode covers MR
  * (currently rxe S4a). Needs survive across SAVE_VHCA_STATE /
@@ -210,6 +222,29 @@ enum holder_mode {
 	HM_PD_MR = 1,
 	HM_PD_CQ = 2,
 	HM_PD_2CQ = 3,
+	/*
+	 * "pd_cq_qp": pre-dump alloc PD + create CQ + create RC QP and
+	 * advance through INIT -> RTR -> RTS via self-loopback (peer =
+	 * own qpn, peer GID = own GID on port 1). Used by mlx5_vfmig
+	 * (S6b B-series) once UVERBS_METHOD_RESTORE_QP and the
+	 * supporting NLDEV emissions land. Post-restore validates the
+	 * QP survived at the source's ufile_handle and same qp_num
+	 * (libibverbs cache must agree), then tears down in
+	 * dependency-order (QP -> CQ -> PD).
+	 *
+	 * RTS is the most aggressive state v0 RESTORE_QP accepts and
+	 * exercises every modify_qp transition along the way; the
+	 * simpler INIT/RTR/RESET cases are covered as side effects of
+	 * the same handler. Pre-dump self-loopback connects qp_a to
+	 * itself so we don't need a peer process for the modify
+	 * chain. No data-path I/O pre-dump (the post-restore acid
+	 * test currently stops at "QP is destroyable") -- a future
+	 * Phase K could post a self-loopback RDMA WRITE through the
+	 * restored QP, but the kernel-side qp_restore probe already
+	 * validated FW QPC byte-equality so the v0 holder doesn't
+	 * try to re-prove it from userspace.
+	 */
+	HM_PD_CQ_QP = 4,
 };
 static enum holder_mode g_mode = HM_PD;
 
@@ -728,6 +763,121 @@ static void run_post_restore_checks_pd_cq(void)
 	write_status("OK");
 }
 
+/*
+ * Post-restore checks for HM_PD_CQ_QP. Mirror of run_post_restore_
+ * checks_pd_cq with an extra QP teardown wedged between QP and CQ
+ * destruction (QP must drain before its parent CQ can be destroyed
+ * cleanly under FW dependency-tracking).
+ *
+ * Three contracts are asserted:
+ *
+ *   1. qp->qp_num matches the pre-dump value @g_qp_num. The
+ *      libibverbs ibv_qp struct lives in the holder's address space
+ *      so the field survives by virtue of memory continuity --
+ *      asserting it here just cross-checks that the kernel side
+ *      didn't write back a different qpn at restore time (which
+ *      would manifest as the pie restorer's resp_qpn != qpn_hint
+ *      hard-fail, but we want the symmetrical userspace assertion
+ *      so a regression on the kernel echo is caught even if the
+ *      pie helper softened the assertion in the future).
+ *
+ *   2. ibv_destroy_qp(g_qp) succeeds. The libibverbs wire command
+ *      walks ufile->idr at the cached g_qp->handle; -EINVAL would
+ *      surface here if the kernel-side IDR slot for the QP is
+ *      missing (i.e. RESTORE_QP didn't run, or installed at a
+ *      different handle than the source's).
+ *
+ *   3. The chained ibv_destroy_cq + ibv_dealloc_pd both succeed in
+ *      that order, exercising the FW dependency-tracking unwound
+ *      via uverbs_destroy_uobject. A regression where the QP's
+ *      kernel ib_uobject didn't link itself into the parent CQ's
+ *      list_send_qp / list_recv_qp during RESTORE_QP would be
+ *      caught here as ibv_destroy_cq -EBUSY ("FW reports CQ has
+ *      outstanding QPs"). Same shape as the rolled-back DEALLOC_PD
+ *      regression that broke S3b, applied to the QP layer.
+ */
+static void run_post_restore_checks_pd_cq_qp(void)
+{
+	char msg[384];
+	int rc;
+	uint32_t cur_qpn;
+
+	if (!g_pd) {
+		write_status("FAIL: post-restore: g_pd missing -- "
+			     "holder lost the pre-dump PD reference");
+		return;
+	}
+	if (!g_cq) {
+		write_status("FAIL: post-restore: g_cq missing despite "
+			     "HM_PD_CQ_QP -- holder lost the pre-dump CQ "
+			     "reference");
+		return;
+	}
+	if (!g_qp) {
+		write_status("FAIL: post-restore: g_qp missing despite "
+			     "HM_PD_CQ_QP -- holder lost the pre-dump QP "
+			     "reference");
+		return;
+	}
+
+	cur_qpn = g_qp->qp_num;
+	if (cur_qpn != g_qp_num) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: pre-dump QP qp_num drifted across restore: "
+			 "%u (pre-dump) != %u (post-restore). The kernel "
+			 "installed a different qpn than the source's; "
+			 "wire-visible peer state on remote endpoints "
+			 "(if any) is now stale",
+			 g_qp_num, cur_qpn);
+		write_status(msg);
+		return;
+	}
+
+	rc = ibv_destroy_qp(g_qp);
+	g_qp = NULL;
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: ibv_destroy_qp of pre-dump QP after "
+			 "restore: %d (%s) -- the source's QP "
+			 "ufile_handle is missing in the destination "
+			 "ucontext IDR. RESTORE_QP did not run, or "
+			 "installed at a different handle than the "
+			 "source's (qpn=%u)", rc, strerror(rc), cur_qpn);
+		write_status(msg);
+		return;
+	}
+
+	rc = ibv_destroy_cq(g_cq);
+	g_cq = NULL;
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: ibv_destroy_cq of pre-dump CQ after "
+			 "tearing down the restored QP: %d (%s) -- CQ's "
+			 "ufile_handle missing in the destination ucontext "
+			 "IDR, or the QP didn't unlink itself from "
+			 "list_{send,recv}_qp on destroy (RESTORE_QP did "
+			 "not link the QP into the parent CQ's qp lists)",
+			 rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+
+	rc = ibv_dealloc_pd(g_pd);
+	g_pd = NULL;
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: ibv_dealloc_pd of pre-dump PD after "
+			 "tearing down the restored QP+CQ: %d (%s) -- "
+			 "kernel uobj cleanup leaked a dependent or "
+			 "the adopted PD identity drifted",
+			 rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+
+	write_status("OK");
+}
+
 static void run_post_restore_checks(void)
 {
 	struct ibv_device_attr dev_attr;
@@ -1048,9 +1198,12 @@ int main(int argc, char **argv)
 		g_mode = HM_PD_CQ;
 	} else if (strcmp(mode, "pd_2cq") == 0) {
 		g_mode = HM_PD_2CQ;
+	} else if (strcmp(mode, "pd_cq_qp") == 0) {
+		g_mode = HM_PD_CQ_QP;
 	} else {
 		fprintf(stderr, "unknown holder mode '%s' "
-				"(expected pd|pd_mr|pd_cq|pd_2cq)\n", mode);
+				"(expected pd|pd_mr|pd_cq|pd_2cq|pd_cq_qp)\n",
+			mode);
 		return 2;
 	}
 
@@ -1155,6 +1308,89 @@ int main(int argc, char **argv)
 			fprintf(stderr,
 				"ibv_create_cq (cq_b, cv=%d): %s\n",
 				g_cq_b_comp_vector, strerror(errno));
+			return 2;
+		}
+	} else if (g_mode == HM_PD_CQ_QP) {
+		/*
+		 * Pre-dump CQ + RC QP, advanced through INIT -> RTR ->
+		 * RTS via self-loopback. Reuses the phase_j_modify_*
+		 * helpers that already drive the same chain post-
+		 * restore in HM_PD_MR's Phase J.
+		 */
+		struct ibv_qp_init_attr qp_init = {0};
+		struct ibv_port_attr port_attr;
+		struct phase_j_qp_info self;
+		int err;
+
+		g_cq = ibv_create_cq(g_ctx, G_CQ_CQE, NULL, NULL, 0);
+		if (!g_cq) {
+			fprintf(stderr,
+				"ibv_create_cq baseline (pd_cq_qp): %s\n",
+				strerror(errno));
+			return 2;
+		}
+
+		qp_init.qp_type = IBV_QPT_RC;
+		qp_init.send_cq = g_cq;
+		qp_init.recv_cq = g_cq;
+		qp_init.cap.max_send_wr = 1;
+		qp_init.cap.max_recv_wr = 1;
+		qp_init.cap.max_send_sge = 1;
+		qp_init.cap.max_recv_sge = 1;
+		g_qp = ibv_create_qp(g_pd, &qp_init);
+		if (!g_qp) {
+			fprintf(stderr,
+				"ibv_create_qp baseline (pd_cq_qp): %s\n",
+				strerror(errno));
+			return 2;
+		}
+		g_qp_num = g_qp->qp_num;
+
+		/*
+		 * Self-loopback connection: peer = own qpn / GID /
+		 * port. mlx5 VFs and rxe both expose port 1 with at
+		 * least one valid GID; query_gid(idx=0) is the
+		 * lightest path. active_mtu defaults to 1024 if the
+		 * driver reports 0 (rxe in down state).
+		 */
+		if (ibv_query_port(g_ctx, 1, &port_attr)) {
+			fprintf(stderr,
+				"ibv_query_port(port=1) for pd_cq_qp: %s\n",
+				strerror(errno));
+			return 2;
+		}
+		memset(&self, 0, sizeof(self));
+		if (ibv_query_gid(g_ctx, 1, 0, &self.gid)) {
+			fprintf(stderr,
+				"ibv_query_gid(port=1, idx=0) for "
+				"pd_cq_qp: %s\n", strerror(errno));
+			return 2;
+		}
+		self.port_num = 1;
+		self.qpn = g_qp_num;
+		self.psn = 0;
+		self.mtu = port_attr.active_mtu ?
+			   port_attr.active_mtu : IBV_MTU_1024;
+
+		err = phase_j_modify_init(g_qp, 1);
+		if (err) {
+			fprintf(stderr,
+				"pd_cq_qp: modify INIT: %d (%s)\n",
+				err, strerror(err));
+			return 2;
+		}
+		err = phase_j_modify_rtr(g_qp, &self);
+		if (err) {
+			fprintf(stderr,
+				"pd_cq_qp: modify RTR (self qpn=0x%x): "
+				"%d (%s)\n", self.qpn, err, strerror(err));
+			return 2;
+		}
+		err = phase_j_modify_rts(g_qp, self.psn);
+		if (err) {
+			fprintf(stderr,
+				"pd_cq_qp: modify RTS: %d (%s)\n",
+				err, strerror(err));
 			return 2;
 		}
 	}
@@ -1293,6 +1529,23 @@ int main(int argc, char **argv)
 		       g_pd->handle,
 		       g_cq->handle, g_cq->cqe,
 		       g_cq_b->handle, g_cq_b->cqe, g_cq_b_comp_vector);
+	} else if (g_mode == HM_PD_CQ_QP && g_cq && g_qp) {
+		/*
+		 * Expose pre-dump QP qp_num + ufile_handle so the
+		 * runner can cross-check identity continuity post-
+		 * restore. qp_state hard-coded to IBV_QPS_RTS (3) in
+		 * the READY line because the holder unconditionally
+		 * advances through the modify chain above; if the
+		 * chain ever becomes mode-conditional, surface
+		 * qp_state from a real ibv_query_qp instead.
+		 */
+		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u "
+		       "cq_handle=%u cq_cqe=%d "
+		       "qp_handle=%u qp_num=0x%x qp_state=RTS\n",
+		       getpid(), devname, g_ctx->async_fd,
+		       g_pd->handle,
+		       g_cq->handle, g_cq->cqe,
+		       g_qp->handle, g_qp_num);
 	} else {
 		printf("READY pid=%d ctx=%s async_fd=%d pd_handle=%u\n",
 		       getpid(), devname, g_ctx->async_fd, g_pd->handle);
@@ -1305,6 +1558,8 @@ int main(int argc, char **argv)
 			g_query = 0;
 			if (g_mode == HM_PD_CQ || g_mode == HM_PD_2CQ)
 				run_post_restore_checks_pd_cq();
+			else if (g_mode == HM_PD_CQ_QP)
+				run_post_restore_checks_pd_cq_qp();
 			else
 				run_post_restore_checks();
 		}
@@ -1316,9 +1571,11 @@ int main(int argc, char **argv)
 	free(g_mr_alloc);
 	g_mr_alloc = NULL;
 	g_mr_buf = NULL;
-	/* Reverse-creation-order CQ teardown so dependents fall before
-	 * the PD they were carved from. cq_b created last -> destroyed
-	 * first; cq_a likewise before the PD. */
+	/* Reverse-creation-order teardown so dependents fall before
+	 * their parents. QP -> CQ_b -> CQ_a -> PD. */
+	if (g_qp)
+		ibv_destroy_qp(g_qp);
+	g_qp = NULL;
 	if (g_cq_b)
 		ibv_destroy_cq(g_cq_b);
 	g_cq_b = NULL;
