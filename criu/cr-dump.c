@@ -2240,6 +2240,18 @@ int cr_dump_tasks(pid_t pid)
 	if (rdma_check_cross_tree_exclusivity(root_item))
 		goto err;
 
+	/*
+	 * QP restorability: refuse to dump a tree holding a QP whose
+	 * type or state v0 RESTORE_QP can't accept, or any SRQ at all
+	 * (v0 has no RESTORE_SRQ and v0 RESTORE_QP rejects SRQ-bound
+	 * QPs). Runs after coverage + exclusivity so we know the
+	 * tree's RDMA contexts are claimed and no cross-tree pid
+	 * collides on an EXCLUSIVE plugin's device. See
+	 * criu/rdma/precheck.c for the v0 contract details.
+	 */
+	if (rdma_check_qp_restorability(root_item))
+		goto err;
+
 	if (checkpoint_devices())
 		goto err;
 

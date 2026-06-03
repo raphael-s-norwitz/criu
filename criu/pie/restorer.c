@@ -970,6 +970,9 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 #ifndef UVERBS_METHOD_RESTORE_CQ
 #define UVERBS_METHOD_RESTORE_CQ		2
 #endif
+#ifndef UVERBS_METHOD_RESTORE_QP
+#define UVERBS_METHOD_RESTORE_QP		3
+#endif
 #ifndef UVERBS_ATTR_RESTORE_MR_HANDLE
 #define UVERBS_ATTR_RESTORE_MR_HANDLE		0
 #define UVERBS_ATTR_RESTORE_MR_PD_HANDLE	1
@@ -991,6 +994,20 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 #define UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL	5	/* unused; UA_OPTIONAL FD */
 #define UVERBS_ATTR_RESTORE_CQ_EVENT_FD		6	/* unused; UA_OPTIONAL FD */
 #define UVERBS_ATTR_RESTORE_CQ_RESP_CQE		7
+#endif
+#ifndef UVERBS_ATTR_RESTORE_QP_HANDLE
+#define UVERBS_ATTR_RESTORE_QP_HANDLE		0
+#define UVERBS_ATTR_RESTORE_QP_PD_HANDLE	1
+#define UVERBS_ATTR_RESTORE_QP_SEND_CQ_HANDLE	2
+#define UVERBS_ATTR_RESTORE_QP_RECV_CQ_HANDLE	3
+#define UVERBS_ATTR_RESTORE_QP_SRQ_HANDLE	4	/* unused for v0 RC/UD */
+#define UVERBS_ATTR_RESTORE_QP_TYPE		5
+#define UVERBS_ATTR_RESTORE_QP_STATE		6
+#define UVERBS_ATTR_RESTORE_QP_USER_HANDLE	7
+#define UVERBS_ATTR_RESTORE_QP_CAP		8
+#define UVERBS_ATTR_RESTORE_QP_CREATE_FLAGS	9
+#define UVERBS_ATTR_RESTORE_QP_EVENT_FD		10	/* unused; UA_OPTIONAL FD */
+#define UVERBS_ATTR_RESTORE_QP_RESP_QPN		11
 #endif
 
 /*
@@ -1142,6 +1159,222 @@ static int restore_rdma_cq(struct rst_rdma_cq *r)
 		"driver_id=%u, uhw_in=%u, uhw_out=%u) ok\n",
 		r->ufile_id, r->target_handle, r->cqe, resp_cqe,
 		r->comp_vector, r->kernel_driver_id,
+		r->uhw_in_len, r->uhw_out_attr_len);
+	return 0;
+}
+
+/*
+ * Issue UVERBS_METHOD_RESTORE_QP for one QP queued by Phase B-prep
+ * (criu/rdma/uobj_restore.c::rdma_prepare_rdma_qps). Runs from
+ * inside the pie blob after the user VMAs have been laid out at
+ * their original addresses, so mlx5_ib_umem_restore_qp's
+ * pin_user_pages_fast() against the WQ buffer + doorbell user-VAs
+ * succeeds against the destination task's mm.
+ *
+ * Wire encoding mirrors restore_rdma_cq: PD_HANDLE / SEND_CQ_HANDLE /
+ * RECV_CQ_HANDLE are IDR attrs (len=0, value inline in attr->data).
+ * TYPE / STATE / CREATE_FLAGS are u32 PTR_IN attrs that fit inline.
+ * USER_HANDLE is a u64 PTR_IN that fits inline. CAP is a 20-byte
+ * PTR_IN(struct ib_uverbs_qp_cap) -- exceeds the inline threshold,
+ * so attr->data carries a userspace VA (here, the address of the
+ * cap_buf array we lay out below). RESP_QPN is a u32 PTR_OUT
+ * attribute the kernel writes via copy_to_user; we receive the
+ * actual installed qpn back via &resp_qpn.
+ *
+ * Identity assertion (Step 6): the kernel installed qpn must equal
+ * the dump-side hint when @qpn_hint is non-zero. v0 mlx5 RESTORE_QP
+ * adopts the FW qpn from the UHW byte-for-byte, so RESP_QPN ==
+ * UHW.qpn == qpn_hint by construction. For rxe (future), RESP_QPN
+ * may differ from rxe_pool_alloc's chosen qpn -- that case will
+ * surface here as a "qpn drift" warning rather than a hard fail
+ * once rxe lands; for now the assertion is hard.
+ */
+static int restore_rdma_qp(struct rst_rdma_qp *r)
+{
+	/*
+	 * 12 attrs: 9 mandatory (handle, pd_handle, send_cq_handle,
+	 * recv_cq_handle, type, state, user_handle, cap, resp_qpn) +
+	 * 1 optional (create_flags, only when non-zero) + up to 2
+	 * plugin-shaped UHW (UHW_IN, UHW_OUT). Worst-case sizing.
+	 */
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[12];
+	} cmd = {};
+	/*
+	 * struct ib_uverbs_qp_cap mirror, laid out inline so we can
+	 * pass &cap_buf as the PTR_IN attr->data. Bytewise identical
+	 * to include/uapi/rdma/ib_user_verbs.h::struct ib_uverbs_qp_cap;
+	 * we mirror rather than include because pie compiles with a
+	 * minimal include surface.
+	 */
+	struct {
+		uint32_t max_send_wr;
+		uint32_t max_recv_wr;
+		uint32_t max_send_sge;
+		uint32_t max_recv_sge;
+		uint32_t max_inline_data;
+	} cap_buf = {
+		.max_send_wr = r->cap_max_send_wr,
+		.max_recv_wr = r->cap_max_recv_wr,
+		.max_send_sge = r->cap_max_send_sge,
+		.max_recv_sge = r->cap_max_recv_sge,
+		.max_inline_data = r->cap_max_inline_data,
+	};
+	uint32_t resp_qpn = 0;
+	uint8_t  uhw_out_actual[RST_RDMA_QP_UHW_OUT_MAX] = {};
+	unsigned int n = 0;
+	int ret;
+
+	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_QP;
+	cmd.hdr.driver_id = r->kernel_driver_id;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_HANDLE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->target_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_PD_HANDLE;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->parent_pd_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_SEND_CQ_HANDLE;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->send_cq_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_RECV_CQ_HANDLE;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->recv_cq_handle;
+	n++;
+
+	/*
+	 * UVERBS_ATTR_CONST_IN(_, enum_type, ...) expands to a PTR_IN
+	 * with min_len == max_len == sizeof(u64) regardless of the
+	 * enum's storage size (see include/rdma/uverbs_ioctl.h). The
+	 * value is carried inline in the attr data slot (which is u64
+	 * already), so the only thing this affects is the framework's
+	 * len gate -- it checks uattr->len >= 8 strictly.
+	 */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_TYPE;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->qp_type;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_STATE;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->qp_state;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_USER_HANDLE;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->user_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_CAP;
+	cmd.attrs[n].len = sizeof(cap_buf);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&cap_buf;
+	n++;
+
+	/*
+	 * CREATE_FLAGS_IN is optional; only emit when non-zero so we
+	 * don't burn a slot for the common "no special create flags"
+	 * case. Kernel uverbs_get_flags32 treats absent as zero.
+	 */
+	if (r->create_flags) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_CREATE_FLAGS;
+		cmd.attrs[n].len = sizeof(uint32_t);
+		cmd.attrs[n].flags = 0;
+		cmd.attrs[n].data = r->create_flags;
+		n++;
+	}
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_RESP_QPN;
+	cmd.attrs[n].len = sizeof(resp_qpn);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp_qpn;
+	n++;
+
+	if (r->uhw_in_len > 0) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
+		cmd.attrs[n].len = r->uhw_in_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)&r->uhw_in_buf;
+		n++;
+	}
+	if (r->uhw_out_attr_len > 0) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_OUT;
+		cmd.attrs[n].len = r->uhw_out_attr_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)uhw_out_actual;
+		n++;
+	}
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	ret = sys_ioctl(r->cmd_fd, RDMA_VERBS_IOCTL, (unsigned long)&cmd);
+	sys_close(r->cmd_fd);
+	if (ret < 0) {
+		pr_err("RDMA: ufile_id=%x RESTORE_QP(target_handle=%u, "
+		       "pd_handle=%u, send_cq=%u, recv_cq=%u, "
+		       "type=%u, state=%u, create_flags=%x, "
+		       "qpn_hint=%u, driver_id=%u, uhw_in=%u, uhw_out=%u) "
+		       "failed: %d\n",
+		       r->ufile_id, r->target_handle, r->parent_pd_handle,
+		       r->send_cq_handle, r->recv_cq_handle,
+		       r->qp_type, r->qp_state, r->create_flags,
+		       r->qpn_hint, r->kernel_driver_id,
+		       r->uhw_in_len, r->uhw_out_attr_len, ret);
+		return -1;
+	}
+
+	/*
+	 * Identity assertion (Step 6): the kernel must install the
+	 * QP at the same qpn the source had, otherwise wire-visible
+	 * peer state (peer's RC connection state, peer's hardware
+	 * AH cache, ...) is silently stale on the destination side
+	 * and round-trip continuity is broken. Only checked when the
+	 * dump-side captured a non-zero qpn_hint (NLDEV RES_LQPN);
+	 * the v0 path always populates it, but defending against the
+	 * rare image-without-LQPN case is cheap.
+	 */
+	if (r->qpn_hint != 0 && resp_qpn != r->qpn_hint) {
+		pr_err("RDMA: ufile_id=%x RESTORE_QP(target_handle=%u): "
+		       "kernel installed qpn=%u differs from dump-side "
+		       "hint qpn=%u; FW qpn-adoption broke for "
+		       "driver_id=%u\n",
+		       r->ufile_id, r->target_handle, resp_qpn,
+		       r->qpn_hint, r->kernel_driver_id);
+		return -1;
+	}
+
+	if (r->uhw_out_verify_len > 0 &&
+	    memcmp(uhw_out_actual, r->uhw_out_expected,
+		   r->uhw_out_verify_len) != 0) {
+		pr_err("RDMA: ufile_id=%x RESTORE_QP(target_handle=%u): "
+		       "kernel UHW_OUT echo (verify %u of %u bytes) does "
+		       "not match plugin's expected bytes\n",
+		       r->ufile_id, r->target_handle,
+		       r->uhw_out_verify_len, r->uhw_out_attr_len);
+		return -1;
+	}
+
+	pr_info("RDMA: ufile_id=%x RESTORE_QP(target_handle=%u, "
+		"resp_qpn=%u, type=%u, state=%u, "
+		"driver_id=%u, uhw_in=%u, uhw_out=%u) ok\n",
+		r->ufile_id, r->target_handle, resp_qpn, r->qp_type,
+		r->qp_state, r->kernel_driver_id,
 		r->uhw_in_len, r->uhw_out_attr_len);
 	return 0;
 }
@@ -2400,27 +2633,37 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			goto core_restore_end;
 
 	/*
-	 * RDMA per-uobject restore (CQs, MRs). Same "needs the user
-	 * mm laid out at its final VAs" rationale as AIO rings --
+	 * RDMA per-uobject restore (CQs, QPs, MRs). Same "needs the
+	 * user mm laid out at its final VAs" rationale as AIO rings --
 	 * mlx5_ib_umem_restore_cq pins the CQ buffer / doorbell pages
-	 * via pin_user_pages_fast against current->mm, and rxe's
-	 * RESTORE_MR pins the MR's user buffer the same way. Both
+	 * via pin_user_pages_fast against current->mm, mlx5_ib_umem_
+	 * restore_qp does the same for the WQ buffer / doorbell, and
+	 * rxe's RESTORE_MR pins the MR's user buffer the same way. All
 	 * only succeed once anon-private VMAs have actually been
 	 * mmap'd at the source-side addresses (the pie blob's job,
 	 * just above this loop). Issued here so any -EFAULT surfaces
 	 * against a fully-laid-out mm and is a real driver bug, not a
 	 * CRIU ordering artefact.
 	 *
-	 * CQ before MR: matches the kernel-side parent dependency
-	 * graph -- MR doesn't reference CQ but a future QP step would,
-	 * and issuing CQs first leaves the per-ufile handle space in a
-	 * forward-compatible order.
+	 * CQ before QP before MR: matches the kernel-side parent
+	 * dependency graph. QP's IDR attrs reference SEND_CQ and
+	 * RECV_CQ ufile_handles which the dispatcher resolves through
+	 * the destination ucontext IDR; if those CQ uobjects haven't
+	 * been installed yet, RESTORE_QP rejects with -ENOENT before
+	 * the driver runs. MR is independent and could equally well
+	 * run before CQ; QP-then-MR keeps the order forward-compat.
 	 */
 	if (args->rdma_cqs_n)
 		pr_info("RDMA: pie restorer: dispatching %u CQ(s)\n",
 			args->rdma_cqs_n);
 	for (i = 0; i < args->rdma_cqs_n; i++)
 		if (restore_rdma_cq(&args->rdma_cqs[i]) < 0)
+			goto core_restore_end;
+	if (args->rdma_qps_n)
+		pr_info("RDMA: pie restorer: dispatching %u QP(s)\n",
+			args->rdma_qps_n);
+	for (i = 0; i < args->rdma_qps_n; i++)
+		if (restore_rdma_qp(&args->rdma_qps[i]) < 0)
 			goto core_restore_end;
 	if (args->rdma_mrs_n)
 		pr_info("RDMA: pie restorer: dispatching %u MR(s)\n",

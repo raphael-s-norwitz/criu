@@ -256,6 +256,71 @@ struct rst_rdma_cq {
 	u8		uhw_out_expected[RST_RDMA_CQ_UHW_OUT_MAX];
 };
 
+/*
+ * Per-QP record consumed by the pie restorer to issue
+ * UVERBS_METHOD_RESTORE_QP. Same shape and motive as rst_rdma_cq:
+ * mlx5_ib_restore_qp pins user pages for the WQ buffer + doorbell
+ * (mlx5_ib_umem_restore_qp -> ib_umem_pin -> pin_user_pages_fast)
+ * against current->mm. CRIU master's mm doesn't have the dumpee's
+ * QP buf_addr / db_addr mapped, so issuing RESTORE_QP from there
+ * returns -EFAULT in the same way RESTORE_CQ did pre-pie. Defer to
+ * the pie restorer blob, which runs in the restoree's mm at
+ * sigreturn_restore time after VMAs are laid out at their original
+ * VAs.
+ *
+ * Wire encoding mirrors restore_rdma_cq's PTR_IN-inline trick: the
+ * QP_CAP attr is a PTR_IN(struct ib_uverbs_qp_cap, 20 bytes) which
+ * exceeds the 8-byte inline threshold, so cap is laid out as a
+ * static array in the rst record and its userspace VA is passed in
+ * attr->data. PD/SEND_CQ/RECV_CQ are IDR attrs (len=0, value
+ * inline). USER_HANDLE is a u64 PTR_IN (8 bytes; fits inline).
+ *
+ * Driver-private UHW comes from the per-driver RDMA plugin's
+ * RDMA_RESTORE_UOBJ_QP_UHW_PACK hook (invoked in CRIU master at
+ * rdma_prepare_rdma_qps time -- see the criu-plugin.h block on the
+ * pie-can't-call-plugins contract). UHW_OUT byte-template verify
+ * mirrors RESTORE_CQ exactly.
+ *
+ * Static array sizing: largest current-tree plugin UHW_IN is mlx5's
+ * struct mlx5_ib_restore_qp_req at 64 bytes; UHW_OUT is unused by
+ * mlx5 RESTORE_QP today (rxe RESTORE_QP isn't yet in tree, so we
+ * size UHW_OUT for forward-compat with whatever rxe will need).
+ * Bump if a future driver's UAPI grows past these.
+ */
+#define RST_RDMA_QP_UHW_IN_MAX	72
+#define RST_RDMA_QP_UHW_OUT_MAX	24
+
+struct rst_rdma_qp {
+	int		cmd_fd;
+	u32		ufile_id;		/* diagnostics only */
+	u32		kernel_driver_id;
+	u32		target_handle;
+	u32		parent_pd_handle;
+	u32		send_cq_handle;
+	u32		recv_cq_handle;
+	u32		qp_type;		/* enum ib_uverbs_qp_type */
+	u32		qp_state;		/* enum ib_qp_state */
+	u32		create_flags;
+	u32		qpn_hint;		/* identity hint; pie hard-asserts equality */
+	u64		user_handle;
+	/*
+	 * struct ib_uverbs_qp_cap (20 bytes). Stored inline so the
+	 * pie blob can pass &cap as the PTR_IN attr->data. Layout is
+	 * the kernel UAPI struct, copied bytewise from the master-
+	 * side RdmaQpCap fields by rdma_prepare_rdma_qps.
+	 */
+	u32		cap_max_send_wr;
+	u32		cap_max_recv_wr;
+	u32		cap_max_send_sge;
+	u32		cap_max_recv_sge;
+	u32		cap_max_inline_data;
+	u16		uhw_in_len;
+	u16		uhw_out_attr_len;
+	u16		uhw_out_verify_len;
+	u8		uhw_in_buf[RST_RDMA_QP_UHW_IN_MAX];
+	u8		uhw_out_expected[RST_RDMA_QP_UHW_OUT_MAX];
+};
+
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
@@ -301,6 +366,9 @@ struct task_restore_args {
 
 	struct rst_rdma_cq *rdma_cqs;
 	unsigned int rdma_cqs_n;
+
+	struct rst_rdma_qp *rdma_qps;
+	unsigned int rdma_qps_n;
 
 	struct rst_rdma_mr *rdma_mrs;
 	unsigned int rdma_mrs_n;

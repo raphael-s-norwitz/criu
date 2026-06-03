@@ -384,16 +384,19 @@ run_pass() {
 	#                      pin_user_pages_fast needs.
 	#
 	# Per-ufile summary line shape (uobj_restore.c::rdma_restore_uobj_dag_for_ufile):
-	#   "Phase A: restored N PD(s) [skipped M], R CQ(s) [skipped Q]; D CQ(s) + S MR(s) deferred ..."
-	# where R = master-restored CQs (rxe path) and D = pie-deferred
-	# CQs (mlx5 path). Their split is per-driver-plugin via the
+	#   "Phase A: restored N PD(s) [skipped M], R CQ(s) [skipped Q]; D CQ(s) + Q QP(s) [skipped V] + S MR(s) deferred ..."
+	# where R = master-restored CQs (rxe path), D = pie-deferred
+	# CQs (mlx5 path), Q = pie-deferred QPs (mlx5 vfmig only --
+	# rxe never hits this column today since the rxe runner doesn't
+	# build pre-dump QPs and rxe's QP path predates the v0
+	# RESTORE_QP work). Their CQ split is per-driver-plugin via the
 	# RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE hook (default: master).
 	#
 	# Mode-specific minima:
-	#   pd_mr  R=0  D=0  S>=1 : 1 PD,  0 CQ,        >=1 MR deferred + pie MR ok
-	#   pd_cq (rxe)  R>=1 D=0 S=0 : 1 PD, >=1 CQ master-restored, 0 deferred
-	#   pd_cq (mlx5) R=0 D>=1 S=0 : 1 PD, 0 master, >=1 CQ pie-deferred + pie CQ ok
-	if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [0-9]+ CQ\(s\) \[skipped [0-9]+\]; [0-9]+ CQ\(s\) \+ [0-9]+ MR\(s\) deferred' \
+	#   pd_mr  R=0  D=0  Q=0 S>=1 : 1 PD,  0 CQ,        >=1 MR deferred + pie MR ok
+	#   pd_cq (rxe)  R>=1 D=0 Q=0 S=0 : 1 PD, >=1 CQ master-restored, 0 deferred
+	#   pd_cq (mlx5) R=0 D>=1 Q=0 S=0 : 1 PD, 0 master, >=1 CQ pie-deferred + pie CQ ok
+	if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], [0-9]+ CQ\(s\) \[skipped [0-9]+\]; [0-9]+ CQ\(s\) \+ [0-9]+ QP\(s\) \[skipped [0-9]+\] \+ [0-9]+ MR\(s\) deferred' \
 		"$DUMPDIR/restore.log"; then
 		echo "FAIL: restore.log shows no RESTORE_PD Phase-A dispatch" \
 		     "by rdma_restore_uobj_dag_for_ufile() -- the per-ufile" \
@@ -406,7 +409,7 @@ run_pass() {
 	fi
 
 	if [[ "$holder_mode" == "pd_mr" ]]; then
-		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], 0 CQ\(s\) \[skipped 0\]; 0 CQ\(s\) \+ [1-9][0-9]* MR\(s\) deferred' \
+		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], 0 CQ\(s\) \[skipped 0\]; 0 CQ\(s\) \+ 0 QP\(s\) \[skipped 0\] \+ [1-9][0-9]* MR\(s\) deferred' \
 			"$DUMPDIR/restore.log"; then
 			echo "FAIL: pd_mr Phase-A summary line did not show" \
 			     ">=1 MR deferred for post-VMA Phase B." >&2
@@ -456,7 +459,7 @@ run_pass() {
 		# hook), so the Phase A line shows R=$min_cq master-
 		# restored CQs and 0 deferred. mlx5 is the inverse;
 		# the mlx5 runner (run_vfmig_cr.sh) asserts that shape.
-		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], '"$min_cq"' CQ\(s\) \[skipped 0\]; 0 CQ\(s\) \+ 0 MR\(s\) deferred' \
+		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], '"$min_cq"' CQ\(s\) \[skipped 0\]; 0 CQ\(s\) \+ 0 QP\(s\) \[skipped 0\] \+ 0 MR\(s\) deferred' \
 			"$DUMPDIR/restore.log"; then
 			echo "FAIL: $holder_mode Phase-A summary line did" \
 			     "not show $min_cq CQ(s) master-restored with" \

@@ -953,6 +953,8 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	int n_cq_restored = 0;
 	int n_cq_pending = 0;
 	int n_cq_skipped = 0;
+	int n_qp_pending = 0;
+	int n_qp_skipped = 0;
 	int n_mr_pending = 0;
 	bool cq_in_pie = false;
 	int ret = -1;
@@ -1276,6 +1278,35 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	}
 
 	/*
+	 * Pass 2.5 (deferred): count QP entries so the Phase B stash
+	 * gate fires when a ufile has only PDs+QPs (e.g. the
+	 * pd_cq_qp host fixture in test/rdma/uverbs_ctx_holder.c
+	 * builds 1 CQ + 1 QP, but a future fixture might drop the
+	 * CQ if RESTORE_QP gains stand-alone coverage). QPs are
+	 * always pie-deferred for v0 (NEEDS_PIE=1 across every
+	 * registered plugin) so master-side dispatch isn't even an
+	 * option here -- the only decision is "do we have any QPs at
+	 * all" -> "stash the cmd_fd dup so rdma_prepare_rdma_qps()
+	 * can find it on rdma_pending_post_vma".
+	 *
+	 * The handle_map for QPs is filled in rdma_prepare_rdma_qps()
+	 * itself (it owns the qp restrack_id -> ufile_handle mapping
+	 * because no later phase needs a QP-keyed xref); we just need
+	 * the count here to drive the stash gate + log line.
+	 */
+	list_for_each_entry(c, &g->entries, link) {
+		const RdmaUobjEntry *e = c->e;
+
+		if (e->type != R3_UOBJ_TYPE__R3UT_QP)
+			continue;
+		if (!e->has_ufile_handle) {
+			n_qp_skipped++;
+			continue;
+		}
+		n_qp_pending++;
+	}
+
+	/*
 	 * Pass 3 (deferred): count VA-dependent MR entries so we know
 	 * whether to stash this ufile for Phase B alongside the CQ count.
 	 */
@@ -1286,7 +1317,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			n_mr_pending++;
 	}
 
-	if (n_cq_pending + n_mr_pending > 0) {
+	if (n_cq_pending + n_qp_pending + n_mr_pending > 0) {
 		int dup;
 
 		/*
@@ -1334,13 +1365,16 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 	ret = 0;
 out:
 	if (n_pd_restored || n_pd_skipped || n_cq_restored ||
-	    n_cq_pending || n_cq_skipped || n_mr_pending)
+	    n_cq_pending || n_cq_skipped || n_qp_pending || n_qp_skipped ||
+	    n_mr_pending)
 		pr_info("uobj DAG: ufile_id=%#x Phase A: restored %d PD(s) "
 			"[skipped %d], %d CQ(s) [skipped %d]; %d CQ(s) + "
-			"%d MR(s) deferred to post-VMA Phase B\n",
+			"%d QP(s) [skipped %d] + %d MR(s) deferred to "
+			"post-VMA Phase B\n",
 			ufile_id, n_pd_restored, n_pd_skipped,
 			n_cq_restored, n_cq_skipped,
-			n_cq_pending, n_mr_pending);
+			n_cq_pending, n_qp_pending, n_qp_skipped,
+			n_mr_pending);
 	xfree(handle_map.e);
 	return ret;
 }
@@ -1592,6 +1626,321 @@ int rdma_prepare_rdma_cqs(struct task_restore_args *ta)
 
 	if (ret == 0)
 		pr_info("uobj DAG: Phase B-prep: %u CQ(s) total queued "
+			"for pie-restorer dispatch\n", n_total_serialised);
+	return ret;
+}
+
+/*
+ * Phase B-prep for per-QP pie-deferred restore. Walks
+ * rdma_pending_post_vma read-only (rdma_prepare_rdma_mrs deletes
+ * the entries when it runs after us), picks R3UT_QP entries,
+ * resolves PARENT_PD / SEND_CQ / RECV_CQ xrefs through p->handle_map,
+ * invokes the cached plugin's RDMA_RESTORE_UOBJ_QP_UHW_PACK hook,
+ * and serialises the per-QP ioctl args + plugin-shaped UHW into
+ * ta->rdma_qps[] (RM_PRIVATE) for the pie restorer blob.
+ *
+ * Per-QP cmd_fd is a fresh dup of p->cmd_fd_dup (matching the per-CQ
+ * and per-MR pattern): each rst_rdma_qp owns its fd and the pie
+ * helper closes it after the ioctl, so one QP's close doesn't
+ * poison a sibling QP's ioctl.
+ *
+ * NEEDS_PIE gating: only QPs whose plugin opts in (mlx5 today; rxe
+ * RESTORE_QP isn't yet in tree) get serialised. A future driver
+ * with VA-independent RESTORE_QP would issue from Phase A through
+ * a master-side rdma_send_restore_qp (analogous to
+ * rdma_send_restore_cq); this function would skip its entries.
+ * For v0 the gate is a defence-in-depth: all in-tree drivers that
+ * implement RESTORE_QP need pie deferral.
+ */
+int rdma_prepare_rdma_qps(struct task_restore_args *ta)
+{
+	struct uobj_pending_post_vma *p;
+	unsigned int n_total_serialised = 0;
+	int ret = 0;
+
+	ta->rdma_qps = (struct rst_rdma_qp *)rst_mem_align_cpos(RM_PRIVATE);
+	ta->rdma_qps_n = 0;
+
+	if (list_empty(&rdma_pending_post_vma))
+		return 0;
+
+	list_for_each_entry(p, &rdma_pending_post_vma, link) {
+		struct uobj_collected *c;
+		unsigned int n_qp_serialised = 0;
+		unsigned int n_qp_skipped = 0;
+		int per_ret = 0;
+		bool qp_in_pie = false;
+
+		/*
+		 * Per-driver dispatch site for RESTORE_QP. Mirrors the
+		 * gate in rdma_prepare_rdma_cqs: plugins without the
+		 * NEEDS_PIE hook either dispatched their QPs from
+		 * Phase A through a (future) master-side path, or
+		 * declined RESTORE_QP entirely. Re-queueing here when
+		 * a Phase A path already installed the handle would
+		 * -EBUSY at the now-occupied target_handle.
+		 */
+		if (p->plugin && p->plugin->d->hooks[
+			CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE]) {
+			CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE_t *fn =
+				p->plugin->d->hooks[
+				CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE];
+			qp_in_pie = (fn() != 0);
+		}
+		if (!qp_in_pie)
+			continue;
+
+		list_for_each_entry(c, &p->g->entries, link) {
+			const RdmaUobjEntry *e = c->e;
+			const RdmaQpAttrs *attrs;
+			struct rst_rdma_qp *r;
+			struct rdma_uhw_spec uhw = {};
+			uint32_t parent_pd_handle = 0;
+			uint32_t send_cq_handle = 0;
+			uint32_t recv_cq_handle = 0;
+			int dup_fd;
+			int pack_rc = 0;
+
+			if (e->type != R3_UOBJ_TYPE__R3UT_QP)
+				continue;
+			if (!e->has_ufile_handle) {
+				n_qp_skipped++;
+				continue;
+			}
+			attrs = e->qp;
+			/*
+			 * RESTORE_QP's MANDATORY core attrs: TYPE, STATE,
+			 * USER_HANDLE, CAP. CAP needs all five sub-fields
+			 * because the kernel struct ib_uverbs_qp_cap is
+			 * a fixed-size PTR_IN. The dump-side mlx5 plugin
+			 * fills the cap from QUERY_QP RESP_CAP (kernel
+			 * commit S6b B5); pre-S6b dumps land here with
+			 * cap == NULL and we refuse the entry rather than
+			 * silently fabricate zeros that the destination
+			 * driver might round-up to a different WQ shape.
+			 */
+			if (!attrs ||
+			    !attrs->has_qp_type || !attrs->has_state ||
+			    !attrs->has_user_handle || !attrs->cap) {
+				pr_err("uobj DAG: ufile_id=%#x QP"
+				       "(handle=%u, restrack_id=%s%u) "
+				       "is missing one or more RESTORE_"
+				       "QP feed fields (have type=%d "
+				       "state=%d user_handle=%d cap=%p). "
+				       "Re-dump against a kernel that "
+				       "emits MLX5_IB_METHOD_VFMIG_QUERY"
+				       "_QP RESP_TYPE/STATE/USER_HANDLE/"
+				       "CAP.\n",
+				       p->ufile_id, e->ufile_handle,
+				       e->has_restrack_id ? "" : "?",
+				       e->has_restrack_id ?
+				       e->restrack_id : 0,
+				       attrs ? attrs->has_qp_type : 0,
+				       attrs ? attrs->has_state : 0,
+				       attrs ? attrs->has_user_handle : 0,
+				       attrs ? (void *)attrs->cap : NULL);
+				per_ret = -1;
+				break;
+			}
+			if (!uobj_resolve_parent(
+					e, R3_XREF_ROLE__R3XR_PARENT_PD,
+					&p->handle_map,
+					&parent_pd_handle)) {
+				pr_err("uobj DAG: ufile_id=%#x QP"
+				       "(handle=%u): no resolvable "
+				       "PARENT_PD xref. RESTORE_QP "
+				       "needs a PD already restored in "
+				       "Phase A.\n",
+				       p->ufile_id, e->ufile_handle);
+				per_ret = -1;
+				break;
+			}
+			if (!uobj_resolve_parent(
+					e, R3_XREF_ROLE__R3XR_SEND_CQ,
+					&p->handle_map,
+					&send_cq_handle)) {
+				pr_err("uobj DAG: ufile_id=%#x QP"
+				       "(handle=%u): no resolvable "
+				       "SEND_CQ xref. The dump's image "
+				       "lacks RES_SEND_CQN -- update "
+				       "the kernel to emit it via "
+				       "fill_res_qp_entry. RESTORE_QP "
+				       "rejects with -ENOENT before "
+				       "the driver runs without it.\n",
+				       p->ufile_id, e->ufile_handle);
+				per_ret = -1;
+				break;
+			}
+			if (!uobj_resolve_parent(
+					e, R3_XREF_ROLE__R3XR_RECV_CQ,
+					&p->handle_map,
+					&recv_cq_handle)) {
+				pr_err("uobj DAG: ufile_id=%#x QP"
+				       "(handle=%u): no resolvable "
+				       "RECV_CQ xref. Same kernel "
+				       "patch needed as SEND_CQ above.\n",
+				       p->ufile_id, e->ufile_handle);
+				per_ret = -1;
+				break;
+			}
+
+			dup_fd = fcntl(p->cmd_fd_dup, F_DUPFD_CLOEXEC,
+				       1 << 14);
+			if (dup_fd < 0) {
+				pr_err("uobj DAG: ufile_id=%#x QP"
+				       "(handle=%u): F_DUPFD_CLOEXEC "
+				       "of cdev fd for pie restorer "
+				       "failed: %s\n",
+				       p->ufile_id, e->ufile_handle,
+				       strerror(errno));
+				per_ret = -1;
+				break;
+			}
+
+			r = rst_mem_alloc(sizeof(*r), RM_PRIVATE);
+			if (!r) {
+				pr_err("uobj DAG: ufile_id=%#x QP"
+				       "(handle=%u): rst_mem_alloc("
+				       "RM_PRIVATE, %zu) failed -- "
+				       "cannot serialise into pie "
+				       "restorer args\n",
+				       p->ufile_id, e->ufile_handle,
+				       sizeof(*r));
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+
+			r->cmd_fd = dup_fd;
+			r->ufile_id = p->ufile_id;
+			r->kernel_driver_id = p->kernel_driver_id;
+			r->target_handle = e->ufile_handle;
+			r->parent_pd_handle = parent_pd_handle;
+			r->send_cq_handle = send_cq_handle;
+			r->recv_cq_handle = recv_cq_handle;
+			r->qp_type = attrs->qp_type;
+			r->qp_state = attrs->state;
+			r->create_flags = attrs->has_create_flags ?
+					  attrs->create_flags : 0;
+			r->qpn_hint = attrs->has_qp_num ?
+				      attrs->qp_num : 0;
+			r->user_handle = attrs->user_handle;
+			r->cap_max_send_wr = attrs->cap->has_max_send_wr ?
+					     attrs->cap->max_send_wr : 0;
+			r->cap_max_recv_wr = attrs->cap->has_max_recv_wr ?
+					     attrs->cap->max_recv_wr : 0;
+			r->cap_max_send_sge = attrs->cap->has_max_send_sge ?
+					      attrs->cap->max_send_sge : 0;
+			r->cap_max_recv_sge = attrs->cap->has_max_recv_sge ?
+					      attrs->cap->max_recv_sge : 0;
+			r->cap_max_inline_data =
+				attrs->cap->has_max_inline_data ?
+				attrs->cap->max_inline_data : 0;
+			r->uhw_in_len = 0;
+			r->uhw_out_attr_len = 0;
+			r->uhw_out_verify_len = 0;
+
+			if (p->plugin && p->plugin->d->hooks[
+				CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK]) {
+				CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK_t *fn =
+					p->plugin->d->hooks[
+					CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK];
+				pack_rc = fn(e, &uhw);
+				if (pack_rc) {
+					pr_err("uobj DAG: ufile_id=%#x QP"
+					       "(handle=%u): plugin '%s' "
+					       "RESTORE_UOBJ_QP_UHW_PACK "
+					       "failed: %d (%s)\n",
+					       p->ufile_id, e->ufile_handle,
+					       p->plugin->d->name, pack_rc,
+					       strerror(-pack_rc));
+					close(dup_fd);
+					per_ret = -1;
+					break;
+				}
+			}
+			if (uhw.in_len > sizeof(r->uhw_in_buf)) {
+				pr_err("uobj DAG: ufile_id=%#x QP"
+				       "(handle=%u): plugin '%s' UHW_IN "
+				       "size %zu exceeds rst_rdma_qp "
+				       "static buffer (%zu); bump "
+				       "RST_RDMA_QP_UHW_IN_MAX in "
+				       "criu/include/restorer.h\n",
+				       p->ufile_id, e->ufile_handle,
+				       p->plugin ? p->plugin->d->name :
+				       "(none)",
+				       uhw.in_len,
+				       sizeof(r->uhw_in_buf));
+				free(uhw.in_buf);
+				free(uhw.out_buf);
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+			if (uhw.out_len > sizeof(r->uhw_out_expected)) {
+				pr_err("uobj DAG: ufile_id=%#x QP"
+				       "(handle=%u): plugin '%s' UHW_OUT "
+				       "expected size %zu exceeds "
+				       "rst_rdma_qp static buffer (%zu); "
+				       "bump RST_RDMA_QP_UHW_OUT_MAX in "
+				       "criu/include/restorer.h\n",
+				       p->ufile_id, e->ufile_handle,
+				       p->plugin ? p->plugin->d->name :
+				       "(none)",
+				       uhw.out_len,
+				       sizeof(r->uhw_out_expected));
+				free(uhw.in_buf);
+				free(uhw.out_buf);
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+			if (uhw.verify_len > uhw.out_len) {
+				pr_err("uobj DAG: ufile_id=%#x QP"
+				       "(handle=%u): plugin '%s' UHW "
+				       "verify_len %zu exceeds out_len "
+				       "%zu; PACK contract violation\n",
+				       p->ufile_id, e->ufile_handle,
+				       p->plugin ? p->plugin->d->name :
+				       "(none)",
+				       uhw.verify_len, uhw.out_len);
+				free(uhw.in_buf);
+				free(uhw.out_buf);
+				close(dup_fd);
+				per_ret = -1;
+				break;
+			}
+			if (uhw.in_len) {
+				memcpy(r->uhw_in_buf, uhw.in_buf,
+				       uhw.in_len);
+				r->uhw_in_len = (uint16_t)uhw.in_len;
+			}
+			if (uhw.out_len) {
+				memcpy(r->uhw_out_expected, uhw.out_buf,
+				       uhw.out_len);
+				r->uhw_out_attr_len =
+					(uint16_t)uhw.out_len;
+				r->uhw_out_verify_len =
+					(uint16_t)uhw.verify_len;
+			}
+			free(uhw.in_buf);
+			free(uhw.out_buf);
+
+			n_qp_serialised++;
+			ta->rdma_qps_n++;
+		}
+
+		pr_info("uobj DAG: ufile_id=%#x Phase B-prep: serialised "
+			"%u QP(s) [skipped %u] for pie restorer\n",
+			p->ufile_id, n_qp_serialised, n_qp_skipped);
+		n_total_serialised += n_qp_serialised;
+
+		if (per_ret < 0)
+			ret = -1;
+	}
+
+	if (ret == 0)
+		pr_info("uobj DAG: Phase B-prep: %u QP(s) total queued "
 			"for pie-restorer dispatch\n", n_total_serialised);
 	return ret;
 }

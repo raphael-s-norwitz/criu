@@ -486,3 +486,263 @@ int rdma_check_cross_tree_exclusivity(struct pstree_item *root)
 	xfree(cc.tuples);
 	return ret;
 }
+
+/*
+ * Pre-suspend per-QP coverage check.
+ *
+ * Walks the host's QPs and SRQs via NLDEV and refuses the dump if
+ * any in-tree pid holds:
+ *
+ *   - a QP whose qp_type is not in {IB_QPT_RC, IB_QPT_UD}
+ *   - a QP whose qp_state is not in {IB_QPS_RESET, IB_QPS_INIT,
+ *     IB_QPS_RTR, IB_QPS_RTS}
+ *   - any SRQ uobject (no per-QP SRQ binding is exposed by NLDEV
+ *     today, so the conservative defence-in-depth is "no SRQ
+ *     uobjects in the tree at all"; tightens to per-QP once
+ *     fill_res_qp_entry surfaces the SRQ join)
+ *
+ * Why pre-suspend rather than per-QP at dump time: an unsupported
+ * QP halfway through the dump leaves the ufiles half-captured and
+ * forces the operator to sift through a noisy mid-dump failure to
+ * understand the contract violation. Surfacing this gate before
+ * SIGSTOP gives a single actionable message naming the tree pid
+ * and the offending QP/SRQ identity.
+ *
+ * Constants are inlined here rather than imported from the kernel
+ * tree because criu is userspace and the IB_QPT_/IB_QPS_ enums are
+ * not in any rdma-core UAPI header (the UAPI ib_uverbs_qp_type
+ * enum is gappy and skips IB_QPT_SMI/GSI; the kernel walker
+ * emits the kernel enum values via NLDEV's u8 RES_TYPE/RES_STATE,
+ * so we mirror those numerically).
+ */
+enum {
+	CRIU_IB_QPT_RC		= 2,
+	CRIU_IB_QPT_UC		= 3,
+	CRIU_IB_QPT_UD		= 4,
+};
+enum {
+	CRIU_IB_QPS_RESET	= 0,
+	CRIU_IB_QPS_INIT	= 1,
+	CRIU_IB_QPS_RTR		= 2,
+	CRIU_IB_QPS_RTS		= 3,
+	CRIU_IB_QPS_SQD		= 4,
+	CRIU_IB_QPS_SQE		= 5,
+	CRIU_IB_QPS_ERR		= 6,
+};
+
+struct qp_cov_ctx {
+	const pid_t *tree_pids;
+	size_t n_tree_pids;
+	int fail_pid;
+	char fail_ibdev[64];
+	uint32_t fail_lqpn;
+	uint8_t fail_qp_type;
+	uint8_t fail_qp_state;
+	enum {
+		QP_COV_OK = 0,
+		QP_COV_BAD_TYPE,
+		QP_COV_BAD_STATE,
+		QP_COV_HAS_SRQ,
+	} fail_kind;
+};
+
+static bool qp_cov_pid_in_tree(const struct qp_cov_ctx *qc, pid_t pid)
+{
+	size_t i;
+
+	for (i = 0; i < qc->n_tree_pids; i++)
+		if (qc->tree_pids[i] == pid)
+			return true;
+	return false;
+}
+
+static const char *qp_cov_qp_type_str(uint8_t t)
+{
+	switch (t) {
+	case CRIU_IB_QPT_RC: return "RC";
+	case CRIU_IB_QPT_UC: return "UC";
+	case CRIU_IB_QPT_UD: return "UD";
+	default:	     return "<other>";
+	}
+}
+
+static const char *qp_cov_qp_state_str(uint8_t s)
+{
+	switch (s) {
+	case CRIU_IB_QPS_RESET: return "RESET";
+	case CRIU_IB_QPS_INIT:	return "INIT";
+	case CRIU_IB_QPS_RTR:	return "RTR";
+	case CRIU_IB_QPS_RTS:	return "RTS";
+	case CRIU_IB_QPS_SQD:	return "SQD";
+	case CRIU_IB_QPS_SQE:	return "SQE";
+	case CRIU_IB_QPS_ERR:	return "ERR";
+	default:		return "<other>";
+	}
+}
+
+static int qp_cov_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct qp_cov_ctx *qc = arg;
+
+	/*
+	 * NLDEV emits one RES_QP entry per QP regardless of pid.
+	 * Filter to in-tree pids; foreign-tree QPs are someone
+	 * else's problem (and by this point cross-tree-exclusivity
+	 * has already accepted the device for non-EXCLUSIVE plugins
+	 * or rejected it for EXCLUSIVE ones, so we can trust we're
+	 * the only owner of the device).
+	 */
+	if (!e->has_pid || !qp_cov_pid_in_tree(qc, e->pid))
+		return 0;
+
+	if (e->qp.qp_type != CRIU_IB_QPT_RC &&
+	    e->qp.qp_type != CRIU_IB_QPT_UD) {
+		qc->fail_pid = e->pid;
+		snprintf(qc->fail_ibdev, sizeof(qc->fail_ibdev), "%.*s",
+			 (int)(sizeof(qc->fail_ibdev) - 1), e->ibdev);
+		qc->fail_lqpn = e->qp.lqpn;
+		qc->fail_qp_type = e->qp.qp_type;
+		qc->fail_qp_state = e->qp.qp_state;
+		qc->fail_kind = QP_COV_BAD_TYPE;
+		return 1;
+	}
+	if (e->qp.qp_state > CRIU_IB_QPS_RTS) {
+		qc->fail_pid = e->pid;
+		snprintf(qc->fail_ibdev, sizeof(qc->fail_ibdev), "%.*s",
+			 (int)(sizeof(qc->fail_ibdev) - 1), e->ibdev);
+		qc->fail_lqpn = e->qp.lqpn;
+		qc->fail_qp_type = e->qp.qp_type;
+		qc->fail_qp_state = e->qp.qp_state;
+		qc->fail_kind = QP_COV_BAD_STATE;
+		return 1;
+	}
+	return 0;
+}
+
+static int qp_cov_srq_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct qp_cov_ctx *qc = arg;
+
+	if (!e->has_pid || !qp_cov_pid_in_tree(qc, e->pid))
+		return 0;
+
+	qc->fail_pid = e->pid;
+	snprintf(qc->fail_ibdev, sizeof(qc->fail_ibdev), "%.*s",
+		 (int)(sizeof(qc->fail_ibdev) - 1), e->ibdev);
+	qc->fail_kind = QP_COV_HAS_SRQ;
+	return 1;
+}
+
+struct qp_cov_walk_arg {
+	struct qp_cov_ctx *qc;
+	int stopped_kind;	/* 0 not-stopped, 1 stopped via cb */
+};
+
+static int qp_cov_per_ibdev_cb(uint32_t dev_index, const char *ibdev,
+			       void *arg)
+{
+	struct qp_cov_walk_arg *wa = arg;
+	int r;
+
+	r = rdma_nl_for_each_resource(dev_index, ibdev, RDMA_NL_RES_QP,
+				      qp_cov_qp_cb, wa->qc);
+	if (r < 0)
+		return r;
+	if (r == 1) {
+		wa->stopped_kind = 1;
+		return 1;
+	}
+
+	r = rdma_nl_for_each_resource(dev_index, ibdev, RDMA_NL_RES_SRQ,
+				      qp_cov_srq_cb, wa->qc);
+	if (r < 0)
+		return r;
+	if (r == 1) {
+		wa->stopped_kind = 1;
+		return 1;
+	}
+	return 0;
+}
+
+int rdma_check_qp_restorability(struct pstree_item *root)
+{
+	struct qp_cov_ctx qc = { 0 };
+	struct qp_cov_walk_arg wa = { .qc = &qc };
+	struct pstree_item *item;
+	pid_t *pids;
+	size_t n = 0, cap = 0;
+	int ret;
+
+	if (!root)
+		return 0;
+
+	for_each_pstree_item(item)
+		cap++;
+
+	if (cap == 0)
+		return 0;
+
+	pids = xmalloc(cap * sizeof(pid_t));
+	if (!pids)
+		return -1;
+
+	for_each_pstree_item(item)
+		pids[n++] = item->pid->real;
+
+	qc.tree_pids = pids;
+	qc.n_tree_pids = n;
+
+	pr_debug("pre-suspend RDMA QP restorability check: walking QPs and "
+		 "SRQs across all ibdevs for snapshot tree of %zu pid(s)\n",
+		 n);
+
+	ret = rdma_nl_for_each_ibdev(qp_cov_per_ibdev_cb, &wa);
+	xfree(pids);
+
+	if (ret < 0) {
+		pr_err("pre-suspend RDMA QP restorability check failed at "
+		       "netlink layer (%d). Failing closed: an unsupported "
+		       "QP type/state in the tree would otherwise surface "
+		       "as a mid-restore failure.\n", ret);
+		return -1;
+	}
+	if (ret == 0)
+		return 0;
+
+	switch (qc.fail_kind) {
+	case QP_COV_BAD_TYPE:
+		pr_err("pre-suspend RDMA QP restorability: pid %d holds a "
+		       "QP on ibdev=%s lqpn=%u with qp_type=%u (%s); v0 "
+		       "RESTORE_QP only supports RC and UD. Refusing to "
+		       "dump a tree whose QP types can't round-trip.\n",
+		       qc.fail_pid, qc.fail_ibdev, qc.fail_lqpn,
+		       qc.fail_qp_type,
+		       qp_cov_qp_type_str(qc.fail_qp_type));
+		break;
+	case QP_COV_BAD_STATE:
+		pr_err("pre-suspend RDMA QP restorability: pid %d holds a "
+		       "QP on ibdev=%s lqpn=%u in qp_state=%u (%s); v0 "
+		       "RESTORE_QP only accepts {RESET, INIT, RTR, RTS}. "
+		       "{SQD, SQE, ERR} are refused at restore-time; "
+		       "refusing the dump to avoid an unrecoverable "
+		       "round-trip.\n",
+		       qc.fail_pid, qc.fail_ibdev, qc.fail_lqpn,
+		       qc.fail_qp_state,
+		       qp_cov_qp_state_str(qc.fail_qp_state));
+		break;
+	case QP_COV_HAS_SRQ:
+		pr_err("pre-suspend RDMA QP restorability: pid %d holds an "
+		       "SRQ on ibdev=%s; v0 RESTORE_QP rejects SRQ-bound QPs "
+		       "and there is no v0 RESTORE_SRQ verb. Refusing the "
+		       "dump until per-QP SRQ binding is exposed by NLDEV "
+		       "and the v0 contract relaxes.\n",
+		       qc.fail_pid, qc.fail_ibdev);
+		break;
+	default:
+		pr_err("pre-suspend RDMA QP restorability: unknown failure "
+		       "kind %d (pid=%d ibdev=%s)\n",
+		       qc.fail_kind, qc.fail_pid, qc.fail_ibdev);
+	}
+	(void)wa;
+	return -1;
+}
