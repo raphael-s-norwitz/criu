@@ -204,6 +204,31 @@ int rdma_prepare_rdma_mrs(struct task_restore_args *ta);
 int rdma_prepare_rdma_cqs(struct task_restore_args *ta);
 
 /*
+ * Phase B-prep for per-QP pie-deferred restore. Mirror of
+ * rdma_prepare_rdma_cqs / rdma_prepare_rdma_mrs: walks
+ * rdma_pending_post_vma's groups, picks R3UT_QP entries, invokes
+ * the cached plugin's RDMA_RESTORE_UOBJ_QP_UHW_PACK hook, and
+ * serialises the per-QP ioctl args (HANDLE, PD_HANDLE, SEND_CQ_
+ * HANDLE, RECV_CQ_HANDLE, TYPE, STATE, USER_HANDLE, CAP, optional
+ * CREATE_FLAGS) + plugin-shaped UHW into ta->rdma_qps (RM_PRIVATE).
+ * The pie blob iterates and issues UVERBS_METHOD_RESTORE_QP at
+ * sigreturn_restore time. Required because mlx5_ib_restore_qp pins
+ * user pages for the WQ buffer / doorbell from source-side VAs that
+ * only exist in the restored task's mm.
+ *
+ * Runs after rdma_prepare_rdma_cqs so the per-ufile handle_map has
+ * every CQ's restrack_id -> ufile_handle entry available for
+ * SEND_CQ / RECV_CQ xref resolution. Runs before rdma_prepare_rdma_
+ * mrs because that function deletes the rdma_pending_post_vma
+ * entries; the QP B-prep needs them intact.
+ *
+ * Returns 0 on success; -1 on the first per-entry serialisation
+ * failure (rst_mem OOM, missing required attrs, unresolvable
+ * PARENT_PD / SEND_CQ / RECV_CQ xref, plugin PACK failure).
+ */
+int rdma_prepare_rdma_qps(struct task_restore_args *ta);
+
+/*
  * Internal-but-shared helpers used by both criu/rdma.c and the
  * pre-suspend coverage check above. Defined in criu/rdma.c.
  *
@@ -319,5 +344,57 @@ int rdma_dispatch_dump_uobj_cq(plugin_desc_t *plugin,
 			       pid_t pid,
 			       RdmaCqAttrs *cq_attrs,
 			       ProtobufCBinaryData *plugin_blob);
+
+/*
+ * Per-QP dump-side dispatcher. Mirror of rdma_dispatch_dump_uobj_cq:
+ * calls @plugin's CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP if registered,
+ * splitting the QP payload across the hw-agnostic per-class
+ * @qp_attrs (filled by the dispatcher with the NLDEV-derived subset
+ * before the plugin sees them, plugin appends user_handle / cap /
+ * create_flags) and the driver-private @plugin_blob (mlx5: 64B
+ * mlx5_ib_restore_qp_req captured via MLX5_IB_METHOD_VFMIG_QUERY_QP;
+ * rxe: future RXE_METHOD_VFMIG_QUERY_QP shape).
+ *
+ * Optional hook semantics: a plugin that doesn't register the hook
+ * is a no-op success. Plugin -ENXIO is treated as a per-uobject skip
+ * (kernel-mode QP routed here by mistake) and surfaces as a
+ * successful dispatch; any other error is dump-fatal.
+ *
+ * No plugin-walk per call: @plugin is the pointer cached on
+ * struct rdma_dumped_ufile.plugin at CLAIM time. Must not be NULL.
+ */
+int rdma_dispatch_dump_uobj_qp(plugin_desc_t *plugin,
+			       const char *ibdev,
+			       uint32_t kernel_driver_id,
+			       int lfd, uint32_t ufile_handle,
+			       pid_t pid,
+			       RdmaQpAttrs *qp_attrs,
+			       ProtobufCBinaryData *plugin_blob);
+
+/*
+ * Pre-suspend per-QP coverage check. Walks every snapshot-tree
+ * pid's contexts via NLDEV's per-resource RES_QP / RES_SRQ dumps and
+ * refuses the dump if any QP violates the v0 RESTORE_QP contract:
+ *
+ *   * QP type not in {IB_QPT_RC, IB_QPT_UD}
+ *   * QP state not in {IB_QPS_RESET, IB_QPS_INIT, IB_QPS_RTR,
+ *     IB_QPS_RTS}
+ *   * SRQ uobjects exist on any in-tree ufile (v0 RESTORE_QP rejects
+ *     SRQ-bound QPs and v0 has no RESTORE_SRQ; the conservative
+ *     defence-in-depth here is "no SRQs at all in the tree". Tightens
+ *     to per-QP SRQ binding once NLDEV emits has_srq on QP entries).
+ *
+ * Same fail-closed posture as rdma_check_dump_coverage(): NLDEV
+ * errors abort the dump rather than silently letting an unsupported
+ * QP through to a mid-dump failure.
+ *
+ * Runs after rdma_check_dump_coverage() / rdma_check_cross_tree_
+ * exclusivity() so by the time we get here every snapshot-tree
+ * context has a claiming plugin and shared-device exclusivity has
+ * been validated. Per-driver QP filters (e.g. specific create_flags
+ * the driver's RESTORE_QP rejects) are out of scope here -- those
+ * land at dump time on the per-QP plugin DUMP hook.
+ */
+int rdma_check_qp_restorability(struct pstree_item *root);
 
 #endif /* __CR_RDMA_H__ */

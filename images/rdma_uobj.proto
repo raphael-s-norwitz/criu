@@ -268,6 +268,27 @@ message rdma_qp_attrs {
 	optional uint32		alt_port_num		= 29;
 	optional uint32		qp_access_flags		= 30;
 	optional uint32		sq_draining		= 31;
+
+	/*
+	 * Userspace tag the source passed as ibv_create_qp()'s
+	 * qp_context parameter, mirrored into ibqp->uobject->user_handle
+	 * by ib_uverbs_create_qp. RESTORE_QP takes this as a MANDATORY
+	 * input via UVERBS_ATTR_RESTORE_QP_USER_HANDLE; the kernel
+	 * stamps the new ib_uobject->user_handle with it so library
+	 * code that caches the tag survives the round-trip.
+	 *
+	 * Provenance:
+	 *   mlx5: MLX5_IB_METHOD_VFMIG_QUERY_QP.RESP_USER_HANDLE,
+	 *         filled at S6b B5 (kernel commit 760534e909c2).
+	 *   rxe:  the future RXE_METHOD_VFMIG_QUERY_QP companion (S6a;
+	 *         pending). Until then the field is absent and the
+	 *         restore-side encoder emits 0 (matches v0 holders that
+	 *         all pass NULL for ibv_create_qp's qp_context arg).
+	 *
+	 * NLDEV does not emit user_handle for QP; this is a per-driver
+	 * QUERY_QP-only field (the same shape as RESP_BLOB above).
+	 */
+	optional uint64		user_handle		= 40;
 };
 
 /*

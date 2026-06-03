@@ -194,6 +194,32 @@ struct rdma_nl_res_entry {
 			uint8_t qp_state;
 			bool has_port;
 			uint32_t port;
+			/*
+			 * SEND_CQN / RECV_CQN are the parent CQs' restrack
+			 * ids -- the join key R3 turns into SEND_CQ /
+			 * RECV_CQ xref edges. They are NOT emitted by
+			 * fill_res_qp_entry today: the kernel surfaces
+			 * dest_qp_num / lqpn / pdn / psns / port but not
+			 * the per-QP CQ binding. UVERBS_METHOD_RESTORE_QP
+			 * needs both as MANDATORY IDR(UVERBS_OBJECT_CQ)
+			 * attrs and the dispatcher rejects with -ENOENT
+			 * before the driver runs, so without these fields
+			 * the QP restore path can't be wired.
+			 *
+			 * Pending kernel ask: extend fill_res_qp_entry to
+			 * emit RDMA_NLDEV_ATTR_RES_SEND_CQN /
+			 * RDMA_NLDEV_ATTR_RES_RECV_CQN (mirrors the
+			 * existing fill_res_srq_entry RES_CQN emission).
+			 * Until landed, has_send_cqn / has_recv_cqn stay
+			 * false and the dump-side QP walker emits R3UT_QP
+			 * entries with no SEND_CQ / RECV_CQ xrefs -- which
+			 * the master-side master/PIE seam refuses with a
+			 * clear "needs RES_{SEND,RECV}_CQN" diagnostic.
+			 */
+			bool has_send_cqn;
+			uint32_t send_cqn;
+			bool has_recv_cqn;
+			uint32_t recv_cqn;
 		} qp;
 		struct {
 			uint64_t mrlen;

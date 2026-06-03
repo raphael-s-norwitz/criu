@@ -75,6 +75,28 @@
 #endif
 
 /*
+ * Compat shim for the per-QP CQ-binding NLDEV emission landing
+ * alongside the Linux S6b QP-restore path. fill_res_qp_entry needs
+ * to emit the source QP's send_cq.uobject->res.id and recv_cq.
+ * uobject->res.id so a CRIU dump can build R3XR_SEND_CQ /
+ * R3XR_RECV_CQ xref edges that resolve to ufile_handle through the
+ * existing CQ handle_map. Without these, UVERBS_METHOD_RESTORE_QP's
+ * MANDATORY IDR(UVERBS_OBJECT_CQ) attrs cannot be filled and the
+ * dispatcher rejects with -ENOENT before the driver runs.
+ *
+ * Slot ids 106 / 107 reserve the first two free positions after K8a
+ * (RES_HANDLE = 105). The kernel patch lands the symbolic names; the
+ * runtime emission is u32, so this build picks them up by numeric
+ * value once the kernel is updated.
+ */
+#ifndef RDMA_NLDEV_ATTR_RES_SEND_CQN
+#define RDMA_NLDEV_ATTR_RES_SEND_CQN 106
+#endif
+#ifndef RDMA_NLDEV_ATTR_RES_RECV_CQN
+#define RDMA_NLDEV_ATTR_RES_RECV_CQN 107
+#endif
+
+/*
  * libnl3's nla_parse stores attribute pointers in a caller-supplied
  * table indexed by nla_type, bounded by the @maxtype argument. We
  * size that argument off RDMA_NLDEV_ATTR_MAX, which on older host
@@ -82,12 +104,13 @@
  * RDMA_NLDEV_ATTR_MAX cap silently drops the new attr and stack-
  * overruns reads past tb[]. Take the max of the host enum tail and
  * (compat constant + 1) to keep both the table and the parse range
- * large enough on either kernel.
+ * large enough on either kernel. RES_RECV_CQN is the highest of the
+ * three CRIU-extended slots so we anchor the cap there.
  */
 #define CRIU_RDMA_NLDEV_ATTR_TBSZ \
-	(RDMA_NLDEV_ATTR_MAX > (RDMA_NLDEV_ATTR_RES_HANDLE + 1) \
+	(RDMA_NLDEV_ATTR_MAX > (RDMA_NLDEV_ATTR_RES_RECV_CQN + 1) \
 		? RDMA_NLDEV_ATTR_MAX \
-		: (RDMA_NLDEV_ATTR_RES_HANDLE + 1))
+		: (RDMA_NLDEV_ATTR_RES_RECV_CQN + 1))
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "rdma_netlink: "
@@ -679,6 +702,27 @@ static int parse_res_entry(struct nlattr *entry,
 		if (tb[RDMA_NLDEV_ATTR_PORT_INDEX]) {
 			e->qp.has_port = true;
 			e->qp.port = nla_get_u32(tb[RDMA_NLDEV_ATTR_PORT_INDEX]);
+		}
+		/*
+		 * RES_SEND_CQN / RES_RECV_CQN are the parent CQ
+		 * restrack ids the (pending) kernel patch will emit
+		 * out of fill_res_qp_entry; presence-gated so a
+		 * pre-patch host header silently leaves the fields
+		 * unset and the QP entry lands without SEND_CQ /
+		 * RECV_CQ xrefs. The R3 dump-side walker emits a
+		 * pr_warn on absence so the kernel-version
+		 * requirement surfaces at dump time rather than as a
+		 * mid-restore -ENOENT from RESTORE_QP's IDR check.
+		 */
+		if (tb[RDMA_NLDEV_ATTR_RES_SEND_CQN]) {
+			e->qp.has_send_cqn = true;
+			e->qp.send_cqn =
+				nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_SEND_CQN]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_RECV_CQN]) {
+			e->qp.has_recv_cqn = true;
+			e->qp.recv_cqn =
+				nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_RECV_CQN]);
 		}
 		break;
 	case RDMA_NL_RES_MR:

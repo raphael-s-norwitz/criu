@@ -412,15 +412,42 @@ static void uobj_attach_parent_pd(RdmaUobjEntry *pe, RdmaUobjXref *xref,
 	pe->xref = xref_arr;
 }
 
-/* QP callback: PDN-join, NLDEV-derived qp identity hints. */
+/*
+ * QP callback: PDN-join, NLDEV-derived qp identity hints, plus
+ * per-driver QUERY_QP dispatch and SEND_CQ / RECV_CQ xref edges.
+ *
+ * The plugin dispatch is the same shape as the per-CQ one (see
+ * uobj_cq_cb): the cached uf->plugin (resolved at CLAIM time) gets
+ * its CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP invoked with the holder's
+ * uctx fd and the source ufile_handle, and fills @plugin_blob with
+ * its driver-private 64B per-QP payload (mlx5: byte-equal to
+ * struct mlx5_ib_restore_qp_req captured via
+ * MLX5_IB_METHOD_VFMIG_QUERY_QP) plus user_handle / type / state /
+ * cap / create_flags into the parallel hw-agnostic fields.
+ *
+ * SEND_CQ / RECV_CQ xref population is presence-gated on the (still
+ * pending) NLDEV emission of RDMA_NLDEV_ATTR_RES_SEND_CQN /
+ * RES_RECV_CQN out of fill_res_qp_entry. Without those attrs the
+ * dump-side has no kernel-blessed way to learn the QP-to-CQ binding
+ * (QUERY_QP's RESP_BLOB carries the FW qpn but no CQ identity, and
+ * neither the legacy IB_USER_VERBS_CMD_QUERY_QP write-path nor
+ * mlx5dv_init_obj cross address spaces). We log loudly when the
+ * fields are absent so the missing kernel emission surfaces at dump
+ * time, but still emit the entry: the master/PIE seam will refuse
+ * the QP at restore-time with a clear "needs RES_{SEND,RECV}_CQN"
+ * diagnostic, keeping the failure mode actionable rather than a
+ * mid-restore -ENOENT from RESTORE_QP's IDR check.
+ */
 static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 {
 	struct uobj_walk_ctx *w = arg;
 	struct rdma_dumped_ufile *uf;
 	RdmaUobjEntry pe;
 	RdmaQpAttrs attrs;
-	RdmaUobjXref xref;
-	RdmaUobjXref *xref_arr[1];
+	RdmaQpCap cap;
+	RdmaUobjXref xrefs[3];
+	RdmaUobjXref *xref_arr[3];
+	int n_xref = 0;
 
 	if (!e->has_pdn) {
 		w->n_dropped++;
@@ -436,6 +463,16 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 			       e->has_restrack_id, e->restrack_id,
 			       e->has_ufile_handle, e->ufile_handle);
 	rdma_qp_attrs__init(&attrs);
+	/*
+	 * Attach the cap sub-message up-front (stack storage owned by
+	 * this callback). The plugin's RDMA_DUMP_UOBJ_QP hook fills its
+	 * fields in place; callers that don't run the hook (no
+	 * holder_uctx_fd, kernel pre-K8a) leave attrs.cap unset by
+	 * not touching the parent pointer below. This keeps cap
+	 * ownership on the dump-side stack rather than the plugin
+	 * heap, mirroring how rdma_uobj_xref are managed here.
+	 */
+	rdma_qp_cap__init(&cap);
 	attrs.has_qp_type = true;
 	attrs.qp_type = e->qp.qp_type;
 	attrs.has_state = true;
@@ -460,8 +497,96 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 	pe.qp = &attrs;
 
-	uobj_attach_parent_pd(&pe, &xref, xref_arr, e->pdn);
-	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
+	{
+		ProtobufCBinaryData plugin_blob = {};
+		bool ran_hook = false;
+
+		if (e->has_ufile_handle && uf->holder_uctx_fd >= 0) {
+			int rc;
+
+			attrs.cap = &cap;
+			rc = rdma_dispatch_dump_uobj_qp(
+					uf->plugin, uf->ibdev,
+					uf->kernel_driver_id,
+					uf->holder_uctx_fd,
+					e->ufile_handle, uf->pid,
+					&attrs, &plugin_blob);
+			if (rc) {
+				pr_err("uobj DAG: per-QP dispatcher failed for "
+				       "ibdev=%s ufile_handle=%u (rc=%d, %s); "
+				       "aborting dump\n",
+				       uf->ibdev, e->ufile_handle, rc,
+				       strerror(rc < 0 ? -rc : rc));
+				attrs.cap = NULL;
+				free(plugin_blob.data);
+				return (w->err = -1);
+			}
+			ran_hook = true;
+		} else if (!e->has_ufile_handle) {
+			pr_debug("uobj DAG: QP on ibdev=%s pdn=%u has no "
+				 "ufile_handle (kernel pre-K8a / RES_HANDLE not "
+				 "emitted); skipping per-driver QUERY_QP\n",
+				 uf->ibdev, e->pdn);
+		} else {
+			pr_warn("uobj DAG: QP on ibdev=%s pdn=%u "
+				"ufile_handle=%u has no holder_uctx_fd dup; "
+				"per-driver QUERY_QP skipped\n",
+				uf->ibdev, e->pdn, e->ufile_handle);
+		}
+		(void)ran_hook;
+
+		rdma_uobj_xref__init(&xrefs[n_xref]);
+		xrefs[n_xref].role = R3_XREF_ROLE__R3XR_PARENT_PD;
+		xrefs[n_xref].target_type = R3_UOBJ_TYPE__R3UT_PD;
+		xrefs[n_xref].target_restrack_id = e->pdn;
+		xref_arr[n_xref] = &xrefs[n_xref];
+		n_xref++;
+
+		if (e->qp.has_send_cqn) {
+			rdma_uobj_xref__init(&xrefs[n_xref]);
+			xrefs[n_xref].role = R3_XREF_ROLE__R3XR_SEND_CQ;
+			xrefs[n_xref].target_type = R3_UOBJ_TYPE__R3UT_CQ;
+			xrefs[n_xref].target_restrack_id = e->qp.send_cqn;
+			xref_arr[n_xref] = &xrefs[n_xref];
+			n_xref++;
+		}
+		if (e->qp.has_recv_cqn) {
+			rdma_uobj_xref__init(&xrefs[n_xref]);
+			xrefs[n_xref].role = R3_XREF_ROLE__R3XR_RECV_CQ;
+			xrefs[n_xref].target_type = R3_UOBJ_TYPE__R3UT_CQ;
+			xrefs[n_xref].target_restrack_id = e->qp.recv_cqn;
+			xref_arr[n_xref] = &xrefs[n_xref];
+			n_xref++;
+		}
+		if (!e->qp.has_send_cqn || !e->qp.has_recv_cqn)
+			pr_warn("uobj DAG: QP on ibdev=%s ufile_handle=%u: "
+				"NLDEV emitted no %s%s%s -- the kernel "
+				"pre-dates the RES_{SEND,RECV}_CQN emission "
+				"in fill_res_qp_entry. RESTORE_QP needs both "
+				"as MANDATORY IDR(UVERBS_OBJECT_CQ) attrs, so "
+				"this entry will be refused at restore-time "
+				"with a clear diagnostic.\n",
+				uf->ibdev, e->ufile_handle,
+				e->qp.has_send_cqn ? "" : "RES_SEND_CQN",
+				(!e->qp.has_send_cqn && !e->qp.has_recv_cqn)
+					? " or " : "",
+				e->qp.has_recv_cqn ? "" : "RES_RECV_CQN");
+
+		pe.n_xref = n_xref;
+		pe.xref = xref_arr;
+
+		if (plugin_blob.data && plugin_blob.len > 0) {
+			pe.has_plugin_blob = true;
+			pe.plugin_blob = plugin_blob;
+		}
+
+		{
+			int rc = uobj_emit(w, &pe);
+
+			free(plugin_blob.data);
+			return rc < 0 ? (w->err = -1) : 0;
+		}
+	}
 }
 
 /*

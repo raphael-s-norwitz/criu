@@ -954,6 +954,66 @@ int rdma_dispatch_dump_uobj_cq(plugin_desc_t *plugin,
 	return rc;
 }
 
+/*
+ * Per-QP dump dispatcher. Mirror of rdma_dispatch_dump_uobj_cq
+ * applied to UVERBS_METHOD_RESTORE_QP's discovery-side counterpart.
+ *
+ * @qp_attrs is owned by the caller and pre-populated with the
+ * NLDEV-derived subset (qp_type, state, qp_num, dest_qp_num, sq_psn,
+ * rq_psn, port_num). The plugin appends user_handle, cap, and
+ * create_flags (none of which are emitted by NLDEV today) and packs
+ * its driver-private 64B per-QP payload into @plugin_blob (mlx5:
+ * byte-equal to struct mlx5_ib_restore_qp_req captured via
+ * MLX5_IB_METHOD_VFMIG_QUERY_QP).
+ *
+ * Plugin -ENXIO is the per-uobject skip signal (kernel-mode QP
+ * routed here by mistake -- mlx5_ib's QUERY_QP handler returns
+ * -ENXIO when base->ubuffer.umem == NULL); demoted to a successful
+ * dispatch with whatever NLDEV-derived bits the caller already
+ * staged. Restore-side guards on absent driver-private fields and
+ * surfaces a clear "image needs a re-dump on a kernel that has
+ * QUERY_QP" diagnostic.
+ *
+ * Optional hook: a plugin that doesn't register the hook is a no-op
+ * success (rxe pre-S6a takes this path until RXE_METHOD_VFMIG_QUERY_QP
+ * lands).
+ */
+int rdma_dispatch_dump_uobj_qp(plugin_desc_t *plugin,
+			       const char *ibdev,
+			       uint32_t kernel_driver_id,
+			       int lfd, uint32_t ufile_handle,
+			       pid_t pid,
+			       RdmaQpAttrs *qp_attrs,
+			       ProtobufCBinaryData *plugin_blob)
+{
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP_t *fn;
+	int rc;
+
+	if (!plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP]) {
+		pr_debug("dump_uobj_qp: plugin '%s' (ibdev=%s) does not "
+			 "register the hook; skipping. ufile_handle=%u "
+			 "will be dumped with NLDEV-only RdmaQpAttrs.\n",
+			 plugin->d->name, ibdev, ufile_handle);
+		return 0;
+	}
+
+	fn = plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP];
+	pr_debug("dump_uobj_qp: dispatching to plugin '%s' "
+		 "(ibdev=%s ufile_handle=%u pid=%d)\n",
+		 plugin->d->name, ibdev, ufile_handle, (int)pid);
+	rc = fn(ibdev, kernel_driver_id, lfd, ufile_handle, pid, qp_attrs,
+		plugin_blob);
+	if (rc == -ENXIO) {
+		pr_warn("dump_uobj_qp: plugin '%s' rejected QP "
+			"ufile_handle=%u on ibdev=%s with -ENXIO "
+			"(kernel-mode QP or no source userspace state); "
+			"per-uobject driver-private fields will be absent\n",
+			plugin->d->name, ufile_handle, ibdev);
+		return 0;
+	}
+	return rc;
+}
+
 int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 {
 	plugin_desc_t *this;
