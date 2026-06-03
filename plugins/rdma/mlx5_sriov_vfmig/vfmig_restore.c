@@ -1342,3 +1342,72 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e,
 	uhw->out_len = 0;
 	return 0;
 }
+
+/*
+ * RDMA_RESTORE_UOBJ_QP_UHW_PACK hook (mlx5).
+ *
+ * Reads the source-side 64-byte mlx5_ib_restore_qp_req packed at
+ * dump time into e->plugin_blob (see rdma_mlx5_vfmig_plugin_dump_uobj_qp)
+ * and hands core a malloc()'d copy as UHW_IN. mlx5_ib_restore_qp
+ * requires exactly sizeof(req) UHW_IN and ignores UHW_OUT (look up
+ * the kernel handler if you need confirmation), so we leave
+ * uhw->out_buf NULL and don't register a UHW_VERIFY companion.
+ *
+ * Allocator contract identical to RESTORE_CQ_UHW_PACK: we malloc
+ * here, core memcpy's into rst_rdma_qp.uhw_in_buf and free()s our
+ * copy before pie hand-off. The pie restorer never sees this
+ * pointer; it sees only the byte-equal copy in static restorer
+ * storage.
+ *
+ * No interpretation of the blob bytes here -- the per-field
+ * sentinel/zero discipline is owned by the dump-side QUERY_QP
+ * handler and the destination kernel's RESTORE_QP handler. CRIU
+ * is purely the courier.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw)
+{
+	const ProtobufCBinaryData *blob;
+
+	if (!e || !uhw)
+		return -EINVAL;
+	if (e->type != R3_UOBJ_TYPE__R3UT_QP) {
+		pr_err("vfmig: RESTORE_QP_UHW_PACK called for non-QP "
+		       "uobject (type=%d ufile_handle=%u); core dispatch "
+		       "bug\n", e->type,
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+	if (!e->has_plugin_blob || e->plugin_blob.len == 0) {
+		pr_err("vfmig: RESTORE_QP_UHW_PACK called for ufile_handle=%u "
+		       "with empty plugin_blob; image is missing the "
+		       "64B mlx5_ib_restore_qp_req captured at dump via "
+		       "MLX5_IB_METHOD_VFMIG_QUERY_QP. Re-dump against a "
+		       "kernel that has the VFMIG_QUERY_QP method and a "
+		       "CRIU plugin build that wires it.\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+
+	blob = &e->plugin_blob;
+	if (blob->len != sizeof(struct mlx5_ib_restore_qp_req_local)) {
+		pr_err("vfmig: RESTORE_QP_UHW_PACK plugin_blob len=%zu "
+		       "ufile_handle=%u, expected %zu (mlx5_ib_restore_qp_req)\n",
+		       blob->len,
+		       e->has_ufile_handle ? e->ufile_handle : 0,
+		       sizeof(struct mlx5_ib_restore_qp_req_local));
+		return -EINVAL;
+	}
+
+	uhw->in_buf = malloc(blob->len);
+	if (!uhw->in_buf) {
+		pr_err("vfmig: RESTORE_QP_UHW_PACK out of memory "
+		       "(%zu bytes)\n", blob->len);
+		return -ENOMEM;
+	}
+	memcpy(uhw->in_buf, blob->data, blob->len);
+	uhw->in_len = blob->len;
+	uhw->out_buf = NULL;
+	uhw->out_len = 0;
+	return 0;
+}

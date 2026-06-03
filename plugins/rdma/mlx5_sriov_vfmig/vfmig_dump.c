@@ -1000,6 +1000,176 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev,
 }
 
 /*
+ * Per-QP dump hook (CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP). Issues
+ * MLX5_IB_METHOD_VFMIG_QUERY_QP on @lfd against @ufile_handle and
+ * splits the seven outs across:
+ *
+ *   - @plugin_blob: the 64-byte mlx5_ib_restore_qp_req that
+ *     RESTORE_QP's UHW.data will consume byte-equal at restore.
+ *     Stored as the entry-level opaque blob; criu core never
+ *     parses it. The companion restore-side hook
+ *     rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack reads it
+ *     back verbatim into UHW_IN. Layout, sentinel discipline, and
+ *     LOAD_VHCA_STATE byte-equality contract are owned by
+ *     mlx5_uapi.h::struct mlx5_ib_restore_qp_req_local.
+ *
+ *   - @qp_attrs: the hw-agnostic per-class proto fields RESTORE_QP
+ *     takes as core attrs (not in UHW). Five outs land here:
+ *     create_flags, cap, user_handle, plus type+state cross-checks
+ *     against the NLDEV-stamped values (see below).
+ *
+ * NLDEV vs QUERY_QP cross-checks. The dispatcher already stamped
+ * qp_attrs->qp_type and qp_attrs->state from NLDEV's RES_TYPE /
+ * RES_STATE before this hook ran (see uobj_qp_cb). QUERY_QP's
+ * RESP_TYPE / RESP_STATE come from the same kernel mqp fields the
+ * NLDEV walker reads. A divergence between the two sources is the
+ * kind of structural surprise we want to surface (means the
+ * walker and the per-handle ioctl are looking at different
+ * objects, or one of the two paths has stale state). Treat as
+ * fatal -- silently dropping wins us no portability and risks an
+ * RTS-vs-RTR mistake at restore.
+ *
+ * RESTORE_QP gates @qp_attrs->qp_type on RC/UD (UC parked) and
+ * @qp_attrs->state on {RESET,INIT,RTR,RTS}; the v0 pre-suspend
+ * coverage filter (rdma_check_qp_restorability) is the canonical
+ * place to enforce that contract. We do NOT re-check it here, the
+ * dump hook is for marshaling, not policy.
+ *
+ * Kernel-mode QP rejection (-ENXIO from the QUERY_QP handler) is
+ * propagated for symmetry with the CQ path; mlx5_ib_qp.umem can be
+ * NULL on raw-packet split-SQ kernel-side QPs. The dispatcher
+ * demotes -ENXIO to a per-uobject skip so a single internal QP
+ * doesn't fail the whole dump.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
+					uint32_t kernel_driver_id,
+					int lfd, uint32_t ufile_handle,
+					pid_t pid,
+					RdmaQpAttrs *qp_attrs,
+					ProtobufCBinaryData *plugin_blob)
+{
+	struct mlx5_ib_restore_qp_req_local blob = {};
+	struct ib_uverbs_qp_cap_local cap = {};
+	uint32_t resp_type = 0, resp_state = 0, create_flags = 0;
+	uint64_t user_handle = 0;
+	uint8_t *blob_buf;
+	int rc;
+
+	(void)kernel_driver_id;
+	(void)pid;
+
+	rc = vfmig_query_qp(lfd, ufile_handle, &blob,
+			    &resp_type, &resp_state, &user_handle,
+			    &cap, &create_flags);
+	if (rc) {
+		if (rc == -ENXIO) {
+			pr_debug("vfmig: QUERY_QP(handle=%u) on ibdev=%s "
+				 "returned -ENXIO (kernel-mode QP); "
+				 "skipping per-uobject capture\n",
+				 ufile_handle, ibdev);
+			return -ENXIO;
+		}
+		pr_err("vfmig: QUERY_QP(handle=%u) on ibdev=%s failed: "
+		       "%d (%s)\n",
+		       ufile_handle, ibdev, rc, strerror(-rc));
+		return rc;
+	}
+
+	/*
+	 * NLDEV stamped qp_type / state on @qp_attrs from
+	 * RES_TYPE / RES_STATE. QUERY_QP returns the same kernel
+	 * fields. Mismatch indicates the IDR walker and per-handle
+	 * ioctl resolved to different mqp's -- structural, fail
+	 * loud rather than silently prefer one source.
+	 */
+	if (qp_attrs->has_qp_type && qp_attrs->qp_type != resp_type) {
+		pr_err("vfmig: QP ufile_handle=%u on ibdev=%s: NLDEV "
+		       "RES_TYPE=%u disagrees with QUERY_QP RESP_TYPE=%u; "
+		       "structural inconsistency, aborting dump\n",
+		       ufile_handle, ibdev, qp_attrs->qp_type, resp_type);
+		return -EILSEQ;
+	}
+	if (qp_attrs->has_state && qp_attrs->state != resp_state) {
+		pr_err("vfmig: QP ufile_handle=%u on ibdev=%s: NLDEV "
+		       "RES_STATE=%u disagrees with QUERY_QP "
+		       "RESP_STATE=%u; structural inconsistency, "
+		       "aborting dump\n",
+		       ufile_handle, ibdev, qp_attrs->state, resp_state);
+		return -EILSEQ;
+	}
+	/*
+	 * Step 6 master-side seam assertion: NLDEV RES_LQPN
+	 * (qp_attrs->qp_num, set by uobj_qp_cb before dispatch) and
+	 * the UHW-carried mlx5_ib_restore_qp_req.qpn must agree.
+	 * They both resolve through ibqp->qp_num on the source mqp,
+	 * so divergence means the IDR walker and the per-handle
+	 * QUERY_QP ioctl resolved to different mqps -- the same
+	 * "structural surprise" class we fail loud on for
+	 * type/state. The PIE restorer's resp_qpn vs qpn_hint
+	 * assertion is the final defence; this one catches the same
+	 * regression class earlier (at dump time, with the source
+	 * still online) where the operator can re-dump.
+	 */
+	if (qp_attrs->has_qp_num && qp_attrs->qp_num != blob.qpn) {
+		pr_err("vfmig: QP ufile_handle=%u on ibdev=%s: NLDEV "
+		       "RES_LQPN=%u disagrees with QUERY_QP UHW "
+		       "blob.qpn=%u; the IDR walker and per-handle "
+		       "QUERY_QP resolved to different QPs, aborting "
+		       "dump\n",
+		       ufile_handle, ibdev, qp_attrs->qp_num, blob.qpn);
+		return -EILSEQ;
+	}
+
+	/*
+	 * @qp_attrs->cap is pre-attached by the dump-side caller
+	 * (uobj_qp_cb) to a stack-local RdmaQpCap so cap memory is
+	 * owned by the dump path, not the plugin. Filling fields
+	 * in-place preserves a single ownership model and removes a
+	 * malloc/free pair per QP.
+	 */
+	if (qp_attrs->cap) {
+		qp_attrs->cap->has_max_send_wr = true;
+		qp_attrs->cap->max_send_wr = cap.max_send_wr;
+		qp_attrs->cap->has_max_recv_wr = true;
+		qp_attrs->cap->max_recv_wr = cap.max_recv_wr;
+		qp_attrs->cap->has_max_send_sge = true;
+		qp_attrs->cap->max_send_sge = cap.max_send_sge;
+		qp_attrs->cap->has_max_recv_sge = true;
+		qp_attrs->cap->max_recv_sge = cap.max_recv_sge;
+		qp_attrs->cap->has_max_inline_data = true;
+		qp_attrs->cap->max_inline_data = cap.max_inline_data;
+	}
+
+	qp_attrs->has_create_flags = true;
+	qp_attrs->create_flags = create_flags;
+	qp_attrs->has_user_handle = true;
+	qp_attrs->user_handle = user_handle;
+
+	blob_buf = malloc(sizeof(blob));
+	if (!blob_buf) {
+		pr_err("vfmig: out of memory packing QP ufile_handle=%u "
+		       "plugin_blob (mlx5_ib_restore_qp_req, %zu bytes)\n",
+		       ufile_handle, sizeof(blob));
+		return -ENOMEM;
+	}
+	memcpy(blob_buf, &blob, sizeof(blob));
+	plugin_blob->data = blob_buf;
+	plugin_blob->len = sizeof(blob);
+
+	pr_debug("vfmig: QUERY_QP ibdev=%s ufile_handle=%u: qpn=%u "
+		 "type=%u state=%u user_handle=0x%llx "
+		 "create_flags=0x%x sq_wqe_count=%u rq_wqe_count=%u "
+		 "rq_wqe_shift=%u flags=0x%x cap={ms_wr=%u mr_wr=%u "
+		 "ms_sge=%u mr_sge=%u inline=%u}\n",
+		 ibdev, ufile_handle, blob.qpn, resp_type, resp_state,
+		 (unsigned long long)user_handle, create_flags,
+		 blob.sq_wqe_count, blob.rq_wqe_count, blob.rq_wqe_shift,
+		 blob.flags, cap.max_send_wr, cap.max_recv_wr,
+		 cap.max_send_sge, cap.max_recv_sge, cap.max_inline_data);
+	return 0;
+}
+
+/*
  * Per-VMA dump-side hook (CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA).
  *
  * mlx5 ibverbs userspace (libmlx5) memory-maps three or four pages

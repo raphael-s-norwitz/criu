@@ -542,3 +542,91 @@ int vfmig_query_cq(int fd,
 		return -errno;
 	return 0;
 }
+
+/*
+ * Issue MLX5_IB_METHOD_VFMIG_QUERY_QP on @fd against @qp_handle.
+ * Mirror of vfmig_query_cq for QP: the byte-equal RESP_BLOB lands in
+ * @blob_out (64 bytes; CRIU memcpy's it into protobuf, then back
+ * into RESTORE_QP's UHW_IN), and the five scalar outs land in their
+ * respective pointers.
+ *
+ * HANDLE is UVERBS_ATTR_IDR(UVERBS_OBJECT_QP); kernel-side
+ * uverbs_process_attr enforces len == 0 for the IDR class and reads
+ * the uobject handle from attrs[].data. Setting len = sizeof(u32)
+ * the way a PTR_IN(u32) attr does trips the dispatcher's
+ * `if (uattr->len != 0) return -EINVAL` guard before the handler
+ * runs. Same shim as vfmig_query_cq above.
+ */
+int vfmig_query_qp(int fd,
+		   uint32_t qp_handle,
+		   struct mlx5_ib_restore_qp_req_local *blob_out,
+		   uint32_t *type_out,
+		   uint32_t *state_out,
+		   uint64_t *user_handle_out,
+		   struct ib_uverbs_qp_cap_local *cap_out,
+		   uint32_t *create_flags_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[7];
+	} cmd = {};
+
+	/*
+	 * Lock in the byte-equal contract at the source-of-marshaling
+	 * site so any drift between this header and the kernel's
+	 * mlx5_ib_restore_qp_req surfaces at compile time, not as a
+	 * silent UHW corruption at restore.
+	 */
+	_Static_assert(sizeof(*blob_out) == 64,
+		"mlx5_ib_restore_qp_req_local must be 64 bytes (kernel UAPI)");
+	_Static_assert(sizeof(*cap_out) == 20,
+		"ib_uverbs_qp_cap_local must be 20 bytes (kernel UAPI)");
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_QP_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[0].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE_LOCAL;
+	cmd.attrs[0].len = 0;
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = qp_handle;
+
+	cmd.attrs[1].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB_LOCAL;
+	cmd.attrs[1].len = sizeof(*blob_out);
+	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].data = (uintptr_t)blob_out;
+
+	cmd.attrs[2].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE_LOCAL;
+	cmd.attrs[2].len = sizeof(*type_out);
+	cmd.attrs[2].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[2].data = (uintptr_t)type_out;
+
+	cmd.attrs[3].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE_LOCAL;
+	cmd.attrs[3].len = sizeof(*state_out);
+	cmd.attrs[3].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[3].data = (uintptr_t)state_out;
+
+	cmd.attrs[4].attr_id =
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE_LOCAL;
+	cmd.attrs[4].len = sizeof(*user_handle_out);
+	cmd.attrs[4].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[4].data = (uintptr_t)user_handle_out;
+
+	cmd.attrs[5].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP_LOCAL;
+	cmd.attrs[5].len = sizeof(*cap_out);
+	cmd.attrs[5].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[5].data = (uintptr_t)cap_out;
+
+	cmd.attrs[6].attr_id =
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS_LOCAL;
+	cmd.attrs[6].len = sizeof(*create_flags_out);
+	cmd.attrs[6].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[6].data = (uintptr_t)create_flags_out;
+
+	cmd.hdr.num_attrs = 7;
+	cmd.hdr.length = sizeof(cmd.hdr) + 7 * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}

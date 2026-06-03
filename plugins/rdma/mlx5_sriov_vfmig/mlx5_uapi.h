@@ -273,6 +273,64 @@ struct mlx5_ib_vfmig_dyn_uar_record_local {
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 4)
 
 /*
+ * Per-uobject QP dump-side discovery verb.
+ *
+ * MLX5_IB_METHOD_VFMIG_QUERY_QP runs on MLX5_IB_OBJECT_VFMIG and is
+ * the dump-side companion of UVERBS_METHOD_RESTORE_QP, mirroring the
+ * QUERY_CQ contract in shape (per-handle, byte-equal RESP_BLOB +
+ * scalar outs that go straight into RESTORE_QP's core attrs).
+ *
+ * The HANDLE attr is UVERBS_ATTR_IDR(UVERBS_OBJECT_QP,
+ * UVERBS_ACCESS_READ): caller's ufile-idr must own the QP, the IDR
+ * pins the uobject for the call. Same security boundary as
+ * INFO_HANDLES(UVERBS_OBJECT_QP).
+ *
+ * Outputs (all MANDATORY):
+ *   RESP_BLOB         struct mlx5_ib_restore_qp_req (64 bytes); CRIU
+ *                     copies verbatim into protobuf at dump time and
+ *                     back into RESTORE_QP's UHW_IN at restore time,
+ *                     no field-level marshaling. Kernel handler
+ *                     zeroes reserved/reserved2 and emits sentinels
+ *                     for uidx (0) / bfreg_index (MLX5_IB_INVALID_
+ *                     BFREG) / ece_options (0) -- the QPC's
+ *                     user_index / uar_page / ece_options round-trip
+ *                     intact across LOAD_VHCA_STATE per K7 so the
+ *                     restore handler validates-and-discards them.
+ *   RESP_TYPE         u32, mqp->type. Goes into UVERBS_ATTR_RESTORE_
+ *                     QP_TYPE; v0 mlx5 RESTORE_QP gates on RC / UD
+ *                     (UC parked at v0 dispatcher; see uobj design
+ *                     doc §5.3.1 / §5.3.4).
+ *   RESP_STATE        u32, mqp->state. Goes into UVERBS_ATTR_RESTORE_
+ *                     QP_STATE; v0 RESTORE_QP gates on
+ *                     {RESET, INIT, RTR, RTS}.
+ *   RESP_USER_HANDLE  u64, ibqp->uobject->user_handle. Goes into
+ *                     UVERBS_ATTR_RESTORE_QP_USER_HANDLE.
+ *   RESP_CAP          struct ib_uverbs_qp_cap, best-effort echo of
+ *                     the cap ibv_create_qp returned.
+ *                     Goes into UVERBS_ATTR_RESTORE_QP_CAP.
+ *   RESP_CREATE_FLAGS u32, mqp->flags. Goes into UVERBS_ATTR_RESTORE_
+ *                     QP_CREATE_FLAGS.
+ *
+ * Method id slot is +5 in the VFMIG enum, after QUERY_CQ (=+4).
+ */
+#define MLX5_IB_METHOD_VFMIG_QUERY_QP_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 5)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 3)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 4)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 5)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 6)
+
+/*
  * Driver-private UHW payload for UVERBS_METHOD_RESTORE_CQ on mlx5,
  * carried from dump to restore as QUERY_CQ's RESP_BLOB and the
  * RESTORE_CQ UHW.data byte-for-byte.
@@ -334,5 +392,88 @@ struct mlx5_ib_restore_mr_req_local {
 	uint32_t reserved;
 	uint64_t reserved2;
 } __attribute__((aligned(8)));
+
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_QP on mlx5,
+ * carried from dump to restore as QUERY_QP's RESP_BLOB and
+ * RESTORE_QP's UHW.data byte-for-byte.
+ *
+ * Layout MUST match include/uapi/rdma/mlx5-abi.h::mlx5_ib_restore_qp_req
+ * exactly: 64 bytes, three __aligned_u64 leading addresses + nine
+ * u32 fields. The dump-side handler emits sentinels for the FW-side
+ * fields LOAD_VHCA_STATE preserves byte-equal (uidx = 0,
+ * bfreg_index = MLX5_IB_INVALID_BFREG_LOCAL, ece_options = 0); the
+ * RESTORE_QP handler validates-and-discards them on the restore
+ * side. CRIU plugin code does not interpret these fields -- it
+ * memcpy's the blob from RESP_BLOB at dump and back into UHW_IN at
+ * restore.
+ *
+ * Wire-shape gotchas the criu plugin packer must respect:
+ *
+ *   - 64 bytes is well above the kernel uverbs UHW INLINE threshold
+ *     (8). Same userspace-pointer-path dodge as the PD/CQ/MR shims.
+ *   - reserved / reserved2 must be zero on send. RESTORE_QP's
+ *     "must be 0" guard rejects any non-zero reserved bit on the
+ *     inbound side; QUERY_QP zeroes them on emit, so a verbatim
+ *     memcpy round-trips without per-field marshaling.
+ *   - qpn is 24 bits significant; 0 is a sentinel rejected by
+ *     RESTORE_QP. uidx is 24 bits significant. rq_wqe_shift in
+ *     [4, 16] when rq_wqe_count > 0.
+ *
+ * MLX5_IB_INVALID_BFREG_LOCAL mirrors the kernel's
+ * drivers/infiniband/hw/mlx5/mlx5_ib.h MLX5_IB_INVALID_BFREG
+ * (= BIT(31) = 0x80000000U). The QUERY_QP handler emits this
+ * constant for bfreg_index because the source's UAR mapping is
+ * encoded in the adopted qpc.uar_page (preserved by
+ * LOAD_VHCA_STATE), not re-derived from the BFREG slot. The
+ * RESTORE_QP handler forces qp->bfregn = this same constant
+ * regardless of what the UHW carried, so emitting the sentinel
+ * here is purely informational: CRIU never constructs this value
+ * itself (we memcpy the QUERY_QP RESP_BLOB straight into
+ * RESTORE_QP UHW_IN), the constant lives here so a reader of the
+ * UHW packing code can verify the sentinel without cross-tree
+ * grepping.
+ */
+#define MLX5_IB_INVALID_BFREG_LOCAL ((uint32_t)0x80000000)
+
+struct mlx5_ib_restore_qp_req_local {
+	uint64_t buf_addr;	/* source userspace VA of WQ ring */
+	uint64_t db_addr;	/* source userspace VA of DBR page */
+	uint64_t sq_buf_addr;	/* raw_packet split-SQ; 0 for v0 RC/UD */
+	uint32_t qpn;		/* FW qpn to adopt (24 bits) */
+	uint32_t sq_wqe_count;
+	uint32_t rq_wqe_count;
+	uint32_t rq_wqe_shift;
+	uint32_t flags;		/* MLX5_QP_FLAG_* bitmask */
+	uint32_t uidx;		/* qpc.user_index sentinel; emit 0 */
+	uint32_t bfreg_index;	/* emit MLX5_IB_INVALID_BFREG_LOCAL */
+	uint32_t ece_options;	/* emit 0 */
+	uint32_t reserved;	/* must be 0 */
+	uint32_t reserved2;	/* must be 0 */
+} __attribute__((aligned(8)));
+
+/*
+ * struct ib_uverbs_qp_cap mirror -- the capability tuple the source
+ * ibv_create_qp returned. CRIU's QUERY_QP RESP_CAP attr is a
+ * PTR_OUT(sizeof(this)) and RESTORE_QP's UVERBS_ATTR_RESTORE_QP_CAP
+ * is a PTR_IN(sizeof(this)); both bytewise-equal to the kernel
+ * struct in include/uapi/rdma/ib_user_verbs.h. The host header has
+ * always shipped this struct (it pre-dates the RESTORE_QP work) so
+ * we could include it -- but inlining keeps the plugin's UAPI
+ * surface self-contained alongside the rest of the VFMIG verbs.
+ *
+ * Field semantics: post-rounding values the kernel returned to the
+ * source's create call. Plugin emits these verbatim; the mlx5
+ * RESTORE_QP handler doesn't validate cap content (the actual WQ
+ * shape comes from the UHW's {sq,rq}_wqe_count / rq_wqe_shift), so
+ * cap is forward-compat surface, not a validation gate.
+ */
+struct ib_uverbs_qp_cap_local {
+	uint32_t max_send_wr;
+	uint32_t max_recv_wr;
+	uint32_t max_send_sge;
+	uint32_t max_recv_sge;
+	uint32_t max_inline_data;
+};
 
 #endif /* __CR_MLX5_VFMIG_UAPI_H__ */

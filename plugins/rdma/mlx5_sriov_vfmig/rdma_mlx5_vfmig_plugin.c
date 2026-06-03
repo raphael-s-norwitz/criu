@@ -330,6 +330,21 @@ static int rdma_mlx5_vfmig_plugin_restore_uobj_cq_needs_pie(void)
 	return 1;
 }
 
+/*
+ * RDMA_RESTORE_UOBJ_QP_NEEDS_PIE hook (mlx5).
+ *
+ * mlx5_ib_restore_qp's UHW carries source-task user VAs (buf_addr,
+ * db_addr; sq_buf_addr is unused for v0 RC/UD). The destination
+ * kernel calls ib_umem_get on these, requiring the restored task's
+ * mm to be active and the source VAs to map the dump-time anonymous
+ * pages. Same constraint as RESTORE_CQ -- defer to PIE so we run
+ * after VMAs are mapped, not before. Opt in.
+ */
+static int rdma_mlx5_vfmig_plugin_restore_uobj_qp_needs_pie(void)
+{
+	return 1;
+}
+
 CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init,
 		   rdma_mlx5_vfmig_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
@@ -338,12 +353,18 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT,
 			rdma_mlx5_vfmig_plugin_dump_uverbs_context)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
 			rdma_mlx5_vfmig_plugin_dump_uobj_cq)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP,
+			rdma_mlx5_vfmig_plugin_dump_uobj_qp)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
 			rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK,
 			rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK,
+			rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE,
 			rdma_mlx5_vfmig_plugin_restore_uobj_cq_needs_pie)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE,
+			rdma_mlx5_vfmig_plugin_restore_uobj_qp_needs_pie)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA,
 			rdma_mlx5_vfmig_plugin_handle_device_vma)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP,

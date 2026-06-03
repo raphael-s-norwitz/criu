@@ -50,6 +50,8 @@ int vfmig_chrdev_to_ibdev(dev_t rdev, char *out, size_t outsz);
 struct mlx5_ib_vfmig_ucontext_meta_local;
 struct mlx5_ib_vfmig_dyn_uar_record_local;
 struct mlx5_ib_restore_cq_req_local;
+struct mlx5_ib_restore_qp_req_local;
+struct ib_uverbs_qp_cap_local;
 
 int vfmig_send_get_context_v2(int fd, uint32_t flags,
 			      uint64_t lib_caps,
@@ -91,6 +93,24 @@ int vfmig_query_cq(int fd,
 		   uint32_t *cqe_out,
 		   uint32_t *comp_vector_out,
 		   uint32_t *flags_out);
+
+/*
+ * Per-QP dump-side discovery via MLX5_IB_METHOD_VFMIG_QUERY_QP.
+ * @qp_handle is the source ufile-idr QP handle from the R3 walk.
+ * On success @blob_out is byte-equal to the payload RESTORE_QP's
+ * UHW.data will consume on the destination; the dump path stores it
+ * in protobuf verbatim. The companion outs (@type_out, @state_out,
+ * @user_handle_out, @cap_out, @create_flags_out) are the per-QP
+ * inputs RESTORE_QP takes as core attrs (not in the UHW blob).
+ */
+int vfmig_query_qp(int fd,
+		   uint32_t qp_handle,
+		   struct mlx5_ib_restore_qp_req_local *blob_out,
+		   uint32_t *type_out,
+		   uint32_t *state_out,
+		   uint64_t *user_handle_out,
+		   struct ib_uverbs_qp_cap_local *cap_out,
+		   uint32_t *create_flags_out);
 
 /*
  * vf_image.c -- on-disk format for the plugin's per-dump
@@ -170,10 +190,19 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev,
 					RdmaCqAttrs *cq_attrs,
 					ProtobufCBinaryData *plugin_blob);
 
+int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
+					uint32_t kernel_driver_id,
+					int lfd, uint32_t ufile_handle,
+					pid_t pid,
+					RdmaQpAttrs *qp_attrs,
+					ProtobufCBinaryData *plugin_blob);
+
 struct rdma_uhw_spec;
 int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
 						    struct rdma_uhw_spec *uhw);
 int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw);
+int rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e,
 						    struct rdma_uhw_spec *uhw);
 
 struct stat;
