@@ -244,6 +244,27 @@ int vfmig_restore_uctx(int fd,
  * Returns 0 on success, -errno on failure (with all out-pointers
  * left NULL).
  */
+/*
+ * Meta-only QUERY_UCONTEXT wrapper. The caller wants
+ * @meta_out->devx_uid (kernel commit c659ab66483d) without paying
+ * for the second-pass uar_table / bfreg_count fetch + alloc. Used
+ * by the per-QP dump hook's "refuse if source ucontext has DEVX"
+ * gate; the full vfmig_snapshot_uctx is overkill there because the
+ * per-context dump path has already snapshotted those arrays for
+ * the image.
+ *
+ * Returns 0 on success, -errno on failure. -EOPNOTSUPP indicates
+ * a dyn-mode (lib_uar_dyn=true) ucontext; the caller should treat
+ * that as "DEVX-on by construction" rather than retry with
+ * QUERY_DYN_UARS, because that verb returns the dyn-UAR records,
+ * not meta.
+ */
+int vfmig_query_uctx_meta(int fd,
+			  struct mlx5_ib_vfmig_ucontext_meta_local *meta_out)
+{
+	return vfmig_query_uctx(fd, NULL, 0, NULL, 0, meta_out);
+}
+
 int vfmig_snapshot_uctx(int fd,
 			       struct mlx5_ib_vfmig_ucontext_meta_local *meta_out,
 			       uint32_t **uar_out, size_t *uar_n_out,

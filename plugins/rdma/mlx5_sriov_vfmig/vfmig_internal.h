@@ -70,6 +70,9 @@ int vfmig_snapshot_uctx(int fd,
 			uint32_t **uar_out, size_t *uar_n_out,
 			uint32_t **cnt_out, size_t *cnt_n_out);
 
+int vfmig_query_uctx_meta(int fd,
+			  struct mlx5_ib_vfmig_ucontext_meta_local *meta_out);
+
 int vfmig_restore_dyn_uars(int fd,
 			   const struct mlx5_ib_vfmig_dyn_uar_record_local *records,
 			   size_t n_records);

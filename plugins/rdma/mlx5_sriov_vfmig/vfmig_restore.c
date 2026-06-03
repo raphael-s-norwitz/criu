@@ -588,30 +588,39 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 		uint32_t flags = MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE;
 
 		/*
-		 * v0 limitation: DEVX adoption is unworkable on current
-		 * mlx5 FW. LOAD_VHCA_STATE preserves the FW
-		 * next_free_uctx counter but NOT the uctx registration
-		 * table -- the source's devx_uid is unregistered on the
-		 * destination post-LOAD, so re-claiming it via
-		 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID lands on a uid that
-		 * FW will reject with "unknown uid" on every subsequent
-		 * CREATE_MKEY/CREATE_QP. See kernel commits
-		 * 73c76f299c01 ("RDMA/mlx5: mark ADOPT_DEVX_UID
-		 * vestigial; rewrite restore_pd pr_warn") and
-		 * a10dc00106a1 ("mlx5_vfmig design: record DEVX-
-		 * adoption blind spot in S3b"), and the DEVX-source
-		 * matrix in tools/testing/mlx5_vfmig/uobject_restore/
-		 * pd_adopt/test_pd_adopt.sh.
+		 * v0 contract: source ucontext devx_uid == 0
+		 * (enforced by the dump-side filter in
+		 * vfmig_collect_uobjects_for_ctx; refuses the dump if
+		 * meta.devx_uid != 0 because LOAD_VHCA_STATE on FW
+		 * 28.48.1000 does not preserve the FW
+		 * uctx-registration table, so neither
+		 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID nor the uid=0
+		 * host-priv lane can correctly run modify/destroy
+		 * commands against PDC/CQC/QPC owned by uid != 0).
 		 *
-		 * Until either FW gains uctx-state preservation or we
-		 * wire a fresh-uctx-with-PD-rebind path on the dest,
-		 * the destination ucontext is opened WITHOUT DEVX and
-		 * all adopted resources live under uid=0
-		 * (host-privileged) -- the only lane that survives
-		 * LOAD_VHCA_STATE. DEVX features (mlx5dv_*) are
-		 * unavailable to the restored process; basic verbs
-		 * work. c->source_devx_uid stays in the image for
-		 * diagnostics but is intentionally not consumed here.
+		 * The destination opens without DEVX (req.flags omits
+		 * MLX5_IB_ALLOC_UCTX_DEVX) so c->devx_uid = 0 here,
+		 * and all adopted resources land in the FW's uid=0
+		 * host-privileged lane -- the only lane that survives
+		 * LOAD_VHCA_STATE on this FW. DEVX features (mlx5dv_*)
+		 * are unavailable to the restored process; basic
+		 * libibverbs verbs are the v0 surface.
+		 *
+		 * c->source_devx_uid is always 0 in v0 images (the
+		 * pre-suspend filter would have refused the dump
+		 * otherwise) and is kept on the image as a forwards-
+		 * compatibility hook for a future "DEVX-source
+		 * supported" pass that threads ADOPT_DEVX_UID through
+		 * GET_CONTEXT.
+		 *
+		 * Defense-in-depth: kernel commit c659ab66483d added a
+		 * strict-equality precondition on
+		 * RESTORE_UCONTEXT.meta.devx_uid vs c->devx_uid; if a
+		 * stale image with meta.devx_uid != 0 is restored
+		 * against a destination opened without DEVX (this
+		 * branch), RESTORE_UCONTEXT returns -EINVAL early
+		 * instead of silently accepting and surfacing later as
+		 * DEALLOC_PD bad_resource_state.
 		 */
 		rc = vfmig_send_get_context_v2(
 			fd, flags,
@@ -694,15 +703,14 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 		uint32_t flags = MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE;
 
 		/*
-		 * v0 limitation: DEVX adoption is unworkable on current
-		 * mlx5 FW (see static-path comment above for the full
-		 * empirical chain and kernel commit refs). lib_uar_dyn=
-		 * true is the libmlx5 default and silently implies
-		 * DEVX on the source, so dyn-mode source ucontexts
-		 * commonly have source_devx_uid != 0. We still open
-		 * the destination WITHOUT DEVX and let restored
-		 * resources live under uid=0; downstream verbs that
-		 * don't depend on DEVX continue to work.
+		 * v0 contract: see static-path comment above. Dyn-UAR
+		 * source ucontexts are gated by the dump-side filter
+		 * the same way as static -- the pre-suspend check on
+		 * meta.devx_uid (resolved via NLDEV PD walk for the
+		 * dyn path because QUERY_DYN_UARS doesn't return meta)
+		 * refuses the dump if non-zero. Destination opens
+		 * without DEVX and all restored resources live under
+		 * uid=0; downstream non-DEVX verbs work.
 		 */
 		rc = vfmig_send_get_context_v2(
 			fd, flags,

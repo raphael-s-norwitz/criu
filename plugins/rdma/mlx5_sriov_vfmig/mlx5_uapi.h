@@ -162,6 +162,42 @@ struct mlx5_ib_alloc_ucontext_resp_local {
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
 #define MLX5_IB_INVALID_UAR_INDEX_LOCAL (1u << 31)
 
+/*
+ * Local mirror of include/uapi/rdma/mlx5_user_ioctl_cmds.h's
+ * struct mlx5_ib_vfmig_ucontext_meta. Wire layout MUST match the
+ * kernel (40 bytes) so QUERY_UCONTEXT's uverbs_copy_to and
+ * RESTORE_UCONTEXT's uverbs_copy_from line up byte-for-byte.
+ *
+ * @devx_uid (kernel commit c659ab66483d "RDMA/mlx5: expose VFMIG
+ * source devx_uid + harden destroy_qp diagnostics") is the source
+ * ucontext's FW owner-id, repurposed from the original
+ * reserved1[0..1] slot. Wire layout was preserved (still 40
+ * bytes); CRIU built against an older kernel that doesn't emit
+ * @devx_uid sees zero, which is correct only for the v0
+ * critical path: a libibverbs ucontext opened without DEVX. Two
+ * consumers in the plugin rely on @devx_uid:
+ *
+ *   1. vfmig dump path: refuses the dump if meta.devx_uid != 0.
+ *      LOAD_VHCA_STATE on FW 28.48.1000 does NOT preserve the FW
+ *      uctx-registration table (S3b "DEVX-adoption blind spot"
+ *      matrix), so the destination kernel issues 2RST_QP /
+ *      DESTROY_QP / DEALLOC_PD with c->devx_uid = 0 against FW
+ *      resources owned by source.devx_uid; FW silently no-ops the
+ *      QP-class opcodes (asymmetric uid acceptance: DESTROY_QP
+ *      requires owner-uid match, DEALLOC_PD/DESTROY_CQ accept
+ *      uid=0 host-priv) and the orphan QPC then surfaces as
+ *      DEALLOC_PD bad_resource_state at the next teardown step.
+ *
+ *   2. RESTORE_UCONTEXT's strict-equality precondition #3: the
+ *      kernel cross-checks meta.devx_uid against the destination
+ *      c->devx_uid (set at GET_CONTEXT time) and returns -EINVAL
+ *      on mismatch. Defense-in-depth -- if the dump-side filter
+ *      at #1 is bypassed (e.g. CRIU running against an older
+ *      kernel that didn't have the filter wired yet), the kernel
+ *      fails restore loud and early instead of silently letting
+ *      restore_pd/cq/qp stamp a uid that surfaces only at
+ *      teardown.
+ */
 struct mlx5_ib_vfmig_ucontext_meta_local {
 	uint32_t num_static_sys_pages;
 	uint32_t num_sys_pages;
@@ -173,7 +209,8 @@ struct mlx5_ib_vfmig_ucontext_meta_local {
 	uint8_t  lib_uar_4k;
 	uint8_t  lib_uar_dyn;
 	uint8_t  cqe_version;
-	uint8_t  reserved1[5];
+	uint8_t  reserved1[3];
+	uint16_t devx_uid;
 } __attribute__((aligned(8)));
 
 /*
