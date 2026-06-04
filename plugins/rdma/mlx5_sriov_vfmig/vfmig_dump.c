@@ -1093,106 +1093,104 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 	(void)pid;
 
 	/*
-	 * v0 contract: refuse the dump if the source ucontext was
-	 * opened with DEVX (meta.devx_uid != 0). This gate is QP-
-	 * specific (rather than per-context) because the underlying
-	 * FW failure mode is asymmetric across opcode families on
-	 * FW 28.48.1000:
+	 * Source-DEVX QP dumps are NO LONGER REFUSED.
 	 *
-	 *   - DEALLOC_PD, DESTROY_CQ, DESTROY_MR with uid=0 against
-	 *     a resource owned by uid != 0: ACCEPTED (uid=0 host-
-	 *     priv lane). Existing pd_cq / pd_mr / pd_2cq passes
-	 *     therefore round-trip cleanly under libmlx5 auto-DEVX
-	 *     (rdma-core ca93d3b73054 makes every libmlx5 ibv_open_
-	 *     device implicitly request MLX5_IB_ALLOC_UCTX_DEVX,
-	 *     yielding source devx_uid=2 in the trace).
+	 * History (v0 / 2026-06-03): an earlier version of this hook
+	 * refused the QP dump if the source ucontext was opened with
+	 * DEVX (meta.devx_uid != 0) or with lib_uar_dyn=true (which
+	 * silently implies DEVX in libmlx5). The refusal was based on
+	 * the (then-current) belief that 2RST_QP / DESTROY_QP under
+	 * uid=0 against a QPC owned by source.devx_uid != 0 silently
+	 * no-op'd at FW, leaving the orphan QPC pinning the PD and
+	 * surfacing the failure as DEALLOC_PD bad_resource_state at
+	 * post-restore teardown.
 	 *
-	 *   - 2RST_QP (modify-to-RESET) and DESTROY_QP with uid=0
-	 *     against a QPC owned by uid != 0: SILENTLY NO-OP'd by
-	 *     FW (status=0 returned, but FW state unchanged). The
-	 *     destination kernel's destroy_qp_common warn-only-
-	 *     logs and mlx5_ib_destroy_qp returns 0 to userspace,
-	 *     so the user-visible failure surfaces only at the next
-	 *     teardown step that propagates its FW errno verbatim
-	 *     (typically DEALLOC_PD bad_resource_state, syndrome
-	 *     0xef0c8a-class -- the orphan QPC is still pinning
-	 *     the PD).
+	 * Empirical investigation (kernel-side
+	 * tools/testing/mlx5_vfmig/uobject_restore/qp_destroy_matrix,
+	 * cq_destroy_matrix, mr_destroy_matrix, dealloc_pd_chain on
+	 * FW 28.48.1000) refuted that hypothesis:
 	 *
-	 * Refusing only on QP dumps therefore preserves the v0
-	 * critical path's working surface (PD/CQ/MR-only round
-	 * trips) while surfacing the structural QP-destroy seam
-	 * loudly at dump time, before any SAVE happens. A silent
-	 * dump-then-broken-restore is the worst possible outcome
-	 * and worth a clean -1 here. See kernel commit
-	 * c659ab66483d ("RDMA/mlx5: expose VFMIG source devx_uid
-	 * + harden destroy_qp diagnostics") for the asymmetric uid
-	 * acceptance matrix and the kernel-side defense-in-depth
-	 * (RESTORE_UCONTEXT now strict-equality-checks
-	 * meta.devx_uid against c->devx_uid; runs after this
-	 * filter would have triggered, as a backstop for older
-	 * CRIU bypassing this gate).
+	 *   - DESTROY_QP / 2RST_QP HONOR cross-uid lanes for RESET-
+	 *     state QPs; QPC is destroyed (post-op QUERY_QP returns
+	 *     not-found) regardless of the asserting uid.
+	 *   - DESTROY_CQ HONORS cross-uid (after dropping the
+	 *     dependent QP first via DESTROY_QP, which itself works
+	 *     cross-uid).
+	 *   - DESTROY_MKEY HONORS cross-uid for vfmig-restored mkeys.
+	 *   - DEALLOC_PD on a vfmig-restored PDN fails with status
+	 *     0x9 syndrome 0xef0c8a regardless of asserting uid --
+	 *     because LOAD_VHCA_STATE wipes the per-VHCA (pdn ->
+	 *     owner_uid) registration table. The same shape is
+	 *     returned for definitely-bogus pdns. The kernel's
+	 *     mlx5_ib_dealloc_pd now suppresses exactly this
+	 *     status/syndrome tuple for vfmig-restored PDs, freeing
+	 *     the kernel-side mpd cleanly while trusting VHCA
+	 *     close to reclaim FW state (commit ee27d8e391aa).
 	 *
-	 * Unblocking DEVX-source dumps requires either a libmlx5
-	 * patch that lets callers opt out of auto-DEVX (mlx5dv_
-	 * open_device with a "no-DEVX" attr; rdma-core does not
-	 * expose this today), a raw-uverbs holder that bypasses
-	 * libmlx5, or a future FW that preserves the
-	 * uctx-registration table across LOAD_VHCA_STATE so
-	 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID can re-claim the
-	 * source's devx_uid on the destination.
+	 * Companion kernel relax: the strict-equality check on
+	 * meta.devx_uid in MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT
+	 * (commit c659ab66483d) was relaxed to log-and-continue,
+	 * since:
+	 *   (a) the DEALLOC_PD failure is mitigated by the
+	 *       vfmig_restored gate, independent of devx_uid match;
+	 *   (b) cross-uid destroys honor uid for QP/CQ/MR;
+	 *   (c) the standard-verbs data path (post-restore traffic
+	 *       through HW doorbells/CQEs) does not consult the FW
+	 *       registration tables and is uid-blind.
+	 *
+	 * See drivers/infiniband/hw/mlx5/vfmig_uctx.c and
+	 * tools/testing/mlx5_vfmig/design/pd_registration_wipe.md
+	 * for the kernel-side artefacts. This hook now just records
+	 * the source's devx_uid for diagnostics; the dump proceeds.
+	 *
+	 * Out of scope for v0:
+	 *   - DEVX-direct manipulation (ibv_devx_obj_*) of restored
+	 *     objects post-LM. Those use the wiped (uid -> uctx_attrs)
+	 *     registration table for ownership validation. If a
+	 *     workload relies on that, it is not yet restorable;
+	 *     a future FW change is the path forward (see the
+	 *     "FW-team escalation" section of the kernel design doc).
 	 */
 	rc = vfmig_query_uctx_meta(lfd, &uctx_meta);
 	if (rc == -EOPNOTSUPP) {
 		/*
-		 * Source ran in lib_uar_dyn=true mode (libmlx5 default
-		 * for dyn-UAR-capable adapters). QUERY_UCONTEXT is
-		 * static-only by kernel construction, but lib_uar_dyn=
-		 * true silently implies DEVX in libmlx5 (the dyn-UAR
-		 * verbs are mlx5dv_devx_alloc_uar / free_uar, gated on
-		 * DEVX), so source devx_uid is non-zero by
-		 * construction. Refuse the QP dump for the same reason
-		 * as the explicit-DEVX case below.
+		 * Source ran in lib_uar_dyn=true mode. QUERY_UCONTEXT
+		 * is static-only by kernel construction, but the dyn-
+		 * UAR path is exercised through QUERY_DYN_UARS at
+		 * dump_uverbs_context() time. Fine for the QP hook --
+		 * we only need uctx_meta.devx_uid for the diagnostic
+		 * log below, and the dyn-UAR ucontext's source
+		 * devx_uid is captured separately via NLDEV
+		 * (vfmig_resolve_source_devx_uid -> source_devx_uid in
+		 * the image).
 		 */
-		pr_err("vfmig: refusing QP dump (handle=%u ibdev=%s): "
-		       "source ucontext is dyn-mode (lib_uar_dyn=true) "
-		       "which silently implies DEVX in libmlx5; v0 "
-		       "LOAD_VHCA_STATE on FW 28.48.1000 cannot honor "
-		       "the resulting cross-uid QP destroy. Falls under "
-		       "the same v0 contract as static-DEVX: source "
-		       "must be opened non-DEVX (raw uverbs "
-		       "GET_CONTEXT, req.flags=0).\n",
-		       ufile_handle, ibdev);
-		return -EOPNOTSUPP;
-	}
-	if (rc) {
+		pr_debug("vfmig: QP dump on dyn-mode ucontext "
+			 "(handle=%u ibdev=%s): QUERY_UCONTEXT "
+			 "EOPNOTSUPP -- proceeding (kernel relax of "
+			 "RESTORE_UCONTEXT devx_uid check + "
+			 "mlx5_ib_dealloc_pd vfmig_restored gate "
+			 "make this safe; see "
+			 "tools/testing/mlx5_vfmig/design/"
+			 "pd_registration_wipe.md)\n",
+			 ufile_handle, ibdev);
+		uctx_meta.devx_uid = 0;
+	} else if (rc) {
 		pr_err("vfmig: QUERY_UCONTEXT(lfd=%d, owning ucontext "
-		       "for QP handle=%u) on ibdev=%s failed: %d (%s) "
-		       "-- can't gate the QP dump on source devx_uid\n",
+		       "for QP handle=%u) on ibdev=%s failed: %d (%s)\n",
 		       lfd, ufile_handle, ibdev, rc, strerror(-rc));
 		return rc;
-	}
-	if (uctx_meta.devx_uid != 0) {
-		pr_err("vfmig: refusing QP dump (handle=%u ibdev=%s): "
-		       "source ucontext was opened with DEVX "
-		       "(meta.devx_uid=%u). v0 LOAD_VHCA_STATE on FW "
-		       "28.48.1000 does not preserve the FW uctx-"
-		       "registration table, so the destination kernel "
-		       "issues DESTROY_QP with uid=0 against a QPC "
-		       "owned by source.devx_uid; FW silently no-ops "
-		       "the destroy and the orphan QPC surfaces as "
-		       "DEALLOC_PD bad_resource_state at post-restore "
-		       "teardown. PD/CQ/MR-only dumps from the same "
-		       "ucontext round-trip cleanly (different opcode-"
-		       "family FW uid-acceptance matrix), so the gate "
-		       "is QP-specific. To exercise QP restore, the "
-		       "source process must open its ibv_context "
-		       "without DEVX (libmlx5 auto-DEVX from rdma-core "
-		       "ca93d3b73054 cannot be opted out of via "
-		       "mlx5dv_open_device today; bypass libmlx5 with a "
-		       "raw uverbs GET_CONTEXT, req.flags=0).\n",
-		       ufile_handle, ibdev,
-		       (unsigned)uctx_meta.devx_uid);
-		return -EOPNOTSUPP;
+	} else if (uctx_meta.devx_uid != 0) {
+		pr_info("vfmig: QP dump (handle=%u ibdev=%s): source "
+			"ucontext is DEVX-enabled (meta.devx_uid=%u). "
+			"Proceeding -- the destination's freshly-"
+			"allocated devx_uid will diverge from the "
+			"source's, which is now tolerated by "
+			"RESTORE_UCONTEXT and is harmless for the "
+			"standard-verbs data path. DEVX-direct "
+			"manipulation of restored objects remains "
+			"out of scope for v0.\n",
+			ufile_handle, ibdev,
+			(unsigned)uctx_meta.devx_uid);
 	}
 
 	rc = vfmig_query_qp(lfd, ufile_handle, &blob,

@@ -476,46 +476,19 @@ run_pass() {
     "$CRIU" dump -t "$HOLDER_PID" -D "$DUMPDIR" -v4 -o dump.log --shell-job $CRIU_LIB_FLAG || {
         local rc=$?
         echo "criu dump returned $rc"
-        # EXPECTED-FAIL handler: pd_cq_qp on a host whose libmlx5
-        # auto-allocates a DEVX context (rdma-core ca93d3b73054
-        # "mlx5: Enable devx by default" -- i.e. every libmlx5
-        # >= v36-ish) cannot exercise the QP restore path because
-        # the v0 LOAD_VHCA_STATE on FW 28.48.1000 doesn't
-        # preserve the FW uctx-registration table. The CRIU mlx5
-        # plugin's per-QP dump hook refuses the dump cleanly with
-        # one of the two well-known phrases below (kernel commit
-        # c659ab66483d: "expose VFMIG source devx_uid + harden
-        # destroy_qp diagnostics"). Treat that as
-        # EXPECTED-FAIL -- pd_cq / pd_mr / pd_2cq still round-trip
-        # cleanly under the same auto-DEVX libmlx5 (DEALLOC_PD /
-        # DESTROY_CQ / DESTROY_MR accept uid=0 host-priv on
-        # cross-uid resources; only QP-class destroy ops silently
-        # no-op on uid mismatch and surface as DEALLOC_PD bad_
-        # resource_state at teardown). To exercise pd_cq_qp the
-        # holder needs to bypass libmlx5 with a raw uverbs cdev
-        # GET_CONTEXT (req.flags = 0); see
-        # tools/testing/mlx5_vfmig/tools/ucontext_vendor_verbs.c
-        # for the kernel-agent's analogue.
-        if [[ "$holder_mode" == "pd_cq_qp" ]] && \
-           grep -qE 'vfmig: refusing QP dump.*(opened with DEVX|dyn-mode)' \
-               "$DUMPDIR/dump.log"; then
-            echo "EXPECTED-FAIL ($PASS_NAME): plugin refused QP dump --"
-            echo "  source ucontext was opened by libmlx5 with DEVX"
-            echo "  (rdma-core ca93d3b73054), and v0 LOAD_VHCA_STATE on"
-            echo "  FW 28.48.1000 cannot honor the resulting cross-uid"
-            echo "  QP destroy chain. PD/CQ/MR-only passes still"
-            echo "  round-trip cleanly. To exercise this scenario,"
-            echo "  the holder must bypass libmlx5 (raw uverbs cdev"
-            echo "  GET_CONTEXT, req.flags=0)."
-            grep -E 'vfmig: refusing QP dump' "$DUMPDIR/dump.log" \
-                | head -2 | sed 's/^/  /'
-            # Make sure the holder is gone -- CRIU dump's failure
-            # left it alive in our pgrp, which would lock the next
-            # pass's VF.
-            kill -9 "$HOLDER_PID" 2>/dev/null || true
-            wait "$HOLDER_PID" 2>/dev/null || true
-            return 0
-        fi
+        # Historical EXPECTED-FAIL on pd_cq_qp + libmlx5 auto-DEVX
+        # was removed (2026-06-04) once the kernel-side gate in
+        # mlx5_ib_dealloc_pd (vfmig_restored + 0xef0c8a syndrome
+        # tolerance) and the RESTORE_UCONTEXT devx_uid relax
+        # landed, plus the empirical confirmation that
+        # DESTROY_QP/CQ/MKEY honor cross-uid (kernel
+        # tools/testing/mlx5_vfmig/uobject_restore/{qp,cq,mr}_
+        # destroy_matrix harnesses). The CRIU plugin's per-QP
+        # dump hook no longer refuses on meta.devx_uid != 0 or
+        # on lib_uar_dyn=true; the v0 critical path (default
+        # libmlx5 auto-DEVX source) round-trips cleanly. See
+        # tools/testing/mlx5_vfmig/design/pd_registration_wipe.md
+        # for the full architectural argument.
         pass_fail "criu dump failed"
     }
     if kill -0 "$HOLDER_PID" 2>/dev/null; then
