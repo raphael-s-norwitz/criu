@@ -238,6 +238,37 @@ message mlx5_vfmig_state_entry {
 	optional bytes		uctx_dyn_uar_records	= 13;
 
 	/*
+	 * Orchestrator-stamped per-VF UUID (KS7.3). 16 raw bytes,
+	 * captured at dump time via MLX5_VFMIG_IOC_QUERY_VF on the
+	 * source PF cdev. Must be present and non-zero in every
+	 * record this plugin emits: the dump path hard-refuses to
+	 * write a Mlx5VfmigStateEntry whose source VF's vf_uuid
+	 * comes back all-zeros, on the assumption that the
+	 * orchestrator (libvirt / kubevirt / equivalent) has
+	 * stamped a stable identity onto the VF before workload
+	 * binding.
+	 *
+	 * The orchestrator owns the UUID. CRIU never calls
+	 * MLX5_VFMIG_IOC_SET_VF_UUID -- the dump path only reads
+	 * the kernel's slot, the restore path iterates eligible
+	 * destination PFs/VFs and binds this saved-state record
+	 * to whichever VF QUERY_VF reports a matching vf_uuid.
+	 *
+	 * Required because every dumped record carries one. An
+	 * image whose entries lack vf_uuid would be ambiguous on
+	 * restore -- there is no fallback identity (vhca_id is
+	 * not stable across SAVE/LOAD; vf_id and pf_bdf are
+	 * orchestrator-assignable on the destination), so a
+	 * missing UUID is unrecoverable.
+	 *
+	 * See KS7.3 in tools/testing/mlx5_vfmig/design/
+	 * vf_prerestore_split.md §3.5 for the full lifecycle
+	 * (orchestrator-stamps-on-provision, kernel-clears-on-
+	 * sriov-numvfs=0, CRIU-reads-only).
+	 */
+	required bytes		vf_uuid			= 15;
+
+	/*
 	 * Source-side DEVX uid that owned the ucontext at dump time
 	 * (mlx5_ib_ucontext.devx_uid as observed by the source).
 	 * Values:

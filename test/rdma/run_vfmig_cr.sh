@@ -163,6 +163,17 @@ RESTORED_PID=
 VF_IBDEV=
 VF_BDF=
 VF_BDF_DEST=
+# Orchestrator-stamped per-VF UUID (KS7.3). Generated once per pass
+# in run_pass and stamped by both provision_vf (source) and
+# reprovision_vf_for_restore (destination) via
+# `mlx5_vfmig <PF> set_vf_uuid 0 <PASS_VF_UUID>`. The CRIU plugin's
+# dump path hard-refuses any VF whose QUERY_VF.vf_uuid is all-zeros,
+# and the restore path matches dumped images to destination VFs by
+# this UUID -- so the harness has to play the orchestrator role and
+# stamp the same UUID on both sides of the cycle. See KS7.3 in
+# tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §3.5 for
+# the full contract.
+PASS_VF_UUID=
 DMESG_SINCE_KTIME=
 
 record_dmesg_mark() {
@@ -253,6 +264,18 @@ provision_vf() {
     echo 1 >"$SRIOV_NUMVFS"
     "$VFMIG_TOOL" "$PF" set_tracked 0 1
     "$VFMIG_TOOL" "$PF" enable_migratable 0
+    # KS7.3: stamp the orchestrator-owned UUID before workload bind.
+    # CRIU dump's vfmig_capture_one_vf() reads QUERY_VF.vf_uuid and
+    # hard-refuses on all-zeros, so the harness has to play
+    # orchestrator and stamp a stable identity here. The same
+    # PASS_VF_UUID is re-stamped on the destination VF in
+    # reprovision_vf_for_restore() so the restore-side identity
+    # match (Phase 2, future work) succeeds.
+    [[ -n "$PASS_VF_UUID" ]] || {
+        echo "BUG: provision_vf called with empty PASS_VF_UUID" >&2
+        exit 1
+    }
+    "$VFMIG_TOOL" "$PF" set_vf_uuid 0 "$PASS_VF_UUID"
     local vf_bdf
     vf_bdf="$(readlink "/sys/bus/pci/devices/$PF/virtfn0" | xargs basename)"
     echo mlx5_core >"/sys/bus/pci/devices/$vf_bdf/driver_override"
@@ -278,6 +301,17 @@ reprovision_vf_for_restore() {
     echo "=== Phase E: provision destination VF (no bind -- plugin handles it) ==="
     echo 1 >"$SRIOV_NUMVFS"
     "$VFMIG_TOOL" "$PF" set_tracked 0 1
+    # KS7.3: re-stamp the same UUID on the destination VF. The
+    # restore-side identity match (Phase 2, future work) iterates
+    # eligible PFs/VFs and binds the dumped image to whichever VF
+    # QUERY_VF reports a matching vf_uuid; without this re-stamp
+    # the destination VF would come up all-zeros after the
+    # sriov_numvfs=0 -> sriov_numvfs=N teardown/recreate cycle.
+    [[ -n "$PASS_VF_UUID" ]] || {
+        echo "BUG: reprovision_vf_for_restore called with empty PASS_VF_UUID" >&2
+        exit 1
+    }
+    "$VFMIG_TOOL" "$PF" set_vf_uuid 0 "$PASS_VF_UUID"
     # Plugin's init(RESTORE) does enable_migratable + driver_override + bind.
     local vf_bdf
     vf_bdf="$(readlink "/sys/bus/pci/devices/$PF/virtfn0" | xargs basename)"
@@ -404,9 +438,19 @@ run_pass() {
 
     mkdir -p "$DUMPDIR"
 
+    # KS7.3: one freshly-generated UUID per pass, stamped on both
+    # the source VF (provision_vf) and the destination VF
+    # (reprovision_vf_for_restore). Reusing one UUID across both
+    # roles in a single pass is the correct cross-host orchestrator
+    # contract -- the source and destination represent the same
+    # logical workload identity even though the underlying PCI VF
+    # slot was torn down and recreated between source-bind and
+    # destination-bind.
+    PASS_VF_UUID="$(cat /proc/sys/kernel/random/uuid)"
+
     echo
     echo "==============================================="
-    echo " pass=$PASS_NAME unaligned=$unaligned"
+    echo " pass=$PASS_NAME unaligned=$unaligned vf_uuid=$PASS_VF_UUID"
     echo "==============================================="
 
     # ---- Phase A: source VF provisioning ------------------------------

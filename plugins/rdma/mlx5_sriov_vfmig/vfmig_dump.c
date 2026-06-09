@@ -95,6 +95,20 @@ struct vfmig_saved_vf {
 	char pf_bdf[64];
 	uint32_t vf_id;
 	uint32_t vhca_id;
+	/*
+	 * Orchestrator-stamped per-VF UUID (KS7.3), captured at
+	 * SAVE time via MLX5_VFMIG_IOC_QUERY_VF on the source PF
+	 * cdev. Persisted into mlx5_vfmig_state_entry.vf_uuid so
+	 * the destination CRIU plugin can iterate VFs across
+	 * eligible PFs and bind this saved-state record to
+	 * whichever VF QUERY_VF reports a matching UUID. A VF
+	 * whose UUID comes back all-zeros at SAVE time is
+	 * rejected up front by vfmig_capture_one_vf() -- the
+	 * orchestrator is expected to have stamped a UUID onto
+	 * the VF before workload bind, and a missing UUID would
+	 * make the dump unrestorable on identity grounds.
+	 */
+	uint8_t vf_uuid[16];
 	char blob_path[PATH_MAX];
 	uint64_t blob_size;
 };
@@ -318,13 +332,21 @@ void vfmig_failed_clear(void)
  * on MLX5_VFMIG_IOC_SAVE_VHCA_STATE):
  *   1. open /dev/mlx5_vfmig/<pf_bdf>
  *   2. ioctl MLX5_VFMIG_IOC_GET_VHCA_ID    (record vhca_id for diags)
- *   3. ioctl MLX5_VFMIG_IOC_SAVE_VHCA_STATE { vf_id,
+ *   3. ioctl MLX5_VFMIG_IOC_QUERY_VF       (read the orchestrator-
+ *      stamped vf_uuid, KS7.3). Hard-refuse the dump if it comes
+ *      back all-zeros: that means the orchestrator has not stamped
+ *      an identity onto this VF, and the resulting image would have
+ *      no way to bind to a destination VF on restore. We perform
+ *      this check BEFORE SAVE_VHCA_STATE so the (expensive,
+ *      VF-suspending) save is never run for a VF the dump is going
+ *      to refuse anyway.
+ *   4. ioctl MLX5_VFMIG_IOC_SAVE_VHCA_STATE { vf_id,
  *        flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED }
  *      -> kernel quiesces the VF (SUSPEND_VHCA INITIATOR/RESPONDER),
  *         allocates DMA-mapped image pages, runs SAVE_VHCA_STATE,
  *         returns a read-only anon-inode fd.
- *   4. read the save_fd to EOF, write into the image dir.
- *   5. close(save_fd) WITHOUT issuing RESUME -- KEEP_SUSPENDED told
+ *   5. read the save_fd to EOF, write into the image dir.
+ *   6. close(save_fd) WITHOUT issuing RESUME -- KEEP_SUSPENDED told
  *      the kernel to leave the source VF stopped; the orchestrator
  *      tears the VF down before any resume on the source. (See
  *      cover note: post-SAVE the VF is intentionally not runnable
@@ -339,7 +361,9 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 				struct vfmig_saved_vf *out)
 {
 	struct mlx5_vfmig_get_vhca_id gv;
+	struct mlx5_vfmig_query_vf qv;
 	struct mlx5_vfmig_save_state ss;
+	uint8_t zero_uuid[16] = { 0 };
 	char cdev_path[PATH_MAX];
 	int cdev_fd;
 
@@ -360,6 +384,43 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 		return -1;
 	}
 	out->vhca_id = gv.vhca_id;
+
+	/*
+	 * KS7.3 capture. Read the orchestrator-stamped vf_uuid and
+	 * hard-refuse on all-zeros. The error message names the
+	 * orchestrator-side step the operator is expected to have
+	 * run (MLX5_VFMIG_IOC_SET_VF_UUID on this PF cdev with the
+	 * desired 16-byte identity), so a harness that hits this is
+	 * pointed at the lockstep work it owes us.
+	 *
+	 * Done BEFORE SAVE_VHCA_STATE: SAVE suspends the source VF
+	 * (and with KEEP_SUSPENDED leaves it parked), so refusing
+	 * after the save would mean we paid the most invasive cost
+	 * the plugin has only to throw away the result.
+	 */
+	memset(&qv, 0, sizeof(qv));
+	qv.vf_id = vf_id;
+	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_QUERY_VF, &qv)) {
+		pr_perror("vfmig: QUERY_VF(pf=%s, vf_id=%u)",
+			  pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+	if (!memcmp(qv.vf_uuid, zero_uuid, sizeof(zero_uuid))) {
+		pr_err("vfmig: refusing to dump pf=%s vf_id=%u: "
+		       "orchestrator has not stamped a vf_uuid on this VF "
+		       "(QUERY_VF.vf_uuid is all-zeros). The orchestrator "
+		       "must call MLX5_VFMIG_IOC_SET_VF_UUID with a stable "
+		       "16-byte identity on this PF cdev before the "
+		       "workload binds the VF, so CRIU's restore path can "
+		       "match the dumped image to a destination VF by "
+		       "UUID. See KS7.3 in tools/testing/mlx5_vfmig/design/"
+		       "vf_prerestore_split.md for the contract.\n",
+		       pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+	memcpy(out->vf_uuid, qv.vf_uuid, sizeof(out->vf_uuid));
 
 	memset(&ss, 0, sizeof(ss));
 	ss.vf_id = vf_id;
@@ -439,8 +500,17 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 	close(cdev_fd);
 
 	pr_info("vfmig: captured pf=%s vf_id=%u vhca_id=%u "
+		"vf_uuid=%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+		"%02x%02x%02x%02x%02x%02x "
 		"blob='%s' size=%llu (flags=%#x%s)\n",
-		pf_bdf, vf_id, out->vhca_id, out->blob_path,
+		pf_bdf, vf_id, out->vhca_id,
+		out->vf_uuid[0],  out->vf_uuid[1],  out->vf_uuid[2],
+		out->vf_uuid[3],  out->vf_uuid[4],  out->vf_uuid[5],
+		out->vf_uuid[6],  out->vf_uuid[7],  out->vf_uuid[8],
+		out->vf_uuid[9],  out->vf_uuid[10], out->vf_uuid[11],
+		out->vf_uuid[12], out->vf_uuid[13], out->vf_uuid[14],
+		out->vf_uuid[15],
+		out->blob_path,
 		(unsigned long long)out->blob_size, ss.flags,
 		(ss.flags & MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED)
 			? "" : ", source-resumed-after-save");
@@ -911,6 +981,7 @@ void vfmig_drain_pending_in_fini(void)
 					     p->source_cdev_path,
 					     st->pf_bdf, st->vf_id,
 					     st->vhca_id,
+					     st->vf_uuid,
 					     st->blob_path, st->blob_size,
 					     &p->uctx_meta,
 					     p->uctx_uar_table,

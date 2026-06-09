@@ -135,6 +135,7 @@ int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
 			     const char *source_cdev_path,
 			     const char *pf_bdf, uint32_t vf_id,
 			     uint32_t vhca_id,
+			     const uint8_t vf_uuid[16],
 			     const char *blob_path, uint64_t blob_size,
 			     const struct mlx5_ib_vfmig_ucontext_meta_local *uctx_meta,
 			     const uint32_t *uctx_uar, size_t uctx_uar_n,
@@ -144,17 +145,42 @@ int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
 			     uint32_t source_devx_uid)
 {
 	Mlx5VfmigStateEntry e = MLX5_VFMIG_STATE_ENTRY__INIT;
+	uint8_t zero_uuid[16] = { 0 };
 	int img_dir, fd;
 	void *buf;
 	size_t plen;
 	uint32_t lenle;
 	struct iovec iov[2];
 
+	/*
+	 * Defensive backstop: vfmig_capture_one_vf() is the only
+	 * upstream of this function in the dump path and it
+	 * already hard-refuses an all-zeros @vf_uuid before any
+	 * SAVE_VHCA_STATE is run. If a future caller forgets that
+	 * invariant we want to fail the entry rather than emit a
+	 * record that is by-construction unrestorable.
+	 */
+	if (!memcmp(vf_uuid, zero_uuid, sizeof(zero_uuid))) {
+		pr_err("vfmig: append_state_entry(ctxn=%u pf=%s vf_id=%u): "
+		       "vf_uuid is all-zeros (caller bug; capture path "
+		       "should have refused)\n", ctxn, pf_bdf, vf_id);
+		return -1;
+	}
+
 	e.ctxn = ctxn;
 	e.ibdev = (char *)ibdev;
 	e.pf_bdf = (char *)pf_bdf;
 	e.vf_id = vf_id;
 	e.vhca_id = vhca_id;
+	/*
+	 * vf_uuid (KS7.3): orchestrator-stamped 16-byte identity
+	 * tag captured by the dump path via MLX5_VFMIG_IOC_QUERY_VF.
+	 * Required field; the bytes pointer aliases the caller's
+	 * buffer and must outlive the pack() call below (which it
+	 * does -- the saved_vf cache entry is the source).
+	 */
+	e.vf_uuid.data = (uint8_t *)vf_uuid;
+	e.vf_uuid.len = 16;
 	e.blob_path = (char *)blob_path;
 	e.blob_size = blob_size;
 	e.source_cdev_path = (char *)source_cdev_path;
