@@ -90,10 +90,10 @@ struct mlx5_vfmig_get_vhca_id {
  * MLX5_VFMIG_IOC_QUERY_VF:
  *   Diagnostic snapshot of one VF on the owning PF. Returns the VF's
  *   live vhca_id (queried via QUERY_HCA_CAP(other_function=1)), the
- *   "restored" and "tracked" bits currently latched on the PF, and
- *   the total number of VFs the PF has provisioned. Userspace
- *   iterates 0..num_vfs-1 to enumerate; that's intentionally cheaper
- *   to maintain than a variable-length list ioctl.
+ *   "restored" / "tracked" bits, the orchestrator-stamped vf_uuid (if
+ *   any), and the total number of VFs the PF has provisioned.
+ *   Userspace iterates 0..num_vfs-1 to enumerate; that's intentionally
+ *   cheaper to maintain than a variable-length list ioctl.
  *
  *   Output fields:
  *     vhca_id:   live VHCA identifier from
@@ -113,6 +113,27 @@ struct mlx5_vfmig_get_vhca_id {
  *                binding any driver. Returned as 0 on out-of-range
  *                vf_id (alongside -ERANGE), so it's safe to read
  *                in the error-path.
+ *     vf_uuid:   16-byte orchestrator-stamped per-VF identity tag
+ *                set via MLX5_VFMIG_IOC_SET_VF_UUID on the PF cdev
+ *                (write side; called by the orchestrator only --
+ *                the CRIU plugin never writes a UUID). All-zeros
+ *                means the orchestrator has not (yet) stamped a
+ *                UUID on this slot. Cleared on SR-IOV teardown
+ *                (sriov_numvfs=0). The CRIU dump path captures
+ *                this into the plugin image; the CRIU restore path
+ *                iterates eligible PFs/VFs and matches by UUID to
+ *                bind a saved-state image to a destination VF.
+ *                See KS7.3 in
+ *                tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
+ *                §3.5 for the dump-side / restore-side contract.
+ *                Returned as all-zeros on out-of-range vf_id.
+ *
+ *   ABI note: this struct grew to add @vf_uuid + @reserved_out after
+ *   the initial release. The encoded ioctl number changes with the
+ *   struct size (sizeof in the _IOWR macro), so old userspace built
+ *   against the smaller struct will get -ENOTTY from a new kernel
+ *   rather than reading a partial / misaligned result. Recompile
+ *   the plugin against this header.
  */
 struct mlx5_vfmig_query_vf {
 	__u32 vf_id;		/* in  */
@@ -122,6 +143,10 @@ struct mlx5_vfmig_query_vf {
 	__u8  tracked;		/* out: 1 if SET_TRACKED { enable=1 }
 				 *      currently in effect on this VF
 				 */
+	__u8  vf_uuid[16];	/* out: orchestrator-stamped UUID,
+				 *      all-zeros if unset
+				 */
+	__u8  reserved_out[8];	/* out: zeroed */
 };
 #define MLX5_VFMIG_IOC_QUERY_VF \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x03, struct mlx5_vfmig_query_vf)
