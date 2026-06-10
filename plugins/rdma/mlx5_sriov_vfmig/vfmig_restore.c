@@ -262,14 +262,25 @@ static void vfmig_uuid_to_str(const uint8_t u[16], char out[VFMIG_UUID_STR_LEN])
  * return the first (pf_bdf, vf_id) tuple whose vf_uuid bitwise-
  * matches @target.
  *
+ * This is half the KS7.3 paired identity match. The other half --
+ * "the destination's `vf_id` MUST equal the image's `vf_id`" -- is
+ * the caller's responsibility, enforced in
+ * vfmig_restore_init_all_vfs() right after this returns 0. We keep
+ * the resolver UUID-only here so the slot-mismatch failure mode
+ * surfaces at the call site with full diagnostic context (image's
+ * source vf_id + matched dest vf_id + the operator-facing
+ * "orchestrator stamped UUID on wrong slot" error message). See
+ * KS7.3 in tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
+ * §3.5.3 for the contract and §3.5.3.1 for why same-`vf_id` is
+ * the natural shape of the kernel/FW model (not a workaround).
+ *
  * The orchestrator is responsible for stamping the destination VF
- * with the matching UUID before the workload is restored onto the
- * VF; CRIU is purely the passive matcher (the kernel's
- * MLX5_VFMIG_IOC_SET_VF_UUID is never called from CRIU code, neither
- * here nor in any future prerestore binary). See KS7.3 in
- * tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §3.5 for
- * the contract; the dump path's vfmig_capture_one_vf() is the
- * source-side companion to this resolver.
+ * with the matching UUID on the matching `vf_id` slot before the
+ * workload is restored onto it; CRIU is purely the passive matcher
+ * (the kernel's MLX5_VFMIG_IOC_SET_VF_UUID is never called from
+ * CRIU code, neither here nor in any future prerestore binary).
+ * The dump path's vfmig_capture_one_vf() is the source-side
+ * companion to this resolver.
  *
  * "First match wins": with a UUID space of 2^128, two PFs / VFs on
  * the same host both reporting the same UUID is an orchestrator
@@ -1053,10 +1064,26 @@ int vfmig_restore_init_all_vfs(void)
 		vfmig_uuid_to_str(e->vf_uuid.data, uuid_str);
 
 		/*
-		 * KS7.3 destination discovery. The dump-recorded
-		 * source (e->pf_bdf, e->vf_id) is diagnostic only --
-		 * the destination's tuple is whatever the
-		 * orchestrator stamped this UUID onto on this host.
+		 * KS7.3 destination discovery. The orchestrator may
+		 * have picked any PF on this host (cross-PF migration
+		 * is fine), but per §3.5.3 + §3.5.3.1 the destination
+		 * `vf_id` slot MUST equal the source's. We resolve by
+		 * UUID first, then enforce the slot equality below.
+		 * Both halves of the contract carry distinct error
+		 * paths so the operator can tell which they violated:
+		 *
+		 *   no UUID match  -> "no VF on this host has
+		 *                      vf_uuid=X" (orchestrator
+		 *                      forgot SET_VF_UUID, or
+		 *                      stamped a different UUID
+		 *                      everywhere).
+		 *   UUID match
+		 *   on wrong slot  -> "found vf_uuid=X on (pf=...,
+		 *                      vf_id=Z) but image dumped
+		 *                      from vf_id=Y" (right workload
+		 *                      identity, wrong slot;
+		 *                      cross-slot LOAD is not
+		 *                      supported -- see §3.5.3.1).
 		 */
 		rc = vfmig_resolve_uuid_to_pf_vf(e->vf_uuid.data,
 						 dest_pf_bdf,
@@ -1067,18 +1094,45 @@ int vfmig_restore_init_all_vfs(void)
 			       "VF on this host has vf_uuid=%s. The "
 			       "orchestrator must call "
 			       "MLX5_VFMIG_IOC_SET_VF_UUID with this UUID "
-			       "on a destination VF cdev before "
-			       "restore. The dump-recorded source tuple "
-			       "is diagnostic only -- the destination "
-			       "(pf_bdf, vf_id) need not match the "
-			       "source. See KS7.3 in tools/testing/"
-			       "mlx5_vfmig/design/vf_prerestore_split.md "
-			       "§3.5.\n",
+			       "on a destination VF before restore. See "
+			       "KS7.3 in tools/testing/mlx5_vfmig/design/"
+			       "vf_prerestore_split.md §3.5.3.\n",
 			       e->ctxn, e->pf_bdf, e->vf_id, uuid_str);
 			goto err;
 		}
 		if (rc < 0)
 			goto err;
+
+		/*
+		 * KS7.3 §3.5.3.1: destination `vf_id` MUST equal
+		 * source `vf_id`. The kernel's per-VF IOVA window is
+		 * `vf_id`-keyed (`base = VFMIG_IOVA_BASE + vf_id *
+		 * VFMIG_IOVA_PER_VF`), and the FW E-Switch
+		 * `vport_num` is `vf_id+1`-keyed; cross-slot LOAD
+		 * fails at the IOVA replay slot grid cross-check
+		 * inside vfmig_iova.c. CRIU does not silently coerce
+		 * onto the orchestrator's chosen slot: it surfaces
+		 * the misconfiguration with a distinct error so the
+		 * operator can fix `sriov_numvfs` / `SET_VF_UUID` on
+		 * the destination instead of chasing a kernel-side
+		 * LOAD-time -EINVAL.
+		 */
+		if (dest_vf_id != e->vf_id) {
+			pr_err("vfmig: ctxn=%u source(pf=%s vf_id=%u): "
+			       "found vf_uuid=%s on (pf=%s, vf_id=%u) "
+			       "but image was dumped from vf_id=%u; "
+			       "orchestrator must provision the "
+			       "matching `vf_id` slot on the destination "
+			       "and stamp the UUID there. Cross-slot "
+			       "LOAD is not supported (kernel's per-VF "
+			       "IOVA window is `vf_id`-keyed; FW "
+			       "E-Switch `vport_num` is `vf_id+1`-keyed). "
+			       "See KS7.3 in tools/testing/mlx5_vfmig/"
+			       "design/vf_prerestore_split.md §3.5.3.1.\n",
+			       e->ctxn, e->pf_bdf, e->vf_id, uuid_str,
+			       dest_pf_bdf, dest_vf_id, e->vf_id);
+			goto err;
+		}
 
 		pr_info("vfmig: matched ctxn=%u source(pf=%s vf_id=%u) "
 			"-> dest(pf=%s vf_id=%u) by vf_uuid=%s\n",
