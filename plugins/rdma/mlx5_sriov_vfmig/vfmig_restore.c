@@ -102,8 +102,10 @@
  * and RDMA_OPEN_UVERBS_CDEV just dup() out of the cache.
  *
  * Caches:
- *   vfmig_restored_vfs   - one entry per unique (pf_bdf, vf_id) the
- *                          image references; carries the resolved
+ *   vfmig_restored_vfs   - one entry per unique vf_uuid the image
+ *                          references; carries the discovered
+ *                          DESTINATION (pf_bdf, vf_id) the UUID
+ *                          matched on this host, the post-bind
  *                          dest VF BDF, dest ibdev, and dest cdev
  *                          path for diagnostics + reuse.
  *   vfmig_restored_ctxs  - one entry per Mlx5VfmigStateEntry; holds
@@ -114,22 +116,51 @@
  *
  * Multi-ctxn-per-VF: not supported in v0. The protobuf contract on
  * the restore side allows multiple state entries against the same
- * (pf_bdf, vf_id), but UPDATE_VMA_MAP receives only the source path
- * as a discriminator -- two ctxns on the same source cdev path
- * would alias in the path-keyed cache. Phase 2 below refuses any
- * such image up front; if it ever needs to be supported, CRIU's
+ * vf_uuid, but UPDATE_VMA_MAP receives only the source path as a
+ * discriminator -- two ctxns on the same source cdev path would
+ * alias in the path-keyed cache. Phase 2 below refuses any such
+ * image up front; if it ever needs to be supported, CRIU's
  * UPDATE_VMA_MAP plugin ABI needs to grow a reg_file id (or
  * equivalent disambiguator).
  *
- * Single-host vs cross-host: for v0 we assume the destination's
- * (pf_bdf, vf_id) tuple matches the source's (i.e. the orchestrator
- * has reproduced the source's SR-IOV layout on the destination).
- * Cross-host migration needs an explicit (source -> dest) remap
- * supplied by the orchestrator; that's a follow-up.
+ * Identity model (KS7.3): the destination VF is found by 16-byte
+ * vf_uuid match against MLX5_VFMIG_IOC_QUERY_VF on every PF cdev
+ * under /dev/mlx5_vfmig/. The orchestrator stamps the same UUID
+ * onto the source VF (consumed by the dump path) and the
+ * destination VF (consumed here). The dump-recorded source
+ * (pf_bdf, vf_id) is diagnostic only on restore -- the
+ * destination's (pf_bdf, vf_id) is whatever QUERY_VF returns for
+ * the matching slot, which the orchestrator may legitimately have
+ * placed on a different PF and/or vf_id index than the source.
+ * Hard-refuse the restore if no PF/VF on this host carries the
+ * image's vf_uuid: that means the orchestrator has not stamped
+ * the destination VF, and CRIU has no safe way to bind the saved
+ * state to a slot on identity grounds.
  */
 
 struct vfmig_restored_vf {
 	struct vfmig_restored_vf *next;
+	/*
+	 * 16-byte orchestrator-stamped UUID (KS7.3). The cache
+	 * lookup key. Equal to both the image entry's vf_uuid and
+	 * QUERY_VF.vf_uuid on the destination VF the resolver
+	 * matched.
+	 */
+	uint8_t vf_uuid[16];
+	/*
+	 * Destination-side (pf_bdf, vf_id) discovered by UUID
+	 * scan over /dev/mlx5_vfmig/. The orchestrator places
+	 * the destination VF wherever it likes; this tuple is
+	 * what we drive ENABLE_MIGRATABLE / SET_TRACKED /
+	 * LOAD_VHCA_STATE / MARK_RESTORED against, and is what
+	 * sysfs walks key off of for the post-bind ibdev /
+	 * cdev resolution. Single-host dump-then-restore on the
+	 * same SR-IOV layout often produces the same numeric
+	 * (pf_bdf, vf_id) here as the dump-recorded source
+	 * tuple, but Phase 2 onwards does NOT rely on that
+	 * coincidence -- the dump-recorded source tuple is
+	 * diagnostic-only on restore.
+	 */
 	char pf_bdf[64];
 	uint32_t vf_id;
 	char vf_bdf[64];
@@ -198,14 +229,153 @@ struct vfmig_restored_ctx {
 static struct vfmig_restored_ctx *vfmig_restored_ctxs;
 
 static struct vfmig_restored_vf *
-vfmig_restored_vf_lookup(const char *pf_bdf, uint32_t vf_id)
+vfmig_restored_vf_lookup_by_uuid(const uint8_t uuid[16])
 {
 	struct vfmig_restored_vf *p;
 
 	for (p = vfmig_restored_vfs; p; p = p->next)
-		if (p->vf_id == vf_id && !strcmp(p->pf_bdf, pf_bdf))
+		if (!memcmp(p->vf_uuid, uuid, 16))
 			return p;
 	return NULL;
+}
+
+/*
+ * Pretty-print a 16-byte UUID into a 37-byte caller buffer in the
+ * canonical 8-4-4-4-12 hex form (so log lines are greppable / round-
+ * trippable through `mlx5_vfmig set_vf_uuid`). @out must be at least
+ * 37 bytes including the trailing NUL.
+ */
+#define VFMIG_UUID_STR_LEN 37
+static void vfmig_uuid_to_str(const uint8_t u[16], char out[VFMIG_UUID_STR_LEN])
+{
+	snprintf(out, VFMIG_UUID_STR_LEN,
+		 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+		 "%02x%02x%02x%02x%02x%02x",
+		 u[0],  u[1],  u[2],  u[3],  u[4],  u[5],
+		 u[6],  u[7],  u[8],  u[9],  u[10], u[11],
+		 u[12], u[13], u[14], u[15]);
+}
+
+/*
+ * KS7.3 destination-VF discovery: scan every PF cdev under
+ * /dev/mlx5_vfmig/, run MLX5_VFMIG_IOC_QUERY_VF on every VF, and
+ * return the first (pf_bdf, vf_id) tuple whose vf_uuid bitwise-
+ * matches @target.
+ *
+ * The orchestrator is responsible for stamping the destination VF
+ * with the matching UUID before the workload is restored onto the
+ * VF; CRIU is purely the passive matcher (the kernel's
+ * MLX5_VFMIG_IOC_SET_VF_UUID is never called from CRIU code, neither
+ * here nor in any future prerestore binary). See KS7.3 in
+ * tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §3.5 for
+ * the contract; the dump path's vfmig_capture_one_vf() is the
+ * source-side companion to this resolver.
+ *
+ * "First match wins": with a UUID space of 2^128, two PFs / VFs on
+ * the same host both reporting the same UUID is an orchestrator
+ * bug, not a CRIU concern. (The kernel's SET_VF_UUID ioctl
+ * deliberately does NOT enforce host-wide uniqueness; cross-PF
+ * coordination is outside the per-PF cdev's scope.)
+ *
+ * Iteration model mirrors probe_pf_cdev() in vfmig_pci.c: QUERY_VF
+ * with vf_id=0 always populates @num_vfs (kernel UAPI invariant,
+ * even on -ERANGE), so one ioctl tells us the iteration bound and
+ * a per-vf loop reads @vf_uuid.
+ *
+ * Returns 0 on match (with @pf_bdf_out + @vf_id_out populated),
+ * -ENOENT if no PF/VF on this host carries @target, -1 on a hard
+ * error (e.g. /dev/mlx5_vfmig itself unreadable). A per-PF cdev
+ * that itself errors (open / first ioctl) is logged + skipped --
+ * one misbehaving PF must not poison the search across the whole
+ * host.
+ */
+static int vfmig_resolve_uuid_to_pf_vf(const uint8_t target[16],
+				       char *pf_bdf_out, size_t pf_bdf_sz,
+				       uint32_t *vf_id_out)
+{
+	DIR *d;
+	struct dirent *de;
+
+	d = opendir(MLX5_VFMIG_DEV_DIR);
+	if (!d) {
+		pr_perror("vfmig: opendir(%s)", MLX5_VFMIG_DEV_DIR);
+		return -1;
+	}
+
+	while ((de = readdir(d)) != NULL) {
+		char path[PATH_MAX];
+		struct mlx5_vfmig_query_vf q;
+		int fd, rc;
+		uint32_t num_vfs, vf;
+
+		if (de->d_name[0] == '.')
+			continue;
+		if (snprintf(path, sizeof(path), "%s/%s",
+			     MLX5_VFMIG_DEV_DIR, de->d_name) >=
+		    (int)sizeof(path))
+			continue;
+
+		fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			pr_warn("vfmig: open(%s) for UUID resolve: %s\n",
+				path, strerror(errno));
+			continue;
+		}
+
+		memset(&q, 0, sizeof(q));
+		q.vf_id = 0;
+		rc = ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, &q);
+		if (rc != 0 && errno != ERANGE) {
+			pr_warn("vfmig: QUERY_VF(%s, vf_id=0) for UUID "
+				"resolve: %s\n", path, strerror(errno));
+			close(fd);
+			continue;
+		}
+		num_vfs = q.num_vfs;
+
+		/*
+		 * vf_id=0 fields (including vf_uuid) are valid only
+		 * when rc == 0; on -ERANGE (no VFs provisioned) the
+		 * kernel populates @num_vfs (which will be 0) but
+		 * leaves the per-VF outputs zero -- comparing
+		 * zero-uuid here would be a false negative, so gate
+		 * on rc.
+		 */
+		if (rc == 0 &&
+		    !memcmp(q.vf_uuid, target, sizeof(q.vf_uuid))) {
+			snprintf(pf_bdf_out, pf_bdf_sz, "%s", de->d_name);
+			*vf_id_out = 0;
+			close(fd);
+			closedir(d);
+			return 0;
+		}
+
+		for (vf = 1; vf < num_vfs; vf++) {
+			struct mlx5_vfmig_query_vf qq;
+
+			memset(&qq, 0, sizeof(qq));
+			qq.vf_id = vf;
+			if (ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, &qq) != 0) {
+				pr_warn("vfmig: QUERY_VF(%s, vf_id=%u) for "
+					"UUID resolve: %s\n", path, vf,
+					strerror(errno));
+				continue;
+			}
+			if (!memcmp(qq.vf_uuid, target,
+				    sizeof(qq.vf_uuid))) {
+				snprintf(pf_bdf_out, pf_bdf_sz, "%s",
+					 de->d_name);
+				*vf_id_out = vf;
+				close(fd);
+				closedir(d);
+				return 0;
+			}
+		}
+		close(fd);
+	}
+
+	closedir(d);
+	return -ENOENT;
 }
 
 static struct vfmig_restored_ctx *
@@ -827,6 +997,7 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 
 int vfmig_restore_init_all_vfs(void)
 {
+	static const uint8_t zero_uuid[16] = { 0 };
 	Mlx5VfmigStateEntry **entries = NULL;
 	size_t n_entries = 0, i;
 
@@ -837,19 +1008,87 @@ int vfmig_restore_init_all_vfs(void)
 
 	pr_info("vfmig: restore: %zu state entries to load\n", n_entries);
 
+	/*
+	 * Pre-flight: every entry must carry a well-formed,
+	 * non-zero vf_uuid. The proto field is `required bytes`
+	 * so unpack already fails on an entry that omits it; what
+	 * we still have to defend against here is a malformed
+	 * length (wire bug) or all-zeros bytes (orchestrator-bug
+	 * that bypassed the dump-side capture refusal). Phase 2's
+	 * UUID-only identity model has no fallback for either.
+	 */
+	for (i = 0; i < n_entries; i++) {
+		const Mlx5VfmigStateEntry *e = entries[i];
+
+		if (e->vf_uuid.len != 16) {
+			pr_err("vfmig: image entry ctxn=%u has malformed "
+			       "vf_uuid (len=%zu, want 16)\n",
+			       e->ctxn, e->vf_uuid.len);
+			goto err;
+		}
+		if (!memcmp(e->vf_uuid.data, zero_uuid, 16)) {
+			pr_err("vfmig: image entry ctxn=%u has all-zeros "
+			       "vf_uuid -- malformed image (the dump-side "
+			       "vfmig_capture_one_vf() should have refused). "
+			       "Cannot match this entry to a destination VF "
+			       "by KS7.3 identity; refusing the restore.\n",
+			       e->ctxn);
+			goto err;
+		}
+	}
+
 	for (i = 0; i < n_entries; i++) {
 		Mlx5VfmigStateEntry *e = entries[i];
 		struct vfmig_restored_vf *v;
+		char dest_pf_bdf[64];
+		uint32_t dest_vf_id;
 		char vf_bdf[64], dest_ibdev[64];
 		char dest_cdev_path[PATH_MAX];
+		char uuid_str[VFMIG_UUID_STR_LEN];
+		int rc;
 
-		if (vfmig_restored_vf_lookup(e->pf_bdf, e->vf_id))
+		if (vfmig_restored_vf_lookup_by_uuid(e->vf_uuid.data))
 			continue;
 
-		if (vfmig_load_one_vf(e->pf_bdf, e->vf_id,
+		vfmig_uuid_to_str(e->vf_uuid.data, uuid_str);
+
+		/*
+		 * KS7.3 destination discovery. The dump-recorded
+		 * source (e->pf_bdf, e->vf_id) is diagnostic only --
+		 * the destination's tuple is whatever the
+		 * orchestrator stamped this UUID onto on this host.
+		 */
+		rc = vfmig_resolve_uuid_to_pf_vf(e->vf_uuid.data,
+						 dest_pf_bdf,
+						 sizeof(dest_pf_bdf),
+						 &dest_vf_id);
+		if (rc == -ENOENT) {
+			pr_err("vfmig: ctxn=%u source(pf=%s vf_id=%u): no "
+			       "VF on this host has vf_uuid=%s. The "
+			       "orchestrator must call "
+			       "MLX5_VFMIG_IOC_SET_VF_UUID with this UUID "
+			       "on a destination VF cdev before "
+			       "restore. The dump-recorded source tuple "
+			       "is diagnostic only -- the destination "
+			       "(pf_bdf, vf_id) need not match the "
+			       "source. See KS7.3 in tools/testing/"
+			       "mlx5_vfmig/design/vf_prerestore_split.md "
+			       "§3.5.\n",
+			       e->ctxn, e->pf_bdf, e->vf_id, uuid_str);
+			goto err;
+		}
+		if (rc < 0)
+			goto err;
+
+		pr_info("vfmig: matched ctxn=%u source(pf=%s vf_id=%u) "
+			"-> dest(pf=%s vf_id=%u) by vf_uuid=%s\n",
+			e->ctxn, e->pf_bdf, e->vf_id,
+			dest_pf_bdf, dest_vf_id, uuid_str);
+
+		if (vfmig_load_one_vf(dest_pf_bdf, dest_vf_id,
 				      e->blob_path, e->blob_size))
 			goto err;
-		if (vfmig_resolve_vf_bdf(e->pf_bdf, e->vf_id,
+		if (vfmig_resolve_vf_bdf(dest_pf_bdf, dest_vf_id,
 					 vf_bdf, sizeof(vf_bdf)))
 			goto err;
 		if (vfmig_driver_override_and_bind(vf_bdf))
@@ -865,8 +1104,9 @@ int vfmig_restore_init_all_vfs(void)
 		v = calloc(1, sizeof(*v));
 		if (!v)
 			goto err;
-		snprintf(v->pf_bdf, sizeof(v->pf_bdf), "%s", e->pf_bdf);
-		v->vf_id = e->vf_id;
+		memcpy(v->vf_uuid, e->vf_uuid.data, 16);
+		snprintf(v->pf_bdf, sizeof(v->pf_bdf), "%s", dest_pf_bdf);
+		v->vf_id = dest_vf_id;
 		snprintf(v->vf_bdf, sizeof(v->vf_bdf), "%s", vf_bdf);
 		snprintf(v->dest_ibdev, sizeof(v->dest_ibdev), "%s",
 			 dest_ibdev);
@@ -875,10 +1115,13 @@ int vfmig_restore_init_all_vfs(void)
 		v->next = vfmig_restored_vfs;
 		vfmig_restored_vfs = v;
 
-		pr_info("vfmig: restored VF: pf=%s vf_id=%u vf_bdf=%s "
+		pr_info("vfmig: restored VF: vf_uuid=%s "
+			"source(pf=%s vf_id=%u) -> "
+			"dest(pf=%s vf_id=%u vf_bdf=%s) "
 			"dest_ibdev=%s dest_cdev=%s\n",
-			v->pf_bdf, v->vf_id, v->vf_bdf, v->dest_ibdev,
-			v->dest_cdev_path);
+			uuid_str, e->pf_bdf, e->vf_id,
+			v->pf_bdf, v->vf_id, v->vf_bdf,
+			v->dest_ibdev, v->dest_cdev_path);
 	}
 
 	for (i = 0; i < n_entries; i++) {
@@ -886,10 +1129,11 @@ int vfmig_restore_init_all_vfs(void)
 		struct vfmig_restored_vf *v;
 		struct vfmig_restored_ctx *c;
 
-		v = vfmig_restored_vf_lookup(e->pf_bdf, e->vf_id);
+		v = vfmig_restored_vf_lookup_by_uuid(e->vf_uuid.data);
 		if (!v) {
 			pr_err("vfmig: restored_vf lookup miss for "
-			       "ctxn=%u\n", e->ctxn);
+			       "ctxn=%u (vf_uuid not found in cache; "
+			       "loop-1 logic bug)\n", e->ctxn);
 			goto err;
 		}
 
