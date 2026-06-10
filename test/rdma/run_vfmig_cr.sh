@@ -674,141 +674,82 @@ run_pass() {
     "$CRIU" restore -D "$DUMPDIR" -v4 -o restore.log -d \
         --pidfile "$RESTORED_PIDFILE" --shell-job $CRIU_LIB_FLAG || restore_rc=$?
 
-    # KS7.5 (kernel cross-slot LOAD gap, surfaced by
-    # pd_cq_crossslot as of 2026-06-10):
-    #     The kernel partitions each VF's IOVA window
-    #     deterministically by vf_id (per-VF slot grid in
-    #     drivers/.../mlx5/core/vfmig/{iova_partition,...}.c). At
-    #     LOAD time the kernel walks the source's saved IOVA
-    #     replay log and rejects any entry whose IOVA falls in
-    #     a slot that doesn't map back to the destination's
-    #     slot grid (vfmig_iova "wire claims slot N for IOVA
-    #     X but destination partitioning maps it to slot M").
-    #     This is a real, reproducible cross-slot LOAD
-    #     limitation: source vf_id=0 -> dest vf_id=N (N != 0)
-    #     can't replay because every saved IOVA was rooted in
-    #     vf 0's slot grid and the destination doesn't have
-    #     that grid. Same-slot LOAD (vf_id=0 -> vf_id=0) works
-    #     fine -- it's been the only cross-host shape exercised
-    #     to date because the reprovision step previously
-    #     hard-coded vf_id=0 on both ends.
-    #
-    # The CRIU plugin's UUID-driven resolver is correctly
-    # picking the dest vf_id by UUID; the failure happens
-    # one layer below, in the kernel's LOAD write. That's
-    # exactly what EXPECT_KERNEL_XSLOT_GAP=1 asserts: the
-    # resolver match fired for the right slot, the LOAD got
-    # as far as the kernel, and the kernel rejected with
-    # the slot-mismatch error. A regression where the
-    # resolver coerces back to vf_id=0 would silently
-    # pass the kernel LOAD (vf_id=0 -> vf_id=0 is supported)
-    # and we'd report PASS where we shouldn't -- so this
-    # branch hard-fails if any of the four pieces of
-    # evidence is missing.
-    if [[ "${EXPECT_KERNEL_XSLOT_GAP:-0}" == "1" ]]; then
-        local xslot_dest="${PASS_DEST_VF_ID:-0}"
-        if [[ "$restore_rc" == "0" ]]; then
-            echo "FAIL ($PASS_NAME): expected criu restore to fail at" \
-                 "the kernel cross-slot LOAD boundary" \
-                 "(EXPECT_KERNEL_XSLOT_GAP=1) but restore succeeded." \
-                 "Either the kernel grew cross-slot LOAD support (in" \
-                 "which case relax this knob and let pd_cq_crossslot" \
-                 "be a real end-to-end positive), or some other" \
-                 "regression made the failure silent." >&2
-            if [[ -s "$RESTORED_PIDFILE" ]]; then
-                local rpid
-                rpid="$(cat "$RESTORED_PIDFILE")"
-                [[ -n "$rpid" ]] && kill -KILL "$rpid" 2>/dev/null || true
-            fi
-            pass_fail "kernel cross-slot LOAD didn't fail as expected"
-        fi
-        # Evidence #1: resolver picked the orchestrator-stamped
-        # dest slot, not vf_id=0 by accident.
-        if ! grep -qE \
-            "vfmig: matched ctxn=[0-9]+ source\(pf=[^ ]+ vf_id=[0-9]+\) -> dest\(pf=[^ ]+ vf_id=${xslot_dest}\) by vf_uuid=" \
-            "$DUMPDIR/restore.log"; then
-            echo "FAIL ($PASS_NAME): cross-slot resolver did not pick" \
-                 "PASS_DEST_VF_ID=${xslot_dest}; the kernel LOAD" \
-                 "would have failed at vf_id=0 -> vf_id=0 for an" \
-                 "unrelated reason and EXPECT_KERNEL_XSLOT_GAP=1" \
-                 "would have falsely confirmed it." >&2
-            grep -E 'vfmig: (matched|no VF on this host)' \
-                "$DUMPDIR/restore.log" >&2 || true
-            pass_fail "resolver match line absent"
-        fi
-        # Evidence #2: write(load_fd) returned EINVAL on the
-        # dest vf_id (proves the failure is at the LOAD wire,
-        # not somewhere upstream like enable_migratable or
-        # driver_override).
-        if ! grep -qE \
-            "vfmig: write\(load_fd\) pf=[^ ]+ vf_id=${xslot_dest}: Invalid argument" \
-            "$DUMPDIR/restore.log"; then
-            echo "FAIL ($PASS_NAME): expected write(load_fd) EINVAL on" \
-                 "vf_id=${xslot_dest} (kernel LOAD entry point) but" \
-                 "the failure was reported elsewhere; restore.log:" >&2
-            grep -E "Error \(vfmig_" "$DUMPDIR/restore.log" >&2 || true
-            pass_fail "LOAD EINVAL absent"
-        fi
-        # Evidence #3: dmesg carries the slot-mismatch error
-        # for the dest vf_id (proves the kernel rejected for
-        # the slot-grid reason, not some unrelated EINVAL --
-        # e.g. plugin sent a malformed write -- which would
-        # mask a real CRIU regression).
-        local slot_err
-        slot_err="$(dmesg | awk -v mark="${DMESG_SINCE_KTIME:-0}" '
-            match($0, /^\[[ ]*([0-9]+\.[0-9]+)\]/, m) {
-                if (m[1]+0 >= mark+0) print
-            }' \
-            | grep -E "vfmig_iova: vf ${xslot_dest} replay: wire claims slot [0-9]+ for IOVA 0x[0-9a-f]+ but destination partitioning maps it to slot [0-9]+" \
-            | head -1)"
-        if [[ -z "$slot_err" ]]; then
-            echo "FAIL ($PASS_NAME): kernel dmesg lacks the expected" \
-                 "vfmig_iova slot-mismatch error for dest" \
-                 "vf_id=${xslot_dest}; either the kernel grew cross-" \
-                 "slot LOAD support or it failed for some other" \
-                 "reason. Either way EXPECT_KERNEL_XSLOT_GAP=1 is" \
-                 "no longer the right diagnostic for this pass." >&2
-            echo "--- dmesg slice (vfmig + iova) ---" >&2
-            dmesg | awk -v mark="${DMESG_SINCE_KTIME:-0}" '
-                match($0, /^\[[ ]*([0-9]+\.[0-9]+)\]/, m) {
-                    if (m[1]+0 >= mark+0) print
-                }' \
-                | grep -E 'vfmig|iova' | tail -40 >&2 || true
-            pass_fail "kernel slot-mismatch evidence absent"
-        fi
-        echo "pass=$PASS_NAME: PASS (resolver-only; kernel cross-slot" \
-             "LOAD XFAIL)"
-        echo "  resolver match: source vf_id=0 -> dest vf_id=${xslot_dest}" \
-             "(by UUID, validated)"
-        echo "  kernel slot-mismatch (KS7.5):" \
-             "$(echo "$slot_err" | sed -E 's/^\[[ ]*[0-9.]+\] //')"
-        echo "  -> CRIU plugin Phase 2 UUID-driven discovery is correct;"
-        echo "  -> kernel cross-slot LOAD support is the next gap to close"
-        echo "     (drivers/.../mlx5/core/vfmig/iova_partition.c needs a"
-        echo "     slot-translation step on replay so source-vf-N IOVAs"
-        echo "     can be retargeted onto dest-vf-M's slot grid)."
-        return 0
-    fi
-
-    # Negative-test branch (KS7.3 cross-slot/orchestrator-bug
+    # Negative-test branch (KS7.3 orchestrator-misconfiguration
     # coverage): EXPECT_RESTORE_FAIL=1 means the harness
     # deliberately misconfigured the destination orchestrator
-    # stamp (PASS_DEST_STAMP_MODE=none|wrong) and the plugin
-    # was supposed to refuse at vfmig_restore_init_all_vfs() with
-    # the "no VF on this host has vf_uuid=..." error. Two
-    # things have to be true: (a) criu restore exited non-zero,
-    # and (b) the refuse fired for the right reason -- a
-    # restore that failed for an *unrelated* error (kernel ABI
-    # mismatch, plugin .so missing, etc.) shouldn't be
-    # interpreted as a passing negative test.
+    # stamp and the plugin was supposed to refuse at
+    # vfmig_restore_init_all_vfs() with one of two distinct
+    # error patterns, selected by EXPECT_RESTORE_FAIL_REASON:
+    #
+    #   uuid_mismatch  -- "no VF on this host has vf_uuid=..."
+    #                     Orchestrator forgot SET_VF_UUID
+    #                     entirely, or stamped a different
+    #                     UUID on every dest slot
+    #                     (PASS_DEST_STAMP_MODE=none|wrong).
+    #
+    #   slot_misalign  -- "found vf_uuid=... on (pf=...,
+    #                     vf_id=Z) but image was dumped from
+    #                     vf_id=Y". Orchestrator stamped the
+    #                     right UUID but on the wrong slot
+    #                     (PASS_DEST_STAMP_MODE=match with
+    #                     PASS_DEST_VF_ID != source's vf_id,
+    #                     which is always 0 in this harness).
+    #                     KS7.3 §3.5.3.1 contract: cross-slot
+    #                     LOAD is not supported (kernel's per-
+    #                     VF IOVA window + FW E-Switch
+    #                     vport_num are both vf_id-keyed) so
+    #                     CRIU refuses BEFORE the kernel LOAD
+    #                     wire to give the operator a clear
+    #                     orchestrator-side error message
+    #                     instead of a kernel-side -EINVAL.
+    #
+    # Two things have to be true regardless of reason: (a)
+    # criu restore exited non-zero, and (b) the refuse fired
+    # for the *expected* reason -- a restore that failed for
+    # an unrelated error (kernel ABI mismatch, plugin .so
+    # missing, etc.) shouldn't be interpreted as a passing
+    # negative test. The reason-specific grep catches a
+    # regression where one refuse path silently degrades into
+    # the other (e.g. slot-misalign degrades to UUID-mismatch
+    # because the resolver started returning -ENOENT for
+    # paired-match instead of plain UUID match).
     if [[ "${EXPECT_RESTORE_FAIL:-0}" == "1" ]]; then
+        local reason="${EXPECT_RESTORE_FAIL_REASON:-uuid_mismatch}"
+        local expected_re reason_label
+        case "$reason" in
+            uuid_mismatch)
+                # vfmig_restore.c emits this when
+                # vfmig_resolve_uuid_to_pf_vf returns -ENOENT.
+                expected_re='no VF on this host has vf_uuid='
+                reason_label="KS7.3 UUID-mismatch path"
+                ;;
+            slot_misalign)
+                # vfmig_restore.c emits this when the resolver
+                # matched a UUID but the matched vf_id != image
+                # vf_id (KS7.3 §3.5.3.1 paired-match contract).
+                # The match is on the literal "found vf_uuid="
+                # token plus "but image was dumped from vf_id=";
+                # both phrases come from the
+                # vfmig_restore_init_all_vfs() error path and
+                # are stable across log-format changes.
+                expected_re='found vf_uuid=.* but image was dumped from vf_id='
+                reason_label="KS7.3 slot-misalignment path (§3.5.3.1)"
+                ;;
+            *)
+                echo "BUG: unknown EXPECT_RESTORE_FAIL_REASON=$reason" \
+                     "(want uuid_mismatch | slot_misalign)" >&2
+                pass_fail "harness misconfigured"
+                ;;
+        esac
         if [[ "$restore_rc" == "0" ]]; then
             echo "FAIL ($PASS_NAME): expected criu restore to refuse" \
-                 "(EXPECT_RESTORE_FAIL=1) but it succeeded; the" \
-                 "harness deliberately misconfigured" \
+                 "via the $reason_label" \
+                 "(EXPECT_RESTORE_FAIL=1, EXPECT_RESTORE_FAIL_REASON=$reason)" \
+                 "but it succeeded; the harness deliberately" \
+                 "misconfigured" \
                  "PASS_DEST_STAMP_MODE=${PASS_DEST_STAMP_MODE:-match}" \
-                 "so the plugin should have hit the KS7.3 UUID-" \
-                 "mismatch refuse path inside" \
+                 "PASS_DEST_VF_ID=${PASS_DEST_VF_ID:-0}" \
+                 "so the plugin should have refused inside" \
                  "vfmig_restore_init_all_vfs()." >&2
             # Reap the wrongly-restored process so it doesn't
             # leak into the next pass (or into systemd-run's
@@ -820,21 +761,25 @@ run_pass() {
             fi
             pass_fail "negative-test refuse path didn't fire"
         fi
-        if ! grep -qE 'no VF on this host has vf_uuid=' \
-            "$DUMPDIR/restore.log"; then
+        if ! grep -qE "$expected_re" "$DUMPDIR/restore.log"; then
             echo "FAIL ($PASS_NAME): criu restore failed (rc=$restore_rc)" \
-                 "but not via the KS7.3 UUID-mismatch refuse path." \
-                 "EXPECT_RESTORE_FAIL=1 only counts as a passing" \
-                 "negative if vfmig_restore_init_all_vfs() emitted" \
-                 "the orchestrator-misconfigured error -- otherwise" \
-                 "the restore probably broke for an unrelated" \
-                 "reason and the negative coverage is bogus." >&2
-            echo "--- restore log tail ---" >&2
-            tail -60 "$DUMPDIR/restore.log" >&2 || true
+                 "but not via the expected $reason_label." \
+                 "EXPECT_RESTORE_FAIL=1 +" \
+                 "EXPECT_RESTORE_FAIL_REASON=$reason only counts as a" \
+                 "passing negative if vfmig_restore_init_all_vfs()" \
+                 "emitted the matching orchestrator-misconfigured" \
+                 "error (regex: $expected_re) -- otherwise the" \
+                 "restore probably broke for an unrelated reason or" \
+                 "one refuse path silently degraded into another and" \
+                 "the negative coverage is bogus." >&2
+            echo "--- restore log resolver / error lines ---" >&2
+            grep -E 'vfmig: (matched|no VF on this host|found vf_uuid=)|Error \(vfmig_' \
+                "$DUMPDIR/restore.log" >&2 \
+                || echo "(no resolver / error lines at all)" >&2
             pass_fail "restore refused but for wrong reason"
         fi
         echo "pass=$PASS_NAME: PASS (negative; restore refused via" \
-             "KS7.3 UUID-mismatch path, rc=$restore_rc)"
+             "$reason_label, rc=$restore_rc)"
         return 0
     fi
 
@@ -846,40 +791,37 @@ run_pass() {
     RESTORED_PID="$(cat "$RESTORED_PIDFILE")"
     echo "restored pid=$RESTORED_PID"
 
-    # Cross-slot positive assertion (KS7.3): when the harness
-    # stamped the dest UUID onto a vf_id != source's vf_id, the
-    # plugin's resolver must have picked that exact slot, not
-    # coincidentally first-match-wins'd the lowest vf_id
-    # (vf_id=0 in every smoke pass we run today). The match
-    # line is emitted unconditionally by
-    # vfmig_restore_init_all_vfs() -- guard with a literal
-    # "vf_id=$PASS_DEST_VF_ID)" check so a regression where
-    # the resolver silently coerces back to vf_id=0 fails
-    # loudly. Skip the assertion in the degenerate
-    # PASS_DEST_VF_ID=0 case where source and dest tuples
-    # coincide and the assertion would degenerate to a
-    # tautology.
-    if (( ${PASS_DEST_VF_ID:-0} > 0 )); then
+    # Multi-VF positive assertion (KS7.3 §3.5.3): when the
+    # harness provisioned more than one slot on the
+    # destination, the resolver had to iterate past at least
+    # one tracked-but-unstamped slot before landing on the
+    # one carrying the matching UUID. Confirm the resolver
+    # match line names the source's vf_id (always 0 in this
+    # harness) on both sides of the arrow -- under the
+    # paired-match contract, dest vf_id MUST equal source
+    # vf_id, so anything other than "vf_id=0 -> ... vf_id=0"
+    # in this assertion line is a regression. Skip in the
+    # degenerate PASS_DEST_NUM_VFS=1 case where there's no
+    # iteration to validate.
+    if (( ${PASS_DEST_NUM_VFS:-1} > 1 )); then
         if ! grep -qE \
-            "vfmig: matched ctxn=[0-9]+ source\(pf=[^ ]+ vf_id=[0-9]+\) -> dest\(pf=[^ ]+ vf_id=${PASS_DEST_VF_ID}\) by vf_uuid=" \
+            "vfmig: matched ctxn=[0-9]+ source\(pf=[^ ]+ vf_id=0\) -> dest\(pf=[^ ]+ vf_id=0\) by vf_uuid=" \
             "$DUMPDIR/restore.log"; then
-            echo "FAIL ($PASS_NAME): cross-slot resolver did not pick" \
-                 "PASS_DEST_VF_ID=${PASS_DEST_VF_ID}; restore.log" \
-                 "is missing the expected" \
-                 "'vfmig: matched ... -> dest(... vf_id=${PASS_DEST_VF_ID})'" \
-                 "line. Either the resolver coerced back to" \
-                 "vf_id=0 (a regression in" \
-                 "vfmig_resolve_uuid_to_pf_vf's iteration order)" \
-                 "or the dest UUID got stamped onto a different" \
-                 "slot than reprovision_vf_for_restore claims." >&2
+            echo "FAIL ($PASS_NAME): multi-VF resolver did not bind" \
+                 "to vf_id=0 on the destination; restore.log is" \
+                 "missing the expected paired-match line. Either" \
+                 "the resolver iterated past vf_id=0 by mistake" \
+                 "(possibly returning vf_id=1's all-zeros UUID as" \
+                 "a match) or the harness stamped the UUID on the" \
+                 "wrong slot." >&2
             echo "--- restore log resolver lines ---" >&2
-            grep -E 'vfmig: (matched|no VF on this host)' \
+            grep -E 'vfmig: (matched|no VF on this host|found vf_uuid=)' \
                 "$DUMPDIR/restore.log" >&2 \
                 || echo "(no resolver lines at all)" >&2
-            pass_fail "cross-slot resolver did not pick expected vf_id"
+            pass_fail "multi-VF resolver did not pick vf_id=0"
         fi
-        echo "cross-slot resolver: source vf_id=0 -> dest" \
-             "vf_id=${PASS_DEST_VF_ID} confirmed via restore.log"
+        echo "multi-VF resolver: source vf_id=0 -> dest vf_id=0" \
+             "confirmed (skipped past ${PASS_DEST_NUM_VFS}-1=$((${PASS_DEST_NUM_VFS}-1)) other tracked slot(s))"
     fi
 
     # Positive RESTORE_{PD,CQ,QP,MR} dispatch assertions (per-ufile
@@ -1120,50 +1062,65 @@ run_pass() {
 #                       commits surfaces as -EOPNOTSUPP on the very
 #                       first run; gate to 0 for kernels that
 #                       pre-date S6b.
-#   pd_cq_crossslot   : KS7.3 cross-slot positive coverage
-#                       (resolver-only as of 2026-06-10; see
-#                       KS7.5 below). Same holder geometry as
-#                       pd_cq, but the harness provisions
-#                       sriov_numvfs=2 on the destination and
-#                       stamps the dest UUID onto vf_id=1 instead
-#                       of vf_id=0 (where the source ran). The
-#                       plugin's restore-side resolver
-#                       (vfmig_resolve_uuid_to_pf_vf) must skip
-#                       the stale vf_id=0 slot and bind the dump
-#                       to vf_id=1 by exact-UUID match.
-#                       Currently runs with EXPECT_KERNEL_XSLOT_GAP=1
-#                       (KS7.5 marker): the resolver part of the
-#                       cross-slot path is asserted as a positive
-#                       (matched -> dest(... vf_id=1) line in
-#                       restore.log), but the kernel-side LOAD is
-#                       expected to fail with the vfmig_iova
-#                       slot-mismatch error because per-vf_id IOVA
-#                       partitioning means a source vf 0 -> dest
-#                       vf 1 LOAD can't replay the saved IOVAs
-#                       without a kernel-side slot-translation
-#                       step that doesn't exist yet. Drop
-#                       EXPECT_KERNEL_XSLOT_GAP once the kernel
-#                       grows that capability and pd_cq_crossslot
-#                       becomes a real end-to-end positive.
+#   pd_cq_multivf_pos : KS7.3 multi-VF positive coverage. Same
+#                       holder geometry as pd_cq, but the harness
+#                       provisions sriov_numvfs=2 on the
+#                       destination, both slots tracked, with the
+#                       matching UUID stamped on vf_id=0 (the
+#                       source's slot per the KS7.3 §3.5.3.1
+#                       paired-match contract) and vf_id=1 left
+#                       tracked-but-unstamped (vf_uuid=all-zeros).
+#                       The resolver must iterate, find the
+#                       matching UUID on vf_id=0, and bind there.
+#                       End-to-end positive: the trivial pd_cq
+#                       case (sriov_numvfs=1) doesn't exercise the
+#                       resolver's iteration loop at all
+#                       (single-slot ⇒ no choice to make), so this
+#                       pass is the only place where iteration
+#                       coverage in the success direction lives.
+#                       Iteration coverage in the failure
+#                       direction lives in pd_cq_neg_slot_misalign
+#                       below.
 #   pd_cq_neg_no_stamp : KS7.3 negative coverage: orchestrator
 #                       forgot to stamp the destination at all
 #                       (PASS_DEST_STAMP_MODE=none). Restore must
 #                       hard-refuse with the "no VF on this host
-#                       has vf_uuid=..." error from
-#                       vfmig_restore_init_all_vfs(). Asserts
-#                       (a) criu restore exits non-zero,
-#                       (b) restore.log carries the refuse error.
-#                       A passing-positive restore (or a
-#                       failing-but-for-wrong-reason restore) both
-#                       fail the pass.
+#                       has vf_uuid=..." error
+#                       (EXPECT_RESTORE_FAIL_REASON=uuid_mismatch).
+#                       Asserts (a) criu restore exits non-zero,
+#                       (b) restore.log carries the matching
+#                       refuse error. A passing-positive restore
+#                       (or a failing-but-for-wrong-reason
+#                       restore) both fail the pass.
 #   pd_cq_neg_wrong_stamp : KS7.3 negative coverage: orchestrator
 #                       stamped a different UUID on the destination
 #                       (PASS_DEST_STAMP_MODE=wrong, near-miss
-#                       case). Same expected behaviour as
+#                       case). Same expected refuse path as
 #                       pd_cq_neg_no_stamp -- the resolver does
-#                       exact 16-byte UUID compare with no near-miss
-#                       tolerance, so a wrong-UUID dest must refuse
-#                       identically to an empty-UUID dest.
+#                       exact 16-byte UUID compare with no near-
+#                       miss tolerance.
+#   pd_cq_neg_slot_misalign : KS7.3 §3.5.3.1 negative coverage:
+#                       orchestrator stamped the right UUID but
+#                       on the *wrong* slot
+#                       (PASS_DEST_NUM_VFS=2, PASS_DEST_VF_ID=1,
+#                       PASS_DEST_STAMP_MODE=match). Source ran
+#                       on vf_id=0; the resolver finds the UUID
+#                       on vf_id=1, then enforces the paired-
+#                       match contract (dest vf_id MUST == source
+#                       vf_id) and refuses with the *distinct*
+#                       slot_misalign error ("found vf_uuid=...
+#                       but image was dumped from vf_id=0",
+#                       EXPECT_RESTORE_FAIL_REASON=slot_misalign).
+#                       The reason-specific assertion catches a
+#                       regression where slot-misalign silently
+#                       degrades to UUID-mismatch (or vice-versa)
+#                       and surfaces the wrong refuse path to the
+#                       operator. CRIU emits this BEFORE hitting
+#                       the kernel LOAD wire, so the operator
+#                       gets a clear orchestrator-side error
+#                       instead of a kernel-side -EINVAL with a
+#                       vfmig_iova slot-grid warn buried in
+#                       dmesg.
 #
 # Each pass is independently gateable via env-var so an operator
 # triaging a CQ-only regression on a host where pd_mr Phase J fails
@@ -1255,36 +1212,31 @@ if [[ "${UVERBS_CR_RUN_KS7_3:-1}" == "1" ]]; then
     # uverbs dispatcher / FW state machine that the earlier
     # passes cover.
 
-    # Cross-slot positive: source ran on vf_id=0, but the
-    # destination orchestrator stamps the dump's UUID onto
-    # vf_id=1 (with vf_id=0 left as a tracked-but-unowned slot,
-    # vf_uuid=all-zeros). The resolver must walk past vf_id=0
-    # and land on vf_id=1 by exact UUID match.
-    #
-    # KS7.5 marker: as of 2026-06-10 the kernel-side LOAD
-    # rejects this configuration because vfmig_iova partitions
-    # each VF's IOVA window deterministically by vf_id and the
-    # source's saved IOVAs (rooted in vf 0's slot grid) don't
-    # map onto vf 1's slot grid. The CRIU plugin's resolver
-    # part of cross-slot is correct; the end-to-end gap is
-    # kernel-side. EXPECT_KERNEL_XSLOT_GAP=1 asserts the
-    # resolver picked vf_id=1 (proving the CRIU work is
-    # right) AND the kernel rejected with the slot-mismatch
-    # error (proving we hit the LOAD wire on the right slot).
-    # Drop the knob once kernel cross-slot LOAD support lands
-    # so this becomes a real end-to-end positive.
-    PASS_DEST_NUM_VFS=2 PASS_DEST_VF_ID=1 EXPECT_KERNEL_XSLOT_GAP=1 \
-        run_pass pd_cq_crossslot      pd_cq 0
+    # Multi-VF positive: source ran on vf_id=0; destination
+    # provisions sriov_numvfs=2 with the matching UUID
+    # stamped on vf_id=0 and vf_id=1 left as a tracked-but-
+    # unstamped slot (vf_uuid=all-zeros). The resolver MUST
+    # iterate, see vf_id=0 carries the matching UUID, and
+    # bind there. End-to-end positive (the kernel LOAD
+    # works because per the KS7.3 §3.5.3.1 contract source
+    # vf_id == dest vf_id == 0). The trivial pd_cq case
+    # (sriov_numvfs=1) doesn't exercise the resolver's
+    # iteration loop -- one slot to choose from = no
+    # iteration coverage. The slot-misalign negative test
+    # below covers iteration in the failure direction; this
+    # pass covers it in the success direction.
+    PASS_DEST_NUM_VFS=2 PASS_DEST_VF_ID=0 \
+        run_pass pd_cq_multivf_pos    pd_cq 0
 
     # Negative: orchestrator forgot to call SET_VF_UUID on the
     # destination at all. Every dest slot stays vf_uuid=all-
     # zeros; the resolver must refuse the restore with the
-    # KS7.3 "no VF on this host has vf_uuid=..." error.
-    # EXPECT_RESTORE_FAIL=1 means run_pass treats a successful
-    # restore (or a restore that failed for a different reason)
-    # as a pass failure, since the negative-coverage value
-    # comes specifically from confirming the *refuse path*
-    # fired.
+    # KS7.3 "no VF on this host has vf_uuid=..." error
+    # (uuid_mismatch reason). EXPECT_RESTORE_FAIL=1 means
+    # run_pass treats a successful restore (or a restore
+    # that failed for a different reason) as a pass failure,
+    # since the negative-coverage value comes specifically
+    # from confirming the *refuse path* fired.
     PASS_DEST_STAMP_MODE=none EXPECT_RESTORE_FAIL=1 \
         run_pass pd_cq_neg_no_stamp   pd_cq 0
 
@@ -1292,12 +1244,28 @@ if [[ "${UVERBS_CR_RUN_KS7_3:-1}" == "1" ]]; then
     # provisioned the destination VF for some other workload's
     # CRIU image and forgot to release it). The resolver does
     # exact 16-byte compare; a near-miss UUID must refuse just
-    # like the empty case. Catches a regression where the
-    # resolver accidentally degrades to fuzzy-match or
-    # first-wins (bind to whatever VF is tracked, regardless
-    # of UUID).
+    # like the empty case (uuid_mismatch reason). Catches a
+    # regression where the resolver accidentally degrades to
+    # fuzzy-match or first-wins (bind to whatever VF is
+    # tracked, regardless of UUID).
     PASS_DEST_STAMP_MODE=wrong EXPECT_RESTORE_FAIL=1 \
         run_pass pd_cq_neg_wrong_stamp pd_cq 0
+
+    # Negative: orchestrator stamped the right UUID but on
+    # the *wrong* slot. Source ran on vf_id=0; destination
+    # provisions sriov_numvfs=2 and stamps the matching UUID
+    # on vf_id=1 instead of vf_id=0. The resolver finds the
+    # UUID hit on vf_id=1, then enforces the KS7.3 §3.5.3.1
+    # paired-match contract (dest vf_id MUST == source vf_id)
+    # and refuses with the distinct slot_misalign error
+    # ("found vf_uuid=... but image was dumped from vf_id=0").
+    # CRIU surfaces this *before* hitting the kernel LOAD
+    # wire so the operator gets a clear orchestrator-side
+    # error instead of a kernel-side -EINVAL with a vfmig_iova
+    # slot-grid warn buried in dmesg.
+    PASS_DEST_NUM_VFS=2 PASS_DEST_VF_ID=1 PASS_DEST_STAMP_MODE=match \
+        EXPECT_RESTORE_FAIL=1 EXPECT_RESTORE_FAIL_REASON=slot_misalign \
+        run_pass pd_cq_neg_slot_misalign pd_cq 0
 else
     echo
     echo "[skip] KS7.3 cross-slot/negative passes disabled by"
