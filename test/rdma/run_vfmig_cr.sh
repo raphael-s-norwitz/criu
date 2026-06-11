@@ -444,6 +444,125 @@ reprovision_vf_for_restore() {
 }
 
 #
+# manual_prerestore_dest -- drive the destination LOAD lifecycle
+# manually, before `criu restore` runs. Stand-in for the future
+# `mlx5_vfmig_restore_vf` binary (the dlopen-the-plugin standalone
+# binary spec'd in vf_prerestore_split.md §6.1). For Phase 3.1 we
+# verify the plugin's soft-fallback branch with an out-of-band CLI
+# sequence; Phase 3.2 swaps this for the real binary.
+#
+# The kernel-UAPI sequence we're reproducing matches the destination
+# LOAD lifecycle in include/uapi/linux/mlx5_vfmig.h (also documented
+# in vf_prerestore_split.md §3.1, the existing surface):
+#
+#   1. ENABLE_MIGRATABLE                              (latch: probe)
+#   2. SET_TRACKED enable=1                            (already done
+#                                                      by reprovision)
+#   3. LOAD_VHCA_STATE -- write blob, close fd        (FW resume)
+#   4. MARK_RESTORED                                   (sets restored=1)
+#   5. driver_override + bind                          (probe applies LOAD)
+#
+# Steps 1, 3, 4 are mlx5_vfmig CLI verbs; step 5 is sysfs writes.
+# After this returns the destination VF is bound, ibdev is up, and
+# QUERY_VF.restored == 1 -- exactly the state the plugin's init()
+# soft-fallback branch keys off of.
+#
+# Caller is responsible for calling reprovision_vf_for_restore()
+# beforehand (so PASS_DEST_VF_ID is stamped + tracked + sized).
+#
+manual_prerestore_dest() {
+    local dest_vf_id="${PASS_DEST_VF_ID:-0}"
+    local blob_path="$DUMPDIR/mlx5_vfmig-pf$PF-vf$dest_vf_id.blob"
+    local vf_bdf="$VF_BDF_DEST"
+
+    echo "=== Phase E.5 ($PASS_NAME): manual prerestore on" \
+         "$PF vf_id=$dest_vf_id (stand-in for mlx5_vfmig_restore_vf) ==="
+
+    [[ -s "$blob_path" ]] || {
+        echo "BUG: prerestore blob $blob_path missing or empty;" \
+             "the dump-side capture should have written it" >&2
+        echo "image dir contents:" >&2
+        ls -la "$DUMPDIR" >&2
+        pass_fail "prerestore blob missing"
+    }
+
+    # Step 1: ENABLE_MIGRATABLE. Idempotent per UAPI; safe to
+    # call even though reprovision_vf_for_restore didn't.
+    "$VFMIG_TOOL" "$PF" enable_migratable "$dest_vf_id" || {
+        pass_fail "manual prerestore: enable_migratable failed"
+    }
+
+    # Step 3: LOAD_VHCA_STATE. The CLI verb opens the cdev,
+    # issues the ioctl, writes the blob to the returned fd, and
+    # closes it -- the kernel commits the staged blob on close().
+    # CLI takes the blob path positionally (not as --blob).
+    "$VFMIG_TOOL" "$PF" load_vhca_state "$dest_vf_id" "$blob_path" || {
+        pass_fail "manual prerestore: load_vhca_state failed"
+    }
+
+    # Step 4: MARK_RESTORED. Sets QUERY_VF.restored=1; this is
+    # the bit the plugin's resolver reads to decide soft-fallback
+    # vs monolithic.
+    "$VFMIG_TOOL" "$PF" mark_restored "$dest_vf_id" || {
+        pass_fail "manual prerestore: mark_restored failed"
+    }
+
+    # Step 5: driver_override + bind. We deliberately do this
+    # from the harness rather than letting the plugin do it,
+    # because the prerestore-binary contract is "by the time
+    # criu restore runs, the VF is fully up". Lazy-bind from
+    # the plugin would defeat the contract -- the operator
+    # would still have to wait for ibdev surfacing inside
+    # criu restore's window, which is exactly what the
+    # split is supposed to remove. wait_for_dest_ibdev down
+    # the plugin path will see a settled ibdev already.
+    echo "mlx5_core" >"/sys/bus/pci/devices/$vf_bdf/driver_override" || {
+        pass_fail "manual prerestore: driver_override write failed"
+    }
+    echo "$vf_bdf" >/sys/bus/pci/drivers/mlx5_core/bind || {
+        pass_fail "manual prerestore: bind write failed"
+    }
+
+    # Wait for the ibdev to appear so the plugin's
+    # vfmig_wait_for_dest_ibdev finds a settled state. Reuses
+    # the same poll loop pattern probe_pf_cdev uses.
+    local i ibdev_path ibdev_name="" deadline=$((SECONDS + 30))
+    while (( SECONDS < deadline )); do
+        for ibdev_path in /sys/bus/pci/devices/$vf_bdf/infiniband/*; do
+            [[ -d "$ibdev_path" ]] || continue
+            ibdev_name="$(basename "$ibdev_path")"
+            break
+        done
+        [[ -n "$ibdev_name" ]] && break
+        sleep 0.1
+    done
+    [[ -n "$ibdev_name" ]] || {
+        pass_fail "manual prerestore: ibdev did not surface within 30s"
+    }
+
+    # Belt-and-braces: confirm the VF is bound to mlx5_core. The
+    # plugin's soft-fallback signal is /sys/bus/pci/devices/<vf_bdf>
+    # /driver symlink existence (the kernel's QUERY_VF.restored bit
+    # is consumed at probe time and isn't queryable post-bind --
+    # see vfmig_is_vf_bound() in vfmig_restore.c). If the bind
+    # write succeeded but the symlink isn't present, the plugin's
+    # init() would mistakenly take the monolithic path and the
+    # smoke would silently pass via that branch -- this assertion
+    # catches that regression early.
+    local driver_link="/sys/bus/pci/devices/$vf_bdf/driver"
+    [[ -e "$driver_link" ]] || {
+        echo "BUG: $driver_link missing post-bind; the plugin's" \
+             "soft-fallback signal won't fire and the smoke will" \
+             "silently take the monolithic path" >&2
+        pass_fail "manual prerestore: VF not bound after bind"
+    }
+
+    echo "manual prerestore complete:" \
+         "vf_id=$dest_vf_id vf_bdf=$vf_bdf ibdev=$ibdev_name" \
+         "(driver symlink present, plugin should soft-fallback)"
+}
+
+#
 # pass_fail <reason> -- print FAIL with logs + dmesg slice for the
 # current pass, then exit 1.
 #
@@ -668,6 +787,17 @@ run_pass() {
     # ---- Phase D + E: teardown + reprovision --------------------------
     reprovision_vf_for_restore
 
+    # ---- Phase E.5: optional manual prerestore (Phase 3.1
+    # stand-in for the eventual mlx5_vfmig_restore_vf binary).
+    # Drives the destination LOAD/bind out-of-band BEFORE criu
+    # restore, so the plugin's init() should see restored=1
+    # from QUERY_VF and take the soft-fallback branch. Gated
+    # on PASS_PRERESTORE so the default (monolithic) path
+    # remains the well-tested one for every other pass.
+    if [[ "${PASS_PRERESTORE:-0}" == "1" ]]; then
+        manual_prerestore_dest
+    fi
+
     # ---- Phase F: criu restore ----------------------------------------
     echo "=== Phase F ($PASS_NAME): criu restore ==="
     local restore_rc=0
@@ -823,6 +953,68 @@ run_pass() {
         echo "multi-VF resolver: source vf_id=0 -> dest vf_id=0" \
              "confirmed (skipped past ${PASS_DEST_NUM_VFS}-1=$((${PASS_DEST_NUM_VFS}-1)) other tracked slot(s))"
     fi
+
+    # Soft-fallback path assertion (vf_prerestore_split.md §6.4):
+    # the plugin's init() always emits exactly one of two
+    # operator-readable status lines per VF, identifying which
+    # path drove the LOAD_VHCA_STATE step:
+    #
+    #   PASS_PRERESTORE=1  (manual prerestore drove LOAD before
+    #                       criu restore via the harness CLI
+    #                       sequence in manual_prerestore_dest):
+    #     "prerestore detected; skipping LOAD_VHCA_STATE"
+    #
+    #   PASS_PRERESTORE=0  (the default for every other pass --
+    #                       no prerestore was run, plugin's init()
+    #                       drives LOAD inline):
+    #     "prerestore was NOT run; applying LOAD_VHCA_STATE in-line"
+    #
+    # The two log lines are mutually exclusive per VF; asserting
+    # both directions catches a regression where the plugin
+    # silently flips the branch (e.g. a stale `restored` cache
+    # from QUERY_VF, or a typo'd `if (dest_restored)` ->
+    # `if (!dest_restored)`).
+    local prerestore_re prerestore_label antimatch_re
+    if [[ "${PASS_PRERESTORE:-0}" == "1" ]]; then
+        # Tolerate the optional "(vf_bdf=...)" diagnostic clause the
+        # plugin emits between "detected" and "; skipping ...".
+        prerestore_re='vfmig: VF dest_vf_id=[0-9]+: prerestore detected[^;]*; skipping LOAD_VHCA_STATE'
+        antimatch_re='vfmig: VF dest_vf_id=[0-9]+: prerestore was NOT run'
+        prerestore_label="prerestore detected (LOAD skipped)"
+    else
+        # Same -- tolerate the "(vf_bdf=... unbound)" clause between
+        # "NOT run" and "; applying ...".
+        prerestore_re='vfmig: VF dest_vf_id=[0-9]+: prerestore was NOT run[^;]*; applying LOAD_VHCA_STATE in-line'
+        antimatch_re='vfmig: VF dest_vf_id=[0-9]+: prerestore detected'
+        prerestore_label="monolithic fallback (LOAD applied in-line)"
+    fi
+    if ! grep -qE "$prerestore_re" "$DUMPDIR/restore.log"; then
+        echo "FAIL ($PASS_NAME): expected the soft-fallback log" \
+             "line for the $prerestore_label path" \
+             "(PASS_PRERESTORE=${PASS_PRERESTORE:-0}) but" \
+             "restore.log is missing it. Either the plugin's" \
+             "init() flipped the branch or the bind-state signal" \
+             "vfmig_is_vf_bound() reads doesn't match the" \
+             "harness's pre-restore state." >&2
+        echo "--- restore log soft-fallback lines ---" >&2
+        grep -E 'vfmig: VF dest_vf_id=' "$DUMPDIR/restore.log" >&2 \
+            || echo "(no soft-fallback lines at all)" >&2
+        pass_fail "soft-fallback log line missing"
+    fi
+    if grep -qE "$antimatch_re" "$DUMPDIR/restore.log"; then
+        echo "FAIL ($PASS_NAME): expected ONLY the" \
+             "$prerestore_label log line but restore.log also" \
+             "carries the *other* path's line. The two lines" \
+             "are mutually exclusive per VF; both firing means" \
+             "either the plugin's init() ran the soft-fallback" \
+             "branch twice, or the test harness left a VF in a" \
+             "weird state where one VF saw restored=1 and" \
+             "another saw restored=0." >&2
+        echo "--- restore log soft-fallback lines ---" >&2
+        grep -E 'vfmig: VF dest_vf_id=' "$DUMPDIR/restore.log" >&2
+        pass_fail "soft-fallback path branched both ways"
+    fi
+    echo "soft-fallback: $prerestore_label confirmed via restore.log"
 
     # Positive RESTORE_{PD,CQ,QP,MR} dispatch assertions (per-ufile
     # DAG summary lines printed by criu/rdma/uobj_restore.c). The
@@ -1062,6 +1254,31 @@ run_pass() {
 #                       commits surfaces as -EOPNOTSUPP on the very
 #                       first run; gate to 0 for kernels that
 #                       pre-date S6b.
+#   pd_cq_prerestore  : Phase 3.1 soft-fallback coverage. Same
+#                       holder geometry as pd_cq, but the harness
+#                       drives the destination LOAD_VHCA_STATE +
+#                       MARK_RESTORED + bind sequence manually
+#                       (via the mlx5_vfmig CLI) BEFORE criu
+#                       restore runs -- a stand-in for the
+#                       eventual mlx5_vfmig_restore_vf binary
+#                       spec'd in vf_prerestore_split.md §6.1.
+#                       Plugin's init() detects the bound VF via
+#                       vfmig_is_vf_bound() (sysfs driver-symlink
+#                       check; QUERY_VF.restored is consumed at
+#                       probe time so it's useless post-bind --
+#                       see vfmig_restore.c) and takes the
+#                       soft-fallback branch (§6.3 + §6.4):
+#                       skips its own LOAD/bind, only resolves
+#                       the runtime tuple (vf_bdf / ibdev /
+#                       cdev_path). The "prerestore detected;
+#                       skipping LOAD_VHCA_STATE" status line in
+#                       restore.log is the operator-readable
+#                       confirmation. The default monolithic-path
+#                       counterpart ("prerestore was NOT run;
+#                       applying LOAD_VHCA_STATE in-line") is
+#                       asserted on every other positive pass --
+#                       both sides of the soft-fallback branch
+#                       run on every smoke invocation.
 #   pd_cq_multivf_pos : KS7.3 multi-VF positive coverage. Same
 #                       holder geometry as pd_cq, but the harness
 #                       provisions sriov_numvfs=2 on the
@@ -1132,6 +1349,7 @@ run_pass() {
 #   UVERBS_CR_RUN_PD_CQ_QP=0 PF=... ./run_vfmig_cr.sh   # no QP coverage
 #   UVERBS_CR_RUN_PD_2CQ=1   PF=... ./run_vfmig_cr.sh   # incl. multi-CQ
 #   UVERBS_CR_RUN_KS7_3=0    PF=... ./run_vfmig_cr.sh   # no KS7.3 coverage
+#   UVERBS_CR_RUN_PRERESTORE=0 PF=... ./run_vfmig_cr.sh # no soft-fallback pass
 #
 if [[ "${UVERBS_CR_RUN_PD_MR:-1}" == "1" ]]; then
     run_pass pd_mr_aligned   pd_mr 0
@@ -1197,6 +1415,49 @@ else
     echo "       mlx5_ib_dev_ops + uverbs dispatcher, where a"
     echo "       pd_cq_qp pass would only ever fail with"
     echo "       -EOPNOTSUPP / -ENOENT on the SEND_CQ NLDEV miss."
+fi
+if [[ "${UVERBS_CR_RUN_PRERESTORE:-1}" == "1" ]]; then
+    # Phase 3.1 soft-fallback coverage. Two passes:
+    #
+    #   pd_cq_prerestore  : the harness drives LOAD_VHCA_STATE +
+    #                       MARK_RESTORED + bind manually (via the
+    #                       mlx5_vfmig CLI) BEFORE criu restore
+    #                       runs. Stand-in for the eventual
+    #                       mlx5_vfmig_restore_vf binary spec'd in
+    #                       vf_prerestore_split.md §6.1. Plugin's
+    #                       init() must detect the bound VF via
+    #                       vfmig_is_vf_bound() (sysfs driver
+    #                       symlink check; QUERY_VF.restored is
+    #                       consumed at probe time and unusable
+    #                       post-bind), log "prerestore detected
+    #                       ...; skipping LOAD_VHCA_STATE" (§6.4),
+    #                       and skip its own LOAD/bind -- only
+    #                       resolving the runtime tuple (vf_bdf /
+    #                       ibdev / cdev_path).
+    #                       PASS_PRERESTORE=1 drives the manual
+    #                       prerestore step; the soft-fallback log
+    #                       assertion in run_pass keys off the
+    #                       expected match line.
+    #
+    #                       The default monolithic-path log line
+    #                       ("prerestore was NOT run; applying
+    #                       LOAD_VHCA_STATE in-line") is asserted
+    #                       on every other pass via the same
+    #                       run_pass machinery -- both sides of
+    #                       the soft-fallback branch are exercised
+    #                       on every test run, not just the new
+    #                       prerestore pass. That symmetry catches
+    #                       a regression where the plugin flips
+    #                       both branches into one or silently
+    #                       loses one of the log lines.
+    PASS_PRERESTORE=1 run_pass pd_cq_prerestore pd_cq 0
+else
+    echo
+    echo "[skip] prerestore-soft-fallback pass disabled by"
+    echo "       UVERBS_CR_RUN_PRERESTORE=0. Disable only on"
+    echo "       hosts/kernels that can't drive the manual"
+    echo "       LOAD_VHCA_STATE + MARK_RESTORED + bind sequence"
+    echo "       via the mlx5_vfmig CLI (e.g. pre-KS7.3 kernel)."
 fi
 if [[ "${UVERBS_CR_RUN_KS7_3:-1}" == "1" ]]; then
     # KS7.3 cross-slot / negative coverage. All three passes share
