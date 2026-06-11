@@ -1,7 +1,16 @@
 PLUGIN_NAME := rdma_mlx5_vfmig_plugin
 PLUGIN_SOBJ := rdma_mlx5_vfmig_plugin.so
 
-DEPS_RDMA_MLX5_VFMIG := $(PLUGIN_SOBJ)
+#
+# Standalone prerestore CLI binary -- dlopens the plugin .so,
+# dlsyms mlx5_vfmig_plugin_restore_vf_only, and drives the
+# destination LOAD/bind dance ahead of `criu restore`. See
+# vf_prerestore_split.md §6.1 / §6.3.
+#
+PRERESTORE_BIN  := mlx5_vfmig_restore_vf
+PRERESTORE_SRCS := mlx5_vfmig_restore_vf.c
+
+DEPS_RDMA_MLX5_VFMIG := $(PLUGIN_SOBJ) $(PRERESTORE_BIN)
 
 #
 # Where to find <linux/mlx5_vfmig.h>. Defaults to the vendored copy
@@ -75,9 +84,29 @@ rdma_mlx5_vfmig_plugin.so: $(PLUGIN_SRCS) $(PLUGIN_PB_C)
 	$(call msg-gen, $@)
 	$(Q) $(CC) $(PLUGIN_CFLAGS) $(DEFINES) $(shell $(COMPEL) includes) $^ -o $@ $(PLUGIN_INCLUDE) $(PLUGIN_LDFLAGS)
 
+#
+# The prerestore binary dlopens the plugin .so. Its outgoing
+# pr_err / pr_info / pr_perror references on the plugin side
+# resolve against print_on_level / criu_get_image_dir /
+# log_get_loglevel shims defined inside the binary -- we need
+# -rdynamic so the dynamic linker exposes the binary's symbols
+# to the dlopen()'d .so. -ldl pulls in dlopen / dlsym / dlclose.
+#
+# The binary is intentionally tiny (single .c file, no protobuf,
+# no compel, no kernel UAPI beyond what the plugin already
+# vendors) so it's easy to drop into a sidecar image alongside
+# the plugin .so.
+#
+PRERESTORE_CFLAGS := -g -Wall -Werror -O2 -D_GNU_SOURCE
+PRERESTORE_LDFLAGS := -rdynamic -ldl
+
+$(PRERESTORE_BIN): $(PRERESTORE_SRCS)
+	$(call msg-gen, $@)
+	$(Q) $(CC) $(PRERESTORE_CFLAGS) $^ -o $@ $(PRERESTORE_LDFLAGS)
+
 clean:
 	$(call msg-clean, $@)
-	$(Q) $(RM) $(PLUGIN_SOBJ)
+	$(Q) $(RM) $(PLUGIN_SOBJ) $(PRERESTORE_BIN)
 .PHONY: clean
 
 mrproper: clean
@@ -86,9 +115,14 @@ install:
 	$(Q) mkdir -p $(DESTDIR)$(PLUGINDIR)
 	$(E) "  INSTALL " $(PLUGIN_NAME)
 	$(Q) install -m 755 $(PLUGIN_SOBJ) $(DESTDIR)$(PLUGINDIR)
+	$(Q) mkdir -p $(DESTDIR)$(SBINDIR)
+	$(E) "  INSTALL " $(PRERESTORE_BIN)
+	$(Q) install -m 755 $(PRERESTORE_BIN) $(DESTDIR)$(SBINDIR)
 .PHONY: install
 
 uninstall:
 	$(E) " UNINSTALL" $(PLUGIN_NAME)
 	$(Q) $(RM) $(DESTDIR)$(PLUGINDIR)/$(PLUGIN_SOBJ)
+	$(E) " UNINSTALL" $(PRERESTORE_BIN)
+	$(Q) $(RM) $(DESTDIR)$(SBINDIR)/$(PRERESTORE_BIN)
 .PHONY: uninstall
