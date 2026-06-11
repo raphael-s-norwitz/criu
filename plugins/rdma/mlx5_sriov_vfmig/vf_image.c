@@ -51,6 +51,48 @@
 #define MLX5_VFMIG_IMG_NAME "mlx5_vfmig.img"
 
 /*
+ * Image-directory fd override.
+ *
+ * Default: -1 (no override) -- vfmig_get_image_dir() falls back
+ * to criu_get_image_dir(), which is criu's own service-fd lookup
+ * and is the only valid path while criu is the loader of the
+ * plugin .so.
+ *
+ * Set to a non-negative value by mlx5_vfmig_plugin_restore_vf_only()
+ * before the standalone prerestore binary drives the LOAD/bind
+ * dance, and cleared again before the symbol returns. The
+ * binary owns the lifetime of the fd it passes in (typically an
+ * O_PATH on the dump's image directory); the plugin only reads
+ * from it (openat / fstat / read).
+ *
+ * Process-global rather than per-call because the call graph
+ * inside the plugin (vfmig_read_image -> ... -> vfmig_load_one_vf
+ * -> ... -> blob openat) threads through several files; an
+ * argument-passed fd would require touching every step. The
+ * single-threaded, single-call-at-a-time invariant of both
+ * `criu restore` and the prerestore binary makes the global
+ * safe in practice.
+ */
+static int vfmig_image_dir_override_fd = -1;
+
+void vfmig_set_image_dir_override(int fd)
+{
+	vfmig_image_dir_override_fd = fd;
+}
+
+void vfmig_clear_image_dir_override(void)
+{
+	vfmig_image_dir_override_fd = -1;
+}
+
+int vfmig_get_image_dir(void)
+{
+	if (vfmig_image_dir_override_fd >= 0)
+		return vfmig_image_dir_override_fd;
+	return criu_get_image_dir();
+}
+
+/*
  * Stream the SAVE_VHCA_STATE save_fd byte-stream into a freshly-
  * created blob file under the CRIU image directory. Returns 0 on
  * success with @save_fd already drained and closed, and total
@@ -67,9 +109,9 @@ int vfmig_drain_save_fd_to_blob(int save_fd,
 	ssize_t n;
 	char buf[64 * 1024];
 
-	img_dir = criu_get_image_dir();
+	img_dir = vfmig_get_image_dir();
 	if (img_dir < 0) {
-		pr_err("vfmig: criu_get_image_dir() returned %d -- "
+		pr_err("vfmig: vfmig_get_image_dir() returned %d -- "
 		       "no image dir set, cannot write blob\n", img_dir);
 		return -1;
 	}
@@ -254,9 +296,9 @@ int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
 		return -1;
 	}
 
-	img_dir = criu_get_image_dir();
+	img_dir = vfmig_get_image_dir();
 	if (img_dir < 0) {
-		pr_err("vfmig: criu_get_image_dir() returned %d\n", img_dir);
+		pr_err("vfmig: vfmig_get_image_dir() returned %d\n", img_dir);
 		free(buf);
 		return -1;
 	}
@@ -312,9 +354,9 @@ int vfmig_read_image(Mlx5VfmigStateEntry ***out_arr, size_t *out_n)
 	*out_arr = NULL;
 	*out_n = 0;
 
-	img_dir = criu_get_image_dir();
+	img_dir = vfmig_get_image_dir();
 	if (img_dir < 0) {
-		pr_err("vfmig: criu_get_image_dir() returned %d on restore\n",
+		pr_err("vfmig: vfmig_get_image_dir() returned %d on restore\n",
 		       img_dir);
 		return -1;
 	}

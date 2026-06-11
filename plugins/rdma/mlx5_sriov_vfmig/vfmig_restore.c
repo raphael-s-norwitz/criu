@@ -480,7 +480,15 @@ static int vfmig_load_one_vf(const char *pf_bdf, uint32_t vf_id,
 	}
 	load_fd = ls.load_fd;
 
-	img_dir = criu_get_image_dir();
+	img_dir = vfmig_get_image_dir();
+	if (img_dir < 0) {
+		pr_err("vfmig: vfmig_get_image_dir() returned %d "
+		       "loading blob for pf=%s vf_id=%u\n",
+		       img_dir, pf_bdf, vf_id);
+		close(load_fd);
+		close(cdev_fd);
+		return -1;
+	}
 	blob_fd = openat(img_dir, blob_path, O_RDONLY | O_CLOEXEC);
 	if (blob_fd < 0) {
 		pr_perror("vfmig: openat(image_dir/%s) for blob",
@@ -1077,7 +1085,25 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 	return 0;
 }
 
-int vfmig_restore_init_all_vfs(void)
+/*
+ * Common phase A for both the plugin's restore-side init() and
+ * the standalone prerestore binary's mlx5_vfmig_plugin_restore_vf_only()
+ * symbol entry point.
+ *
+ * Phase A   = read mlx5_vfmig.img, pre-flight UUID validation,
+ *             per-VF discovery + LOAD_VHCA_STATE + bind +
+ *             ibdev/cdev_path resolution. Builds the
+ *             vfmig_restored_vfs cache.
+ *
+ * Phase B   = per-context uctx snapshot validation +
+ *             vfmig_restored_ctxs cache build.
+ *
+ * @run_phase_b: true for the plugin's init() (criu restore needs
+ *   the per-context cache for UPDATE_VMA_MAP / OPEN_UVERBS_CDEV
+ *   downstream), false for the prerestore binary (it stops as
+ *   soon as the destination VFs are bound and ibdev/cdev are up).
+ */
+static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 {
 	static const uint8_t zero_uuid[16] = { 0 };
 	Mlx5VfmigStateEntry **entries = NULL;
@@ -1088,7 +1114,9 @@ int vfmig_restore_init_all_vfs(void)
 	if (n_entries == 0)
 		return 0;
 
-	pr_info("vfmig: restore: %zu state entries to load\n", n_entries);
+	pr_info("vfmig: restore: %zu state entries to load%s\n",
+		n_entries,
+		run_phase_b ? "" : " (phase A only -- prerestore binary)");
 
 	/*
 	 * Pre-flight: every entry must carry a well-formed,
@@ -1307,6 +1335,17 @@ int vfmig_restore_init_all_vfs(void)
 			v->dest_ibdev, v->dest_cdev_path);
 	}
 
+	/*
+	 * Phase A done. The prerestore binary stops here -- it has
+	 * brought the destination VFs to "bound, ibdev up" and that's
+	 * all it owes the operator. The plugin's init() continues into
+	 * Phase B (per-context uctx snapshot) so UPDATE_VMA_MAP /
+	 * OPEN_UVERBS_CDEV downstream of the criu restore can dup() out
+	 * of the per-context cdev cache.
+	 */
+	if (!run_phase_b)
+		goto out_phase_a_done;
+
 	for (i = 0; i < n_entries; i++) {
 		Mlx5VfmigStateEntry *e = entries[i];
 		struct vfmig_restored_vf *v;
@@ -1503,6 +1542,7 @@ int vfmig_restore_init_all_vfs(void)
 		continue;
 	}
 
+out_phase_a_done:
 	for (i = 0; i < n_entries; i++)
 		mlx5_vfmig_state_entry__free_unpacked(entries[i], NULL);
 	free(entries);
@@ -1517,6 +1557,67 @@ err:
 	}
 	vfmig_restore_fini_close_all();
 	return -1;
+}
+
+int vfmig_restore_init_all_vfs(void)
+{
+	return vfmig_restore_init_all_vfs_internal(true);
+}
+
+/*
+ * Exported entry point for the standalone mlx5_vfmig_restore_vf
+ * binary spec'd in tools/testing/mlx5_vfmig/design/
+ * vf_prerestore_split.md §6.1.
+ *
+ * Drives Phase A (read mlx5_vfmig.img + per-VF discovery +
+ * LOAD_VHCA_STATE + bind + ibdev resolution) for every entry in
+ * the dump; returns once the destination VFs are bound and their
+ * ibdev / uverbs cdev are visible. Does NOT drive Phase B (per-
+ * ucontext uctx snapshot, RESTORE_UCONTEXT / RESTORE_DYN_UARS) --
+ * those need a real `criu restore` and are run by the plugin's
+ * own init() against the same image.
+ *
+ * The caller (the prerestore binary) is responsible for opening
+ * the image dir (typically with O_PATH / O_DIRECTORY) and passing
+ * the fd here. The plugin only reads through it; lifetime stays
+ * with the caller. Passing image_dir_fd < 0 returns -1 without
+ * touching kernel state.
+ *
+ * Soft-fallback contract is the same as the plugin's init():
+ * VFs that are already bound on the destination (e.g. by a prior
+ * prerestore invocation, or by an explicit operator-driven LOAD)
+ * are detected via /sys/bus/pci/devices/<vf_bdf>/driver and
+ * skipped without re-driving LOAD/bind. See vfmig_is_vf_bound()
+ * for the rationale.
+ *
+ * Returns 0 on success (every VF in the image is now bound and
+ * ibdev-up on this host), -1 on any error (with details in
+ * stderr / journal via the plugin's pr_err() macros).
+ */
+int mlx5_vfmig_plugin_restore_vf_only(int image_dir_fd)
+{
+	int rc;
+
+	if (image_dir_fd < 0) {
+		pr_err("vfmig: mlx5_vfmig_plugin_restore_vf_only: "
+		       "invalid image_dir_fd=%d\n", image_dir_fd);
+		return -1;
+	}
+
+	vfmig_set_image_dir_override(image_dir_fd);
+	rc = vfmig_restore_init_all_vfs_internal(false);
+	vfmig_clear_image_dir_override();
+
+	/*
+	 * Free the in-memory vfmig_restored_vfs cache so a subsequent
+	 * caller (e.g. a long-running prerestore daemon driving
+	 * multiple dumps in sequence) starts clean. The binary
+	 * process typically exits right after we return; the call is
+	 * cheap regardless. Phase B's vfmig_restored_ctxs is empty
+	 * because we requested phase A only.
+	 */
+	vfmig_restore_fini_close_all();
+	return rc;
 }
 
 void vfmig_restore_fini_close_all(void)

@@ -154,6 +154,29 @@ int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev,
 int vfmig_read_image(Mlx5VfmigStateEntry ***out_arr, size_t *out_n);
 
 /*
+ * Image-directory fd indirection.
+ *
+ * vfmig_get_image_dir() returns the override fd if one is set
+ * (see vfmig_set_image_dir_override()), else criu_get_image_dir().
+ * All plugin paths that openat() into the image directory go
+ * through this helper so the standalone prerestore binary
+ * (mlx5_vfmig_restore_vf, the eventual Phase 3.2 deliverable)
+ * can drive the LOAD/bind dance against an image dir of its
+ * own choosing without depending on criu's service-fd table.
+ *
+ * Override invariants:
+ *   - Caller owns the fd lifetime; the plugin only reads from it.
+ *   - Process-global; safe under both criu's and the prerestore
+ *     binary's single-threaded, one-call-at-a-time invariant.
+ *   - Cleared back to -1 before the prerestore symbol returns
+ *     so a subsequent in-process criu invocation falls back
+ *     cleanly to criu_get_image_dir().
+ */
+int vfmig_get_image_dir(void);
+void vfmig_set_image_dir_override(int fd);
+void vfmig_clear_image_dir_override(void);
+
+/*
  * Process-global activation flag. Set true by init() iff at
  * least one tracked VF was found across the host's PF cdevs.
  * Read by every dump+restore hook to short-circuit when no
