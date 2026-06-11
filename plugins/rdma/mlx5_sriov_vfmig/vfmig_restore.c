@@ -299,6 +299,21 @@ static void vfmig_uuid_to_str(const uint8_t u[16], char out[VFMIG_UUID_STR_LEN])
  * that itself errors (open / first ioctl) is logged + skipped --
  * one misbehaving PF must not poison the search across the whole
  * host.
+ *
+ * Notably absent from the return contract: a "was prerestore
+ * already run on this VF?" indicator. The natural candidate
+ * (QUERY_VF.restored, the bit MARK_RESTORED sets) is consumed at
+ * VF-probe time -- mlx5_vfmig_vf_consume_restored() clears
+ * sriov->vfs_ctx[].restored as soon as the bind triggers
+ * mlx5_load_one() -- so any post-bind QUERY_VF will read it back
+ * as 0 regardless of whether prerestore drove a LOAD/MARK_RESTORED
+ * cycle moments earlier. We can't rely on the kernel's "restored"
+ * UAPI bit for the soft-fallback decision in the plugin's init()
+ * (which always runs post-bind: either prerestore-then-criu or
+ * criu-binds-then-criu). Soft-fallback detection happens at the
+ * call site via vfmig_is_vf_bound() (sysfs driver symlink check),
+ * which under the orchestrator contract -- "do not bind the
+ * destination VF except via prerestore" -- is a clean signal.
  */
 static int vfmig_resolve_uuid_to_pf_vf(const uint8_t target[16],
 				       char *pf_bdf_out, size_t pf_bdf_sz,
@@ -559,6 +574,62 @@ static int vfmig_resolve_vf_bdf(const char *pf_bdf, uint32_t vf_id,
 		base = target;
 	snprintf(out, outsz, "%s", base);
 	return 0;
+}
+
+/*
+ * Soft-fallback signal: is @vf_bdf bound to any kernel driver?
+ *
+ * Returns 1 if /sys/bus/pci/devices/<vf_bdf>/driver exists (i.e.
+ * the VF is bound -- exactly what the prerestore binary, when it
+ * lands, will leave behind: ENABLE_MIGRATABLE + LOAD_VHCA_STATE +
+ * MARK_RESTORED + driver_override + bind, with the bind being the
+ * trailing step). Returns 0 if the symlink doesn't exist (i.e. the
+ * VF is the orchestrator-provisioned-but-unbound state that the
+ * monolithic plugin path expects).
+ *
+ * This is intentionally a sysfs-level check rather than a
+ * MLX5_VFMIG_IOC_QUERY_VF.restored read: the kernel's `restored`
+ * bit is consumed at probe time (mlx5_vfmig_vf_consume_restored()
+ * clears sriov->vfs_ctx[vf_id].restored as soon as the bind
+ * triggers mlx5_load_one), so any post-bind QUERY_VF reads it back
+ * as 0 regardless of whether prerestore drove a LOAD/MARK_RESTORED
+ * cycle moments earlier. The plugin's init() always runs post-bind
+ * (either prerestore-binds-then-criu, or criu-binds-then-criu), so
+ * `restored` cannot tell those two cases apart.
+ *
+ * The orchestrator contract is what makes "is bound to mlx5_core"
+ * a clean signal: the destination VF is created with autoprobe=0
+ * and provisioned via SET_TRACKED + SET_VF_UUID (no bind). The
+ * only path that binds the destination VF is prerestore (today)
+ * or the plugin's own monolithic path (the fallback). A VF that's
+ * bound when the plugin's init() runs ⇒ prerestore drove the
+ * bind. Documented as the contract; an orchestrator that binds
+ * the destination VF for some unrelated reason is doing something
+ * outside the spec.
+ *
+ * Returns 1 (bound), 0 (unbound), or -1 (sysfs error). On error
+ * the caller should treat it as a hard failure -- we don't have
+ * a way to safely choose between the two soft-fallback branches
+ * without a reliable bound/unbound answer.
+ */
+static int vfmig_is_vf_bound(const char *vf_bdf)
+{
+	char path[PATH_MAX];
+	struct stat st;
+
+	if (snprintf(path, sizeof(path),
+		     "/sys/bus/pci/devices/%s/driver",
+		     vf_bdf) >= (int)sizeof(path)) {
+		pr_err("vfmig: vf_bdf=%s too long for sysfs path\n",
+		       vf_bdf);
+		return -1;
+	}
+	if (lstat(path, &st) == 0)
+		return 1;
+	if (errno == ENOENT)
+		return 0;
+	pr_perror("vfmig: lstat(%s) for soft-fallback bind check", path);
+	return -1;
 }
 
 /*
@@ -1053,6 +1124,7 @@ int vfmig_restore_init_all_vfs(void)
 		struct vfmig_restored_vf *v;
 		char dest_pf_bdf[64];
 		uint32_t dest_vf_id;
+		int dest_bound;
 		char vf_bdf[64], dest_ibdev[64];
 		char dest_cdev_path[PATH_MAX];
 		char uuid_str[VFMIG_UUID_STR_LEN];
@@ -1139,14 +1211,71 @@ int vfmig_restore_init_all_vfs(void)
 			e->ctxn, e->pf_bdf, e->vf_id,
 			dest_pf_bdf, dest_vf_id, uuid_str);
 
-		if (vfmig_load_one_vf(dest_pf_bdf, dest_vf_id,
-				      e->blob_path, e->blob_size))
-			goto err;
+		/*
+		 * Resolve the destination VF's BDF early (sysfs
+		 * symlink under /sys/bus/pci/devices/<pf>/virtfn<vf_id>);
+		 * we need it for the bind-state check below regardless
+		 * of which soft-fallback branch we take.
+		 */
 		if (vfmig_resolve_vf_bdf(dest_pf_bdf, dest_vf_id,
 					 vf_bdf, sizeof(vf_bdf)))
 			goto err;
-		if (vfmig_driver_override_and_bind(vf_bdf))
+
+		/*
+		 * Soft-fallback decision per vf_prerestore_split.md
+		 * §6.3 / §6.4: did something out-of-band already
+		 * drive LOAD_VHCA_STATE + bind on this VF? See the
+		 * vfmig_is_vf_bound() docstring for why we use the
+		 * sysfs driver-symlink check rather than
+		 * QUERY_VF.restored. Always emit one operator-readable
+		 * status line per VF (not gated on verbosity) so the
+		 * operator can correlate the chosen path with their
+		 * orchestration flow.
+		 */
+		dest_bound = vfmig_is_vf_bound(vf_bdf);
+		if (dest_bound < 0)
 			goto err;
+
+		if (dest_bound) {
+			/*
+			 * Prerestore path: something out-of-band already
+			 * drove LOAD_VHCA_STATE + MARK_RESTORED + bind on
+			 * this VF. Skip our LOAD/bind; just resolve the
+			 * runtime tuple (vf_bdf / ibdev / cdev_path).
+			 * vfmig_wait_for_dest_ibdev tolerates an already-
+			 * up ibdev without spinning, so it's safe to call
+			 * after a prerestore-driven bind.
+			 */
+			pr_info("vfmig: VF dest_vf_id=%u: prerestore "
+				"detected (vf_bdf=%s already bound to "
+				"mlx5_core); skipping LOAD_VHCA_STATE "
+				"(av.dmac will reflect whatever ARP cache "
+				"the operator pinned between prerestore "
+				"and criu restore)\n",
+				dest_vf_id, vf_bdf);
+		} else {
+			/*
+			 * Monolithic fallback: orchestrator stamped UUID
+			 * but nobody ran prerestore. Drive LOAD inline
+			 * against the matched VF. apply_load_vhca_state()
+			 * also issues MARK_RESTORED but does NOT touch
+			 * vf_uuid -- that's already set by the
+			 * orchestrator.
+			 */
+			pr_info("vfmig: VF dest_vf_id=%u: prerestore was "
+				"NOT run (vf_bdf=%s unbound); applying "
+				"LOAD_VHCA_STATE in-line (av.dmac refresh "
+				"will rely on the operator having pinned "
+				"ARP before traffic resumes; see "
+				"qp_av_dmac_swap.md §S6b)\n",
+				dest_vf_id, vf_bdf);
+			if (vfmig_load_one_vf(dest_pf_bdf, dest_vf_id,
+					      e->blob_path, e->blob_size))
+				goto err;
+			if (vfmig_driver_override_and_bind(vf_bdf))
+				goto err;
+		}
+
 		if (vfmig_wait_for_dest_ibdev(vf_bdf, dest_ibdev,
 					      sizeof(dest_ibdev)))
 			goto err;
