@@ -470,13 +470,36 @@ reprovision_vf_for_restore() {
 # Caller is responsible for calling reprovision_vf_for_restore()
 # beforehand (so PASS_DEST_VF_ID is stamped + tracked + sized).
 #
+#
+# Phase 3.2 path: drive the destination LOAD/bind via the
+# standalone mlx5_vfmig_restore_vf binary (the prerestore tool
+# spec'd in vf_prerestore_split.md §6.1). The binary dlopens
+# rdma_mlx5_vfmig_plugin.so, dlsyms mlx5_vfmig_plugin_restore_vf_only,
+# and runs the same Phase-A path the plugin's init() would --
+# read mlx5_vfmig.img, KS7.3 discovery, LOAD_VHCA_STATE +
+# MARK_RESTORED, driver_override + bind, wait for ibdev. In
+# other words, this replaces the inline CLI sequence the Phase-3.1
+# version of this helper used (enable_migratable + load_vhca_state
+# + mark_restored + sysfs writes), with the same effective
+# end-state but driven through the binary.
+#
+# Caller is responsible for calling reprovision_vf_for_restore()
+# beforehand (so PASS_DEST_VF_ID is stamped + tracked + sized).
+#
+# Belt-and-braces: confirm the binary's success by checking the
+# driver symlink under /sys -- that's the actual signal
+# vfmig_is_vf_bound() in the plugin reads, so checking it here
+# catches a regression where the binary returns 0 but the bind
+# state isn't quite right (e.g. wait_for_dest_ibdev raced).
+#
 manual_prerestore_dest() {
     local dest_vf_id="${PASS_DEST_VF_ID:-0}"
     local blob_path="$DUMPDIR/mlx5_vfmig-pf$PF-vf$dest_vf_id.blob"
     local vf_bdf="$VF_BDF_DEST"
+    local prerestore_bin="${VFMIG_RESTORE_VF_BIN:-mlx5_vfmig_restore_vf}"
 
-    echo "=== Phase E.5 ($PASS_NAME): manual prerestore on" \
-         "$PF vf_id=$dest_vf_id (stand-in for mlx5_vfmig_restore_vf) ==="
+    echo "=== Phase E.5 ($PASS_NAME): prerestore via $prerestore_bin on" \
+         "$PF vf_id=$dest_vf_id ==="
 
     [[ -s "$blob_path" ]] || {
         echo "BUG: prerestore blob $blob_path missing or empty;" \
@@ -486,47 +509,30 @@ manual_prerestore_dest() {
         pass_fail "prerestore blob missing"
     }
 
-    # Step 1: ENABLE_MIGRATABLE. Idempotent per UAPI; safe to
-    # call even though reprovision_vf_for_restore didn't.
-    "$VFMIG_TOOL" "$PF" enable_migratable "$dest_vf_id" || {
-        pass_fail "manual prerestore: enable_migratable failed"
+    # Pre-flight: make sure the binary is on PATH and resolves
+    # to a callable executable. A common dev-box trip wire is
+    # `make install` not running after a build; the resulting
+    # silent fallback to the inline-CLI path would mask the
+    # whole point of Phase 3.2.
+    command -v "$prerestore_bin" >/dev/null 2>&1 || {
+        pass_fail "prerestore binary $prerestore_bin not on PATH;" \
+                  "did you run 'make install'?"
     }
 
-    # Step 3: LOAD_VHCA_STATE. The CLI verb opens the cdev,
-    # issues the ioctl, writes the blob to the returned fd, and
-    # closes it -- the kernel commits the staged blob on close().
-    # CLI takes the blob path positionally (not as --blob).
-    "$VFMIG_TOOL" "$PF" load_vhca_state "$dest_vf_id" "$blob_path" || {
-        pass_fail "manual prerestore: load_vhca_state failed"
+    # Drive the prerestore. The binary is verbose by default
+    # (info-level on stderr) so the harness log captures the
+    # plugin's matching / soft-fallback / LOAD diagnostics
+    # alongside the harness's own narrative.
+    "$prerestore_bin" -D "$DUMPDIR" || {
+        pass_fail "prerestore binary $prerestore_bin failed"
     }
 
-    # Step 4: MARK_RESTORED. Sets QUERY_VF.restored=1; this is
-    # the bit the plugin's resolver reads to decide soft-fallback
-    # vs monolithic.
-    "$VFMIG_TOOL" "$PF" mark_restored "$dest_vf_id" || {
-        pass_fail "manual prerestore: mark_restored failed"
-    }
-
-    # Step 5: driver_override + bind. We deliberately do this
-    # from the harness rather than letting the plugin do it,
-    # because the prerestore-binary contract is "by the time
-    # criu restore runs, the VF is fully up". Lazy-bind from
-    # the plugin would defeat the contract -- the operator
-    # would still have to wait for ibdev surfacing inside
-    # criu restore's window, which is exactly what the
-    # split is supposed to remove. wait_for_dest_ibdev down
-    # the plugin path will see a settled ibdev already.
-    echo "mlx5_core" >"/sys/bus/pci/devices/$vf_bdf/driver_override" || {
-        pass_fail "manual prerestore: driver_override write failed"
-    }
-    echo "$vf_bdf" >/sys/bus/pci/drivers/mlx5_core/bind || {
-        pass_fail "manual prerestore: bind write failed"
-    }
-
-    # Wait for the ibdev to appear so the plugin's
-    # vfmig_wait_for_dest_ibdev finds a settled state. Reuses
-    # the same poll loop pattern probe_pf_cdev uses.
-    local i ibdev_path ibdev_name="" deadline=$((SECONDS + 30))
+    # Belt-and-braces 1: ibdev surfaced. The binary's
+    # vfmig_wait_for_dest_ibdev should already have settled
+    # this; if it didn't, the Phase-F criu restore would race
+    # and emit a confusing "ibdev not found" error. Confirm
+    # here so the failure is attributable to prerestore.
+    local ibdev_path ibdev_name="" deadline=$((SECONDS + 5))
     while (( SECONDS < deadline )); do
         for ibdev_path in /sys/bus/pci/devices/$vf_bdf/infiniband/*; do
             [[ -d "$ibdev_path" ]] || continue
@@ -537,27 +543,28 @@ manual_prerestore_dest() {
         sleep 0.1
     done
     [[ -n "$ibdev_name" ]] || {
-        pass_fail "manual prerestore: ibdev did not surface within 30s"
+        pass_fail "prerestore: ibdev did not surface within 5s of binary return"
     }
 
-    # Belt-and-braces: confirm the VF is bound to mlx5_core. The
-    # plugin's soft-fallback signal is /sys/bus/pci/devices/<vf_bdf>
-    # /driver symlink existence (the kernel's QUERY_VF.restored bit
-    # is consumed at probe time and isn't queryable post-bind --
-    # see vfmig_is_vf_bound() in vfmig_restore.c). If the bind
-    # write succeeded but the symlink isn't present, the plugin's
-    # init() would mistakenly take the monolithic path and the
-    # smoke would silently pass via that branch -- this assertion
+    # Belt-and-braces 2: confirm the VF is bound to mlx5_core.
+    # The plugin's soft-fallback signal is the
+    # /sys/bus/pci/devices/<vf_bdf>/driver symlink (the kernel's
+    # QUERY_VF.restored bit is consumed at probe time and isn't
+    # queryable post-bind -- see vfmig_is_vf_bound() in
+    # vfmig_restore.c). If the binary returned 0 but the symlink
+    # isn't present, the plugin's init() would mistakenly take
+    # the monolithic path on the next criu restore and the smoke
+    # would silently pass via that branch -- this assertion
     # catches that regression early.
     local driver_link="/sys/bus/pci/devices/$vf_bdf/driver"
     [[ -e "$driver_link" ]] || {
-        echo "BUG: $driver_link missing post-bind; the plugin's" \
+        echo "BUG: $driver_link missing post-binary; the plugin's" \
              "soft-fallback signal won't fire and the smoke will" \
              "silently take the monolithic path" >&2
-        pass_fail "manual prerestore: VF not bound after bind"
+        pass_fail "prerestore: VF not bound after binary returned"
     }
 
-    echo "manual prerestore complete:" \
+    echo "prerestore complete:" \
          "vf_id=$dest_vf_id vf_bdf=$vf_bdf ibdev=$ibdev_name" \
          "(driver symlink present, plugin should soft-fallback)"
 }
