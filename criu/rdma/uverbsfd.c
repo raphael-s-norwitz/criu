@@ -1014,6 +1014,60 @@ int rdma_dispatch_dump_uobj_qp(plugin_desc_t *plugin,
 	return rc;
 }
 
+/*
+ * Per-PD dump dispatcher. Mirror of rdma_dispatch_dump_uobj_cq /
+ * _qp applied to UVERBS_METHOD_RESTORE_PD's discovery-side
+ * counterpart.
+ *
+ * @pd_attrs is owned by the caller. v0 PD carries no NLDEV-derived
+ * or plugin-owned hw-agnostic fields (PD allocation is access-flag-
+ * less in IB verbs), so the plugin normally leaves it untouched and
+ * packs its driver-private payload (mlx5: struct mlx5_ib_restore_pd_req
+ * carrying the FW pdn captured via MLX5_IB_METHOD_VFMIG_QUERY_PD) into
+ * @plugin_blob.
+ *
+ * Plugin -ENXIO is the per-uobject skip signal (kernel-internal PD
+ * routed here by mistake); demoted to a successful dispatch with the
+ * plugin_blob left empty. Optional hook: a plugin that doesn't
+ * register the hook is a no-op success (rxe -- rxe_restore_pd reads
+ * no UHW).
+ */
+int rdma_dispatch_dump_uobj_pd(plugin_desc_t *plugin,
+			       const char *ibdev,
+			       uint32_t kernel_driver_id,
+			       int lfd, uint32_t ufile_handle,
+			       pid_t pid,
+			       RdmaPdAttrs *pd_attrs,
+			       ProtobufCBinaryData *plugin_blob)
+{
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD_t *fn;
+	int rc;
+
+	if (!plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD]) {
+		pr_debug("dump_uobj_pd: plugin '%s' (ibdev=%s) does not "
+			 "register the hook; skipping. ufile_handle=%u "
+			 "will be dumped with no plugin_blob.\n",
+			 plugin->d->name, ibdev, ufile_handle);
+		return 0;
+	}
+
+	fn = plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD];
+	pr_debug("dump_uobj_pd: dispatching to plugin '%s' "
+		 "(ibdev=%s ufile_handle=%u pid=%d)\n",
+		 plugin->d->name, ibdev, ufile_handle, (int)pid);
+	rc = fn(ibdev, kernel_driver_id, lfd, ufile_handle, pid, pd_attrs,
+		plugin_blob);
+	if (rc == -ENXIO) {
+		pr_warn("dump_uobj_pd: plugin '%s' rejected PD "
+			"ufile_handle=%u on ibdev=%s with -ENXIO "
+			"(kernel-mode PD or no source FW state); "
+			"per-uobject driver-private fields will be absent\n",
+			plugin->d->name, ufile_handle, ibdev);
+		return 0;
+	}
+	return rc;
+}
+
 int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 {
 	plugin_desc_t *this;

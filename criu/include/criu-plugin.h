@@ -427,6 +427,67 @@ enum {
 	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE = 23,
 
 	/*
+	 * Per-PD uobject dump-side capture. Mirror of
+	 * CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ / _QP for PD: the per-driver
+	 * RDMA plugin reads the source's FW-side PD identity through its
+	 * own QUERY_PD verb (mlx5: MLX5_IB_METHOD_VFMIG_QUERY_PD) on the
+	 * holder's uctx fd and packs the driver-private per-PD payload
+	 * (mlx5: byte-equal to struct mlx5_ib_restore_pd_req carrying the
+	 * FW pdn) into @plugin_blob. The caller (uobj_pd_cb) attaches the
+	 * bytes onto the entry-level RdmaUobjEntry.plugin_blob field.
+	 *
+	 * This supersedes the legacy NLDEV driver-TLV discovery path
+	 * ("fw_pdn"/"fw_uid" under RDMA_NLDEV_ATTR_DRIVER, kernel
+	 * d4acb54ebd3d) which CRIU used to read straight off the per-PD
+	 * NLDEV resource entry. Moving PD onto the per-handle QUERY plane
+	 * makes the dump family uniform (cqn via QUERY_CQ, qpn via
+	 * QUERY_QP, pdn via QUERY_PD) and drops the CAP_NET_ADMIN /
+	 * cross-netns NLDEV dependency: CRIU learns the FW pdn on the
+	 * uverbs fd it already holds for QUERY_CQ/_QP.
+	 *
+	 * @pd_attrs is the hw-agnostic rdma_pd_attrs sub-message; v0 PD
+	 * carries no hw-agnostic fields the plugin owns (PD allocation is
+	 * access-flag-less in IB verbs), so the plugin SHOULD leave it
+	 * untouched -- the whole per-driver payload travels in
+	 * @plugin_blob. The arg is kept for symmetry with the CQ/QP hooks
+	 * and so a future driver with per-PD core attrs has a home.
+	 *
+	 * @plugin_blob is caller-owned ProtobufCBinaryData; the plugin
+	 * malloc()'s @data and the caller (uobj_pd_cb -> uobj_emit ->
+	 * pb_write_one) free()'s after pb_write_one consumes the bytes.
+	 * Plugin SHOULD set {data=NULL, len=0} when it has no driver-
+	 * private state for this PD. -ENXIO is demoted to a per-uobject
+	 * skip by the dispatcher, mirroring the CQ/QP hooks.
+	 *
+	 * Optional hook: a plugin that doesn't register it (rxe -- its
+	 * restore_pd is a pure kernel-side wrapper that reads no UHW) is
+	 * a no-op success and the PD is dumped with no plugin_blob.
+	 */
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD = 24,
+
+	/*
+	 * Per-PD uobject restore-side UHW shape callback. Same contract
+	 * as RDMA_RESTORE_UOBJ_CQ_UHW_PACK / _MR / _QP applied to
+	 * UVERBS_METHOD_RESTORE_PD: criu core builds the driver-agnostic
+	 * ioctl skeleton (RESTORE_PD_HANDLE) from the ufile handle map;
+	 * the per-driver plugin shapes UHW_IN around it from its own
+	 * per-PD plugin_blob schema.
+	 *
+	 * mlx5: emits the struct mlx5_ib_restore_pd_req captured at dump
+	 * via QUERY_PD's RESP_BLOB (carries the FW pdn mlx5_ib_restore_pd
+	 * adopts); no UHW_OUT.
+	 * rxe:  no UHW -- does not register the hook; core leaves UHW
+	 *       empty and rxe_restore_pd runs on the core HANDLE attr
+	 *       alone.
+	 *
+	 * Hook is optional. PD restore is dispatched from CRIU master
+	 * (mlx5_ib_restore_pd does not pin user pages), so there is no
+	 * NEEDS_PIE companion. PACK failures abort the restore for that
+	 * PD.
+	 */
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK = 25,
+
+	/*
 	 * Per-QP uobject dump-side capture. Mirror of
 	 * CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ for QP: the per-driver
 	 * RDMA plugin reads the source's per-QP state through its
@@ -463,7 +524,7 @@ enum {
 	 * needs a re-dump on a kernel that emits RES_HANDLE"
 	 * diagnostic.
 	 */
-	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP = 24,
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP = 26,
 
 	/*
 	 * Per-QP uobject restore-side UHW shape callback. Same
@@ -491,7 +552,7 @@ enum {
 	 * template verify uses the same byte-equal post-ioctl memcmp
 	 * machinery as the CQ / MR paths.
 	 */
-	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK = 25,
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK = 27,
 
 	/*
 	 * Per-driver opt-in: this driver's RESTORE_QP ioctl needs to
@@ -517,7 +578,7 @@ enum {
 	 * deferral register it. Keeps the sandbox cleanly "rxe-style
 	 * works without any extra hook" once rxe lands its handler.
 	 */
-	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE = 26,
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE = 28,
 
 	CR_PLUGIN_HOOK__MAX
 };
@@ -655,6 +716,24 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK,
 			 struct rdma_uhw_spec *uhw);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE,
 			 void);
+
+/*
+ * Per-PD dump+restore hooks. Same shape as the CQ / QP counterparts:
+ * the dump-side hook takes the per-class @pd_attrs + a caller-owned
+ * @plugin_blob the plugin malloc()'s; the restore-side UHW hook takes
+ * the materialised entry @e and the caller's rdma_uhw_spec scratch
+ * the plugin populates. PD restore is master-dispatched, so there is
+ * no NEEDS_PIE predicate.
+ */
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD,
+			 const char *ibdev, uint32_t kernel_driver_id,
+			 int lfd, uint32_t ufile_handle,
+			 pid_t pid,
+			 RdmaPdAttrs *pd_attrs,
+			 ProtobufCBinaryData *plugin_blob);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK,
+			 const RdmaUobjEntry *e,
+			 struct rdma_uhw_spec *uhw);
 
 /*
  * Per-QP dump+restore hooks. Same shape as the CQ counterparts: the

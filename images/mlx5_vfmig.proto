@@ -296,23 +296,23 @@ message mlx5_vfmig_state_entry {
 	 *                  a stale/wrong uid surfaces as -EINVAL or
 	 *                  similar up the alloc-ucontext path.
 	 *
-	 * Provenance: computed at dump-time by the plugin's
-	 * DUMP_UVERBS_CONTEXT hook from a per-ucontext NLDEV PD walk.
-	 * Each user-allocated PD on this ucontext carries an
-	 * "fw_uid" driver TLV (see rdma_uobj.proto::fw_uid); the
-	 * plugin validates that all of them share one value (a
-	 * mismatch would be a kernel bug, fail loud) and persists
-	 * it here. PD-less ucontexts have no observable fw_uid via
-	 * NLDEV today; if encountered, source_devx_uid is left
-	 * unset (treat as 0).
+	 * Provenance: sourced at dump-time by the plugin's
+	 * DUMP_UVERBS_CONTEXT hook from QUERY_UCONTEXT's
+	 * meta.devx_uid (kernel commit c659ab66483d). The earlier
+	 * per-ucontext NLDEV PD walk over each PD's "fw_uid" driver
+	 * TLV was removed when the kernel dropped those TLVs; the
+	 * per-PD uid is now available via MLX5_IB_METHOD_VFMIG_QUERY_PD's
+	 * RESP_UID (dump-side diagnostic only). The dyn-UAR / DEVX
+	 * source path leaves meta.devx_uid (hence this field) 0.
 	 *
-	 * Added by the same change that wires CRIU's RESTORE_PD
-	 * UHW to ship FW pdn (rather than restrack id). Both halves
-	 * are required against post-d4acb54ebd3d /
-	 * afb3b5614af3 kernels; the kernel's mlx5_ib_restore_pd
-	 * FW-probes (req_pdn, ucontext->devx_uid) and rejects
-	 * mismatched pairs with -ENOENT plus a pr_warn naming
-	 * either "stale pdn" or "did not adopt devx_uid".
+	 * Image-only metadata: NOT consumed at restore. The v0
+	 * restore path always opens the destination ucontext WITHOUT
+	 * DEVX (adopt_devx_uid forced to 0), because LOAD_VHCA_STATE
+	 * does not preserve the FW uctx registration table, so a
+	 * non-zero uid is unrecoverable. The FW pdn RESTORE_PD adopts
+	 * travels per-PD in rdma_uobj_entry.plugin_blob (struct
+	 * mlx5_ib_restore_pd_req), captured via QUERY_PD -- not via
+	 * this field or the removed NLDEV fw_pdn TLV.
 	 */
 	optional uint32		source_devx_uid		= 14;
 }

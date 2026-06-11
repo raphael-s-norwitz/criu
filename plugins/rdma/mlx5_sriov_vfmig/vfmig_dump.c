@@ -16,10 +16,11 @@
  *     with KEEP_SUSPENDED, drains the kernel save_fd into a blob
  *     file under criu_get_image_dir() via vf_image.c.
  *
- *   - vfmig_resolve_source_devx_uid() + its NLDEV walk callbacks:
- *     pin down mlx5_ib_ucontext.devx_uid via the kernel's named
- *     "fw_uid" PD-resource TLV (kernel d4acb54ebd3d), so the
- *     restore-side GET_CONTEXT can re-adopt the same uid.
+ *   - Per-uobject dump hooks RDMA_DUMP_UOBJ_{PD,CQ,QP}: drive the
+ *     mlx5-private QUERY_{PD,CQ,QP} verbs on the holder's uctx fd and
+ *     pack each uobject's byte-equal RESTORE_* request blob into the
+ *     per-uobj plugin_blob. QUERY_PD supersedes the old NLDEV per-PD
+ *     "fw_pdn"/"fw_uid" driver-TLV discovery.
  *
  *   - The two dump hooks: RDMA_DUMP_UVERBS_CONTEXT (queues onto
  *     the pending list) and HANDLE_DEVICE_VMA (claims uverbs-cdev
@@ -202,16 +203,17 @@ struct vfmig_pending_ctx {
 	 * Per-ucontext source devx_uid (mlx5_ib_ucontext.devx_uid as
 	 * observed at dump time). 0 = non-DEVX ucontext, non-zero =
 	 * DEVX-opted-in (libmlx5 default lib_uar_dyn=true silently
-	 * sets this even with no explicit DEVX call). Computed by
-	 * the dump hook from a per-ucontext NLDEV PD walk: each PD's
-	 * "fw_uid" driver TLV (kernel d4acb54ebd3d) is the same uid,
-	 * and the dump hook validates uniqueness across the
-	 * ucontext's PDs (a mismatch would be a kernel bug).
+	 * sets this even with no explicit DEVX call). Sourced by the
+	 * dump hook from QUERY_UCONTEXT's meta.devx_uid (kernel commit
+	 * c659ab66483d); the old per-ucontext NLDEV PD-walk over each
+	 * PD's "fw_uid" driver TLV was removed when the kernel dropped
+	 * those TLVs. The per-PD uid is now available via QUERY_PD's
+	 * RESP_UID (dump-side diagnostic only).
 	 *
-	 * Persisted into mlx5_vfmig_state_entry.source_devx_uid so
-	 * the restore-side GET_CONTEXT can adopt it via
-	 * MLX5_IB_ALLOC_UCTX_ADOPT_DEVX_UID + adopt_devx_uid; see
-	 * vfmig_send_get_context_v2 for the call shape.
+	 * Image-only metadata: persisted into
+	 * mlx5_vfmig_state_entry.source_devx_uid but NOT consumed at
+	 * restore -- the v0 restore path always opens the destination
+	 * ucontext WITHOUT DEVX (adopt_devx_uid forced to 0).
 	 */
 	uint32_t source_devx_uid;
 };
@@ -549,171 +551,18 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
  * hook ABI so future plugins that do need them have them.
  */
 /*
- * Per-ucontext source devx_uid resolver. Walks NLDEV PDs filtered
- * by ctxn, reads each PD's named "fw_uid" driver TLV (kernel
- * d4acb54ebd3d), validates that all PDs of this ucontext share
- * one value, and returns it.
- *
- * Why per-ucontext via NLDEV rather than a new mlx5-private ioctl
- * on the lfd? mlx5 doesn't expose mlx5_ib_ucontext.devx_uid via
- * uverbs today, but every PD allocated through a DEVX ucontext
- * carries mpd->uid == ucontext->devx_uid by construction (mlx5_ib_
- * alloc_pd's uid_offset path), and the kernel surfaces mpd->uid
- * via the new "fw_uid" TLV. So one PD per ucontext is enough to
- * pin down the value -- and the validation below ensures we
- * notice if the kernel ever drifts that invariant.
- *
- * Returns:
- *   0 on success. *@out_uid is the per-ucontext devx_uid (zero
- *   for non-DEVX ucontexts and for ucontexts with no PDs).
- *   -1 on a hard error (NLDEV walk failure, or the kernel emitted
- *   inconsistent fw_uid across the same ucontext's PDs -- both
- *   are CRIU-bug or kernel-bug territory and the dump must
- *   abort).
- *
- * Quiet path: if the kernel pre-dates d4acb54ebd3d (no fw_uid
- * TLVs), we leave *@out_uid = 0. Restore against a current kernel
- * will then send adopt_devx_uid=0 and the kernel's mlx5_ib_
- * restore_pd FW probe will reject any PD whose mpd->uid was
- * non-zero -- with a clear pr_warn naming the missing adoption.
+ * Per-ucontext source devx_uid is sourced from QUERY_UCONTEXT's
+ * meta.devx_uid (kernel commit c659ab66483d), captured below by
+ * vfmig_snapshot_uctx(). The earlier NLDEV PD-walk resolver (reading
+ * each PD's "fw_uid" driver TLV) was removed when the kernel dropped
+ * those TLVs from fill_res_pd_entry; the per-PD uid is now available
+ * via MLX5_IB_METHOD_VFMIG_QUERY_PD's RESP_UID (dump-side diagnostic
+ * only). source_devx_uid is image-only metadata -- the restore path
+ * always opens the destination ucontext WITHOUT DEVX (adopt_devx_uid
+ * = 0) under the v0 contract -- so the static-path meta.devx_uid is a
+ * sufficient source; the dyn-UAR path leaves it 0, which is benign
+ * because dyn/DEVX QP dumps are refused by the per-QP dump hook.
  */
-struct vfmig_devx_uid_walk_ctx {
-	uint32_t target_ctxn;
-	uint32_t devx_uid;
-	bool seen_any;
-	bool inconsistent;
-	uint32_t first_seen;
-};
-
-struct vfmig_dev_index_lookup_ctx {
-	const char *target_ibdev;
-	uint32_t dev_index;
-	bool found;
-};
-
-static int vfmig_dev_index_lookup_cb(uint32_t dev_index, const char *ibdev,
-				     void *arg)
-{
-	struct vfmig_dev_index_lookup_ctx *ctx = arg;
-
-	if (!strcmp(ibdev, ctx->target_ibdev)) {
-		ctx->dev_index = dev_index;
-		ctx->found = true;
-		return 1;	/* short-circuit */
-	}
-	return 0;
-}
-
-static int vfmig_pd_devx_uid_cb(const struct rdma_nl_res_entry *e, void *arg)
-{
-	struct vfmig_devx_uid_walk_ctx *w = arg;
-
-	/* Filter to PDs owned by this ucontext. */
-	if (!e->has_ctxn || e->ctxn != w->target_ctxn)
-		return 0;
-
-	/*
-	 * Pre-d4acb54ebd3d kernels emit no fw_uid; treat as 0
-	 * (non-DEVX) but log so the operator can correlate restore-
-	 * side FW-probe rejections against the missing kernel patch.
-	 * Continue walking (don't return early) so a mixed image
-	 * surfaces as "inconsistent" instead of silently picking up
-	 * the first PD's uid.
-	 */
-	if (!e->has_fw_uid) {
-		if (!w->seen_any) {
-			w->seen_any = true;
-			w->first_seen = 0;
-		} else if (w->first_seen != 0) {
-			w->inconsistent = true;
-		}
-		return 0;
-	}
-
-	if (!w->seen_any) {
-		w->seen_any = true;
-		w->first_seen = e->fw_uid;
-		w->devx_uid = e->fw_uid;
-	} else if (e->fw_uid != w->first_seen) {
-		w->inconsistent = true;
-	}
-	return 0;
-}
-
-static int vfmig_resolve_source_devx_uid(const char *ibdev, uint32_t ctxn,
-					 uint32_t *out_uid)
-{
-	struct vfmig_devx_uid_walk_ctx w = { .target_ctxn = ctxn };
-	struct vfmig_dev_index_lookup_ctx idx = { .target_ibdev = ibdev };
-	int rc;
-
-	/*
-	 * Resolve the kernel's per-ibdev dev_index first; the per-
-	 * resource NLDEV dump REQUIRES RDMA_NLDEV_ATTR_DEV_INDEX as
-	 * the ibdev filter (kernel res_get_common_dumpit() in
-	 * drivers/infiniband/core/nldev.c rejects without it).
-	 * Passing 0 silently filters to whatever ibdev happens to
-	 * have index 0, which on a multi-ibdev host is rarely the
-	 * VF we actually care about.
-	 */
-	rc = rdma_nl_for_each_ibdev(vfmig_dev_index_lookup_cb, &idx);
-	if (rc < 0) {
-		pr_err("vfmig: NLDEV ibdev enumeration to resolve "
-		       "dev_index for ibdev=%s failed: %d (%s)\n",
-		       ibdev, rc, strerror(-rc));
-		return -1;
-	}
-	if (!idx.found) {
-		pr_err("vfmig: NLDEV does not list ibdev=%s; cannot "
-		       "resolve source devx_uid\n", ibdev);
-		return -1;
-	}
-
-	rc = rdma_nl_for_each_resource(idx.dev_index, ibdev, RDMA_NL_RES_PD,
-				       vfmig_pd_devx_uid_cb, &w);
-	if (rc < 0) {
-		pr_err("vfmig: NLDEV PD walk on ibdev=%s (dev_index=%u) "
-		       "for source devx_uid resolution failed: %d (%s)\n",
-		       ibdev, idx.dev_index, rc, strerror(-rc));
-		return -1;
-	}
-
-	if (w.inconsistent) {
-		pr_err("vfmig: ibdev=%s ctxn=%u: PDs of one ucontext "
-		       "report different fw_uid values via NLDEV. This "
-		       "is either a kernel bug (mlx5_ib_alloc_pd should "
-		       "always set mpd->uid = ucontext->devx_uid) or a "
-		       "race with a sibling process modifying the "
-		       "ucontext's PDs concurrently. Aborting dump to "
-		       "avoid producing an unrestorable image.\n",
-		       ibdev, ctxn);
-		return -1;
-	}
-
-	if (!w.seen_any) {
-		/*
-		 * No PDs on this ucontext yet (newly-opened context
-		 * with no allocations). source_devx_uid stays 0; the
-		 * restore-side GET_CONTEXT will skip ADOPT_DEVX_UID.
-		 * If the user later allocates a PD that ends up DEVX-
-		 * uid'd, the restore would still install it with
-		 * uid=0 -- which the kernel's FW probe would reject
-		 * loud. v0 punts on this edge case (user code that
-		 * dumps an empty ucontext is unusual).
-		 */
-		pr_info("vfmig: ibdev=%s ctxn=%u: no PDs visible via "
-			"NLDEV; source_devx_uid := 0\n", ibdev, ctxn);
-		*out_uid = 0;
-		return 0;
-	}
-
-	*out_uid = w.devx_uid;
-	pr_info("vfmig: ibdev=%s ctxn=%u: resolved source_devx_uid="
-		"%u (from %sfw_uid driver TLV)\n",
-		ibdev, ctxn, w.devx_uid,
-		w.devx_uid ? "" : "absent or zero ");
-	return 0;
-}
 
 int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 						      uint32_t kernel_driver_id,
@@ -794,22 +643,6 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 		uint32_t source_devx_uid = 0;
 		int rc;
 
-		/*
-		 * Resolve the source ucontext's devx_uid via NLDEV PD
-		 * walk + per-PD fw_uid TLV. Done before the
-		 * QUERY_UCONTEXT calls because the latter would also
-		 * fail loud on a kernel mismatch and we want to
-		 * surface the more-specific "inconsistent fw_uid"
-		 * diagnostic first if it triggers. Kernel pre-
-		 * d4acb54ebd3d returns 0 here; that's fine for non-
-		 * DEVX images (the common rxe-shape case) and gets
-		 * caught at restore-time on DEVX images by mlx5_ib_
-		 * restore_pd's FW probe.
-		 */
-		if (vfmig_resolve_source_devx_uid(ibdev, ctxn,
-						  &source_devx_uid))
-			return -1;
-
 		rc = vfmig_snapshot_uctx(lfd, &uctx_meta,
 					 &uctx_uar, &uctx_uar_n,
 					 &uctx_cnt, &uctx_cnt_n);
@@ -851,36 +684,19 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 		}
 
 		/*
-		 * Diagnostic only: log a uid-source consistency drift
-		 * between QUERY_UCONTEXT.meta.devx_uid (kernel commit
-		 * c659ab66483d) and the NLDEV-derived source_devx_uid.
-		 * Both are 0 on the v0 critical path. The actual
-		 * "refuse dump if source devx_uid != 0" gate lives in
-		 * the per-QP dump hook (rdma_mlx5_vfmig_plugin_dump_
-		 * uobj_qp), narrowed to the failing-class scenario:
-		 * cross-uid PD/CQ/MR destroy survives the FW's
-		 * asymmetric uid-acceptance matrix (uid=0 host-priv
-		 * accepted on DEALLOC_PD/DESTROY_CQ/DESTROY_MR), only
-		 * QP-class opcodes (2RST_QP, DESTROY_QP) silently no-op
-		 * and surface as DEALLOC_PD bad_resource_state at
-		 * teardown. So pd_cq and pd_mr passes -- which currently
-		 * use libmlx5 auto-DEVX (rdma-core ca93d3b73054, source
-		 * devx_uid = 2 in the failing trace) -- continue to
-		 * round-trip cleanly; only QP-bearing dumps refuse.
+		 * source_devx_uid is image-only metadata (the restore
+		 * path always opens the destination ucontext WITHOUT
+		 * DEVX under the v0 contract, so adopt_devx_uid is
+		 * forced to 0). Source it from QUERY_UCONTEXT's
+		 * meta.devx_uid (kernel commit c659ab66483d), which the
+		 * static path filled above. The dyn-UAR / DEVX path
+		 * leaves it 0 -- benign here because dyn/DEVX QP dumps
+		 * are refused by the per-QP dump hook, and the per-PD
+		 * QUERY_PD RESP_UID carries the authoritative per-PD uid
+		 * for diagnostics. This replaces the removed NLDEV
+		 * per-PD "fw_uid" driver-TLV walk.
 		 */
-		{
-			uint32_t kernel_emit_uid = (uint32_t)uctx_meta.devx_uid;
-			if (kernel_emit_uid && source_devx_uid &&
-			    kernel_emit_uid != source_devx_uid) {
-				pr_warn("vfmig: ctxn=%u ibdev=%s: "
-					"QUERY_UCONTEXT.meta.devx_uid=%u != "
-					"NLDEV-derived source_devx_uid=%u "
-					"(kernel UAPI / NLDEV walker drift; "
-					"both are 0 on the v0 critical path)\n",
-					ctxn, ibdev, kernel_emit_uid,
-					source_devx_uid);
-			}
-		}
+		source_devx_uid = (uint32_t)uctx_meta.devx_uid;
 
 		if (vfmig_pending_enqueue(ctxn, ibdev, pf_bdf, vf_id,
 					  src_cdev,
@@ -1104,6 +920,87 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev,
 }
 
 /*
+ * Per-PD dump hook (CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD). Issues
+ * MLX5_IB_METHOD_VFMIG_QUERY_PD on @lfd against @ufile_handle, packs
+ * the 16-byte RESP_BLOB byte-equal to mlx5_ib_restore_pd_req into
+ * @plugin_blob (the entry-level opaque per-uobj container -- core
+ * never inspects these bytes, the schema is mlx5-private and the
+ * companion restore-side hook
+ * rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack reads them back
+ * verbatim into RESTORE_PD's UHW_IN). This supersedes the legacy
+ * NLDEV "fw_pdn" / "fw_uid" driver-TLV discovery -- the FW pdn
+ * RESTORE_PD adopts now travels in plugin_blob, learned on the
+ * uverbs fd CRIU already holds.
+ *
+ * @pd_attrs is unused: v0 PD has no plugin-owned hw-agnostic fields
+ * (PD allocation is access-flag-less in IB verbs); the whole per-
+ * driver payload travels in @plugin_blob.
+ *
+ * RESP_UID (the source PD's mpd->uid) is dump-side diagnostic only:
+ * unlike the per-QP hook, PD dump does NOT refuse a non-zero uid.
+ * Cross-uid PD destroy survives the FW's asymmetric uid-acceptance
+ * matrix (uid=0 host-priv accepted on DEALLOC_PD), so pd_cq / pd_mr
+ * passes that use libmlx5 auto-DEVX (uid != 0) still round-trip; the
+ * v0 refuse-on-DEVX gate lives only in the QP-class dump hook.
+ *
+ * Allocates @plugin_blob->data via malloc; the caller
+ * (criu/rdma/uobj_dump.c::uobj_pd_cb -> uobj_emit -> pb_write_one)
+ * frees it after pb_write_one consumes the bytes.
+ *
+ * Kernel-internal PD rejection (-ENXIO from QUERY_PD) is propagated
+ * so the dispatcher can demote it to a per-uobject skip.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uobj_pd(const char *ibdev,
+					uint32_t kernel_driver_id,
+					int lfd, uint32_t ufile_handle,
+					pid_t pid,
+					RdmaPdAttrs *pd_attrs,
+					ProtobufCBinaryData *plugin_blob)
+{
+	struct mlx5_ib_restore_pd_req_local blob = {};
+	uint32_t uid = 0;
+	uint8_t *blob_buf;
+	int rc;
+
+	(void)kernel_driver_id;	/* validated by the dispatcher */
+	(void)pid;		/* mlx5 sources its PD state from QUERY_PD on @lfd */
+	(void)pd_attrs;		/* v0 PD has no plugin-owned hw-agnostic fields */
+
+	rc = vfmig_query_pd(lfd, ufile_handle, &blob, &uid);
+	if (rc) {
+		if (rc == -ENXIO) {
+			pr_debug("vfmig: QUERY_PD(handle=%u) on ibdev=%s "
+				 "returned -ENXIO (kernel-internal PD); "
+				 "skipping per-uobject capture\n",
+				 ufile_handle, ibdev);
+			return -ENXIO;
+		}
+		pr_err("vfmig: QUERY_PD(handle=%u) on ibdev=%s failed: "
+		       "%d (%s)\n",
+		       ufile_handle, ibdev, rc, strerror(-rc));
+		return rc;
+	}
+
+	blob_buf = malloc(sizeof(blob));
+	if (!blob_buf) {
+		pr_err("vfmig: out of memory packing PD ufile_handle=%u "
+		       "plugin_blob (mlx5_ib_restore_pd_req, 16 bytes)\n",
+		       ufile_handle);
+		return -ENOMEM;
+	}
+	memcpy(blob_buf, &blob, sizeof(blob));
+	plugin_blob->data = blob_buf;
+	plugin_blob->len = sizeof(blob);
+
+	pr_debug("vfmig: QUERY_PD ibdev=%s ufile_handle=%u: pdn=%u "
+		 "uid=%u%s\n", ibdev, ufile_handle, blob.pdn, uid,
+		 uid ? " (source PD under a DEVX lane; uid is dump-side "
+		       "diagnostic only, RESTORE_PD takes uid from the "
+		       "adopted ucontext)" : "");
+	return 0;
+}
+
+/*
  * Per-QP dump hook (CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP). Issues
  * MLX5_IB_METHOD_VFMIG_QUERY_QP on @lfd against @ufile_handle and
  * splits the seven outs across:
@@ -1230,10 +1127,9 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 		 * UAR path is exercised through QUERY_DYN_UARS at
 		 * dump_uverbs_context() time. Fine for the QP hook --
 		 * we only need uctx_meta.devx_uid for the diagnostic
-		 * log below, and the dyn-UAR ucontext's source
-		 * devx_uid is captured separately via NLDEV
-		 * (vfmig_resolve_source_devx_uid -> source_devx_uid in
-		 * the image).
+		 * log below; the image's source_devx_uid is sourced
+		 * from QUERY_UCONTEXT.meta.devx_uid at
+		 * dump_uverbs_context() time (image-only metadata).
 		 */
 		pr_debug("vfmig: QP dump on dyn-mode ucontext "
 			 "(handle=%u ibdev=%s): QUERY_UCONTEXT "

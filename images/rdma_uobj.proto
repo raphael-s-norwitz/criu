@@ -404,41 +404,6 @@ message rdma_uobj_entry {
 	optional uint32		ufile_handle		= 4;
 	optional uint32		restrack_id		= 5;
 
-	/*
-	 * mlx5-private FW identity for PD entries. Sourced from
-	 * the named driver TLVs ("fw_pdn", "fw_uid") nested under
-	 * RDMA_NLDEV_ATTR_DRIVER on the source's NLDEV PD walk
-	 * (see rdma_netlink.c::parse_pd_driver_tlvs).
-	 *
-	 * fw_pdn is the value mlx5 firmware allocated for this PD
-	 * (mpd->pdn). It is *not* the same as restrack_id: restrack
-	 * ids are per-ibdev xa_alloc_cyclic counters, while
-	 * mpd->pdn is what the FW returned for ALLOC_PD. The two
-	 * coincide on freshly-booted hosts but diverge once the
-	 * restrack idr has wrapped enough to overtake the FW
-	 * allocator. mlx5's UVERBS_METHOD_RESTORE_PD takes mpd->pdn
-	 * (via mlx5_ib_restore_pd_req.pdn UHW), not restrack_id;
-	 * shipping restrack_id where mpd->pdn was expected was the
-	 * silent-correctness bug fixed by the kernel's
-	 * d4acb54ebd3d. Restore-side rdma_send_restore_pd reads
-	 * fw_pdn here. Required-in-practice on PD entries against
-	 * any post-d4acb54ebd3d kernel; absent on rxe and on PDs
-	 * whose dump pre-dates that kernel patch.
-	 *
-	 * fw_uid is mpd->uid -- the devx_uid that owns the PD on
-	 * the FW side. Zero for non-DEVX libibverbs ucontexts;
-	 * non-zero for DEVX-opted-in ucontexts. Recorded per-PD;
-	 * the per-ufile common value is also persisted on
-	 * mlx5_vfmig_state_entry.source_devx_uid (this same number
-	 * is replayed by GET_CONTEXT(MLX5_IB_ALLOC_UCTX_ADOPT_
-	 * DEVX_UID) at restore -- see mlx5_vfmig.proto). Carried
-	 * here too for image-inspection convenience and for the
-	 * dump-time defense-in-depth check that all PDs of one
-	 * ufile share fw_uid (a mismatch is a kernel bug).
-	 */
-	optional uint32		fw_pdn			= 6;
-	optional uint32		fw_uid			= 7;
-
 	/* HW-agnostic per-class attrs. EXACTLY ONE matches `type`. */
 	optional rdma_pd_attrs	pd			= 10;
 	optional rdma_cq_attrs	cq			= 11;

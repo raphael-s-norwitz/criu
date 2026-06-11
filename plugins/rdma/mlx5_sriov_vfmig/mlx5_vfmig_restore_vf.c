@@ -131,56 +131,14 @@ int criu_get_image_dir(void)
 }
 
 /*
- * The plugin .so also references criu/rdma/netlink.c helpers that
- * only get hit on the dump path (vfmig_dump.c's NLDEV iteration to
- * pin source-side devx_uid). The prerestore symbol's call graph
- * never reaches them, but RTLD_NOW resolves every undefined symbol
- * at dlopen() time, so we'd fail to load the .so without these
- * stubs. They abort if accidentally called -- a calling-binary
- * bug in any future code path that pulls in dump logic.
- *
- * Signatures lifted from criu/criu/include/rdma_netlink.h. The
- * typedef forward-declarations let us match the exported
- * function prototypes without dragging the entire criu header
- * into the binary's include set.
+ * Note: earlier revisions of this binary also shimmed
+ * rdma_nl_for_each_ibdev() / rdma_nl_for_each_resource() because the
+ * plugin .so referenced them on its dump path (the per-ucontext NLDEV
+ * PD walk that pinned source devx_uid). That walk was removed when PD
+ * FW identity moved onto MLX5_IB_METHOD_VFMIG_QUERY_PD, so the plugin
+ * .so no longer has any undefined NLDEV symbols and the stubs are no
+ * longer needed for RTLD_NOW to resolve at dlopen() time.
  */
-
-struct rdma_nl_res_entry;
-
-typedef int (*rdma_nl_ibdev_cb_t)(uint32_t dev_index, const char *ibdev,
-				  void *arg);
-typedef int (*rdma_nl_res_cb_t)(const struct rdma_nl_res_entry *e,
-				void *arg);
-
-__attribute__((visibility("default")))
-int rdma_nl_for_each_ibdev(rdma_nl_ibdev_cb_t cb, void *arg)
-{
-	(void)cb;
-	(void)arg;
-	fprintf(stderr,
-		"mlx5_vfmig_restore_vf: BUG: rdma_nl_for_each_ibdev() "
-		"called on the standalone-binary path -- this is a "
-		"dump-side helper, the prerestore call graph should "
-		"never reach it.\n");
-	return -1;
-}
-
-__attribute__((visibility("default")))
-int rdma_nl_for_each_resource(uint32_t dev_index, const char *ibdev,
-			      int type, rdma_nl_res_cb_t cb, void *arg)
-{
-	(void)dev_index;
-	(void)ibdev;
-	(void)type;
-	(void)cb;
-	(void)arg;
-	fprintf(stderr,
-		"mlx5_vfmig_restore_vf: BUG: rdma_nl_for_each_resource()"
-		" called on the standalone-binary path -- this is a "
-		"dump-side helper, the prerestore call graph should "
-		"never reach it.\n");
-	return -1;
-}
 
 /* -------- CLI -------- */
 

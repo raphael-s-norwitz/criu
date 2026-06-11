@@ -372,6 +372,30 @@ int rdma_dispatch_dump_uobj_qp(plugin_desc_t *plugin,
 			       ProtobufCBinaryData *plugin_blob);
 
 /*
+ * Per-PD dump-side dispatcher. Mirror of rdma_dispatch_dump_uobj_cq /
+ * _qp: calls @plugin's CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD if
+ * registered, packing the driver-private per-PD payload (mlx5: the
+ * mlx5_ib_restore_pd_req FW pdn captured via
+ * MLX5_IB_METHOD_VFMIG_QUERY_PD) into @plugin_blob. @pd_attrs is the
+ * hw-agnostic per-class sub-message; v0 PD has no plugin-owned core
+ * fields so it is normally left untouched.
+ *
+ * Optional hook semantics: a plugin that doesn't register the hook
+ * (rxe -- restore_pd reads no UHW) is a no-op success. Plugin -ENXIO
+ * is treated as a per-uobject skip; any other error is dump-fatal.
+ *
+ * No plugin-walk per call: @plugin is the pointer cached on
+ * struct rdma_dumped_ufile.plugin at CLAIM time. Must not be NULL.
+ */
+int rdma_dispatch_dump_uobj_pd(plugin_desc_t *plugin,
+			       const char *ibdev,
+			       uint32_t kernel_driver_id,
+			       int lfd, uint32_t ufile_handle,
+			       pid_t pid,
+			       RdmaPdAttrs *pd_attrs,
+			       ProtobufCBinaryData *plugin_blob);
+
+/*
  * Pre-suspend per-QP coverage check. Walks every snapshot-tree
  * pid's contexts via NLDEV's per-resource RES_QP / RES_SRQ dumps and
  * refuses the dump if any QP violates the v0 RESTORE_QP contract:

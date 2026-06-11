@@ -1947,3 +1947,73 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e,
 	uhw->out_len = 0;
 	return 0;
 }
+
+/*
+ * RDMA_RESTORE_UOBJ_PD_UHW_PACK hook (mlx5).
+ *
+ * Reads the source-side 16B mlx5_ib_restore_pd_req packed at dump
+ * time into e->plugin_blob (see rdma_mlx5_vfmig_plugin_dump_uobj_pd)
+ * and hands core a malloc()'d copy as UHW_IN. The blob carries the
+ * source FW pdn (mpd->pdn) that mlx5_ib_restore_pd adopts (Model A,
+ * no FW round-trip; the pdn is already reserved after
+ * LOAD_VHCA_STATE). mlx5_ib_restore_pd requires exactly sizeof(req)
+ * UHW_IN and rejects any UHW_OUT, so we leave uhw->out_buf NULL.
+ *
+ * This replaces the legacy core-side mlx5_ib_restore_pd_req shim that
+ * read a fw_pdn field off the rdma_uobj entry (sourced from the
+ * removed NLDEV "fw_pdn" driver TLV). The FW pdn now travels in the
+ * per-PD plugin_blob, captured via MLX5_IB_METHOD_VFMIG_QUERY_PD.
+ *
+ * Allocator contract identical to RESTORE_CQ_UHW_PACK: we malloc
+ * here, core attaches the bytes as the RESTORE_PD UHW_IN attr and
+ * free()s our copy after the ioctl. PD restore runs from CRIU master
+ * (mlx5_ib_restore_pd pins no user pages), so no pie hand-off.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw)
+{
+	const ProtobufCBinaryData *blob;
+
+	if (!e || !uhw)
+		return -EINVAL;
+	if (e->type != R3_UOBJ_TYPE__R3UT_PD) {
+		pr_err("vfmig: RESTORE_PD_UHW_PACK called for non-PD "
+		       "uobject (type=%d ufile_handle=%u); core dispatch "
+		       "bug\n", e->type,
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+	if (!e->has_plugin_blob || e->plugin_blob.len == 0) {
+		pr_err("vfmig: RESTORE_PD_UHW_PACK called for ufile_handle=%u "
+		       "with empty plugin_blob; image is missing the "
+		       "16B mlx5_ib_restore_pd_req captured at dump via "
+		       "MLX5_IB_METHOD_VFMIG_QUERY_PD. Re-dump against a "
+		       "kernel that has the VFMIG_QUERY_PD method and a "
+		       "CRIU plugin build that wires it.\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+
+	blob = &e->plugin_blob;
+	if (blob->len != sizeof(struct mlx5_ib_restore_pd_req_local)) {
+		pr_err("vfmig: RESTORE_PD_UHW_PACK plugin_blob len=%zu "
+		       "ufile_handle=%u, expected %zu (mlx5_ib_restore_pd_req)\n",
+		       blob->len,
+		       e->has_ufile_handle ? e->ufile_handle : 0,
+		       sizeof(struct mlx5_ib_restore_pd_req_local));
+		return -EINVAL;
+	}
+
+	uhw->in_buf = malloc(blob->len);
+	if (!uhw->in_buf) {
+		pr_err("vfmig: RESTORE_PD_UHW_PACK out of memory "
+		       "(%zu bytes)\n", blob->len);
+		return -ENOMEM;
+	}
+	memcpy(uhw->in_buf, blob->data, blob->len);
+	uhw->in_len = blob->len;
+	/* mlx5_ib_restore_pd rejects any UHW_OUT -- leave out_buf NULL. */
+	uhw->out_buf = NULL;
+	uhw->out_len = 0;
+	return 0;
+}

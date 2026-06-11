@@ -51,6 +51,7 @@ struct mlx5_ib_vfmig_ucontext_meta_local;
 struct mlx5_ib_vfmig_dyn_uar_record_local;
 struct mlx5_ib_restore_cq_req_local;
 struct mlx5_ib_restore_qp_req_local;
+struct mlx5_ib_restore_pd_req_local;
 struct ib_uverbs_qp_cap_local;
 
 int vfmig_send_get_context_v2(int fd, uint32_t flags,
@@ -114,6 +115,20 @@ int vfmig_query_qp(int fd,
 		   uint64_t *user_handle_out,
 		   struct ib_uverbs_qp_cap_local *cap_out,
 		   uint32_t *create_flags_out);
+
+/*
+ * Per-PD dump-side discovery via MLX5_IB_METHOD_VFMIG_QUERY_PD.
+ * @pd_handle is the source ufile-idr PD handle from the R3 walk.
+ * On success @blob_out is byte-equal to the payload RESTORE_PD's
+ * UHW.data will consume on the destination (carries the FW pdn); the
+ * dump path stores it in the per-PD plugin_blob verbatim. @uid_out is
+ * the source PD's mpd->uid -- dump-side diagnostic only, not a
+ * restore input.
+ */
+int vfmig_query_pd(int fd,
+		   uint32_t pd_handle,
+		   struct mlx5_ib_restore_pd_req_local *blob_out,
+		   uint32_t *uid_out);
 
 /*
  * vf_image.c -- on-disk format for the plugin's per-dump
@@ -224,12 +239,21 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 					RdmaQpAttrs *qp_attrs,
 					ProtobufCBinaryData *plugin_blob);
 
+int rdma_mlx5_vfmig_plugin_dump_uobj_pd(const char *ibdev,
+					uint32_t kernel_driver_id,
+					int lfd, uint32_t ufile_handle,
+					pid_t pid,
+					RdmaPdAttrs *pd_attrs,
+					ProtobufCBinaryData *plugin_blob);
+
 struct rdma_uhw_spec;
 int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
 						    struct rdma_uhw_spec *uhw);
 int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e,
 						    struct rdma_uhw_spec *uhw);
 int rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw);
+int rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack(const RdmaUobjEntry *e,
 						    struct rdma_uhw_spec *uhw);
 
 struct stat;

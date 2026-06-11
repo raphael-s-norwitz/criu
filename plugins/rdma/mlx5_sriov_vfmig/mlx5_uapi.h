@@ -368,6 +368,73 @@ struct mlx5_ib_vfmig_dyn_uar_record_local {
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 6)
 
 /*
+ * Per-uobject PD dump-side discovery verb.
+ *
+ * MLX5_IB_METHOD_VFMIG_QUERY_PD runs on MLX5_IB_OBJECT_VFMIG and is
+ * the dump-side companion of UVERBS_METHOD_RESTORE_PD, in the same
+ * family as QUERY_CQ / QUERY_QP: per-handle, byte-equal RESP_BLOB
+ * that round-trips into RESTORE_PD's UHW with no field-level
+ * marshaling.
+ *
+ * The HANDLE attr is UVERBS_ATTR_IDR(UVERBS_OBJECT_PD,
+ * UVERBS_ACCESS_READ): caller's ufile-idr must own the PD, the IDR
+ * pins the uobject for the call. Same security boundary as
+ * INFO_HANDLES(UVERBS_OBJECT_PD).
+ *
+ * Outputs (all MANDATORY):
+ *   RESP_BLOB  struct mlx5_ib_restore_pd_req (16 bytes); carries the
+ *              FW pdn mlx5_ib_restore_pd adopts. CRIU copies it
+ *              verbatim into the per-PD plugin_blob at dump time and
+ *              back into RESTORE_PD's UHW_IN at restore time. The
+ *              handler leaves req.reserved / req.reserved2 zero so
+ *              the restore path's "must be 0" guards pass round-trip.
+ *   RESP_UID   u32, the source PD's mpd->uid. Dump-side diagnostic
+ *              only -- not consumed by RESTORE_PD (restore always
+ *              adopts under the destination ucontext's uid).
+ *
+ * Method id slot is +6 in the VFMIG enum, after QUERY_QP (=+5).
+ */
+#define MLX5_IB_METHOD_VFMIG_QUERY_PD_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 6)
+#define MLX5_IB_ATTR_VFMIG_QUERY_PD_HANDLE_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_BLOB_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_UID_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_PD on mlx5,
+ * carried from dump to restore as QUERY_PD's RESP_BLOB and
+ * RESTORE_PD's UHW.data byte-for-byte.
+ *
+ * Layout MUST match include/uapi/rdma/mlx5-abi.h::mlx5_ib_restore_pd_req
+ * exactly: 16 bytes, u32 pdn + u32 reserved + u64 reserved2.
+ *
+ * Wire-shape gotchas the criu plugin packer must respect:
+ *
+ *   - sizeof > sizeof(u64) is intentional. Kernel uverbs UHW dispatch
+ *     treats len <= 8 as INLINE (stuffs attr->data into a kernel
+ *     staging slot and rewrites udata->inbuf to a kernel pointer);
+ *     on x86_64 with masked-user-access enabled that breaks
+ *     ib_copy_from_udata's copy_from_user. The 8-byte reserved2
+ *     pads us above the threshold so the kernel takes the ptr path.
+ *     Same dodge as the CQ/MR/QP shims.
+ *   - reserved/reserved2 must be zero on send; the kernel handler
+ *     validates this for forward-compat (-EINVAL otherwise). QUERY_PD
+ *     zeroes them on emit, so a verbatim memcpy round-trips.
+ *   - pdn is 24 bits significant; QUERY_PD never emits 0 because a
+ *     live PD always has a nonzero FW id.
+ *
+ * Drop once host rdma-core ships the struct upstream.
+ */
+struct mlx5_ib_restore_pd_req_local {
+	uint32_t pdn;
+	uint32_t reserved;
+	uint64_t reserved2;
+} __attribute__((aligned(8)));
+
+/*
  * Driver-private UHW payload for UVERBS_METHOD_RESTORE_CQ on mlx5,
  * carried from dump to restore as QUERY_CQ's RESP_BLOB and the
  * RESTORE_CQ UHW.data byte-for-byte.

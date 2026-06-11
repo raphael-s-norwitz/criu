@@ -417,89 +417,75 @@ static int uobj_ufile_group_check_xrefs(struct uobj_ufile_group *g)
  * the UHW pair from the plugin via
  * CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_{PACK,VERIFY}.
  *
- * UAPI lag shim for include/uapi/rdma/mlx5-abi.h's
- * struct mlx5_ib_restore_pd_req. Driver-private UHW payload for
- * UVERBS_METHOD_RESTORE_PD on mlx5; carries the source's FW pdn so
- * mlx5_ib_restore_pd can adopt it into a fresh kernel-side mlx5_ib_pd
- * via "Model A" (no destination FW round-trip; the source pdn is
- * already reserved in firmware after LOAD_VHCA_STATE). The
- * (independent) ufile target handle still travels in the core
- * UVERBS_ATTR_RESTORE_PD_HANDLE attribute.
- *
- * Layout details that matter for wire correctness:
- *   - sizeof > sizeof(u64) is intentional. The uverbs UHW dispatch
- *     path treats len <= sizeof(u64) as INLINE (stuffs attr->data
- *     into a kernel staging slot and rewrites udata->inbuf to a
- *     kernel pointer), which on x86_64 with masked-user-access
- *     support breaks ib_copy_from_udata's copy_from_user. Sizing
- *     above the threshold (12 + 8 = 24 with __aligned_u64 padding;
- *     here 16 with explicit __aligned_u64) takes the ptr path and
- *     ib_copy_from_udata works as expected. We pass by pointer in
- *     attr->data, matching what pd_restore_probe_mlx5_vfmig does.
- *   - reserved/reserved2 must be zero on send. Kernel-side
- *     mlx5_ib_restore_pd validates this for forward-compat
- *     (returns -EINVAL otherwise).
- *
- * Keep this in sync with struct mlx5_ib_restore_pd_req in
- * include/uapi/rdma/mlx5-abi.h. Drop once host rdma-core ships the
- * struct upstream.
+ * RESTORE_PD follows the same model (see rdma_send_restore_pd
+ * below): the driver-private UHW shape -- mlx5's source FW pdn
+ * carried in struct mlx5_ib_restore_pd_req -- lives in the per-
+ * driver plugin's CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK
+ * hook, which reads the per-PD plugin_blob the plugin packed at
+ * dump via MLX5_IB_METHOD_VFMIG_QUERY_PD. Core no longer carries
+ * any mlx5_ib_restore_pd_req shim or a fw_pdn core field.
  */
-struct mlx5_ib_restore_pd_req_local {
-	uint32_t	pdn;		/* source FW pdn to adopt */
-	uint32_t	reserved;	/* must be 0 */
-	uint64_t	reserved2;	/* must be 0; pads above the
-					 * 8-byte inline-UHW threshold */
-};
 
 /*
  * Issue UVERBS_METHOD_RESTORE_PD on @cmd_fd, asking the kernel to
  * mint a PD uobject at the caller-chosen ufile handle
  * @target_handle.
  *
- * Per-driver UHW shape:
- *   - rxe: no UHW. rxe_restore_pd is a pure kernel-side wrapper;
- *     the only thing it cares about is the ufile target handle.
- *   - mlx5: UHW carries struct mlx5_ib_restore_pd_req with
- *     {pdn = source FW pdn, reserved = 0, reserved2 = 0}. The
- *     source pdn comes from the rdma-uobj.img PD entry's fw_pdn
- *     field, which the dump side sourced from the named
- *     "fw_pdn" driver TLV that mlx5_ib's fill_res_pd_entry
- *     emits under RDMA_NLDEV_ATTR_DRIVER (kernel
- *     d4acb54ebd3d). Earlier CRIUs shipped the entry's
- *     restrack_id here -- restrack_id is NLDEV's
- *     RDMA_NLDEV_ATTR_RES_PDN, *not* mpd->pdn; the two values
- *     coincide on freshly-booted hosts but diverge as the
- *     restrack idr wraps. Sending restrack_id where mpd->pdn
- *     was expected was the silent-correctness bug fixed in
- *     d4acb54ebd3d.
+ * Driver-agnostic core (RESTORE_PD_HANDLE) + plugin-shaped UHW_IN
+ * through @plugin's CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK:
+ *   - rxe: registers no hook. rxe_restore_pd is a pure kernel-side
+ *     wrapper that reads no UHW; the ufile target handle is the only
+ *     input, so UHW stays empty.
+ *   - mlx5: the hook emits struct mlx5_ib_restore_pd_req carrying the
+ *     source FW pdn (mpd->pdn) captured at dump via QUERY_PD's
+ *     RESP_BLOB, so mlx5_ib_restore_pd can adopt it into a fresh
+ *     kernel-side mlx5_ib_pd ("Model A": no destination FW round-trip,
+ *     the source pdn is already reserved in firmware after
+ *     LOAD_VHCA_STATE).
  *
- * @has_src_pdn / @src_pdn carry the source FW pdn captured at dump
- * time. They are mandatory for RDMA_DRIVER_MLX5 (the verb is
- * meaningless without an adoption target) and ignored for any
- * driver whose restore_pd doesn't read UHW.
+ * @e is the per-uobj image entry; the plugin's UHW_PACK hook reads
+ * its plugin_blob. PD restore is issued from CRIU master (mlx5_ib_
+ * restore_pd does not pin user pages), so there is no pie deferral.
  *
- * Returns 0 on success, -errno on ioctl failure or -EINVAL if a
- * required input is missing for the chosen driver.
+ * Returns 0 on success, -errno on ioctl failure, or the plugin's
+ * UHW_PACK error.
  *
  * Wire-format references:
  *   tools/testing/mlx5_vfmig/uobject_restore/pd_restore/
  *     pd_restore_probe_rxe.c::do_restore_pd        (rxe shape)
  *     pd_restore_probe_mlx5_vfmig.c::do_restore_pd (mlx5 shape, UHW)
  */
-static int rdma_send_restore_pd(int cmd_fd, uint32_t driver_id,
+static int rdma_send_restore_pd(int cmd_fd, plugin_desc_t *plugin,
+				uint32_t kernel_driver_id,
 				uint32_t target_handle,
-				bool has_src_pdn, uint32_t src_pdn)
+				const RdmaUobjEntry *e)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr	hdr;
 		struct ib_uverbs_attr		attrs[2];
 	} cmd = {};
-	struct mlx5_ib_restore_pd_req_local mlx5_uhw = {};
+	struct rdma_uhw_spec uhw = {};
 	unsigned int n = 0;
+	int rc;
+
+	if (plugin && plugin->d->hooks[
+		CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK]) {
+		CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK_t *fn =
+			plugin->d->hooks[
+			CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK];
+		rc = fn(e, &uhw);
+		if (rc) {
+			pr_err("rdma_send_restore_pd: plugin '%s' UHW_PACK "
+			       "for target_handle=%u failed: %d (%s)\n",
+			       plugin->d->name, target_handle, rc,
+			       strerror(rc < 0 ? -rc : rc));
+			return rc;
+		}
+	}
 
 	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
 	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_PD;
-	cmd.hdr.driver_id = driver_id;
+	cmd.hdr.driver_id = kernel_driver_id;
 
 	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_PD_HANDLE;
 	cmd.attrs[n].len = sizeof(uint32_t);
@@ -507,37 +493,23 @@ static int rdma_send_restore_pd(int cmd_fd, uint32_t driver_id,
 	cmd.attrs[n].data = target_handle;
 	n++;
 
-	if (driver_id == RDMA_DRIVER_MLX5) {
-		if (!has_src_pdn) {
-			pr_err("RESTORE_PD on driver_id=%u (mlx5) requires "
-			       "the source FW pdn (mpd->pdn) from rdma-"
-			       "uobj.img, but the PD entry has no fw_pdn. "
-			       "The image was dumped against a kernel "
-			       "that pre-dates d4acb54ebd3d (RDMA/mlx5: "
-			       "fix CRIU PD restore by exposing FW pdn): "
-			       "re-dump against a current kernel and "
-			       "restore against the new image. Note that "
-			       "RES_PDN (== restrack_id) is NOT the FW "
-			       "pdn -- the two only coincided on freshly-"
-			       "booted hosts before this fix.\n",
-			       driver_id);
-			return -EINVAL;
-		}
-		mlx5_uhw.pdn = src_pdn;
-		/* reserved/reserved2 already zero from designated init */
+	if (uhw.in_len) {
 		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
-		cmd.attrs[n].len = sizeof(mlx5_uhw);
+		cmd.attrs[n].len = (uint16_t)uhw.in_len;
 		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-		cmd.attrs[n].data = (uintptr_t)&mlx5_uhw;
+		cmd.attrs[n].data = (uintptr_t)uhw.in_buf;
 		n++;
 	}
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
 
-	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
-		return -errno;
-	return 0;
+	rc = ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0 ? -errno : 0;
+
+	/* PD has no UHW_OUT; only the PACK in_buf needs freeing. */
+	free(uhw.in_buf);
+	free(uhw.out_buf);
+	return rc;
 }
 
 /*
@@ -1051,35 +1023,23 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			continue;
 		}
 		/*
-		 * Source the FW pdn from the per-PD fw_pdn field
-		 * (rdma_uobj.proto), which the dump side sourced
-		 * from the kernel's named "fw_pdn" driver TLV.
-		 * restrack_id is NOT the FW pdn -- it's
-		 * RDMA_NLDEV_ATTR_RES_PDN's per-ibdev restrack
-		 * counter -- and historically was passed here by
-		 * accident (silently correct on freshly-booted
-		 * hosts only). Falling back to restrack_id on
-		 * an old image keeps backward-compat for rxe
-		 * (which ignores UHW anyway), at the cost of
-		 * mlx5 images dumped against a pre-fix kernel
-		 * being rejected loudly by rdma_send_restore_pd.
+		 * The FW pdn RESTORE_PD adopts travels in the per-PD
+		 * plugin_blob (mlx5: struct mlx5_ib_restore_pd_req,
+		 * captured at dump via MLX5_IB_METHOD_VFMIG_QUERY_PD);
+		 * rdma_send_restore_pd asks the resolved plugin's
+		 * RESTORE_UOBJ_PD_UHW_PACK hook to shape it into UHW_IN.
+		 * rxe registers no such hook -- its restore_pd reads no
+		 * UHW and runs on the core HANDLE attr alone.
 		 */
-		rc = rdma_send_restore_pd(cmd_fd, kernel_driver_id,
-					  e->ufile_handle,
-					  e->has_fw_pdn,
-					  e->fw_pdn);
+		rc = rdma_send_restore_pd(cmd_fd, plugin, kernel_driver_id,
+					  e->ufile_handle, e);
 		if (rc) {
 			pr_err("uobj DAG: ufile_id=%#x RESTORE_PD"
-			       "(target_handle=%u, driver_id=%u, "
-			       "fw_pdn=%s%u, fw_uid=%s%u) failed: "
+			       "(target_handle=%u, driver_id=%u) failed: "
 			       "%d (%s)%s\n",
 			       ufile_id, e->ufile_handle,
 			       kernel_driver_id,
-			       e->has_fw_pdn ? "" : "?",
-			       e->has_fw_pdn ? e->fw_pdn : 0,
-			       e->has_fw_uid ? "" : "?",
-			       e->has_fw_uid ? e->fw_uid : 0,
-			       rc, strerror(-rc),
+			       rc, strerror(rc < 0 ? -rc : rc),
 			       rc == -EOPNOTSUPP
 			       ? " -- kernel has no "
 			         "ib_device_ops.restore_pd for this "
@@ -1105,11 +1065,11 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			         "policy: dest ucontext is opened "
 			         "WITHOUT DEVX so devx_uid=0 is the "
 			         "expected probe lane; if -ENOENT "
-			         "still fires, the image's fw_pdn "
-			         "is stale (re-dump needed: kernel "
-			         "ABI for fw_pdn is the named "
-			         "driver TLV in RDMA_NLDEV_ATTR_"
-			         "DRIVER, kernel d4acb54ebd3d). "
+			         "still fires, the image's FW pdn "
+			         "is stale (re-dump needed: the FW "
+			         "pdn now comes from the per-PD "
+			         "plugin_blob captured via "
+			         "MLX5_IB_METHOD_VFMIG_QUERY_PD). "
 			         "DEVX-uid adoption is vestigial: "
 			         "LOAD_VHCA_STATE does not preserve "
 			         "the FW uctx registration table, "
@@ -1123,8 +1083,9 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id,
 			       ? " -- mlx5_ib_restore_pd rejected the "
 			         "UHW (pdn=0 is reserved, reserved/"
 			         "reserved2 must be 0, or udata size "
-			         "mismatch -- check struct "
-			         "mlx5_ib_restore_pd_req packing)"
+			         "mismatch -- check the plugin's "
+			         "RESTORE_UOBJ_PD_UHW_PACK packing of "
+			         "struct mlx5_ib_restore_pd_req)"
 			       : "");
 			goto out;
 		}

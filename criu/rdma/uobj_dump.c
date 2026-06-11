@@ -242,8 +242,20 @@ static int uobj_emit(struct uobj_walk_ctx *w, RdmaUobjEntry *e)
 	return 0;
 }
 
-/* PD callback: direct CTXN, populate the ibdev's pdn_map for later
- * QP/MR/SRQ joins. */
+/*
+ * PD callback: direct CTXN, populate the ibdev's pdn_map for later
+ * QP/MR/SRQ joins, then per-driver QUERY_PD dispatch.
+ *
+ * The plugin dispatch is the same shape as the per-CQ / per-QP ones
+ * (see uobj_cq_cb / uobj_qp_cb): the cached uf->plugin (resolved at
+ * CLAIM time) gets its CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD invoked with
+ * the holder's uctx fd and the source ufile_handle, and packs its
+ * driver-private per-PD payload (mlx5: byte-equal to struct
+ * mlx5_ib_restore_pd_req captured via MLX5_IB_METHOD_VFMIG_QUERY_PD)
+ * into @plugin_blob. This supersedes the legacy NLDEV "fw_pdn" /
+ * "fw_uid" driver-TLV path: the FW pdn RESTORE_PD adopts now travels
+ * in plugin_blob, not in a core RdmaUobjEntry field.
+ */
 static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
 {
 	struct uobj_walk_ctx *w = arg;
@@ -271,26 +283,49 @@ static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
 	rdma_pd_attrs__init(&attrs);
 	pe.pd = &attrs;
 
-	/*
-	 * mlx5-private FW identity. fw_pdn is the value RESTORE_PD's
-	 * UHW (mlx5_ib_restore_pd_req.pdn) must ship -- rdma_send_
-	 * restore_pd reads pe.fw_pdn at restore. fw_uid is recorded
-	 * for image-inspection symmetry and is sourced from the
-	 * same TLV; the per-ufile aggregate is captured separately
-	 * by the mlx5 plugin's DUMP_UVERBS_CONTEXT hook (which does
-	 * its own NLDEV PD walk). Absent on rxe and on pre-
-	 * d4acb54ebd3d kernels; restore-side guards that and fails
-	 * the dump as un-restorable on a re-dump-required diagnostic.
-	 */
-	if (e->has_fw_pdn) {
-		pe.has_fw_pdn = true;
-		pe.fw_pdn = e->fw_pdn;
+	{
+		ProtobufCBinaryData plugin_blob = {};
+
+		if (e->has_ufile_handle && uf->holder_uctx_fd >= 0) {
+			int rc = rdma_dispatch_dump_uobj_pd(
+					uf->plugin, uf->ibdev,
+					uf->kernel_driver_id,
+					uf->holder_uctx_fd,
+					e->ufile_handle, uf->pid,
+					&attrs, &plugin_blob);
+			if (rc) {
+				pr_err("uobj DAG: per-PD dispatcher failed for "
+				       "ibdev=%s ufile_handle=%u (rc=%d, %s); "
+				       "aborting dump\n",
+				       uf->ibdev, e->ufile_handle, rc,
+				       strerror(rc < 0 ? -rc : rc));
+				free(plugin_blob.data);
+				return (w->err = -1);
+			}
+		} else if (!e->has_ufile_handle) {
+			pr_debug("uobj DAG: PD on ibdev=%s ctxn=%u has no "
+				 "ufile_handle (kernel pre-K8a / RES_HANDLE not "
+				 "emitted); skipping per-driver QUERY_PD\n",
+				 uf->ibdev, uf->ctxn);
+		} else {
+			pr_warn("uobj DAG: PD on ibdev=%s ctxn=%u "
+				"ufile_handle=%u has no holder_uctx_fd dup; "
+				"per-driver QUERY_PD skipped\n",
+				uf->ibdev, uf->ctxn, e->ufile_handle);
+		}
+
+		if (plugin_blob.data && plugin_blob.len > 0) {
+			pe.has_plugin_blob = true;
+			pe.plugin_blob = plugin_blob;
+		}
+
+		{
+			int rc = uobj_emit(w, &pe);
+
+			free(plugin_blob.data);
+			return rc < 0 ? (w->err = -1) : 0;
+		}
 	}
-	if (e->has_fw_uid) {
-		pe.has_fw_uid = true;
-		pe.fw_uid = e->fw_uid;
-	}
-	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
 }
 
 /* CQ callback: direct CTXN. */
