@@ -333,20 +333,21 @@ struct mlx5_ib_vfmig_dyn_uar_record_local {
  *                     user_index / uar_page / ece_options round-trip
  *                     intact across LOAD_VHCA_STATE per K7 so the
  *                     restore handler validates-and-discards them.
- *   RESP_TYPE         u32, mqp->type. Goes into UVERBS_ATTR_RESTORE_
- *                     QP_TYPE; v0 mlx5 RESTORE_QP gates on RC / UD
- *                     (UC parked at v0 dispatcher; see uobj design
- *                     doc §5.3.1 / §5.3.4).
- *   RESP_STATE        u32, mqp->state. Goes into UVERBS_ATTR_RESTORE_
- *                     QP_STATE; v0 RESTORE_QP gates on
- *                     {RESET, INIT, RTR, RTS}.
  *   RESP_USER_HANDLE  u64, ibqp->uobject->user_handle. Goes into
  *                     UVERBS_ATTR_RESTORE_QP_USER_HANDLE.
- *   RESP_CAP          struct ib_uverbs_qp_cap, best-effort echo of
- *                     the cap ibv_create_qp returned.
- *                     Goes into UVERBS_ATTR_RESTORE_QP_CAP.
  *   RESP_CREATE_FLAGS u32, mqp->flags. Goes into UVERBS_ATTR_RESTORE_
  *                     QP_CREATE_FLAGS.
+ *
+ * Trimmed set: RESP_TYPE / RESP_STATE / RESP_CAP were dropped. Those
+ * are standard-queryable -- CRIU's HW-generic dump path sources
+ * qp_type / state from NLDEV (RES_TYPE / RES_STATE) and the cap tuple
+ * from the standard QUERY_QP verb (rdma_uverbs_query_qp), so a
+ * driver-private verb re-exporting them was redundant. Only the two
+ * fields with no standard/NLDEV surface remain alongside the opaque
+ * blob. KEEP IN LOCKSTEP with the kernel enum in
+ * include/uapi/rdma/mlx5_user_ioctl_cmds.h (enum
+ * mlx5_ib_vfmig_query_qp_attrs); the attr ids below mirror its
+ * post-trim renumbering.
  *
  * Method id slot is +5 in the VFMIG enum, after QUERY_CQ (=+4).
  */
@@ -356,16 +357,10 @@ struct mlx5_ib_vfmig_dyn_uar_record_local {
 	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
 #define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB_LOCAL \
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
-#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE_LOCAL \
-	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
-#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE_LOCAL \
-	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 3)
 #define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE_LOCAL \
-	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 4)
-#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP_LOCAL \
-	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 5)
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
 #define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS_LOCAL \
-	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 6)
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 3)
 
 /*
  * Per-uobject PD dump-side discovery verb.
@@ -557,27 +552,12 @@ struct mlx5_ib_restore_qp_req_local {
 } __attribute__((aligned(8)));
 
 /*
- * struct ib_uverbs_qp_cap mirror -- the capability tuple the source
- * ibv_create_qp returned. CRIU's QUERY_QP RESP_CAP attr is a
- * PTR_OUT(sizeof(this)) and RESTORE_QP's UVERBS_ATTR_RESTORE_QP_CAP
- * is a PTR_IN(sizeof(this)); both bytewise-equal to the kernel
- * struct in include/uapi/rdma/ib_user_verbs.h. The host header has
- * always shipped this struct (it pre-dates the RESTORE_QP work) so
- * we could include it -- but inlining keeps the plugin's UAPI
- * surface self-contained alongside the rest of the VFMIG verbs.
- *
- * Field semantics: post-rounding values the kernel returned to the
- * source's create call. Plugin emits these verbatim; the mlx5
- * RESTORE_QP handler doesn't validate cap content (the actual WQ
- * shape comes from the UHW's {sq,rq}_wqe_count / rq_wqe_shift), so
- * cap is forward-compat surface, not a validation gate.
+ * The QP capability tuple (struct ib_uverbs_qp_cap) is no longer
+ * mirrored here: RESP_CAP was dropped from VFMIG QUERY_QP. CRIU's
+ * HW-generic dump path sources the cap from the standard QUERY_QP
+ * verb (criu/rdma/uverbsfd.c::rdma_uverbs_query_qp) and feeds it to
+ * RESTORE_QP's UVERBS_ATTR_RESTORE_QP_CAP, so the plugin never
+ * marshals cap.
  */
-struct ib_uverbs_qp_cap_local {
-	uint32_t max_send_wr;
-	uint32_t max_recv_wr;
-	uint32_t max_send_sge;
-	uint32_t max_recv_sge;
-	uint32_t max_inline_data;
-};
 
 #endif /* __CR_MLX5_VFMIG_UAPI_H__ */

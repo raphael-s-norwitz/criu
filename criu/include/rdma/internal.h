@@ -89,4 +89,40 @@ plugin_desc_t *rdma_find_plugin_by_provided_driver(uint32_t criu_driver,
 						   const char **first_name,
 						   const char **second_name);
 
+/*
+ * Hardware-agnostic QP attributes sourced from the *standard*
+ * QUERY_QP verb (see rdma_uverbs_query_qp). These are the bits the
+ * generic dump path lifts off any provider's QP without a driver-
+ * private verb: the create-time capability tuple (which RESTORE_QP
+ * takes as its mandatory CAP core attr and which, for rxe, sizes the
+ * restored SQ/RQ rings) plus the current IBTA state (cross-checked
+ * against NLDEV RES_STATE).
+ */
+struct rdma_std_qp_attrs {
+	uint32_t max_send_wr;
+	uint32_t max_recv_wr;
+	uint32_t max_send_sge;
+	uint32_t max_recv_sge;
+	uint32_t max_inline_data;
+	uint8_t  qp_state;
+};
+
+/*
+ * uverbsfd.c: source @qp_handle's hw-agnostic capability tuple (and
+ * current state) from the standard QUERY_QP verb on the dumpee's
+ * uverbs cdev @cmd_fd (the holder dup). ib_query_qp populates the
+ * init_attr cap (the rounded WQ depths the kernel installed at
+ * create) and attr->qp_state for every provider, so this is the
+ * cross-driver source of truth for RESTORE_QP's CAP core attr --
+ * the per-driver VFMIG QUERY_QP verbs need only carry the residue
+ * the standard verb cannot express (FW resource ids, rxe live PSN
+ * cursors / ring mmap offsets, the uobject user_handle).
+ *
+ * Returns 0 and fills @out on success, -errno on failure (the
+ * caller treats failure as "cap unavailable" -- non-fatal at dump,
+ * but RESTORE_QP will refuse the entry).
+ */
+int rdma_uverbs_query_qp(int cmd_fd, uint32_t qp_handle,
+			 struct rdma_std_qp_attrs *out);
+
 #endif /* __CR_RDMA_INTERNAL_H__ */

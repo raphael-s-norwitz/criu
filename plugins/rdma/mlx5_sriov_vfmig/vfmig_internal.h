@@ -52,7 +52,6 @@ struct mlx5_ib_vfmig_dyn_uar_record_local;
 struct mlx5_ib_restore_cq_req_local;
 struct mlx5_ib_restore_qp_req_local;
 struct mlx5_ib_restore_pd_req_local;
-struct ib_uverbs_qp_cap_local;
 
 int vfmig_send_get_context_v2(int fd, uint32_t flags,
 			      uint64_t lib_caps,
@@ -103,17 +102,16 @@ int vfmig_query_cq(int fd,
  * @qp_handle is the source ufile-idr QP handle from the R3 walk.
  * On success @blob_out is byte-equal to the payload RESTORE_QP's
  * UHW.data will consume on the destination; the dump path stores it
- * in protobuf verbatim. The companion outs (@type_out, @state_out,
- * @user_handle_out, @cap_out, @create_flags_out) are the per-QP
- * inputs RESTORE_QP takes as core attrs (not in the UHW blob).
+ * in protobuf verbatim. The residual outs (@user_handle_out,
+ * @create_flags_out) are the per-QP RESTORE_QP core attrs that have
+ * no standard/NLDEV surface. qp_type / state come from NLDEV and the
+ * cap tuple from the standard QUERY_QP verb (rdma_uverbs_query_qp),
+ * so they are no longer queried here.
  */
 int vfmig_query_qp(int fd,
 		   uint32_t qp_handle,
 		   struct mlx5_ib_restore_qp_req_local *blob_out,
-		   uint32_t *type_out,
-		   uint32_t *state_out,
 		   uint64_t *user_handle_out,
-		   struct ib_uverbs_qp_cap_local *cap_out,
 		   uint32_t *create_flags_out);
 
 /*

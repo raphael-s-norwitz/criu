@@ -349,11 +349,17 @@ int rdma_dispatch_dump_uobj_cq(plugin_desc_t *plugin,
  * Per-QP dump-side dispatcher. Mirror of rdma_dispatch_dump_uobj_cq:
  * calls @plugin's CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP if registered,
  * splitting the QP payload across the hw-agnostic per-class
- * @qp_attrs (filled by the dispatcher with the NLDEV-derived subset
- * before the plugin sees them, plugin appends user_handle / cap /
- * create_flags) and the driver-private @plugin_blob (mlx5: 64B
+ * @qp_attrs and the driver-private @plugin_blob (mlx5: 64B
  * mlx5_ib_restore_qp_req captured via MLX5_IB_METHOD_VFMIG_QUERY_QP;
  * rxe: future RXE_METHOD_VFMIG_QUERY_QP shape).
+ *
+ * @qp_attrs reaches the plugin pre-stamped with the NLDEV-derived
+ * subset (qp_type, state, qp_num, dest_qp_num, sq/rq_psn, port_num)
+ * AND the cap tuple, which the caller (uobj_qp_cb) sources from the
+ * standard QUERY_QP verb -- NOT from the plugin. The plugin appends
+ * only user_handle and create_flags (neither emitted by NLDEV nor by
+ * the standard verb) and packs its driver-private blob. It must not
+ * touch qp_attrs->cap.
  *
  * Optional hook semantics: a plugin that doesn't register the hook
  * is a no-op success. Plugin -ENXIO is treated as a per-uobject skip

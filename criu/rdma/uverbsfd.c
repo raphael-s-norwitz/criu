@@ -47,6 +47,7 @@
 #include <rdma/rdma_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_verbs.h>
+#include <rdma/ib_user_verbs.h>
 
 #include "common/compiler.h"
 #include "common/list.h"
@@ -598,6 +599,54 @@ int criu_ib_uverbs_get_context(int cmd_fd, uint32_t driver_id)
 }
 
 /*
+ * Source a QP's hw-agnostic cap + state from the standard QUERY_QP
+ * verb. See the contract in criu/include/rdma/internal.h.
+ *
+ * QUERY_QP has no ioctl-namespace method (unlike GET_CONTEXT /
+ * INFO_HANDLES, which is why the rest of this file uses
+ * RDMA_VERBS_IOCTL); it is a legacy write() command. The legacy
+ * framing (drivers/infiniband/core/uverbs_main.c::ib_uverbs_write +
+ * verify_hdr) is: total write length == hdr.in_words * 4 (hdr
+ * included), the response buffer is reachable via the @response u64
+ * at the head of the command body, and hdr.out_words * 4 must cover
+ * sizeof(resp). attr_mask is left 0: the cap we need rides in
+ * ib_query_qp's init_attr, which every provider fills regardless of
+ * mask (rxe_qp_to_init / mlx5_ib_query_qp), as does attr->qp_state.
+ */
+int rdma_uverbs_query_qp(int cmd_fd, uint32_t qp_handle,
+			 struct rdma_std_qp_attrs *out)
+{
+	struct {
+		struct ib_uverbs_cmd_hdr  hdr;
+		struct ib_uverbs_query_qp cmd;
+	} req = {};
+	struct ib_uverbs_query_qp_resp resp = {};
+	ssize_t n;
+
+	BUILD_BUG_ON(sizeof(req) % 4 != 0);
+	BUILD_BUG_ON(sizeof(resp) % 4 != 0);
+
+	req.hdr.command = IB_USER_VERBS_CMD_QUERY_QP;
+	req.hdr.in_words = sizeof(req) / 4;
+	req.hdr.out_words = sizeof(resp) / 4;
+	req.cmd.response = (uintptr_t)&resp;
+	req.cmd.qp_handle = qp_handle;
+	req.cmd.attr_mask = 0;
+
+	n = write(cmd_fd, &req, sizeof(req));
+	if (n != (ssize_t)sizeof(req))
+		return n < 0 ? -errno : -EIO;
+
+	out->max_send_wr = resp.max_send_wr;
+	out->max_recv_wr = resp.max_recv_wr;
+	out->max_send_sge = resp.max_send_sge;
+	out->max_recv_sge = resp.max_recv_sge;
+	out->max_inline_data = resp.max_inline_data;
+	out->qp_state = resp.qp_state;
+	return 0;
+}
+
+/*
  * Restore-time counterpart of dump_uverbsfile()'s arbitration step.
  *
  * Re-runs the per-plugin claim() probe against the restoring host's
@@ -960,11 +1009,12 @@ int rdma_dispatch_dump_uobj_cq(plugin_desc_t *plugin,
  *
  * @qp_attrs is owned by the caller and pre-populated with the
  * NLDEV-derived subset (qp_type, state, qp_num, dest_qp_num, sq_psn,
- * rq_psn, port_num). The plugin appends user_handle, cap, and
- * create_flags (none of which are emitted by NLDEV today) and packs
- * its driver-private 64B per-QP payload into @plugin_blob (mlx5:
- * byte-equal to struct mlx5_ib_restore_qp_req captured via
- * MLX5_IB_METHOD_VFMIG_QUERY_QP).
+ * rq_psn, port_num) plus the cap tuple, which the caller sources
+ * from the standard QUERY_QP verb (not from this plugin). The plugin
+ * appends user_handle and create_flags (neither emitted by NLDEV nor
+ * by the standard verb) and packs its driver-private 64B per-QP
+ * payload into @plugin_blob (mlx5: byte-equal to struct
+ * mlx5_ib_restore_qp_req captured via MLX5_IB_METHOD_VFMIG_QUERY_QP).
  *
  * Plugin -ENXIO is the per-uobject skip signal (kernel-mode QP
  * routed here by mistake -- mlx5_ib's QUERY_QP handler returns

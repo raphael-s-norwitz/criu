@@ -568,8 +568,14 @@ int vfmig_query_cq(int fd,
  * Issue MLX5_IB_METHOD_VFMIG_QUERY_QP on @fd against @qp_handle.
  * Mirror of vfmig_query_cq for QP: the byte-equal RESP_BLOB lands in
  * @blob_out (64 bytes; CRIU memcpy's it into protobuf, then back
- * into RESTORE_QP's UHW_IN), and the five scalar outs land in their
- * respective pointers.
+ * into RESTORE_QP's UHW_IN), and the two residual scalar outs
+ * (@user_handle_out, @create_flags_out) land in their pointers.
+ *
+ * Trimmed set: RESP_TYPE / RESP_STATE / RESP_CAP were dropped from
+ * this verb (see mlx5_uapi.h). The dump path sources qp_type / state
+ * from NLDEV and the cap tuple from the standard QUERY_QP verb, so
+ * this private verb only carries what the standard surfaces cannot
+ * express: the FW blob, the uobject user_handle, and create_flags.
  *
  * HANDLE is UVERBS_ATTR_IDR(UVERBS_OBJECT_QP); kernel-side
  * uverbs_process_attr enforces len == 0 for the IDR class and reads
@@ -581,15 +587,12 @@ int vfmig_query_cq(int fd,
 int vfmig_query_qp(int fd,
 		   uint32_t qp_handle,
 		   struct mlx5_ib_restore_qp_req_local *blob_out,
-		   uint32_t *type_out,
-		   uint32_t *state_out,
 		   uint64_t *user_handle_out,
-		   struct ib_uverbs_qp_cap_local *cap_out,
 		   uint32_t *create_flags_out)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;
-		struct ib_uverbs_attr attrs[7];
+		struct ib_uverbs_attr attrs[4];
 	} cmd = {};
 
 	/*
@@ -600,8 +603,6 @@ int vfmig_query_qp(int fd,
 	 */
 	_Static_assert(sizeof(*blob_out) == 64,
 		"mlx5_ib_restore_qp_req_local must be 64 bytes (kernel UAPI)");
-	_Static_assert(sizeof(*cap_out) == 20,
-		"ib_uverbs_qp_cap_local must be 20 bytes (kernel UAPI)");
 
 	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
 	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_QP_LOCAL;
@@ -617,35 +618,20 @@ int vfmig_query_qp(int fd,
 	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[1].data = (uintptr_t)blob_out;
 
-	cmd.attrs[2].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_TYPE_LOCAL;
-	cmd.attrs[2].len = sizeof(*type_out);
-	cmd.attrs[2].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[2].data = (uintptr_t)type_out;
-
-	cmd.attrs[3].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_STATE_LOCAL;
-	cmd.attrs[3].len = sizeof(*state_out);
-	cmd.attrs[3].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[3].data = (uintptr_t)state_out;
-
-	cmd.attrs[4].attr_id =
+	cmd.attrs[2].attr_id =
 		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE_LOCAL;
-	cmd.attrs[4].len = sizeof(*user_handle_out);
-	cmd.attrs[4].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[4].data = (uintptr_t)user_handle_out;
+	cmd.attrs[2].len = sizeof(*user_handle_out);
+	cmd.attrs[2].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[2].data = (uintptr_t)user_handle_out;
 
-	cmd.attrs[5].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CAP_LOCAL;
-	cmd.attrs[5].len = sizeof(*cap_out);
-	cmd.attrs[5].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[5].data = (uintptr_t)cap_out;
-
-	cmd.attrs[6].attr_id =
+	cmd.attrs[3].attr_id =
 		MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS_LOCAL;
-	cmd.attrs[6].len = sizeof(*create_flags_out);
-	cmd.attrs[6].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[6].data = (uintptr_t)create_flags_out;
+	cmd.attrs[3].len = sizeof(*create_flags_out);
+	cmd.attrs[3].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[3].data = (uintptr_t)create_flags_out;
 
-	cmd.hdr.num_attrs = 7;
-	cmd.hdr.length = sizeof(cmd.hdr) + 7 * sizeof(cmd.attrs[0]);
+	cmd.hdr.num_attrs = 4;
+	cmd.hdr.length = sizeof(cmd.hdr) + 4 * sizeof(cmd.attrs[0]);
 
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;

@@ -496,13 +496,13 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 			       e->has_ufile_handle, e->ufile_handle);
 	rdma_qp_attrs__init(&attrs);
 	/*
-	 * Attach the cap sub-message up-front (stack storage owned by
-	 * this callback). The plugin's RDMA_DUMP_UOBJ_QP hook fills its
-	 * fields in place; callers that don't run the hook (no
-	 * holder_uctx_fd, kernel pre-K8a) leave attrs.cap unset by
-	 * not touching the parent pointer below. This keeps cap
-	 * ownership on the dump-side stack rather than the plugin
-	 * heap, mirroring how rdma_uobj_xref are managed here.
+	 * cap sub-message storage (stack-owned by this callback). It is
+	 * filled by the HW-generic standard QUERY_QP below (not by the
+	 * per-driver plugin hook) and attached to attrs only on a
+	 * successful query; callers that can't query (no holder_uctx_fd,
+	 * kernel pre-K8a, or QUERY_QP failure) leave attrs.cap NULL.
+	 * Keeping cap on the dump-side stack mirrors how rdma_uobj_xref
+	 * are managed here.
 	 */
 	rdma_qp_cap__init(&cap);
 	attrs.has_qp_type = true;
@@ -534,9 +534,62 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 		bool ran_hook = false;
 
 		if (e->has_ufile_handle && uf->holder_uctx_fd >= 0) {
+			struct rdma_std_qp_attrs sq = {};
 			int rc;
 
-			attrs.cap = &cap;
+			/*
+			 * HW-generic: source the capability tuple
+			 * (RESTORE_QP's mandatory CAP core attr) from the
+			 * standard QUERY_QP verb rather than from each
+			 * driver's private VFMIG QUERY_QP. ib_query_qp
+			 * fills the rounded WQ depths the kernel installed
+			 * at create for every provider, so this is the one
+			 * cross-driver source -- the per-driver hook below
+			 * carries only the residue the standard verb can't
+			 * express (FW resource ids, rxe live PSN cursors /
+			 * ring mmap offsets, the uobject user_handle).
+			 */
+			rc = rdma_uverbs_query_qp(uf->holder_uctx_fd,
+						  e->ufile_handle, &sq);
+			if (rc == 0) {
+				cap.has_max_send_wr = true;
+				cap.max_send_wr = sq.max_send_wr;
+				cap.has_max_recv_wr = true;
+				cap.max_recv_wr = sq.max_recv_wr;
+				cap.has_max_send_sge = true;
+				cap.max_send_sge = sq.max_send_sge;
+				cap.has_max_recv_sge = true;
+				cap.max_recv_sge = sq.max_recv_sge;
+				cap.has_max_inline_data = true;
+				cap.max_inline_data = sq.max_inline_data;
+				attrs.cap = &cap;
+
+				/*
+				 * Cross-check the standard verb's state
+				 * against NLDEV RES_STATE (stamped above).
+				 * Both read the same kernel mqp->state on a
+				 * frozen dumpee; a divergence is a structural
+				 * surprise worth surfacing. Best-effort warn:
+				 * NLDEV stays authoritative for the
+				 * RESTORE_QP_STATE core attr.
+				 */
+				if (attrs.has_state &&
+				    attrs.state != sq.qp_state)
+					pr_warn("uobj DAG: QP ibdev=%s "
+						"ufile_handle=%u: NLDEV "
+						"RES_STATE=%u disagrees with "
+						"standard QUERY_QP state=%u\n",
+						uf->ibdev, e->ufile_handle,
+						attrs.state, sq.qp_state);
+			} else {
+				pr_warn("uobj DAG: standard QUERY_QP on "
+					"ibdev=%s ufile_handle=%u failed: %d "
+					"(%s); QP cap will be absent and "
+					"RESTORE_QP refuses a capless entry\n",
+					uf->ibdev, e->ufile_handle, rc,
+					strerror(rc < 0 ? -rc : rc));
+			}
+
 			rc = rdma_dispatch_dump_uobj_qp(
 					uf->plugin, uf->ibdev,
 					uf->kernel_driver_id,

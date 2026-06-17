@@ -1050,9 +1050,8 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 					ProtobufCBinaryData *plugin_blob)
 {
 	struct mlx5_ib_restore_qp_req_local blob = {};
-	struct ib_uverbs_qp_cap_local cap = {};
 	struct mlx5_ib_vfmig_ucontext_meta_local uctx_meta = {};
-	uint32_t resp_type = 0, resp_state = 0, create_flags = 0;
+	uint32_t create_flags = 0;
 	uint64_t user_handle = 0;
 	uint8_t *blob_buf;
 	int rc;
@@ -1161,8 +1160,7 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 	}
 
 	rc = vfmig_query_qp(lfd, ufile_handle, &blob,
-			    &resp_type, &resp_state, &user_handle,
-			    &cap, &create_flags);
+			    &user_handle, &create_flags);
 	if (rc) {
 		if (rc == -ENXIO) {
 			pr_debug("vfmig: QUERY_QP(handle=%u) on ibdev=%s "
@@ -1178,39 +1176,20 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 	}
 
 	/*
-	 * NLDEV stamped qp_type / state on @qp_attrs from
-	 * RES_TYPE / RES_STATE. QUERY_QP returns the same kernel
-	 * fields. Mismatch indicates the IDR walker and per-handle
-	 * ioctl resolved to different mqp's -- structural, fail
-	 * loud rather than silently prefer one source.
-	 */
-	if (qp_attrs->has_qp_type && qp_attrs->qp_type != resp_type) {
-		pr_err("vfmig: QP ufile_handle=%u on ibdev=%s: NLDEV "
-		       "RES_TYPE=%u disagrees with QUERY_QP RESP_TYPE=%u; "
-		       "structural inconsistency, aborting dump\n",
-		       ufile_handle, ibdev, qp_attrs->qp_type, resp_type);
-		return -EILSEQ;
-	}
-	if (qp_attrs->has_state && qp_attrs->state != resp_state) {
-		pr_err("vfmig: QP ufile_handle=%u on ibdev=%s: NLDEV "
-		       "RES_STATE=%u disagrees with QUERY_QP "
-		       "RESP_STATE=%u; structural inconsistency, "
-		       "aborting dump\n",
-		       ufile_handle, ibdev, qp_attrs->state, resp_state);
-		return -EILSEQ;
-	}
-	/*
-	 * Step 6 master-side seam assertion: NLDEV RES_LQPN
-	 * (qp_attrs->qp_num, set by uobj_qp_cb before dispatch) and
-	 * the UHW-carried mlx5_ib_restore_qp_req.qpn must agree.
-	 * They both resolve through ibqp->qp_num on the source mqp,
-	 * so divergence means the IDR walker and the per-handle
-	 * QUERY_QP ioctl resolved to different mqps -- the same
-	 * "structural surprise" class we fail loud on for
-	 * type/state. The PIE restorer's resp_qpn vs qpn_hint
-	 * assertion is the final defence; this one catches the same
-	 * regression class earlier (at dump time, with the source
-	 * still online) where the operator can re-dump.
+	 * Master-side seam assertion: NLDEV RES_LQPN (qp_attrs->qp_num,
+	 * set by uobj_qp_cb before dispatch) and the UHW-carried
+	 * mlx5_ib_restore_qp_req.qpn must agree. They both resolve
+	 * through ibqp->qp_num on the source mqp, so divergence means
+	 * the IDR walker and the per-handle QUERY_QP ioctl resolved to
+	 * different mqps -- a structural surprise. The PIE restorer's
+	 * resp_qpn vs qpn_hint assertion is the final defence; this one
+	 * catches the same regression class earlier (at dump time, with
+	 * the source still online) where the operator can re-dump.
+	 *
+	 * (The former NLDEV-vs-QUERY_QP type/state cross-checks are
+	 * gone: RESP_TYPE / RESP_STATE were dropped from the verb, and
+	 * the HW-generic dump path now cross-checks NLDEV RES_STATE
+	 * against the standard QUERY_QP verb's state instead.)
 	 */
 	if (qp_attrs->has_qp_num && qp_attrs->qp_num != blob.qpn) {
 		pr_err("vfmig: QP ufile_handle=%u on ibdev=%s: NLDEV "
@@ -1223,25 +1202,11 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 	}
 
 	/*
-	 * @qp_attrs->cap is pre-attached by the dump-side caller
-	 * (uobj_qp_cb) to a stack-local RdmaQpCap so cap memory is
-	 * owned by the dump path, not the plugin. Filling fields
-	 * in-place preserves a single ownership model and removes a
-	 * malloc/free pair per QP.
+	 * cap is NOT filled here: qp_attrs->cap is sourced by the
+	 * HW-generic dump path (uobj_qp_cb) from the standard QUERY_QP
+	 * verb. This hook only contributes the residue with no standard
+	 * surface -- the FW blob (below), user_handle, create_flags.
 	 */
-	if (qp_attrs->cap) {
-		qp_attrs->cap->has_max_send_wr = true;
-		qp_attrs->cap->max_send_wr = cap.max_send_wr;
-		qp_attrs->cap->has_max_recv_wr = true;
-		qp_attrs->cap->max_recv_wr = cap.max_recv_wr;
-		qp_attrs->cap->has_max_send_sge = true;
-		qp_attrs->cap->max_send_sge = cap.max_send_sge;
-		qp_attrs->cap->has_max_recv_sge = true;
-		qp_attrs->cap->max_recv_sge = cap.max_recv_sge;
-		qp_attrs->cap->has_max_inline_data = true;
-		qp_attrs->cap->max_inline_data = cap.max_inline_data;
-	}
-
 	qp_attrs->has_create_flags = true;
 	qp_attrs->create_flags = create_flags;
 	qp_attrs->has_user_handle = true;
@@ -1259,15 +1224,13 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 	plugin_blob->len = sizeof(blob);
 
 	pr_debug("vfmig: QUERY_QP ibdev=%s ufile_handle=%u: qpn=%u "
-		 "type=%u state=%u user_handle=0x%llx "
-		 "create_flags=0x%x sq_wqe_count=%u rq_wqe_count=%u "
-		 "rq_wqe_shift=%u flags=0x%x cap={ms_wr=%u mr_wr=%u "
-		 "ms_sge=%u mr_sge=%u inline=%u}\n",
-		 ibdev, ufile_handle, blob.qpn, resp_type, resp_state,
+		 "user_handle=0x%llx create_flags=0x%x sq_wqe_count=%u "
+		 "rq_wqe_count=%u rq_wqe_shift=%u flags=0x%x (cap sourced "
+		 "via standard QUERY_QP; type/state via NLDEV)\n",
+		 ibdev, ufile_handle, blob.qpn,
 		 (unsigned long long)user_handle, create_flags,
 		 blob.sq_wqe_count, blob.rq_wqe_count, blob.rq_wqe_shift,
-		 blob.flags, cap.max_send_wr, cap.max_recv_wr,
-		 cap.max_send_sge, cap.max_recv_sge, cap.max_inline_data);
+		 blob.flags);
 	return 0;
 }
 
