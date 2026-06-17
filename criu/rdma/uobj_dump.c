@@ -23,9 +23,7 @@
  * uverbsfd.c is the producer; this file is the consumer.
  *
  * Owns the cleanup of per-entry holder_uctx_fd dups (this is
- * the only consumer) and triggers rdma_cdev_vma_recs_free()
- * on the side-table populated by the RDMA-class plugins'
- * CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA hooks.
+ * the only consumer).
  */
 
 #include <errno.h>
@@ -366,9 +364,8 @@ static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
 	 *     attach onto the entry-level RdmaUobjEntry.plugin_blob
 	 *     field below. mlx5 packs the 32B mlx5_ib_restore_cq_req
 	 *     captured via MLX5_IB_METHOD_VFMIG_QUERY_CQ; rxe packs
-	 *     an 8B vm_pgoff popped from the side-table its
-	 *     PROCESS_DEVICE_VMA hook fed (see
-	 *     plugins/rdma/rxe/rdma_rxe_plugin.c).
+	 *     an 8B vm_pgoff read via RXE_IB_METHOD_VFMIG_QUERY_CQ
+	 *     (see plugins/rdma/rxe/rdma_rxe_plugin.c).
 	 *
 	 * Skipped if @holder_uctx_fd is unavailable or if NLDEV
 	 * didn't surface a per-CQ ufile_handle (pre-K8a kernels):
@@ -1166,15 +1163,5 @@ out:
 			}
 		}
 	}
-	/*
-	 * Free the process-global cdev VMA side-table populated by
-	 * RDMA-class plugins' CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA
-	 * hooks. Entries were consumed by the rxe plugin's per-CQ
-	 * dump hook (rdma_pop_cdev_vma_offset, packed into the
-	 * per-uobj plugin_blob). We drop everything unconditionally
-	 * so a long-running criu service process doesn't carry stale
-	 * entries into its next dump cycle.
-	 */
-	rdma_cdev_vma_recs_free();
 	return ret;
 }

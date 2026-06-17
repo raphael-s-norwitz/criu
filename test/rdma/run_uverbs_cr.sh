@@ -565,11 +565,11 @@ run_pass() {
 #                       mmap_info(forced_offset)). The req struct
 #                       is sized > 8 bytes to escape the uverbs
 #                       inline-attr trap.
-#                    2. CRIU: rdma_record_cdev_vma() (rxe plugin
-#                       PROCESS_DEVICE_VMA) feeds the dump-side
-#                       vm_pgoff into a side-table that
-#                       rdma_send_restore_cq replays as UHW_IN at
-#                       restore time.
+#                    2. CRIU: the rxe plugin's DUMP_UOBJ_CQ hook
+#                       reads the source vm_pgoff per CQ handle via
+#                       RXE_IB_METHOD_VFMIG_QUERY_CQ and packs it
+#                       into plugin_blob; RESTORE_CQ_UHW_PACK
+#                       replays it as UHW_IN at restore time.
 #                    3. CRIU: the rxe plugin's UPDATE_VMA_MAP hook
 #                       hands open_filemap a dup of the cdev fd
 #                       open_uverbs_cdev minted with GET_CONTEXT
@@ -606,15 +606,15 @@ else
 	echo "       support in rxe_restore_cq (S5a-vma-remap)."
 fi
 # pd_2cq -- two CQs on one ibv_context, the canonical perftest
-# multi-CQ pattern (separate send_cq + recv_cq). Default-on as of
-# the borrowed-VFI PROCESS_DEVICE_VMA fix in proc_parse.c: holders
-# with N back-to-back uverbs cdev VMAs now feed N entries into the
-# rxe plugin's cdev_vma_offset queue (instead of just one),
-# preserving the 1:1 join between vm_pgoff and per-CQ uobject
-# that RESTORE_CQ.UHW_IN replay needs. Pre-fix this regressed
-# silently inside rxe_mmap's pending_mmaps lookup at pie restore
-# time. Switch retained so we can selectively skip on older
-# CRIU/proc_parse builds.
+# multi-CQ pattern (separate send_cq + recv_cq). Each CQ's source
+# vm_pgoff is sourced per handle via RXE_IB_METHOD_VFMIG_QUERY_CQ
+# in the rxe plugin's DUMP_UOBJ_CQ hook, so the 1:1 join between
+# vm_pgoff and per-CQ uobject that RESTORE_CQ.UHW_IN replay needs
+# holds regardless of how many cdev VMAs a ufile maps. (This
+# replaced the fragile /proc/<pid>/smaps cdev-VMA FIFO scrape,
+# which could not tell a CQ ring apart from a QP's SQ/RQ ring on a
+# shared ufile.) Switch retained so the pass can be skipped on
+# kernels lacking the QUERY_CQ verb.
 if [[ "${UVERBS_CR_RUN_PD_2CQ:-1}" == "1" ]]; then
 	run_pass pd_2cq pd_2cq 0
 fi

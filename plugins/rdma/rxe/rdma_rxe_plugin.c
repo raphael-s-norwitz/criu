@@ -36,6 +36,7 @@
 
 #include <rdma/ib_user_ioctl_verbs.h>
 #include <rdma/ib_user_verbs.h>
+#include <rdma/rdma_user_ioctl_cmds.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -47,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -735,26 +737,22 @@ static int rxe_chrdev_to_ibdev(dev_t rdev, char *out, size_t outsz)
  *
  * No per-VMA join key is needed: source pgoff equals dest pgoff
  * once piece (1) lands, so UPDATE_VMA_MAP only substitutes the
- * fd. The PROCESS_DEVICE_VMA hook below feeds the source
- * vm_pgoff into the side-table consumed by rdma_send_restore_cq
- * (criu/rdma.c) for the UHW_IN replay.
+ * fd. The source vm_pgoff each CQ's UHW_IN replays is sourced at
+ * dump time from RXE_IB_METHOD_VFMIG_QUERY_CQ (rdma_rxe_plugin_
+ * dump_uobj_cq below), keyed by the CQ's ufile_handle -- not from
+ * a /proc/<pid>/smaps VMA scrape, which could not tell a CQ ring
+ * apart from a QP's SQ/RQ ring on a shared ufile.
  *
  * @fd is unused: we resolve off @stat->st_rdev only, matching the
  * rationale spelled out on the mlx5_vfmig sibling hook.
  */
 /*
- * Predicate shared by HANDLE_DEVICE_VMA (claim) and
- * PROCESS_DEVICE_VMA (post-claim notify): does this VMA's @st
+ * Predicate behind HANDLE_DEVICE_VMA (claim): does this VMA's @st
  * resolve to an rxe-driven uverbs cdev?
  *
  * On a successful match, writes the ibdev name (e.g. "rxe0") to
  * @ibdev_out and returns 0. On any decline, returns -ENOTSUP and
  * leaves @ibdev_out untouched (callers don't read it on failure).
- *
- * Centralising the predicate keeps the two hooks bit-for-bit in
- * agreement: a VMA HANDLE claims must also be a VMA PROCESS
- * records (and vice versa), even as the rxe-cdev test grows new
- * filters (e.g. multi-ibdev minor disambiguation).
  */
 static int rxe_match_cdev_vma(const struct stat *st, char *ibdev_out,
 			      size_t ibdev_sz)
@@ -798,57 +796,91 @@ static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
 }
 
 /*
- * Per-VMA dump-side post-claim notify
- * (CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA).
+ * UAPI shims for the rxe VFMIG dump-side uverbs object, mirrors of
+ *   include/uapi/rdma/rxe_user_ioctl_cmds.h
+ *     enum rxe_ib_objects        { RXE_IB_OBJECT_VFMIG = (1<<NS_SHIFT) };
+ *     enum rxe_ib_vfmig_methods  { ..._FREEZE_DATAPATH, ..._QUERY_QP,
+ *                                  ..._QUERY_CQ };
+ *     enum rxe_ib_vfmig_query_cq_attrs { ..._HANDLE, ..._RESP_BLOB };
  *
- * Fires once per cdev VMA after rdma_rxe_plugin_handle_device_vma
- * has already returned 0 on the same (fd, st) pair. Forwards
- * (pid, ibdev, vma_pgoff_bytes) into criu/rdma.c's process-global
- * cdev VMA side-table, so the per-uobj DAG dump (uobj_cq_cb in
- * rdma.c) can attach the source-time mmap cookie to each
- * RdmaCqAttrs.mmap_offset and round-trip it as UHW_IN at restore-
- * time RESTORE_CQ -- pinning the destination CQ's mmap region at
- * exactly the source's vm_pgoff so the pie restorer's mmap-at-
- * dumped-pgoff lands on a kernel pending_mmaps entry.
- *
- * The vma_pgoff_bytes argument is vma->vm_pgoff << PAGE_SHIFT,
- * already in the units rxe_mmap_info.info.offset (and therefore
- * rxe_restore_cq_req.vm_pgoff) takes.
- *
- * Returns 0 on success (the only meaningful return). Returns
- * -ENOMEM only on rdma_record_cdev_vma() allocation failure --
- * which run_plugins() will short-circuit, and which the
- * proc_parse caller treats as a hard dump error. Declines
- * (-ENOTSUP) for non-rxe cdev VMAs so runs with multiple RDMA
- * plugins behave correctly.
+ * UVERBS_ID_NS_SHIFT is 12 across the uverbs UAPI; pinned locally here
+ * (matching the mlx5_vfmig plugin's UVERBS_ID_NS_SHIFT_LOCAL) so a
+ * header drift can't silently shift these ids. RXE_IB_OBJECT_VFMIG is
+ * the first (and only) rxe driver object, so it sits at (1<<SHIFT)+0;
+ * QUERY_CQ is the third method (FREEZE_DATAPATH=+0, QUERY_QP=+1,
+ * QUERY_CQ=+2). Keep in sync with the kernel UAPI; remove once host
+ * rdma-core ships rxe_user_ioctl_cmds.h.
  */
-static int rdma_rxe_plugin_process_device_vma(pid_t pid, int fd,
-					      const struct stat *st,
-					      uint64_t vma_start,
-					      uint64_t vma_end,
-					      uint64_t vma_pgoff_bytes)
+#define RXE_UVERBS_ID_NS_SHIFT_LOCAL 12
+#define RXE_IB_OBJECT_VFMIG_LOCAL \
+	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_METHOD_VFMIG_QUERY_CQ_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL \
+	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+
+/*
+ * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
+ * rxe_query_cq_resp (16 bytes): the RXE_IB_METHOD_VFMIG_QUERY_CQ
+ * PTR_OUT blob. @vm_pgoff is the CQ ring's mmap byte offset
+ * (cq->queue->ip->info.offset); @cqe is the CQ's user-visible entry
+ * count (cq->ibcq.cqe). Remove once host rdma-core ships the struct.
+ */
+struct rxe_query_cq_resp_local {
+	uint64_t vm_pgoff;
+	uint32_t cqe;
+	uint32_t reserved;
+};
+
+/*
+ * Issue RXE_IB_METHOD_VFMIG_QUERY_CQ on @fd against @cq_handle, the
+ * dump-side counterpart of UVERBS_METHOD_RESTORE_CQ. @fd is criu's
+ * dup of the dumpee's uverbs cdev fd (the holder of the CQ IDR), so
+ * the security boundary is the ufile that owns the CQ. The kernel
+ * fills @resp_out with the CQ ring's mmap offset + entry count read
+ * straight from the live CQ -- the authoritative source that retires
+ * the old /proc/<pid>/smaps cdev-VMA FIFO scrape (which a mixed
+ * CQ+QP ufile would corrupt, since QP rings are cdev VMAs too).
+ *
+ * HANDLE is UVERBS_ATTR_IDR(UVERBS_OBJECT_CQ); the kernel enforces
+ * len == 0 for the IDR class and reads the handle from attrs[].data
+ * (same shim as the mlx5 QUERY_CQ helper). Kernel-mode CQs return
+ * -ENXIO; a bogus handle returns -ENOENT from the IDR lookup.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+static int rxe_vfmig_query_cq(int fd, uint32_t cq_handle,
+			      struct rxe_query_cq_resp_local *resp_out)
 {
-	char ibdev[64];
-	int rc;
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[2];
+	} cmd = {};
 
-	(void)fd;
-	(void)vma_start;
-	(void)vma_end;
+	_Static_assert(sizeof(*resp_out) == 16,
+		"rxe_query_cq_resp_local must be 16 bytes (kernel UAPI)");
 
-	rc = rxe_match_cdev_vma(st, ibdev, sizeof(ibdev));
-	if (rc)
-		return rc;
+	cmd.hdr.object_id = RXE_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_VFMIG_QUERY_CQ_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
 
-	if (rdma_record_cdev_vma(pid, ibdev, vma_pgoff_bytes) < 0) {
-		pr_err("process_vma(%s): rdma_record_cdev_vma failed for "
-		       "pid=%d pgoff=%#" PRIx64 "\n",
-		       ibdev, pid, vma_pgoff_bytes);
-		return -ENOMEM;
-	}
+	cmd.attrs[0].attr_id = RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL;
+	cmd.attrs[0].len = 0;
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = cq_handle;
 
-	pr_info("process_vma(%s, pid=%d): recorded cdev VMA pgoff=%#" PRIx64
-		" for restore-time UHW_IN replay\n",
-		ibdev, pid, vma_pgoff_bytes);
+	cmd.attrs[1].attr_id = RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB_LOCAL;
+	cmd.attrs[1].len = sizeof(*resp_out);
+	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].data = (uintptr_t)resp_out;
+
+	cmd.hdr.num_attrs = 2;
+	cmd.hdr.length = sizeof(cmd.hdr) + 2 * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
 	return 0;
 }
 
@@ -901,26 +933,29 @@ struct rxe_restore_cq_req_local {
 };
 
 /*
- * RDMA_DUMP_UOBJ_CQ hook (rxe). Drains one cdev-VMA pgoff cookie
- * from the process-global side-table fed by
- * rdma_rxe_plugin_process_device_vma() above, packs it as the
- * 8-byte rxe_cq_plugin_blob into the entry-level plugin_blob the
- * caller will attach onto RdmaUobjEntry.plugin_blob, and stamps
- * comp_vector=0 / flags=0 (rxe has only one comp vector and no
- * non-zero create-CQ flags in v0).
+ * RDMA_DUMP_UOBJ_CQ hook (rxe). Issues RXE_IB_METHOD_VFMIG_QUERY_CQ
+ * on @lfd (criu's dup of the dumpee's uverbs cdev fd, the holder of
+ * the CQ IDR) against @ufile_handle, packs the kernel-reported CQ
+ * ring mmap offset as the 8-byte rxe_cq_plugin_blob into the entry-
+ * level plugin_blob the caller attaches onto RdmaUobjEntry.
+ * plugin_blob, and stamps comp_vector=0 / flags=0 (rxe has only one
+ * comp vector and no non-zero create-CQ flags in v0).
  *
- * If the side-table is empty -- pre-K8a kernel that didn't surface
- * the matching cdev VMA, or a holder that never mmap'd this CQ's
- * ring -- @plugin_blob is left as the caller staged it (NULL data,
- * len 0) and the restore-side UHW PACK below treats that as
- * "fall back to the kernel's monotonic counter at RESTORE_CQ".
+ * QUERY_CQ supersedes the old /proc/<pid>/smaps cdev-VMA FIFO
+ * (PROCESS_DEVICE_VMA -> rdma_record/pop_cdev_vma_offset). That
+ * scrape keyed nothing but FIFO order, so a ufile holding both a CQ
+ * and a QP -- whose SQ/RQ rings are cdev VMAs too -- would hand the
+ * CQ pop a QP ring's offset. Sourcing vm_pgoff straight off the live
+ * CQ (cq->queue->ip->info.offset) makes it per-handle exact and
+ * mirrors how QP rings are dumped via QUERY_QP.
  *
  * Allocates plugin_blob->data via malloc; criu/rdma/uobj_dump.c::
  * uobj_cq_cb frees it after pb_write_one consumes the bytes
  * (allocator contract identical to the mlx5 plugin's hook).
  *
  * @kernel_driver_id is unused -- the dispatcher already guaranteed
- * we only get rxe CQs.
+ * we only get rxe CQs. @pid is unused: unlike the retired FIFO
+ * path, QUERY_CQ needs no (pid, ibdev) side-table consult.
  */
 static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev,
 					uint32_t kernel_driver_id,
@@ -929,39 +964,49 @@ static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev,
 					RdmaCqAttrs *cq_attrs,
 					ProtobufCBinaryData *plugin_blob)
 {
+	struct rxe_query_cq_resp_local resp = {};
 	struct rxe_cq_plugin_blob_local pb = {};
-	uint64_t pgoff_bytes = 0;
 	uint8_t *buf;
 	int rc;
 
-	(void)lfd;
 	(void)kernel_driver_id;
+	(void)pid;
 
-	rc = rdma_pop_cdev_vma_offset(pid, ibdev, &pgoff_bytes);
-	if (rc == -ENOENT) {
-		pr_debug("rxe: dump_uobj_cq: no cdev VMA cookie left for "
-			 "ibdev=%s ufile_handle=%u (pre-K8a or non-mmap "
-			 "holder); leaving plugin_blob empty\n",
-			 ibdev, ufile_handle);
-		/* Leave plugin_blob empty; restore-side falls back. */
-	} else if (rc < 0) {
-		pr_err("rxe: dump_uobj_cq: rdma_pop_cdev_vma_offset "
-		       "ibdev=%s ufile_handle=%u failed: %d\n",
-		       ibdev, ufile_handle, rc);
+	rc = rxe_vfmig_query_cq(lfd, ufile_handle, &resp);
+	if (rc) {
+		pr_err("rxe: dump_uobj_cq: QUERY_CQ(handle=%u) on ibdev=%s "
+		       "failed: %d (%s)\n",
+		       ufile_handle, ibdev, rc, strerror(-rc));
 		return rc;
-	} else {
-		pb.vm_pgoff = pgoff_bytes;
-		buf = malloc(sizeof(pb));
-		if (!buf) {
-			pr_err("rxe: dump_uobj_cq: out of memory packing "
-			       "plugin_blob (%zu bytes) for ufile_handle=%u\n",
-			       sizeof(pb), ufile_handle);
-			return -ENOMEM;
-		}
-		memcpy(buf, &pb, sizeof(pb));
-		plugin_blob->data = buf;
-		plugin_blob->len = sizeof(pb);
 	}
+
+	/*
+	 * Sanity belt mirroring the mlx5 plugin: NLDEV's RES_CQE (which
+	 * the dispatcher already stamped onto cq_attrs->cqe_count) and
+	 * QUERY_CQ's cqe resolve through the same kernel field
+	 * (ibcq->cqe). A mismatch means the IDR walker and NLDEV are
+	 * looking at different objects -- surface it rather than paper
+	 * over it.
+	 */
+	if (cq_attrs->has_cqe_count && cq_attrs->cqe_count != resp.cqe) {
+		pr_err("rxe: CQ ufile_handle=%u on ibdev=%s: NLDEV "
+		       "RES_CQE=%u disagrees with QUERY_CQ cqe=%u; "
+		       "structural inconsistency, aborting dump\n",
+		       ufile_handle, ibdev, cq_attrs->cqe_count, resp.cqe);
+		return -EILSEQ;
+	}
+
+	pb.vm_pgoff = resp.vm_pgoff;
+	buf = malloc(sizeof(pb));
+	if (!buf) {
+		pr_err("rxe: dump_uobj_cq: out of memory packing "
+		       "plugin_blob (%zu bytes) for ufile_handle=%u\n",
+		       sizeof(pb), ufile_handle);
+		return -ENOMEM;
+	}
+	memcpy(buf, &pb, sizeof(pb));
+	plugin_blob->data = buf;
+	plugin_blob->len = sizeof(pb);
 
 	cq_attrs->has_comp_vector = true;
 	cq_attrs->comp_vector = 0;
@@ -969,9 +1014,8 @@ static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev,
 	cq_attrs->flags = 0;
 
 	pr_debug("rxe: dump_uobj_cq ibdev=%s ufile_handle=%u: "
-		 "vm_pgoff=%#" PRIx64 " (%s) comp_vector=0 flags=0\n",
-		 ibdev, ufile_handle, pb.vm_pgoff,
-		 plugin_blob->len ? "captured" : "absent");
+		 "vm_pgoff=%#" PRIx64 " cqe=%u comp_vector=0 flags=0\n",
+		 ibdev, ufile_handle, pb.vm_pgoff, resp.cqe);
 	return 0;
 }
 
@@ -1085,8 +1129,6 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV,
 			rdma_rxe_plugin_open_uverbs_cdev)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA,
 			rdma_rxe_plugin_handle_device_vma)
-CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA,
-			rdma_rxe_plugin_process_device_vma)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP,
 			rdma_rxe_plugin_update_vma_map)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,

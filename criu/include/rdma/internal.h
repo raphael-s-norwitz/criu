@@ -15,19 +15,6 @@
 #include "plugin.h"		/* plugin_desc_t for cached per-ufile dispatch */
 
 /*
- * plugin_api.c: process-global side-table of source-side
- * cdev-mapped VMA offsets. Producer is rdma_record_cdev_vma()
- * (declared in criu-plugin.h, called from RDMA-class plugins'
- * CR_PLUGIN_HOOK__PROCESS_DEVICE_VMA). Consumers live in
- * criu/rdma/rdma.c (the per-uobj DAG dump callbacks). See the
- * block comment over rdma_cdev_vma_rec in plugin_api.c for
- * lifecycle details.
- */
-int rdma_pop_cdev_vma_offset(pid_t pid, const char *ibdev,
-			     uint64_t *out);
-void rdma_cdev_vma_recs_free(void);
-
-/*
  * driver.c: chrdev (major,minor) -> ibdev name resolver. Used
  * by uverbsfd.c's dump_uverbsfile() to identify the source-side
  * uverbs cdev a held fd refers to. The two driver-name helpers
