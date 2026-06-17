@@ -44,6 +44,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1121,6 +1122,394 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
 	return 0;
 }
 
+/*
+ * UAPI shims for the rxe VFMIG QP dump verbs, mirrors of
+ *   include/uapi/rdma/rxe_user_ioctl_cmds.h
+ *     enum rxe_ib_vfmig_methods {
+ *         RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH = (1<<NS_SHIFT) + 0,
+ *         RXE_IB_METHOD_VFMIG_QUERY_QP        = (1<<NS_SHIFT) + 1,
+ *         RXE_IB_METHOD_VFMIG_QUERY_CQ        = (1<<NS_SHIFT) + 2 };
+ *     enum rxe_ib_vfmig_freeze_datapath_attrs {
+ *         ..._QP_HANDLE = (1<<NS_SHIFT) + 0, ..._FREEZE = +1 };
+ *     enum rxe_ib_vfmig_query_qp_attrs {
+ *         RXE_IB_ATTR_QUERY_QP_HANDLE           = (1<<NS_SHIFT) + 0,
+ *         RXE_IB_ATTR_QUERY_QP_RESP_BLOB        = +1,
+ *         RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE = +2 };
+ *
+ * Same pinning rationale as the QUERY_CQ shims above; keep in sync
+ * with the kernel UAPI, remove once host rdma-core ships the header.
+ */
+#define RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 0)
+#define RXE_IB_METHOD_VFMIG_QUERY_QP_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE_LOCAL \
+	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define RXE_IB_ATTR_QUERY_QP_HANDLE_LOCAL \
+	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_ATTR_QUERY_QP_RESP_BLOB_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+
+/*
+ * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
+ * rxe_restore_qp_req (184 bytes): the RXE_IB_METHOD_VFMIG_QUERY_QP
+ * RESP_BLOB payload, which is also the RESTORE_QP UHW_IN. CRIU is a
+ * pure courier for these bytes -- dump captures them verbatim into
+ * the per-uobj plugin_blob, restore replays them verbatim as UHW_IN
+ * -- so the only fields this plugin reads are @qpn (the master-side
+ * NLDEV-vs-QUERY_QP seam check) and @rq_vm_pgoff (the RESTORE_QP
+ * UHW_OUT verify template). @av is the kernel's 88-byte struct
+ * rxe_av; treated opaque here to avoid mirroring its nested
+ * grh/sockaddr unions. Keep in sync with the kernel UAPI; remove
+ * once host rdma-core ships the struct.
+ */
+struct rxe_restore_qp_req_local {
+	uint8_t		av[88];		/* opaque struct rxe_av */
+	uint64_t	sq_vm_pgoff;
+	uint64_t	rq_vm_pgoff;
+	uint32_t	qpn;
+	uint32_t	dest_qp_num;
+	uint32_t	qkey;
+	uint32_t	sq_psn;
+	uint32_t	rq_psn;
+	uint32_t	qp_access_flags;
+	uint32_t	max_rd_atomic;
+	uint32_t	max_dest_rd_atomic;
+	uint32_t	req_psn;
+	uint32_t	comp_psn;
+	uint32_t	resp_psn;
+	uint32_t	resp_msn;
+	uint32_t	req_wqe_index;
+	uint32_t	ssn;
+	uint16_t	pkey_index;
+	uint8_t		path_mtu;
+	uint8_t		retry_cnt;
+	uint8_t		rnr_retry;
+	uint8_t		min_rnr_timer;
+	uint8_t		timeout;
+	uint8_t		port_num;
+	uint8_t		sq_sig_all;
+	uint8_t		reserved;
+	uint16_t	reserved1;
+	uint64_t	reserved2;
+};
+
+_Static_assert(sizeof(struct rxe_restore_qp_req_local) == 184,
+	"rxe_restore_qp_req_local must be 184 bytes (kernel UAPI)");
+_Static_assert(offsetof(struct rxe_restore_qp_req_local, sq_vm_pgoff) == 88,
+	"rxe_restore_qp_req_local.sq_vm_pgoff offset drift");
+_Static_assert(offsetof(struct rxe_restore_qp_req_local, rq_vm_pgoff) == 96,
+	"rxe_restore_qp_req_local.rq_vm_pgoff offset drift");
+_Static_assert(offsetof(struct rxe_restore_qp_req_local, qpn) == 104,
+	"rxe_restore_qp_req_local.qpn offset drift");
+
+/*
+ * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
+ * rxe_create_qp_resp (32 bytes): { struct mminfo rq_mi; struct
+ * mminfo sq_mi; }, each mminfo being { __aligned_u64 offset; __u32
+ * size; __u32 pad; }. This is the RESTORE_QP UHW_OUT -- rxe_restore_qp
+ * rejects udata->outlen < sizeof(*uresp) before doing any work, so we
+ * must always wire a 32-byte receive buffer even though we only verify
+ * the leading rq_mi.offset. Keep in sync with the kernel UAPI.
+ */
+struct rxe_create_qp_resp_local {
+	uint64_t	rq_mi_offset;
+	uint32_t	rq_mi_size;
+	uint32_t	rq_mi_pad;
+	uint64_t	sq_mi_offset;
+	uint32_t	sq_mi_size;
+	uint32_t	sq_mi_pad;
+};
+
+_Static_assert(sizeof(struct rxe_create_qp_resp_local) == 32,
+	"rxe_create_qp_resp_local must be 32 bytes (kernel UAPI)");
+
+/*
+ * Issue RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH on @fd against
+ * @qp_handle to pause (@freeze=1) or resume (@freeze=0) the QP's
+ * req/resp/comp worker tasks. The dump path pauses before QUERY_QP
+ * so the PSN/cursor snapshot is consistent; the dumpee is killed
+ * post-checkpoint so the dump never resumes.
+ *
+ * HANDLE is UVERBS_ATTR_IDR(UVERBS_OBJECT_QP) (len 0, handle in
+ * attrs[].data); FREEZE is a PTR_IN(u8) carried inline in the data
+ * slot. Kernel-mode QPs return -ENXIO. Returns 0 on success,
+ * -errno on failure.
+ */
+static int rxe_vfmig_freeze_datapath(int fd, uint32_t qp_handle,
+				     uint8_t freeze)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[2];
+	} cmd = {};
+
+	cmd.hdr.object_id = RXE_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
+
+	cmd.attrs[0].attr_id = RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE_LOCAL;
+	cmd.attrs[0].len = 0;
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = qp_handle;
+
+	cmd.attrs[1].attr_id = RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE_LOCAL;
+	cmd.attrs[1].len = sizeof(uint8_t);
+	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].data = freeze;
+
+	cmd.hdr.num_attrs = 2;
+	cmd.hdr.length = sizeof(cmd.hdr) + 2 * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Issue RXE_IB_METHOD_VFMIG_QUERY_QP on @fd against @qp_handle, the
+ * dump-side counterpart of UVERBS_METHOD_RESTORE_QP. The kernel fills
+ * @blob_out (the full 184-byte rxe wire state, byte-equal to struct
+ * rxe_restore_qp_req) and @user_handle_out (the async-event cookie
+ * ibv_create_qp recorded, not standard-queryable). cap / qp_type /
+ * qp_state are intentionally NOT returned -- CRIU sources those from
+ * the standard QUERY_QP verb + NLDEV.
+ *
+ * HANDLE is UVERBS_ATTR_IDR(UVERBS_OBJECT_QP); RESP_BLOB and
+ * RESP_USER_HANDLE are PTR_OUT. Kernel-mode QPs return -ENXIO; a
+ * bogus handle returns -ENOENT from the IDR lookup. Returns 0 on
+ * success, -errno on failure.
+ */
+static int rxe_vfmig_query_qp(int fd, uint32_t qp_handle,
+			      struct rxe_restore_qp_req_local *blob_out,
+			      uint64_t *user_handle_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[3];
+	} cmd = {};
+
+	cmd.hdr.object_id = RXE_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_VFMIG_QUERY_QP_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
+
+	cmd.attrs[0].attr_id = RXE_IB_ATTR_QUERY_QP_HANDLE_LOCAL;
+	cmd.attrs[0].len = 0;
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = qp_handle;
+
+	cmd.attrs[1].attr_id = RXE_IB_ATTR_QUERY_QP_RESP_BLOB_LOCAL;
+	cmd.attrs[1].len = sizeof(*blob_out);
+	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].data = (uintptr_t)blob_out;
+
+	cmd.attrs[2].attr_id = RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE_LOCAL;
+	cmd.attrs[2].len = sizeof(*user_handle_out);
+	cmd.attrs[2].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[2].data = (uintptr_t)user_handle_out;
+
+	cmd.hdr.num_attrs = 3;
+	cmd.hdr.length = sizeof(cmd.hdr) + 3 * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * RDMA_DUMP_UOBJ_QP hook (rxe). Follows the documented dump
+ * choreography: pause the QP's datapath (FREEZE_DATAPATH) then snap
+ * its wire state (QUERY_QP) on @lfd (criu's dup of the dumpee's
+ * uverbs cdev fd, the holder of the QP IDR). The 184-byte
+ * rxe_restore_qp_req the kernel returns is packed verbatim into the
+ * entry-level plugin_blob; the destination replays it as RESTORE_QP
+ * UHW_IN. user_handle + create_flags (rxe has none, always 0) are
+ * stamped onto qp_attrs; cap / type / state are sourced by the
+ * HW-generic dump path (standard QUERY_QP + NLDEV), not here.
+ *
+ * Kernel-mode QPs surface as -ENXIO from FREEZE/QUERY and are
+ * skipped (no user datapath / wire state to migrate). The dumpee is
+ * killed post-checkpoint, so the paused QP is never resumed.
+ *
+ * @kernel_driver_id / @pid are unused (the dispatcher already
+ * guaranteed rxe QPs and QUERY_QP needs no side-table consult).
+ * Allocates plugin_blob->data via malloc; criu/rdma/uobj_dump.c
+ * frees it after pb_write_one consumes the bytes.
+ */
+static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev,
+					uint32_t kernel_driver_id,
+					int lfd, uint32_t ufile_handle,
+					pid_t pid,
+					RdmaQpAttrs *qp_attrs,
+					ProtobufCBinaryData *plugin_blob)
+{
+	struct rxe_restore_qp_req_local blob = {};
+	uint64_t user_handle = 0;
+	uint8_t *buf;
+	int rc;
+
+	(void)kernel_driver_id;
+	(void)pid;
+
+	rc = rxe_vfmig_freeze_datapath(lfd, ufile_handle, 1);
+	if (rc == -ENXIO) {
+		pr_debug("rxe: dump_uobj_qp: FREEZE_DATAPATH(handle=%u) on "
+			 "ibdev=%s returned -ENXIO (kernel-mode QP); "
+			 "skipping per-uobject capture\n",
+			 ufile_handle, ibdev);
+		return -ENXIO;
+	}
+	if (rc) {
+		pr_err("rxe: dump_uobj_qp: FREEZE_DATAPATH(handle=%u) on "
+		       "ibdev=%s failed: %d (%s)\n",
+		       ufile_handle, ibdev, rc, strerror(-rc));
+		return rc;
+	}
+
+	rc = rxe_vfmig_query_qp(lfd, ufile_handle, &blob, &user_handle);
+	if (rc) {
+		if (rc == -ENXIO) {
+			pr_debug("rxe: dump_uobj_qp: QUERY_QP(handle=%u) on "
+				 "ibdev=%s returned -ENXIO (kernel-mode "
+				 "QP); skipping per-uobject capture\n",
+				 ufile_handle, ibdev);
+			return -ENXIO;
+		}
+		pr_err("rxe: dump_uobj_qp: QUERY_QP(handle=%u) on ibdev=%s "
+		       "failed: %d (%s)\n",
+		       ufile_handle, ibdev, rc, strerror(-rc));
+		return rc;
+	}
+
+	/*
+	 * Seam assertion mirroring the mlx5 plugin: NLDEV RES_LQPN
+	 * (qp_attrs->qp_num, stamped by uobj_qp_cb before dispatch)
+	 * and QUERY_QP's blob.qpn both resolve through ibqp->qp_num
+	 * on the source QP; divergence means the IDR walker and the
+	 * per-handle QUERY_QP resolved to different QPs.
+	 */
+	if (qp_attrs->has_qp_num && qp_attrs->qp_num != blob.qpn) {
+		pr_err("rxe: QP ufile_handle=%u on ibdev=%s: NLDEV "
+		       "RES_LQPN=%u disagrees with QUERY_QP blob.qpn=%u; "
+		       "structural inconsistency, aborting dump\n",
+		       ufile_handle, ibdev, qp_attrs->qp_num, blob.qpn);
+		return -EILSEQ;
+	}
+
+	/*
+	 * cap / type / state are NOT filled here (HW-generic dump path
+	 * owns them). rxe has no create_flags (rxe_restore_qp rejects
+	 * non-zero), so stamp 0 explicitly.
+	 */
+	qp_attrs->has_create_flags = true;
+	qp_attrs->create_flags = 0;
+	qp_attrs->has_user_handle = true;
+	qp_attrs->user_handle = user_handle;
+
+	buf = malloc(sizeof(blob));
+	if (!buf) {
+		pr_err("rxe: dump_uobj_qp: out of memory packing "
+		       "plugin_blob (%zu bytes) for ufile_handle=%u\n",
+		       sizeof(blob), ufile_handle);
+		return -ENOMEM;
+	}
+	memcpy(buf, &blob, sizeof(blob));
+	plugin_blob->data = buf;
+	plugin_blob->len = sizeof(blob);
+
+	pr_debug("rxe: dump_uobj_qp ibdev=%s ufile_handle=%u: qpn=%u "
+		 "user_handle=0x%llx sq_vm_pgoff=%#" PRIx64 " "
+		 "rq_vm_pgoff=%#" PRIx64 " (cap/type/state via standard "
+		 "QUERY_QP + NLDEV)\n",
+		 ibdev, ufile_handle, blob.qpn,
+		 (unsigned long long)user_handle, blob.sq_vm_pgoff,
+		 blob.rq_vm_pgoff);
+	return 0;
+}
+
+/*
+ * RDMA_RESTORE_UOBJ_QP_UHW_PACK hook (rxe).
+ *
+ * Reads the 184-byte rxe_restore_qp_req packed at dump time into
+ * e->plugin_blob and shapes the RESTORE_QP UHW pair:
+ *
+ *   - UHW_IN is the blob verbatim (every byte of rxe wire state the
+ *     destination cannot re-derive from the generic RESTORE_QP
+ *     method attrs travels here; rxe_restore_qp stamps it directly).
+ *   - UHW_OUT is always present (sizeof rxe_create_qp_resp = 32).
+ *     rxe_restore_qp rejects udata->outlen < sizeof(*uresp) before
+ *     any work, so we always wire the receive buffer.
+ *
+ * Output verification is byte-template-based (same contract as the
+ * RESTORE_CQ hook): we pre-fill out_buf->rq_mi_offset with the
+ * dumped rq_vm_pgoff and set verify_len=8 so core memcmp's the
+ * kernel's echoed rq_mi.offset against it. When rq_vm_pgoff==0
+ * (pgoff-agnostic / monotonic-counter fallback) we skip the verify.
+ * sq_mi sits past the contiguous-from-start verify window and is
+ * left unchecked (kernel-determined sizes interleave).
+ *
+ * Allocator contract identical to RESTORE_CQ_UHW_PACK: core memcpy's
+ * our buffers into the restorer args and frees our copies.
+ */
+static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e,
+						    struct rdma_uhw_spec *uhw)
+{
+	const struct rxe_restore_qp_req_local *pb;
+	struct rxe_create_qp_resp_local *out;
+	void *in;
+
+	if (!e || !uhw)
+		return -EINVAL;
+
+	if (!e->has_plugin_blob || e->plugin_blob.len == 0) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u with empty "
+		       "plugin_blob; image is missing the 184B "
+		       "rxe_restore_qp_req captured at dump via "
+		       "RXE_IB_METHOD_VFMIG_QUERY_QP. Re-dump against a "
+		       "kernel + plugin build that wire the QP dump hook.\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+	if (e->plugin_blob.len != sizeof(struct rxe_restore_qp_req_local)) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u plugin_blob "
+		       "len=%zu, expected %zu (rxe_restore_qp_req)\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0,
+		       e->plugin_blob.len,
+		       sizeof(struct rxe_restore_qp_req_local));
+		return -EINVAL;
+	}
+	pb = (const struct rxe_restore_qp_req_local *)e->plugin_blob.data;
+
+	in = malloc(e->plugin_blob.len);
+	if (!in) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK out of memory (in_buf %zu "
+		       "bytes)\n", e->plugin_blob.len);
+		return -ENOMEM;
+	}
+	memcpy(in, e->plugin_blob.data, e->plugin_blob.len);
+
+	out = malloc(sizeof(*out));
+	if (!out) {
+		free(in);
+		pr_err("rxe: RESTORE_QP_UHW_PACK out of memory (out_buf %zu "
+		       "bytes)\n", sizeof(*out));
+		return -ENOMEM;
+	}
+	memset(out, 0, sizeof(*out));
+	out->rq_mi_offset = pb->rq_vm_pgoff;
+
+	uhw->in_buf = in;
+	uhw->in_len = e->plugin_blob.len;
+	uhw->out_buf = out;
+	uhw->out_len = sizeof(*out);
+	uhw->verify_len = pb->rq_vm_pgoff ? sizeof(out->rq_mi_offset) : 0;
+	return 0;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
@@ -1135,6 +1524,20 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
 			rdma_rxe_plugin_dump_uobj_cq)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
 			rdma_rxe_plugin_restore_uobj_cq_uhw_pack)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP,
+			rdma_rxe_plugin_dump_uobj_qp)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK,
+			rdma_rxe_plugin_restore_uobj_qp_uhw_pack)
+/*
+ * No CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE hook: rxe is in
+ * the master-restored camp (like its CQ). rxe_restore_qp allocates
+ * the SQ/RQ rings in kernel pages and registers their vm_pgoff slots
+ * on the cdev mmap table -- it pins no dumpee user pages, so master's
+ * mm is fine, and the verb MUST run before the user-VMA pass mmaps
+ * the cdev fd at those offsets. Absence of this hook routes the QP
+ * through core's Phase A rdma_send_restore_qp (mirrors the CQ camp
+ * split documented in criu/rdma/uobj_restore.c).
+ */
 
 /*
  * RDMA provided driver: RCD_RXE.

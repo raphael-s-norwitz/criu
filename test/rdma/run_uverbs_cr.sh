@@ -474,6 +474,24 @@ run_pass() {
 			exit 1
 		fi
 		echo "RESTORE_PD + RESTORE_CQ x$min_cq (Phase A master) dispatched ok"
+	elif [[ "$holder_mode" == "pd_cq_qp" ]]; then
+		# pd_cq_qp -- PD + 1 CQ + 1 QP, all master-restored in
+		# Phase A on rxe (no NEEDS_PIE hooks): the summary shows
+		# 1 CQ [skipped 0] + 0 CQ/QP/MR deferred, plus the
+		# appended "1 QP(s) master-restored in Phase A" tail.
+		if ! grep -qE 'uobj DAG: ufile_id=[^ ]+ Phase A: restored [1-9][0-9]* PD\(s\) \[skipped 0\], 1 CQ\(s\) \[skipped 0\]; 0 CQ\(s\) \+ 0 QP\(s\) \[skipped 0\] \+ 0 MR\(s\) deferred to post-VMA Phase B; 1 QP\(s\) master-restored in Phase A' \
+			"$DUMPDIR/restore.log"; then
+			echo "FAIL: pd_cq_qp Phase-A summary line did not" \
+			     "show 1 CQ + 1 QP master-restored with 0" \
+			     "deferred. Either Phase A failed before the QP" \
+			     "loop, the kernel pre-dates rxe RESTORE_QP, or" \
+			     "the dump-side R3 walk lost the QP entry." >&2
+			echo "--- restore log uobj DAG lines ---" >&2
+			grep -E 'uobj DAG' "$DUMPDIR/restore.log" >&2 || \
+				echo "(no uobj DAG lines at all)" >&2
+			exit 1
+		fi
+		echo "RESTORE_PD + RESTORE_CQ + RESTORE_QP (Phase A master) dispatched ok"
 	fi
 
 	#
@@ -617,6 +635,24 @@ fi
 # kernels lacking the QUERY_CQ verb.
 if [[ "${UVERBS_CR_RUN_PD_2CQ:-1}" == "1" ]]; then
 	run_pass pd_2cq pd_2cq 0
+fi
+# pd_cq_qp -- PD + CQ + RC QP driven to RTS pre-dump, the first pass
+# that exercises RESTORE_QP end-to-end on rxe. rxe is in the master-
+# restored camp (no RDMA_RESTORE_UOBJ_QP_NEEDS_PIE hook), so both the
+# CQ and the QP are dispatched from CRIU master in Phase A, before the
+# user-VMA pass mmaps the cdev fd at the kernel-registered SQ/RQ ring
+# vm_pgoff slots. The rxe plugin's DUMP_UOBJ_QP hook captures the full
+# rxe_restore_qp_req wire state via RXE_IB_METHOD_VFMIG_QUERY_QP (after
+# FREEZE_DATAPATH), and its RESTORE_UOBJ_QP_UHW_PACK hook replays it as
+# RESTORE_QP UHW_IN. Switch retained so the pass can be skipped on
+# kernels lacking the QUERY_QP / RESTORE_QP verbs.
+if [[ "${UVERBS_CR_RUN_PD_CQ_QP:-1}" == "1" ]]; then
+	run_pass pd_cq_qp pd_cq_qp 0
+else
+	echo
+	echo "[skip] pd_cq_qp pass disabled by UVERBS_CR_RUN_PD_CQ_QP=0."
+	echo "       Default is to run; this switch exists for kernels"
+	echo "       that pre-date rxe RESTORE_QP / VFMIG_QUERY_QP."
 fi
 
 echo
