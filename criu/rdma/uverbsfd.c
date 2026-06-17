@@ -609,10 +609,19 @@ int criu_ib_uverbs_get_context(int cmd_fd, uint32_t driver_id)
  * verify_hdr) is: total write length == hdr.in_words * 4 (hdr
  * included), the response buffer is reachable via the @response u64
  * at the head of the command body, and hdr.out_words * 4 must cover
- * sizeof(resp). attr_mask is left 0: the cap we need rides in
- * ib_query_qp's init_attr, which every provider fills regardless of
- * mask (rxe_qp_to_init / mlx5_ib_query_qp), as does attr->qp_state.
+ * sizeof(resp).
+ *
+ * attr_mask is NOT optional for cap: ib_query_qp passes it to the
+ * provider, and mlx5_ib_query_qp gates the init_attr send-side cap
+ * (max_send_wr / max_send_sge / max_inline_data) behind IB_QP_CAP --
+ * mask=0 returns those as 0 (empirically verified on ConnectX-7;
+ * rxe_qp_to_init fills cap unconditionally but the bit is harmless
+ * there). IB_QP_STATE asks for attr->qp_state. The mask bits are the
+ * enum ib_qp_attr_mask values (kernel-internal ib_verbs.h, not UAPI,
+ * but stable wire ABI -- libibverbs' IBV_QP_* mirror them).
  */
+#define RDMA_IB_QP_STATE (1u << 0)
+#define RDMA_IB_QP_CAP	 (1u << 19)
 int rdma_uverbs_query_qp(int cmd_fd, uint32_t qp_handle,
 			 struct rdma_std_qp_attrs *out)
 {
@@ -631,7 +640,7 @@ int rdma_uverbs_query_qp(int cmd_fd, uint32_t qp_handle,
 	req.hdr.out_words = sizeof(resp) / 4;
 	req.cmd.response = (uintptr_t)&resp;
 	req.cmd.qp_handle = qp_handle;
-	req.cmd.attr_mask = 0;
+	req.cmd.attr_mask = RDMA_IB_QP_STATE | RDMA_IB_QP_CAP;
 
 	n = write(cmd_fd, &req, sizeof(req));
 	if (n != (ssize_t)sizeof(req))
