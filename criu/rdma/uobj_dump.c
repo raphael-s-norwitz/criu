@@ -1170,10 +1170,44 @@ int rdma_dump_uobj_dag(void)
 		}
 
 		for (size_t i = 0; i < ARRAY_SIZE(stages); i++) {
-			int r = rdma_nl_for_each_resource(ib->dev_index,
-							  ib->ibdev,
-							  stages[i].t,
-							  stages[i].cb, &w);
+			bool is_qp = (stages[i].t == RDMA_NL_RES_QP);
+			struct rdma_dumped_ufile *uf0 =
+				ib->n_ufiles ? ib->ufiles[0] : NULL;
+			bool bracket = is_qp && uf0 && uf0->plugin;
+			int r;
+
+			/*
+			 * Snapshot-ordering thaw/re-freeze. The QP NLDEV fill
+			 * issues a firmware QUERY_QP on the device's command
+			 * ring (and CRIU's per-QP cap query hits it too), which
+			 * is dead if the claiming plugin froze the datapath at
+			 * CHECKPOINT_DEVICES. Let the plugin briefly thaw the
+			 * device for just this stage and re-freeze right after.
+			 * PD/CQ/MR/SRQ read cached restrack/sw state and run on
+			 * a frozen device untouched, so only QP is bracketed.
+			 * A failed thaw is dump-fatal (the walk would otherwise
+			 * silently drop every QP); re-freeze is best-effort and
+			 * runs even when the walk itself failed.
+			 */
+			if (bracket &&
+			    rdma_dispatch_dump_pre_qp(uf0->plugin, ib->ibdev,
+						      uf0->kernel_driver_id,
+						      uf0->pid)) {
+				pr_err("uobj DAG: pre-QP thaw failed on ibdev "
+				       "'%s'; aborting\n", ib->ibdev);
+				goto out;
+			}
+
+			r = rdma_nl_for_each_resource(ib->dev_index,
+						      ib->ibdev,
+						      stages[i].t,
+						      stages[i].cb, &w);
+
+			if (bracket)
+				(void)rdma_dispatch_dump_post_qp(
+					uf0->plugin, ib->ibdev,
+					uf0->kernel_driver_id, uf0->pid);
+
 			if (r < 0 || w.err) {
 				pr_err("uobj DAG: %s walk failed on ibdev "
 				       "'%s' (idx=%u): r=%d err=%d\n",

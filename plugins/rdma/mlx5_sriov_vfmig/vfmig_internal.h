@@ -218,6 +218,54 @@ void vfmig_pending_clear(void);
 void vfmig_failed_clear(void);
 void vfmig_drain_pending_in_fini(void);
 
+/*
+ * Snapshot-ordering pause/resume (design/snapshot_ordering_pause_
+ * capture.md Part A). vfmig_suspended_clear() resets the per-dump
+ * suspended-VF set (called from init/fini like the lists above).
+ *
+ * rdma_mlx5_vfmig_plugin_checkpoint_devices() is the CHECKPOINT_DEVICES
+ * hook: it runs after the dumpee tree is frozen but BEFORE its memory
+ * is copied, enumerates the pid's tracked mlx5 VFs and issues
+ * MLX5_VFMIG_IOC_SUSPEND_VHCA on each so no peer DMA lands in
+ * mid-snapshot MR pages.
+ *
+ * vfmig_resume_suspended_vfs() issues MLX5_VFMIG_IOC_RESUME_VHCA on
+ * every VF this dump parked. Called from fini(DUMP): @keep_suspended
+ * leaves the VFs parked (migration / dump-then-destroy), otherwise the
+ * source is resumed (default, and always on an aborted dump).
+ */
+void vfmig_suspended_clear(void);
+int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid);
+void vfmig_resume_suspended_vfs(bool keep_suspended);
+bool vfmig_keep_suspended_requested(void);
+
+/*
+ * QP-stage bracket hooks (RDMA_DUMP_PRE_QP / RDMA_DUMP_POST_QP). The
+ * uobj DAG walk's QP stage needs the VF command ring live (RES_QP runs
+ * a firmware QUERY_QP), which CHECKPOINT_DEVICES killed. pre_qp briefly
+ * RESUME_VHCAs the VF backing @ibdev for that stage; post_qp re-issues
+ * SUSPEND_VHCA after. Both keep the parked-set entry intact so the late
+ * SAVE/resume bookkeeping is unaffected. No-op when @ibdev wasn't parked
+ * by this dump.
+ */
+int rdma_mlx5_vfmig_plugin_dump_pre_qp(const char *ibdev,
+				       uint32_t kernel_driver_id, pid_t pid);
+int rdma_mlx5_vfmig_plugin_dump_post_qp(const char *ibdev,
+					uint32_t kernel_driver_id, pid_t pid);
+
+/*
+ * Claimed-VF cache. CLAIM (rdma_check_dump_coverage -> per-context
+ * arbitration) already resolves every snapshot-tree context's
+ * (pf_bdf, vf_id) and confirms QUERY_VF.tracked just before
+ * CHECKPOINT_DEVICES runs. vfmig_claimed_add() records each VF we win
+ * the claim for so the CHECKPOINT_DEVICES hook can park exactly that
+ * set without re-walking /proc/<pid>/fd or re-querying sysfs.
+ * Deduplicated (a VF can back several contexts). Reset by init/fini
+ * via vfmig_claimed_clear().
+ */
+void vfmig_claimed_add(const char *ibdev, const char *pf_bdf, uint32_t vf_id);
+void vfmig_claimed_clear(void);
+
 int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev,
 					       uint32_t kernel_driver_id,
 					       uint32_t ctxn,

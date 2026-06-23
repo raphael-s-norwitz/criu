@@ -378,6 +378,28 @@ int rdma_dispatch_dump_uobj_qp(plugin_desc_t *plugin,
 			       ProtobufCBinaryData *plugin_blob);
 
 /*
+ * QP-stage bracket dispatchers (snapshot-ordering thaw/re-freeze).
+ * rdma_dispatch_dump_pre_qp() calls @plugin's
+ * CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP immediately before the per-ibdev
+ * RDMA_NL_RES_QP enumeration; rdma_dispatch_dump_post_qp() calls
+ * CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP immediately after (and on the
+ * QP-stage error path). A plugin that froze the device's datapath at
+ * CHECKPOINT_DEVICES uses these to briefly thaw it for the (ring-
+ * dependent) QP query and re-freeze afterwards; see the hook docs in
+ * criu-plugin.h.
+ *
+ * Optional hook: a plugin that doesn't register it is a no-op success.
+ * pre_qp returning non-zero is dump-fatal (a frozen device would drop
+ * its QPs from the NLDEV walk); post_qp errors are logged but not
+ * fatal. @plugin is the pointer cached on rdma_dumped_ufile.plugin at
+ * CLAIM time; must not be NULL.
+ */
+int rdma_dispatch_dump_pre_qp(plugin_desc_t *plugin, const char *ibdev,
+			      uint32_t kernel_driver_id, pid_t pid);
+int rdma_dispatch_dump_post_qp(plugin_desc_t *plugin, const char *ibdev,
+			       uint32_t kernel_driver_id, pid_t pid);
+
+/*
  * Per-PD dump-side dispatcher. Mirror of rdma_dispatch_dump_uobj_cq /
  * _qp: calls @plugin's CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD if
  * registered, packing the driver-private per-PD payload (mlx5: the

@@ -78,6 +78,8 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 	vfmig_saved_clear();
 	vfmig_pending_clear();
 	vfmig_failed_clear();
+	vfmig_suspended_clear();
+	vfmig_claimed_clear();
 
 	d = opendir(MLX5_VFMIG_DEV_DIR);
 	if (!d) {
@@ -183,6 +185,21 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 		vfmig_drain_pending_in_fini();
 
 	/*
+	 * Snapshot-ordering resume (design/snapshot_ordering_pause_
+	 * capture.md Part A). CHECKPOINT_DEVICES parked every tracked VF
+	 * backing the dumpee tree before its memory was copied; now that
+	 * the dump is done (or lost) bring the source datapath back. On a
+	 * successful dump we honor CRIU_VFMIG_KEEP_SUSPENDED=1 (leave the
+	 * source parked for migration / dump-then-destroy); on an aborted
+	 * dump (ret != 0) we always resume so a failed checkpoint never
+	 * strands a live process's VF stopped. No-op when the parked set
+	 * is empty (no early hook ran / no tracked VFs / RESTORE stage).
+	 */
+	if (stage == CR_PLUGIN_STAGE__DUMP)
+		vfmig_resume_suspended_vfs(ret == 0 &&
+					   vfmig_keep_suspended_requested());
+
+	/*
 	 * On restore, close the per-context cdev fds the eager init
 	 * cached. We do this unconditionally on RESTORE (success or
 	 * failure): on success the dumpee's restored fdtable holds
@@ -201,6 +218,8 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 	vfmig_saved_clear();
 	vfmig_pending_clear();
 	vfmig_failed_clear();
+	vfmig_suspended_clear();
+	vfmig_claimed_clear();
 }
 
 /*
@@ -314,6 +333,14 @@ static int rdma_mlx5_vfmig_plugin_claim_uverbs_context(const char *ibdev,
 	pr_info("claim(%s, vf_bdf=%s, pf=%s, vf_id=%d): claiming as "
 		"RCD_MLX5_SRIOV_VFMIG\n",
 		ibdev, vf_bdf, pf_bdf, vf_id);
+	/*
+	 * Record the VF so CHECKPOINT_DEVICES can park it before the
+	 * memory dump without re-resolving it (snapshot-ordering pause).
+	 * Dump-side only; harmless on the restore-side claim path (the
+	 * cache is cleared at fini and CHECKPOINT_DEVICES never fires
+	 * during restore).
+	 */
+	vfmig_claimed_add(ibdev, pf_bdf, (uint32_t)vf_id);
 	return RDMA_CRIU_DRIVER__RCD_MLX5_SRIOV_VFMIG;
 }
 
@@ -347,6 +374,8 @@ static int rdma_mlx5_vfmig_plugin_restore_uobj_qp_needs_pie(void)
 
 CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init,
 		   rdma_mlx5_vfmig_plugin_fini)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES,
+			rdma_mlx5_vfmig_plugin_checkpoint_devices)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
 			rdma_mlx5_vfmig_plugin_claim_uverbs_context)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT,
@@ -357,6 +386,10 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
 			rdma_mlx5_vfmig_plugin_dump_uobj_cq)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP,
 			rdma_mlx5_vfmig_plugin_dump_uobj_qp)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP,
+			rdma_mlx5_vfmig_plugin_dump_pre_qp)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP,
+			rdma_mlx5_vfmig_plugin_dump_post_qp)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK,
 			rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,

@@ -519,6 +519,40 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE = 28,
 
+	/*
+	 * Bracket hooks around the per-ibdev QP stage of the dump-time
+	 * NLDEV uobject walk (rdma_dump_uobj_dag). PRE fires immediately
+	 * before the RDMA_NL_RES_QP enumeration for an ibdev; POST fires
+	 * immediately after (including on the QP-stage error path).
+	 *
+	 * Motivation (snapshot-ordering): the snapshot-ordering pause
+	 * (CHECKPOINT_DEVICES) quiesces the device's datapath *before*
+	 * the dumpee's memory is copied, which for mlx5 means the VF is
+	 * in a STOP state with a dead command ring by the time the uobj
+	 * walk runs. The QP stage is the only stage that needs a live
+	 * ring: the kernel's RES_QP fill calls ib_query_qp() (a firmware
+	 * QUERY_QP on the VF ring) and CRIU's per-QP cap query hits the
+	 * ring too. PD/CQ/MR/SRQ enumeration reads cached restrack/sw
+	 * state and works on a frozen device. So a plugin that froze the
+	 * device at CHECKPOINT_DEVICES uses PRE_QP to briefly thaw it for
+	 * the QP enumeration and POST_QP to re-freeze, keeping the bulk
+	 * memory snapshot taken against a quiesced datapath.
+	 *
+	 * A plugin SHOULD keep its logical "this device is parked for the
+	 * dump" bookkeeping intact across the thaw (only toggling the
+	 * hardware), so the late SAVE/capture and the dump-end resume
+	 * still behave as if the device were parked the whole time.
+	 *
+	 * Both are per-ibdev (dispatched to the plugin that CLAIMed the
+	 * ibdev's context) and optional: a plugin that registers neither
+	 * is a no-op (the device was never frozen, or QUERY_QP works on
+	 * it regardless). A non-zero PRE_QP return aborts the dump (the
+	 * QP enumeration would otherwise silently drop QPs); POST_QP is
+	 * best-effort (memory is already copied by then).
+	 */
+	CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP = 29,
+	CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP = 30,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -685,6 +719,12 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP,
 			 pid_t pid,
 			 RdmaQpAttrs *qp_attrs,
 			 ProtobufCBinaryData *plugin_blob);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP,
+			 const char *ibdev, uint32_t kernel_driver_id,
+			 pid_t pid);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP,
+			 const char *ibdev, uint32_t kernel_driver_id,
+			 pid_t pid);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK,
 			 const RdmaUobjEntry *e,
 			 struct rdma_uhw_spec *uhw);

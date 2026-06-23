@@ -328,6 +328,399 @@ void vfmig_failed_clear(void)
 }
 
 /*
+ * Claimed-VF cache (snapshot-ordering pause input set).
+ *
+ * The dump-time coverage check (rdma_check_dump_coverage(), cr-dump.c)
+ * runs the per-context claim arbitration over the whole snapshot tree
+ * BEFORE CHECKPOINT_DEVICES fires -- and our CLAIM hook already
+ * resolves each context's (pf_bdf, vf_id) and confirms QUERY_VF.tracked.
+ * Rather than have CHECKPOINT_DEVICES re-walk /proc/<pid>/fd and redo
+ * that sysfs+ioctl resolution, the CLAIM hook records every VF it wins
+ * here; the early hook just parks this set. Deduped by (pf_bdf, vf_id),
+ * since a VF can back several contexts across several pids.
+ */
+struct vfmig_claimed_vf {
+	struct vfmig_claimed_vf *next;
+	char ibdev[64];
+	char pf_bdf[64];
+	uint32_t vf_id;
+};
+static struct vfmig_claimed_vf *vfmig_claimed_head = NULL;
+
+void vfmig_claimed_add(const char *ibdev, const char *pf_bdf, uint32_t vf_id)
+{
+	struct vfmig_claimed_vf *p;
+
+	for (p = vfmig_claimed_head; p; p = p->next)
+		if (p->vf_id == vf_id && !strcmp(p->pf_bdf, pf_bdf))
+			return; /* already recorded */
+
+	p = calloc(1, sizeof(*p));
+	if (!p) {
+		/*
+		 * Best-effort: a missed cache entry means this VF won't be
+		 * parked at CHECKPOINT_DEVICES and SAVE will fall back to
+		 * self-suspend (with a loud warning). Not worth failing CLAIM.
+		 */
+		pr_warn("vfmig: OOM caching claimed pf=%s vf_id=%u; it may not "
+			"be parked before the memory dump\n", pf_bdf, vf_id);
+		return;
+	}
+	snprintf(p->ibdev, sizeof(p->ibdev), "%s", ibdev);
+	snprintf(p->pf_bdf, sizeof(p->pf_bdf), "%s", pf_bdf);
+	p->vf_id = vf_id;
+	p->next = vfmig_claimed_head;
+	vfmig_claimed_head = p;
+}
+
+void vfmig_claimed_clear(void)
+{
+	struct vfmig_claimed_vf *p, *n;
+
+	for (p = vfmig_claimed_head; p; p = n) {
+		n = p->next;
+		free(p);
+	}
+	vfmig_claimed_head = NULL;
+}
+
+/*
+ * Snapshot-ordering pause set (design/snapshot_ordering_pause_capture.md
+ * Part A).
+ *
+ * The CHECKPOINT_DEVICES hook parks every tracked VF backing the
+ * dumpee tree by issuing MLX5_VFMIG_IOC_SUSPEND_VHCA *before* CRIU
+ * copies the dumpee's memory, so a peer can't DMA RDMA WRITE/SEND
+ * payload into pinned MR pages mid-snapshot. This list remembers which
+ * (pf_bdf, vf_id) pairs this dump parked, so:
+ *   - we suspend each VF exactly once (a VF can back several contexts
+ *     across several pids), and
+ *   - fini(DUMP) can resume them (vfmig_resume_suspended_vfs) -- the
+ *     source is brought back to runnable unless the operator opted into
+ *     leaving it parked (CRIU_VFMIG_KEEP_SUSPENDED=1), and always on an
+ *     aborted dump.
+ * The kernel SAVE_VHCA_STATE is suspend-aware: for a VF already in this
+ * set it skips its self-suspend and the resume-on-close, leaving the
+ * resume to us. The kernel also force-resumes any still-parked VF at
+ * SR-IOV teardown, so a crashed dumper can't strand one.
+ */
+struct vfmig_suspended_vf {
+	struct vfmig_suspended_vf *next;
+	char ibdev[64];
+	char pf_bdf[64];
+	uint32_t vf_id;
+};
+static struct vfmig_suspended_vf *vfmig_suspended_head = NULL;
+
+static struct vfmig_suspended_vf *
+vfmig_suspended_lookup(const char *pf_bdf, uint32_t vf_id)
+{
+	struct vfmig_suspended_vf *p;
+
+	for (p = vfmig_suspended_head; p; p = p->next)
+		if (p->vf_id == vf_id && !strcmp(p->pf_bdf, pf_bdf))
+			return p;
+	return NULL;
+}
+
+/*
+ * Lookup by ibdev name -- the key the QP-stage bracket hooks have (the
+ * NLDEV walk works in ibdev terms, not (pf,vf)). One VF backs exactly
+ * one ibdev, so this is unambiguous.
+ */
+static struct vfmig_suspended_vf *
+vfmig_suspended_lookup_ibdev(const char *ibdev)
+{
+	struct vfmig_suspended_vf *p;
+
+	for (p = vfmig_suspended_head; p; p = p->next)
+		if (!strcmp(p->ibdev, ibdev))
+			return p;
+	return NULL;
+}
+
+static int vfmig_suspended_add(const char *ibdev, const char *pf_bdf,
+			       uint32_t vf_id)
+{
+	struct vfmig_suspended_vf *p = calloc(1, sizeof(*p));
+
+	if (!p)
+		return -1;
+	snprintf(p->ibdev, sizeof(p->ibdev), "%s", ibdev);
+	snprintf(p->pf_bdf, sizeof(p->pf_bdf), "%s", pf_bdf);
+	p->vf_id = vf_id;
+	p->next = vfmig_suspended_head;
+	vfmig_suspended_head = p;
+	return 0;
+}
+
+void vfmig_suspended_clear(void)
+{
+	struct vfmig_suspended_vf *p, *n;
+
+	for (p = vfmig_suspended_head; p; p = n) {
+		n = p->next;
+		free(p);
+	}
+	vfmig_suspended_head = NULL;
+}
+
+/*
+ * Whether the operator asked for the source VF to stay parked after a
+ * successful dump (migration / dump-then-destroy), rather than being
+ * resumed. Same env knob the legacy SAVE-flag path consulted; centralized
+ * so the early-suspend resume policy (fini) and the SAVE fallback agree.
+ */
+bool vfmig_keep_suspended_requested(void)
+{
+	const char *env = getenv("CRIU_VFMIG_KEEP_SUSPENDED");
+
+	return env && !strcmp(env, "1");
+}
+
+/* Issue RESUME_VHCA on one parked VF (best-effort). */
+static int vfmig_resume_one_vf(const char *pf_bdf, uint32_t vf_id)
+{
+	struct mlx5_vfmig_resume_vhca rv;
+	char cdev_path[PATH_MAX];
+	int fd, rc;
+
+	snprintf(cdev_path, sizeof(cdev_path), "%s/%s",
+		 MLX5_VFMIG_DEV_DIR, pf_bdf);
+	fd = open(cdev_path, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		pr_perror("vfmig: resume: open(%s)", cdev_path);
+		return -1;
+	}
+	memset(&rv, 0, sizeof(rv));
+	rv.vf_id = vf_id;
+	rc = ioctl(fd, MLX5_VFMIG_IOC_RESUME_VHCA, &rv);
+	close(fd);
+	if (rc) {
+		pr_perror("vfmig: RESUME_VHCA(pf=%s vf_id=%u)", pf_bdf, vf_id);
+		return -1;
+	}
+	return 0;
+}
+
+/* Raw SUSPEND_VHCA ioctl on one VF (no parked-set bookkeeping). */
+static int vfmig_suspend_vhca_ioctl(const char *pf_bdf, uint32_t vf_id)
+{
+	struct mlx5_vfmig_suspend_vhca sv;
+	char cdev_path[PATH_MAX];
+	int fd, rc;
+
+	snprintf(cdev_path, sizeof(cdev_path), "%s/%s",
+		 MLX5_VFMIG_DEV_DIR, pf_bdf);
+	fd = open(cdev_path, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		pr_perror("vfmig: suspend: open(%s)", cdev_path);
+		return -1;
+	}
+	memset(&sv, 0, sizeof(sv));
+	sv.vf_id = vf_id;
+	rc = ioctl(fd, MLX5_VFMIG_IOC_SUSPEND_VHCA, &sv);
+	close(fd);
+	if (rc) {
+		pr_perror("vfmig: SUSPEND_VHCA(pf=%s vf_id=%u)", pf_bdf, vf_id);
+		return -1;
+	}
+	return 0;
+}
+
+/* Issue SUSPEND_VHCA on one VF and record it in the parked set. */
+static int vfmig_suspend_one_vf(const char *ibdev, const char *pf_bdf,
+				uint32_t vf_id)
+{
+	if (vfmig_suspend_vhca_ioctl(pf_bdf, vf_id))
+		return -1;
+
+	if (vfmig_suspended_add(ibdev, pf_bdf, vf_id)) {
+		/*
+		 * We parked the VF but can't remember it -> fini wouldn't
+		 * resume it. Roll the suspend back and fail the dump rather
+		 * than strand the source (the kernel's teardown force-resume
+		 * is only a last-resort net for a crashed dumper).
+		 */
+		pr_err("vfmig: checkpoint: OOM tracking suspended pf=%s "
+		       "vf_id=%u; rolling back suspend and failing dump\n",
+		       pf_bdf, vf_id);
+		(void)vfmig_resume_one_vf(pf_bdf, vf_id);
+		return -1;
+	}
+
+	pr_info("vfmig: suspended pf=%s vf_id=%u datapath "
+		"(snapshot-ordering pause)\n", pf_bdf, vf_id);
+	return 0;
+}
+
+/*
+ * CHECKPOINT_DEVICES hook -- the "pause" half of the stop-and-copy
+ * snapshot-ordering fix. Runs after the tree is frozen and after the
+ * RDMA coverage check (which already claimed every tree context and
+ * populated the claimed-VF cache), but BEFORE the per-task memory-dump
+ * loop. We park every claimed VF via SUSPEND_VHCA so the firmware
+ * datapath is quiesced before any MR/recv-buffer page is copied into
+ * the image.
+ *
+ * The hook is invoked once per alive pstree item, but the claimed set
+ * is tree-wide, so we park the whole set on the first call; the parked
+ * set dedups subsequent calls (and SUSPEND_VHCA is itself idempotent).
+ * @pid is unused -- the claim-time cache already scoped the VFs to this
+ * snapshot tree.
+ *
+ * Returns 0 on success (including "nothing to do"), -ENOTSUP when the
+ * plugin is inactive (lets CRIU's hook chain treat us as absent), or -1
+ * if a VF we must park fails to suspend (the dump cannot honor its
+ * memory-consistency guarantee, so fail loudly rather than silently
+ * snapshot a live datapath).
+ */
+int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid)
+{
+	struct vfmig_claimed_vf *c;
+	int suspended_now = 0;
+
+	(void)pid;
+
+	if (!vfmig_active)
+		return -ENOTSUP;
+
+	for (c = vfmig_claimed_head; c; c = c->next) {
+		if (vfmig_suspended_lookup(c->pf_bdf, c->vf_id))
+			continue;
+		if (vfmig_suspend_one_vf(c->ibdev, c->pf_bdf, c->vf_id))
+			return -1;
+		suspended_now++;
+	}
+
+	if (suspended_now)
+		pr_info("vfmig: checkpoint: parked %d VF datapath(s) before "
+			"memory dump\n", suspended_now);
+	return 0;
+}
+
+/*
+ * Resume (or deliberately leave parked) every VF this dump suspended.
+ * Called from fini(DUMP). @keep_suspended leaves the source parked
+ * (migration / dump-then-destroy via CRIU_VFMIG_KEEP_SUSPENDED=1);
+ * otherwise -- the default, and unconditionally on an aborted dump --
+ * the source is brought back to runnable. Best-effort: a failed RESUME
+ * is logged but we still drop the tracking entry (the kernel's
+ * SR-IOV-teardown force-resume is the backstop). Frees the parked set.
+ */
+void vfmig_resume_suspended_vfs(bool keep_suspended)
+{
+	struct vfmig_suspended_vf *p, *n;
+	int resumed = 0, kept = 0, failed = 0;
+
+	for (p = vfmig_suspended_head; p; p = n) {
+		n = p->next;
+		if (keep_suspended) {
+			kept++;
+		} else if (vfmig_resume_one_vf(p->pf_bdf, p->vf_id)) {
+			failed++;
+		} else {
+			pr_info("vfmig: resumed pf=%s vf_id=%u datapath\n",
+				p->pf_bdf, p->vf_id);
+			resumed++;
+		}
+		free(p);
+	}
+	vfmig_suspended_head = NULL;
+
+	if (resumed || kept || failed)
+		pr_info("fini-DUMP resume: resumed=%d left_parked=%d "
+			"resume_failed=%d\n", resumed, kept, failed);
+}
+
+/*
+ * RDMA_DUMP_PRE_QP -- thaw the device for the QP-stage NLDEV walk.
+ *
+ * CHECKPOINT_DEVICES parked the datapath (SUSPEND_VHCA) before the
+ * memory dump, which leaves the VF command ring dead. The QP stage of
+ * the uobj DAG walk is the one stage that needs that ring live: the
+ * kernel's RES_QP fill runs ib_query_qp() (a firmware QUERY_QP on the
+ * VF ring) and CRIU's per-QP cap query hits it too. On a parked VF
+ * those queries stall and the QP is silently dropped from the walk.
+ *
+ * So briefly RESUME_VHCA the VF backing @ibdev for just the QP stage.
+ * We deliberately KEEP the parked-set entry: the logical "this VF is
+ * parked for the dump" state must survive the thaw so the late
+ * SAVE_VHCA_STATE still takes the KEEP_SUSPENDED path and fini still
+ * resumes it. RDMA_DUMP_POST_QP re-issues SUSPEND_VHCA right after.
+ *
+ * No-op (success) when this VF wasn't parked by us -- either the
+ * plugin is inactive, or CHECKPOINT_DEVICES didn't run, in which case
+ * the ring is already live and QUERY_QP works. A failed thaw is fatal
+ * to the dump (the caller aborts) because a frozen device would drop
+ * every QP from the image.
+ */
+int rdma_mlx5_vfmig_plugin_dump_pre_qp(const char *ibdev,
+				       uint32_t kernel_driver_id, pid_t pid)
+{
+	struct vfmig_suspended_vf *p;
+
+	(void)kernel_driver_id;
+	(void)pid;
+
+	if (!vfmig_active)
+		return 0;
+
+	p = vfmig_suspended_lookup_ibdev(ibdev);
+	if (!p)
+		return 0;
+
+	if (vfmig_resume_one_vf(p->pf_bdf, p->vf_id)) {
+		pr_err("vfmig: pre-QP: failed to thaw pf=%s vf_id=%u for "
+		       "ibdev=%s QP enumeration\n",
+		       p->pf_bdf, p->vf_id, ibdev);
+		return -1;
+	}
+	pr_info("vfmig: pre-QP: thawed pf=%s vf_id=%u (ibdev=%s) for QP "
+		"enumeration\n", p->pf_bdf, p->vf_id, ibdev);
+	return 0;
+}
+
+/*
+ * RDMA_DUMP_POST_QP -- re-freeze after the QP-stage walk.
+ *
+ * Re-park (raw SUSPEND_VHCA, the parked-set entry is still live from
+ * CHECKPOINT_DEVICES) the VF that RDMA_DUMP_PRE_QP thawed, so the rest
+ * of the dump and the late SAVE see a quiesced datapath again.
+ *
+ * Best-effort: the bulk memory snapshot is already taken by the time
+ * the uobj walk runs, so a failed re-freeze can't corrupt it -- it
+ * only leaves the source runnable until fini SAVE re-parks it (and the
+ * KEEP_SUSPENDED path keeps tracking consistent regardless). Hence a
+ * warning rather than a dump-fatal error.
+ */
+int rdma_mlx5_vfmig_plugin_dump_post_qp(const char *ibdev,
+					uint32_t kernel_driver_id, pid_t pid)
+{
+	struct vfmig_suspended_vf *p;
+
+	(void)kernel_driver_id;
+	(void)pid;
+
+	if (!vfmig_active)
+		return 0;
+
+	p = vfmig_suspended_lookup_ibdev(ibdev);
+	if (!p)
+		return 0;
+
+	if (vfmig_suspend_vhca_ioctl(p->pf_bdf, p->vf_id)) {
+		pr_warn("vfmig: post-QP: failed to re-freeze pf=%s vf_id=%u "
+			"(ibdev=%s); source stays runnable until fini SAVE "
+			"re-parks it\n", p->pf_bdf, p->vf_id, ibdev);
+		return 0;
+	}
+	pr_info("vfmig: post-QP: re-froze pf=%s vf_id=%u (ibdev=%s) after QP "
+		"enumeration\n", p->pf_bdf, p->vf_id, ibdev);
+	return 0;
+}
+
+/*
  * Capture the firmware blob for one (pf_bdf, vf_id) pair.
  *
  * Steps (matching the source-side lifecycle in the kernel UAPI doc
@@ -467,18 +860,36 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 	 * plugin .so works for both dev and prod -- CRIU's plugin
 	 * loader doesn't differentiate.
 	 */
-	{
-		const char *env = getenv("CRIU_VFMIG_KEEP_SUSPENDED");
-
-		if (env && strcmp(env, "1") == 0) {
-			ss.flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
-			pr_info("vfmig: SAVE with KEEP_SUSPENDED "
-				"(CRIU_VFMIG_KEEP_SUSPENDED=1); source "
-				"VF will be left suspended after save_fd "
-				"close. Caller is responsible for tearing "
-				"the VF down before any orchestrator "
-				"action that would race a resume.\n");
-		}
+	if (vfmig_suspended_lookup(pf_bdf, vf_id)) {
+		/*
+		 * Snapshot-ordering happy path: CHECKPOINT_DEVICES already
+		 * parked this VF before the memory dump. Pass KEEP_SUSPENDED
+		 * so SAVE doesn't resume on close -- the source resume is
+		 * owned by fini's vfmig_resume_suspended_vfs(). (The kernel
+		 * also infers this from its persistent vfmig_suspended bit
+		 * via owns_suspend, so SAVE skips its self-suspend pair; we
+		 * set the flag too so the intent is explicit and correct even
+		 * against an older suspend-unaware kernel.)
+		 */
+		ss.flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
+	} else if (vfmig_keep_suspended_requested()) {
+		/*
+		 * Fallback: this VF was NOT pre-suspended at CHECKPOINT_
+		 * DEVICES (e.g. the early hook didn't run, or fd enumeration
+		 * missed it). SAVE will self-suspend now -- which means the
+		 * dumpee's memory for this VF was copied while its datapath
+		 * was still live (the stop-and-copy window this fix exists to
+		 * close). Warn, and honor the operator's keep-parked request.
+		 */
+		pr_warn("vfmig: pf=%s vf_id=%u not parked at CHECKPOINT_DEVICES; "
+			"SAVE self-suspends -- memory snapshot for this VF may "
+			"be inconsistent with a live peer\n", pf_bdf, vf_id);
+		ss.flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
+	} else {
+		pr_warn("vfmig: pf=%s vf_id=%u not parked at CHECKPOINT_DEVICES; "
+			"SAVE self-suspends + resumes on close -- memory "
+			"snapshot for this VF may be inconsistent with a live "
+			"peer\n", pf_bdf, vf_id);
 	}
 
 	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_SAVE_VHCA_STATE, &ss)) {

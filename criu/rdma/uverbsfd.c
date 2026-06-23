@@ -1074,6 +1074,39 @@ int rdma_dispatch_dump_uobj_qp(plugin_desc_t *plugin,
 }
 
 /*
+ * QP-stage bracket dispatchers. See the hook docs in criu-plugin.h and
+ * the declaration in rdma.h. Both are optional-hook no-op-success and
+ * route to a single plugin (the one that CLAIMed the ibdev's context).
+ */
+int rdma_dispatch_dump_pre_qp(plugin_desc_t *plugin, const char *ibdev,
+			      uint32_t kernel_driver_id, pid_t pid)
+{
+	CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP_t *fn;
+
+	if (!plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP])
+		return 0;
+
+	fn = plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP];
+	pr_debug("dump_pre_qp: dispatching to plugin '%s' (ibdev=%s pid=%d)\n",
+		 plugin->d->name, ibdev, (int)pid);
+	return fn(ibdev, kernel_driver_id, pid);
+}
+
+int rdma_dispatch_dump_post_qp(plugin_desc_t *plugin, const char *ibdev,
+			       uint32_t kernel_driver_id, pid_t pid)
+{
+	CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP_t *fn;
+
+	if (!plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP])
+		return 0;
+
+	fn = plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP];
+	pr_debug("dump_post_qp: dispatching to plugin '%s' (ibdev=%s pid=%d)\n",
+		 plugin->d->name, ibdev, (int)pid);
+	return fn(ibdev, kernel_driver_id, pid);
+}
+
+/*
  * Per-PD dump dispatcher. Mirror of rdma_dispatch_dump_uobj_cq /
  * _qp applied to UVERBS_METHOD_RESTORE_PD's discovery-side
  * counterpart.
