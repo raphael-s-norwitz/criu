@@ -707,44 +707,30 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 	ss.vf_id = vf_id;
 
 	/*
-	 * SAVE flag policy: default flags=0 (kernel auto-RESUMEs the
-	 * source VF on save_fd close), opt in to KEEP_SUSPENDED via
-	 * the CRIU_VFMIG_KEEP_SUSPENDED=1 env var.
+	 * SAVE flag policy. The source VF's post-dump fate is the
+	 * migration question "will the dumpee keep running?", answered by
+	 * criu_dumpee_will_resume() -- NOT a separate knob:
 	 *
-	 * Why default=0:
+	 *   - parked at CHECKPOINT_DEVICES (the normal snapshot-ordering
+	 *     path): always KEEP_SUSPENDED so SAVE doesn't resume on
+	 *     close; fini's vfmig_resume_suspended_vfs() owns the resume
+	 *     decision for the whole tracked set.
+	 *   - not parked + migrate-and-kill (!criu_dumpee_will_resume()):
+	 *     KEEP_SUSPENDED -- a successful migrate leaves the source
+	 *     quiesced through kill, so it can't emit datapath traffic
+	 *     that diverges from the state handed to the destination.
+	 *   - not parked + will-resume (--leave-running / aborted dump):
+	 *     flags=0, kernel resumes the VF on save_fd close.
 	 *
-	 *   The kernel's reference vfmig test (tools/testing/mlx5_vfmig/
-	 *   test_m2r_iova.sh) issues SAVE_VHCA_STATE with no flags and
-	 *   then does sriov_numvfs=0 cheaply -- exactly the flow CRIU
-	 *   needs to support same-host dump-and-restore validation. The
-	 *   KEEP_SUSPENDED + sriov_numvfs=0 path that the kernel UAPI
-	 *   doc gestures at ("CRIU dump-then-destroy where the VF is
-	 *   about to be torn down via sriov_numvfs=0 anyway") is not
-	 *   exercised by the kernel test suite, and on the current
-	 *   kernel mlx5_core's release path walks the suspended VF's
-	 *   own cmd ring -- DESTROY_QP, DESTROY_CQ, DESTROY_MKEY,
-	 *   DEALLOC_PD, DEALLOC_UAR, DESTROY_UCTX, ... ~15-20 commands,
-	 *   each timing out at the kernel's 60s MLX5_CMD_TIMEOUT --
-	 *   making sriov_numvfs=0 take 15-25 minutes. Until the kernel
-	 *   gains a fast-teardown path that detects suspended VHCAs
-	 *   and skips per-resource DESTROY commands (or a vfmig-
-	 *   specific destroy ioctl that bypasses the cmd ring), shipping
-	 *   KEEP_SUSPENDED as the default makes CRIU's dump uncomposable
-	 *   with the orchestrator's expected destroy step in any
-	 *   reasonable timeframe.
-	 *
-	 * Why we keep an opt-in:
-	 *
-	 *   The KEEP_SUSPENDED semantic is genuinely useful for
-	 *   production deployments where the orchestrator handles
-	 *   destroy out-of-band asynchronously (paying the long
-	 *   teardown off-line) and wants to guarantee no resumed-source
-	 *   window between SAVE and destroy. Once kernel fast-teardown
-	 *   lands, we may flip this default again.
-	 *
-	 * Implementation note: env var (not a build flag) so the same
-	 * plugin .so works for both dev and prod -- CRIU's plugin
-	 * loader doesn't differentiate.
+	 * Note on teardown cost: leaving a VF in STOP across the
+	 * orchestrator's sriov_numvfs=0 makes pci_disable_sriov() walk the
+	 * VF's dead command ring (one ~60s MLX5_CMD_TIMEOUT per DESTROY,
+	 * ~15-25 min total; see snapshot_ordering_pause_capture.md A.4).
+	 * That is an orchestrator/kernel concern, not CRIU's: a successful
+	 * migrate-and-kill correctly leaves the source parked, and the
+	 * orchestrator must RESUME_VHCA (or the kernel must resume parked
+	 * VFs before per-VF teardown) ahead of destroy. CRIU only encodes
+	 * the migration intent here.
 	 */
 	if (vfmig_suspended_lookup(pf_bdf, vf_id)) {
 		/*
