@@ -237,21 +237,6 @@ void vfmig_drain_pending_in_fini(void);
 void vfmig_suspended_clear(void);
 int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid);
 void vfmig_resume_suspended_vfs(bool keep_suspended);
-bool vfmig_keep_suspended_requested(void);
-
-/*
- * QP-stage bracket hooks (RDMA_DUMP_PRE_QP / RDMA_DUMP_POST_QP). The
- * uobj DAG walk's QP stage needs the VF command ring live (RES_QP runs
- * a firmware QUERY_QP), which CHECKPOINT_DEVICES killed. pre_qp briefly
- * RESUME_VHCAs the VF backing @ibdev for that stage; post_qp re-issues
- * SUSPEND_VHCA after. Both keep the parked-set entry intact so the late
- * SAVE/resume bookkeeping is unaffected. No-op when @ibdev wasn't parked
- * by this dump.
- */
-int rdma_mlx5_vfmig_plugin_dump_pre_qp(const char *ibdev,
-				       uint32_t kernel_driver_id, pid_t pid);
-int rdma_mlx5_vfmig_plugin_dump_post_qp(const char *ibdev,
-					uint32_t kernel_driver_id, pid_t pid);
 
 /*
  * Claimed-VF cache. CLAIM (rdma_check_dump_coverage -> per-context

@@ -121,11 +121,34 @@ struct uobj_ibdev {
 /* Cross-walk state shared by the per-resource callbacks. */
 struct uobj_walk_ctx {
 	struct uobj_ibdev *ib;
-	struct cr_img *img;
 	int n_emitted;
 	int n_dropped;
 	int err;
 };
+
+/*
+ * A single uobject captured during the walk, packed to an owned
+ * byte buffer with its RdmaUobjEntry.ufile_id deliberately left 0.
+ *
+ * Capture (rdma_capture_uobj_dag) runs early -- before the dumpee's
+ * memory is copied and before CRIU's file collection has assigned
+ * this ucontext its uverbs-file id (uvfe_id). So everything *except*
+ * ufile_id is known at capture; we snapshot the built entry here and
+ * bind ufile_id at emit time (rdma_emit_uobj_dag), reading it from
+ * @uf->uvfe_id once dump_uverbsfile() has back-filled it. @uf stays
+ * valid across the gap because rdma_dumped_ufiles outlives both
+ * phases. We pack/unpack rather than deep-copy the message + its
+ * nested attrs/plugin_blob, which keeps lifetime management trivial.
+ */
+struct rdma_captured_uobj {
+	struct list_head link;
+	const struct rdma_dumped_ufile *uf;
+	void *packed;
+	size_t packed_len;
+	int type;		/* R3UobjType, for diagnostics only */
+};
+
+static LIST_HEAD(rdma_captured_uobjs);
 
 static struct uobj_ibdev *uobj_ibdev_find(struct list_head *head,
 					  const char *ibdev)
@@ -215,7 +238,12 @@ static void uobj_entry_init_common(RdmaUobjEntry *e,
 				   bool has_ufile_handle, uint32_t ufile_handle)
 {
 	rdma_uobj_entry__init(e);
-	e->ufile_id = uf->uvfe_id;
+	/*
+	 * ufile_id is bound late (rdma_emit_uobj_dag) from uf->uvfe_id;
+	 * at capture time the dumpee's uverbs-file id is not yet
+	 * assigned. Leave it 0 here -- uobj_emit() packs the entry with
+	 * this placeholder and the emit phase patches it.
+	 */
 	e->hw_driver_id = uf->criu_driver;
 	e->type = type;
 	if (has_restrack_id) {
@@ -228,14 +256,37 @@ static void uobj_entry_init_common(RdmaUobjEntry *e,
 	}
 }
 
-static int uobj_emit(struct uobj_walk_ctx *w, RdmaUobjEntry *e)
+/*
+ * Snapshot a built uobject entry into the capture list. @uf is the
+ * in-tree ufile the entry belongs to; its ufile_id is bound later in
+ * rdma_emit_uobj_dag(). The entry is packed (ufile_id left 0) into an
+ * owned buffer so the caller's stack-local @e (and its nested attrs /
+ * plugin_blob) can be torn down immediately as today.
+ */
+static int uobj_emit(struct uobj_walk_ctx *w,
+		     const struct rdma_dumped_ufile *uf, RdmaUobjEntry *e)
 {
-	if (pb_write_one(w->img, e, PB_RDMA_UOBJ) < 0) {
-		pr_err("rdma_dump_uobj_dag: pb_write_one(rdma_uobj.img) "
-		       "failed for ufile_id=%#x type=%u\n",
-		       e->ufile_id, e->type);
+	struct rdma_captured_uobj *c;
+	size_t len = rdma_uobj_entry__get_packed_size(e);
+	void *buf;
+
+	buf = xmalloc(len);
+	if (!buf)
+		return -1;
+	rdma_uobj_entry__pack(e, buf);
+
+	c = xzalloc(sizeof(*c));
+	if (!c) {
+		xfree(buf);
 		return -1;
 	}
+	c->uf = uf;
+	c->packed = buf;
+	c->packed_len = len;
+	c->type = e->type;
+	INIT_LIST_HEAD(&c->link);
+	list_add_tail(&c->link, &rdma_captured_uobjs);
+
 	w->n_emitted++;
 	return 0;
 }
@@ -318,7 +369,7 @@ static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
 		}
 
 		{
-			int rc = uobj_emit(w, &pe);
+			int rc = uobj_emit(w, uf, &pe);
 
 			free(plugin_blob.data);
 			return rc < 0 ? (w->err = -1) : 0;
@@ -412,7 +463,7 @@ static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
 		}
 
 		{
-			int rc = uobj_emit(w, &pe);
+			int rc = uobj_emit(w, uf, &pe);
 
 			/*
 			 * Plugin-allocated bytes (DUMP_UOBJ_CQ contract:
@@ -666,7 +717,7 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 		}
 
 		{
-			int rc = uobj_emit(w, &pe);
+			int rc = uobj_emit(w, uf, &pe);
 
 			free(plugin_blob.data);
 			return rc < 0 ? (w->err = -1) : 0;
@@ -994,7 +1045,7 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	pe.mr = &attrs;
 
 	uobj_attach_parent_pd(&pe, &xref, xref_arr, e->pdn);
-	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
+	return uobj_emit(w, uf, &pe) < 0 ? (w->err = -1) : 0;
 }
 
 /*
@@ -1059,7 +1110,7 @@ static int uobj_srq_cb(const struct rdma_nl_res_entry *e, void *arg)
 
 	pe.n_xref = n;
 	pe.xref = xref_arr;
-	return uobj_emit(w, &pe) < 0 ? (w->err = -1) : 0;
+	return uobj_emit(w, uf, &pe) < 0 ? (w->err = -1) : 0;
 }
 
 /*
@@ -1085,16 +1136,42 @@ static int devidx_resolver_cb(uint32_t dev_index, const char *ibdev,
 	return 0;
 }
 
-int rdma_dump_uobj_dag(void)
+/* Free every captured entry. Idempotent. */
+static void rdma_drop_captured_uobjs(void)
+{
+	struct rdma_captured_uobj *c, *cn;
+
+	list_for_each_entry_safe(c, cn, &rdma_captured_uobjs, link) {
+		list_del(&c->link);
+		xfree(c->packed);
+		xfree(c);
+	}
+}
+
+/*
+ * Capture phase: enumerate every in-tree ucontext's PD/CQ/QP/MR/SRQ
+ * uobjects over NLDEV, run the per-class plugin queries (mlx5 QUERY_QP
+ * on a live command ring; rxe FREEZE_DATAPATH + QUERY_QP), and pack
+ * each built entry into the capture list with its ufile_id deferred.
+ *
+ * This is the half that is order-sensitive: it must run before the
+ * datapath is frozen (so a firmware QUERY_QP hits a live ring) and,
+ * for rxe, its in-hook FREEZE_DATAPATH must run before the dumpee's
+ * memory is copied. The serialization (rdma_emit_uobj_dag) is order-
+ * insensitive and runs later, once uvfe_id has been assigned.
+ *
+ * Consumes (and closes) the holder_uctx_fd dups: this walk is their
+ * only user.
+ */
+int rdma_capture_uobj_dag(void)
 {
 	struct rdma_dumped_ufile *uf;
 	struct uobj_ibdev *ib, *ib_next;
 	LIST_HEAD(ibdevs);
-	struct cr_img *img = NULL;
 	int ret = -1;
 
 	if (list_empty(&rdma_dumped_ufiles)) {
-		pr_debug("uobj DAG: no in-tree uverbs contexts dumped, "
+		pr_debug("uobj DAG: no in-tree uverbs contexts captured, "
 			 "skipping per-uobject discovery\n");
 		return 0;
 	}
@@ -1130,26 +1207,13 @@ int rdma_dump_uobj_dag(void)
 	}
 
 	/*
-	 * 3. Open the image. Only do so once we know we have at
-	 * least one ibdev to walk -- skipping the open-then-close
-	 * dance saves an empty rdma_uobj.img landing on disk for
-	 * dump trees with zero RDMA contexts (already guarded by
-	 * the list_empty check, but defence in depth).
-	 */
-	img = open_image_at(AT_FDCWD, CR_FD_RDMA_UOBJ, O_DUMP);
-	if (!img) {
-		pr_err("uobj DAG: open_image(rdma-uobj, O_DUMP) failed\n");
-		goto out;
-	}
-
-	/*
-	 * 4. Per-ibdev: PD first (populates pdn_map), then CQ
+	 * 3. Per-ibdev: PD first (populates pdn_map), then CQ
 	 * (direct ctxn), then QP/MR/SRQ (PDN-join through the just-
 	 * built pdn_map). Order matters only for the PDN-join
 	 * dependency; CQ could equally well run before or after PD.
 	 */
 	list_for_each_entry(ib, &ibdevs, link) {
-		struct uobj_walk_ctx w = { .ib = ib, .img = img };
+		struct uobj_walk_ctx w = { .ib = ib };
 		static const struct {
 			enum rdma_nl_res_type t;
 			rdma_nl_res_cb_t cb;
@@ -1170,43 +1234,21 @@ int rdma_dump_uobj_dag(void)
 		}
 
 		for (size_t i = 0; i < ARRAY_SIZE(stages); i++) {
-			bool is_qp = (stages[i].t == RDMA_NL_RES_QP);
-			struct rdma_dumped_ufile *uf0 =
-				ib->n_ufiles ? ib->ufiles[0] : NULL;
-			bool bracket = is_qp && uf0 && uf0->plugin;
 			int r;
 
 			/*
-			 * Snapshot-ordering thaw/re-freeze. The QP NLDEV fill
-			 * issues a firmware QUERY_QP on the device's command
-			 * ring (and CRIU's per-QP cap query hits it too), which
-			 * is dead if the claiming plugin froze the datapath at
-			 * CHECKPOINT_DEVICES. Let the plugin briefly thaw the
-			 * device for just this stage and re-freeze right after.
-			 * PD/CQ/MR/SRQ read cached restrack/sw state and run on
-			 * a frozen device untouched, so only QP is bracketed.
-			 * A failed thaw is dump-fatal (the walk would otherwise
-			 * silently drop every QP); re-freeze is best-effort and
-			 * runs even when the walk itself failed.
+			 * Capture runs before the datapath is frozen, so the
+			 * device's command ring is live: the QP NLDEV fill's
+			 * firmware QUERY_QP (and CRIU's per-QP cap query) just
+			 * work, with no thaw/re-freeze dance. rxe's per-QP
+			 * FREEZE_DATAPATH fires inside the QP-stage hook and,
+			 * because capture precedes the memory snapshot, lands
+			 * the freeze before the dumpee's pages are copied.
 			 */
-			if (bracket &&
-			    rdma_dispatch_dump_pre_qp(uf0->plugin, ib->ibdev,
-						      uf0->kernel_driver_id,
-						      uf0->pid)) {
-				pr_err("uobj DAG: pre-QP thaw failed on ibdev "
-				       "'%s'; aborting\n", ib->ibdev);
-				goto out;
-			}
-
 			r = rdma_nl_for_each_resource(ib->dev_index,
 						      ib->ibdev,
 						      stages[i].t,
 						      stages[i].cb, &w);
-
-			if (bracket)
-				(void)rdma_dispatch_dump_post_qp(
-					uf0->plugin, ib->ibdev,
-					uf0->kernel_driver_id, uf0->pid);
 
 			if (r < 0 || w.err) {
 				pr_err("uobj DAG: %s walk failed on ibdev "
@@ -1225,8 +1267,6 @@ int rdma_dump_uobj_dag(void)
 
 	ret = 0;
 out:
-	if (img)
-		close_image(img);
 	list_for_each_entry_safe(ib, ib_next, &ibdevs, link) {
 		list_del(&ib->link);
 		xfree(ib->ufiles);
@@ -1234,12 +1274,11 @@ out:
 		xfree(ib);
 	}
 	/*
-	 * Drop the holder uverbsfd dups stashed by dump_uverbsfile. The
-	 * walk above is the only consumer; from this point on the holder
-	 * is being killed and the ucontext is gone anyway. Skipping
-	 * close() here would just leak fds into criu's own image-write
-	 * phase, which makes file-leak detectors angry on long-running
-	 * dumps.
+	 * Drop the holder uverbsfd dups stashed during capture. This
+	 * walk is the only consumer; the emit phase serializes from the
+	 * already-captured packed entries and needs no fd. Closing them
+	 * here avoids leaking fds into criu's own image-write phase,
+	 * which makes file-leak detectors angry on long-running dumps.
 	 */
 	{
 		struct rdma_dumped_ufile *uf2;
@@ -1250,5 +1289,62 @@ out:
 			}
 		}
 	}
+	if (ret)
+		rdma_drop_captured_uobjs();
 	return ret;
 }
+
+/*
+ * Emit phase: serialize the captured uobjects to rdma_uobj.img,
+ * binding each entry's ufile_id from its ufile's now-assigned
+ * uvfe_id (back-filled by dump_uverbsfile during file collection).
+ * Order-insensitive; runs after the memory snapshot. Drains the
+ * capture list either way.
+ */
+int rdma_emit_uobj_dag(void)
+{
+	struct rdma_captured_uobj *c;
+	struct cr_img *img = NULL;
+	int ret = -1;
+
+	if (list_empty(&rdma_captured_uobjs)) {
+		pr_debug("uobj DAG: nothing captured, no rdma_uobj.img\n");
+		return 0;
+	}
+
+	img = open_image_at(AT_FDCWD, CR_FD_RDMA_UOBJ, O_DUMP);
+	if (!img) {
+		pr_err("uobj DAG: open_image(rdma-uobj, O_DUMP) failed\n");
+		goto out;
+	}
+
+	list_for_each_entry(c, &rdma_captured_uobjs, link) {
+		RdmaUobjEntry *e;
+
+		e = rdma_uobj_entry__unpack(NULL, c->packed_len, c->packed);
+		if (!e) {
+			pr_err("uobj DAG: failed to unpack captured entry "
+			       "(type=%d) for emission\n", c->type);
+			goto out;
+		}
+		/* Late-bind the ufile id now that file collection ran. */
+		e->ufile_id = c->uf->uvfe_id;
+
+		if (pb_write_one(img, e, PB_RDMA_UOBJ) < 0) {
+			pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed "
+			       "for ufile_id=%#x type=%u\n",
+			       e->ufile_id, e->type);
+			rdma_uobj_entry__free_unpacked(e, NULL);
+			goto out;
+		}
+		rdma_uobj_entry__free_unpacked(e, NULL);
+	}
+
+	ret = 0;
+out:
+	if (img)
+		close_image(img);
+	rdma_drop_captured_uobjs();
+	return ret;
+}
+

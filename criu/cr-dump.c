@@ -2107,6 +2107,15 @@ static int cr_dump_finish(int ret)
 	if (arch_set_thread_regs(root_item, true) < 0)
 		return -1;
 
+	/*
+	 * Finalize the will-resume predicate before fini() so plugins
+	 * can undo dump-time device quiescing on the non-kill paths.
+	 * Mirrors the pstree_switch_state() decision just below: a
+	 * failed dump or failed post-dump script forces the tree back
+	 * to running regardless of opts.final_state.
+	 */
+	cr_plugin_dump_set_will_resume(ret || post_dump_ret || opts.final_state == TASK_ALIVE);
+
 	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 
 	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
@@ -2170,6 +2179,13 @@ int cr_dump_tasks(pid_t pid)
 
 	if (cr_plugin_init(CR_PLUGIN_STAGE__DUMP))
 		goto err;
+
+	/*
+	 * Up-front "will the dumpee keep running?" intent, read by
+	 * plugins mid-dump (e.g. mlx5 SAVE). The failure-rollback cases
+	 * are folded in later by cr_dump_finish() before fini.
+	 */
+	cr_plugin_dump_set_will_resume(opts.final_state == TASK_ALIVE);
 
 	if (lsm_check_opts())
 		goto err;
@@ -2252,6 +2268,20 @@ int cr_dump_tasks(pid_t pid)
 	if (rdma_check_qp_restorability(root_item))
 		goto err;
 
+	/*
+	 * Early uverbs-context capture. Runs while the RDMA datapath is
+	 * still live (before checkpoint_devices()) and before the memory
+	 * snapshot: it dups each dumpee's uverbs cdev via pidfd_getfd and
+	 * drives the order-sensitive half of the uobject DAG (NLDEV walks
+	 * + plugin QUERY_QP, rxe FREEZE_DATAPATH). The serialization half
+	 * (rdma_emit_uobj_dag) runs after the per-task dump below, once
+	 * file collection has assigned each context its uverbs-file id.
+	 * This is why the device need not be thawed for QP enumeration and
+	 * why rxe's freeze precedes the page copy.
+	 */
+	if (rdma_capture_uverbs_contexts(root_item))
+		goto err;
+
 	if (checkpoint_devices())
 		goto err;
 
@@ -2289,14 +2319,14 @@ int cr_dump_tasks(pid_t pid)
 	}
 
 	/*
-	 * R3 (per-uobject DAG) dump. Runs once after every task has
-	 * been dumped, so dump_uverbsfile() has fully populated the
-	 * in-memory list of dumped ufiles that drives the per-ibdev
-	 * NLDEV walks. No-op for trees that hold no RDMA contexts.
-	 * S1.b scope is discovery + image emission only; restore
-	 * action lands incrementally across S1.c-S6.
+	 * R3 (per-uobject DAG) emit. The order-sensitive capture ran
+	 * earlier (rdma_capture_uverbs_contexts, before the datapath
+	 * freeze); this serializes the captured uobjects to
+	 * rdma_uobj.img now that dump_uverbsfile() has assigned each
+	 * context its uverbs-file id (bound onto the entries here).
+	 * No-op for trees that hold no RDMA contexts.
 	 */
-	if (rdma_dump_uobj_dag())
+	if (rdma_emit_uobj_dag())
 		goto err;
 
 	ret = run_plugins(DUMP_DEVICES_LATE, pid);

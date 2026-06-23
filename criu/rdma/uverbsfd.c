@@ -30,14 +30,18 @@
  *                                     reads from it.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -58,9 +62,11 @@
 #include "image.h"
 #include "imgset.h"
 #include "int.h"
+#include "kerndat.h"
 #include "log.h"
 #include "plugin.h"
 #include "protobuf.h"
+#include "pstree.h"
 #include "rdma.h"
 #include "rdma/internal.h"
 #include "xmalloc.h"
@@ -113,6 +119,182 @@ static int rdma_record_dumped_ufile(pid_t pid, const char *ibdev,
 		 (int)(sizeof(r->ibdev) - 1), ibdev);
 	list_add_tail(&r->link, &rdma_dumped_ufiles);
 	return 0;
+}
+
+/* Find a captured ufile by its owning pid + context number. */
+static struct rdma_dumped_ufile *rdma_find_dumped_ufile(pid_t pid,
+							bool has_ctxn,
+							uint32_t ctxn)
+{
+	struct rdma_dumped_ufile *uf;
+
+	list_for_each_entry(uf, &rdma_dumped_ufiles, link) {
+		if (uf->pid != pid)
+			continue;
+		if (uf->has_ctxn != has_ctxn)
+			continue;
+		if (has_ctxn && uf->ctxn != ctxn)
+			continue;
+		return uf;
+	}
+	return NULL;
+}
+
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_getfd
+#define __NR_pidfd_getfd 438
+#endif
+
+static int sys_pidfd_open(pid_t pid)
+{
+	return syscall(__NR_pidfd_open, pid, 0);
+}
+
+static int sys_pidfd_getfd(int pidfd, int targetfd)
+{
+	return syscall(__NR_pidfd_getfd, pidfd, targetfd, 0);
+}
+
+/*
+ * Early uverbs-context capture, one dumpee at a time.
+ *
+ * Walks /proc/<pid>/fd for /dev/infiniband/uverbsN cdev fds (the
+ * async-event evfd is an anon inode, so it's skipped), and for each
+ * distinct ucontext: resolves its ibdev/driver/plugin from the cdev
+ * rdev, reads its ctxn from fdinfo, and dups the *same* struct file
+ * out of the (SEIZE-stopped) dumpee via pidfd_getfd -- a re-open of
+ * /proc/<pid>/fd/N would mint a fresh, empty ucontext, so pidfd_getfd
+ * is mandatory. The dup is stashed as the ufile's holder_uctx_fd for
+ * the capture walk; uvfe_id is left 0 and back-filled later by
+ * dump_uverbsfile() once file collection assigns it.
+ */
+static int rdma_capture_pid_uverbs(pid_t pid)
+{
+	char path[64];
+	DIR *d;
+	struct dirent *de;
+	int pidfd = -1, ret = -1;
+
+	snprintf(path, sizeof(path), "/proc/%d/fd", pid);
+	d = opendir(path);
+	if (!d) {
+		pr_perror("rdma capture: opendir %s", path);
+		return -1;
+	}
+
+	while ((de = readdir(d))) {
+		char link[PATH_MAX];
+		ssize_t n;
+		struct stat st;
+		UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
+		struct rdma_uverbs_ctx_ident ident;
+		int fd_no, uctx_fd;
+
+		if (de->d_name[0] == '.')
+			continue;
+
+		n = readlinkat(dirfd(d), de->d_name, link, sizeof(link) - 1);
+		if (n < 0)
+			continue;
+		link[n] = '\0';
+		if (strncmp(link, "/dev/infiniband/uverbs",
+			    strlen("/dev/infiniband/uverbs")) != 0)
+			continue;
+
+		if (fstatat(dirfd(d), de->d_name, &st, 0) < 0 ||
+		    !S_ISCHR(st.st_mode))
+			continue;
+
+		fd_no = atoi(de->d_name);
+
+		if (parse_fdinfo_pid(pid, fd_no, FD_TYPES__UVERBSFD, &uve)) {
+			pr_err("rdma capture: parse fdinfo for pid=%d fd=%d "
+			       "(%s) failed\n", pid, fd_no, link);
+			goto out;
+		}
+
+		/*
+		 * A process can hold several fds to the same ucontext
+		 * (dup, fork-shared table); capture each ucontext once.
+		 */
+		if (rdma_find_dumped_ufile(pid, uve.has_ctxn, uve.ctxn))
+			continue;
+
+		if (rdma_resolve_uverbs_cdev(major(st.st_rdev),
+					     minor(st.st_rdev), &ident))
+			goto out;
+
+		if (!kdat.has_pidfd_getfd) {
+			pr_err("rdma capture: pidfd_getfd is required to dup "
+			       "the dumpee's uverbs context (pid=%d %s) but "
+			       "the kernel does not support it\n",
+			       pid, link);
+			goto out;
+		}
+
+		if (pidfd < 0) {
+			pidfd = sys_pidfd_open(pid);
+			if (pidfd < 0) {
+				pr_perror("rdma capture: pidfd_open(%d)", pid);
+				goto out;
+			}
+		}
+
+		uctx_fd = sys_pidfd_getfd(pidfd, fd_no);
+		if (uctx_fd < 0) {
+			pr_perror("rdma capture: pidfd_getfd(pid=%d fd=%d %s)",
+				  pid, fd_no, link);
+			goto out;
+		}
+
+		/* uvfe_id deferred: dump_uverbsfile() back-fills it. */
+		if (rdma_record_dumped_ufile(pid, ident.ibdev, ident.driver_id,
+					     ident.criu_driver, ident.plugin,
+					     0, uve.has_ctxn, uve.ctxn,
+					     uctx_fd))
+			goto out;
+
+		pr_info("rdma capture: pid=%d ibdev=%s ctxn=%u (fd=%d) "
+			"captured for uobj DAG\n",
+			pid, ident.ibdev, uve.has_ctxn ? uve.ctxn : 0, fd_no);
+	}
+
+	ret = 0;
+out:
+	if (pidfd >= 0)
+		close(pidfd);
+	closedir(d);
+	return ret;
+}
+
+/*
+ * Early uverbs-context capture pass (see rdma.h). Runs after the RDMA
+ * coverage/exclusivity/restorability checks and *before* the datapath
+ * freeze (checkpoint_devices) and the memory snapshot: it records the
+ * tree's uverbs contexts and drives the order-sensitive half of the
+ * uobject DAG (rdma_capture_uobj_dag) while the device is still live.
+ */
+int rdma_capture_uverbs_contexts(struct pstree_item *root)
+{
+	struct pstree_item *item;
+
+	if (!root)
+		return 0;
+
+	for_each_pstree_item(item) {
+		if (!item->pid || item->pid->real <= 0)
+			continue;
+		if (rdma_capture_pid_uverbs(item->pid->real))
+			return -1;
+	}
+
+	/* No uverbs contexts in the tree -> nothing to capture. */
+	if (list_empty(&rdma_dumped_ufiles))
+		return 0;
+
+	return rdma_capture_uobj_dag();
 }
 
 bool is_async_eventfd(char *link)
@@ -348,24 +530,22 @@ int rdma_arbitrate_plugin_claim(const char *ibdev,
 static int dump_uverbsfile_cc_precheck(int lfd, uint32_t driver_id,
 				       const char *ibdev, uint32_t ctxn);
 
-static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
+/*
+ * Resolve a uverbs cdev to its ibdev / kernel-driver / criu-driver
+ * tuple and the claiming CRIU plugin, from the chrdev (major,minor)
+ * alone. See criu/include/rdma/internal.h for the full contract;
+ * this is the fd-independent identity work shared by the per-fd
+ * dump_uverbsfile() path and the early uverbs-context capture pass.
+ */
+int rdma_resolve_uverbs_cdev(unsigned int rdev_maj, unsigned int rdev_min,
+			     struct rdma_uverbs_ctx_ident *out)
 {
-	UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
-	FileEntry fe = FILE_ENTRY__INIT;
-	struct cr_img *img;
 	const char *claimer = NULL;
-	plugin_desc_t *plugin = NULL;
-	char ibdev[64];
-	char driver[64];
-	int rcd, ret = -1;
+	const char *first_name = NULL, *second_name = NULL;
+	bool ambiguous = false;
+	int rcd;
 
-	uve.id = id;
-
-	if (parse_fdinfo_pid(p->pid, p->fd, FD_TYPES__UVERBSFD, &uve))
-		return -1;
-
-	if (dump_one_reg_file(lfd, id, p))
-		return -1;
+	memset(out, 0, sizeof(*out));
 
 	/*
 	 * Resolve the cdev to its ibdev and backing kernel driver. Both go
@@ -373,31 +553,25 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	 * inferring it (and so future per-provider plugins can claim the
 	 * context by driver name).
 	 */
-	if (rdma_ibdev_from_chrdev(major(p->stat.st_rdev),
-				   minor(p->stat.st_rdev),
-				   ibdev, sizeof(ibdev))) {
+	if (rdma_ibdev_from_chrdev(rdev_maj, rdev_min, out->ibdev,
+				   sizeof(out->ibdev))) {
 		pr_err("Can't resolve ibdev for uverbs cdev %u:%u\n",
-		       major(p->stat.st_rdev), minor(p->stat.st_rdev));
-		goto out;
+		       rdev_maj, rdev_min);
+		return -1;
 	}
-	if (rdma_driver_name_from_ibdev(ibdev, driver, sizeof(driver))) {
-		pr_err("Can't resolve kernel driver for ibdev '%s'\n", ibdev);
-		goto out;
+	if (rdma_driver_name_from_ibdev(out->ibdev, out->driver,
+					sizeof(out->driver))) {
+		pr_err("Can't resolve kernel driver for ibdev '%s'\n",
+		       out->ibdev);
+		return -1;
 	}
 
-	uve.ib_dev = xstrdup(ibdev);
-	uve.driver_name = xstrdup(driver);
-	if (!uve.ib_dev || !uve.driver_name)
-		goto out;
-
-	uve.driver_id = rdma_driver_name_to_id(driver);
-	uve.has_driver_id = true;
-	if (uve.driver_id == RDMA_DRIVER_UNKNOWN) {
+	out->driver_id = rdma_driver_name_to_id(out->driver);
+	if (out->driver_id == RDMA_DRIVER_UNKNOWN) {
 		pr_err("Unknown RDMA driver '%s' for ibdev '%s' (uverbs cdev %u:%u). "
 		       "Add a mapping to rdma_driver_name_to_id() in criu/rdma.c.\n",
-		       driver, ibdev,
-		       major(p->stat.st_rdev), minor(p->stat.st_rdev));
-		goto out;
+		       out->driver, out->ibdev, rdev_maj, rdev_min);
+		return -1;
 	}
 
 	/*
@@ -408,75 +582,96 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	 * never mind another one. Hard fail: better than silently
 	 * producing dead images.
 	 */
-	rcd = rdma_arbitrate_plugin_claim(ibdev, uve.driver_id, &claimer);
+	rcd = rdma_arbitrate_plugin_claim(out->ibdev, out->driver_id, &claimer);
 	if (rcd < 0) {
-		pr_err("dump_uverbsfile: plugin arbitration failed for "
-		       "ibdev=%s driver=%s: %d\n",
-		       ibdev, driver, rcd);
-		goto out;
+		pr_err("rdma_resolve_uverbs_cdev: plugin arbitration failed "
+		       "for ibdev=%s driver=%s: %d\n",
+		       out->ibdev, out->driver, rcd);
+		return -1;
 	}
 	if (rcd == RDMA_CRIU_DRIVER__RCD_UNKNOWN) {
-		pr_err("dump_uverbsfile: no RDMA CRIU plugin claims "
+		pr_err("rdma_resolve_uverbs_cdev: no RDMA CRIU plugin claims "
 		       "ibdev=%s driver=%s (RDMA_DRIVER id=%u). Refusing "
 		       "to checkpoint a context that no plugin can "
 		       "restore. Load the appropriate plugin via "
 		       "CRIU_LIBS_DIR or install it into "
 		       "/usr/lib/criu/.\n",
-		       ibdev, driver, uve.driver_id);
-		goto out;
+		       out->ibdev, out->driver, out->driver_id);
+		return -1;
 	}
-	uve.criu_driver = rcd;
+	out->criu_driver = rcd;
+
+	/*
+	 * Resolve the cached plugin pointer once. CLAIM arbitration just
+	 * succeeded against this very criu_driver, so a miss here means the
+	 * operator's plugin set is inconsistent (claim hook lives in plugin
+	 * A, provided-driver symbol lives in plugin B) -- hard fail rather
+	 * than re-walk per uobject.
+	 */
+	out->plugin = rdma_find_plugin_by_provided_driver(out->criu_driver,
+							  &ambiguous,
+							  &first_name,
+							  &second_name);
+	if (ambiguous) {
+		pr_err("rdma_resolve_uverbs_cdev: multiple plugins declare "
+		       "cr_rdma_provided_driver=%u ('%s' and '%s'); "
+		       "operator's plugin set is inconsistent.\n",
+		       out->criu_driver, first_name, second_name);
+		return -1;
+	}
+	if (!out->plugin) {
+		pr_err("rdma_resolve_uverbs_cdev: no loaded RDMA plugin "
+		       "exports cr_rdma_provided_driver=%u for ibdev=%s -- "
+		       "CLAIM arbitration just named this driver, so the "
+		       "plugin list changed mid-dump or the winning plugin "
+		       "is missing its CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER "
+		       "declaration.\n",
+		       out->criu_driver, out->ibdev);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
+{
+	UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
+	FileEntry fe = FILE_ENTRY__INIT;
+	struct cr_img *img;
+	struct rdma_uverbs_ctx_ident ident;
+	plugin_desc_t *plugin = NULL;
+	int ret = -1;
+
+	uve.id = id;
+
+	if (parse_fdinfo_pid(p->pid, p->fd, FD_TYPES__UVERBSFD, &uve))
+		return -1;
+
+	if (dump_one_reg_file(lfd, id, p))
+		return -1;
+
+	if (rdma_resolve_uverbs_cdev(major(p->stat.st_rdev),
+				     minor(p->stat.st_rdev), &ident))
+		goto out;
+
+	uve.ib_dev = xstrdup(ident.ibdev);
+	uve.driver_name = xstrdup(ident.driver);
+	if (!uve.ib_dev || !uve.driver_name)
+		goto out;
+
+	uve.driver_id = ident.driver_id;
+	uve.has_driver_id = true;
+	uve.criu_driver = ident.criu_driver;
 	uve.has_criu_driver = true;
+	plugin = ident.plugin;
 
 	pr_info("Dumping uverbs char device %d with id %#x ibdev=%s driver=%s "
-		"id=%u claimed by plugin '%s' rcd=%d",
-		lfd, id, ibdev, driver, uve.driver_id, claimer, rcd);
+		"id=%u claimed by plugin '%s'",
+		lfd, id, ident.ibdev, ident.driver, uve.driver_id,
+		plugin->d->name);
 	if (uve.has_ctxn)
 		pr_info(" ctxn %u", uve.ctxn);
 	pr_info("\n");
-
-	/*
-	 * Resolve the cached plugin pointer once for this ufile.
-	 * CLAIM arbitration just succeeded against this very
-	 * criu_driver, so a miss here means the operator's plugin
-	 * set is inconsistent (claim hook lives in plugin A,
-	 * provided-driver symbol lives in plugin B) -- hard fail
-	 * rather than re-walk per uobject.
-	 *
-	 * The cached pointer flows in two directions: synchronously
-	 * into rdma_dispatch_dump_uverbs_context() below (so the
-	 * dispatcher doesn't redo the lookup), and onto the
-	 * struct rdma_dumped_ufile recorded a few lines down (so
-	 * every per-uobject dump dispatcher in the post-walk
-	 * picks it up via uf->plugin without another walk).
-	 */
-	{
-		const char *first_name = NULL, *second_name = NULL;
-		bool ambiguous = false;
-
-		plugin = rdma_find_plugin_by_provided_driver(uve.criu_driver,
-							     &ambiguous,
-							     &first_name,
-							     &second_name);
-		if (ambiguous) {
-			pr_err("dump_uverbsfile: multiple plugins declare "
-			       "cr_rdma_provided_driver=%u ('%s' and '%s'); "
-			       "operator's plugin set is inconsistent.\n",
-			       uve.criu_driver, first_name, second_name);
-			goto out;
-		}
-		if (!plugin) {
-			pr_err("dump_uverbsfile: no loaded RDMA plugin "
-			       "exports cr_rdma_provided_driver=%u for "
-			       "ibdev=%s -- CLAIM arbitration just named "
-			       "this driver, so the plugin list changed "
-			       "mid-dump or the winning plugin is missing "
-			       "its CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER "
-			       "declaration.\n",
-			       uve.criu_driver, ibdev);
-			goto out;
-		}
-	}
 
 	/*
 	 * Per-context dump-side state capture (e.g. mlx5
@@ -490,12 +685,12 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	 * join key the plugin's restore-side counterpart will use to
 	 * find this capture again.
 	 */
-	if (rdma_dispatch_dump_uverbs_context(plugin, ibdev, uve.driver_id,
+	if (rdma_dispatch_dump_uverbs_context(plugin, ident.ibdev, uve.driver_id,
 					      uve.has_ctxn ? uve.ctxn : 0,
 					      lfd, p->pid)) {
 		pr_err("dump_uverbsfile: per-context dump hook failed for "
 		       "ibdev=%s ctxn=%u; aborting dump\n",
-		       ibdev, uve.has_ctxn ? uve.ctxn : 0);
+		       ident.ibdev, uve.has_ctxn ? uve.ctxn : 0);
 		goto out;
 	}
 
@@ -505,7 +700,7 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	 * has any live comp_channel uobjects. Best-effort -- ioctl
 	 * failure downgrades to a warn (see helper).
 	 */
-	if (dump_uverbsfile_cc_precheck(lfd, uve.driver_id, ibdev,
+	if (dump_uverbsfile_cc_precheck(lfd, uve.driver_id, ident.ibdev,
 					uve.has_ctxn ? uve.ctxn : 0))
 		goto out;
 
@@ -514,40 +709,30 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	fe.uvfd = &uve;
 
 	/*
-	 * Record this ufile for the post-dump R3 per-uobject DAG
-	 * walk. Done before pb_write_one so a record-side OOM aborts
-	 * the dump with the same atomicity guarantee as a write
-	 * failure -- partial uverbs records on disk without a
-	 * matching DAG entry would be confusing on inspection.
+	 * Bind this uverbs file's now-assigned id (uvfe_id) onto the
+	 * record the early capture pass made for this ucontext. The
+	 * per-uobject DAG was already captured (pre-freeze) keyed by
+	 * ctxn with ufile_id deferred; rdma_emit_uobj_dag() reads the
+	 * uvfe_id we set here to bind each entry's ufile_id at emit.
 	 *
-	 * Dup @lfd into a long-lived O_CLOEXEC fd before the record;
-	 * the dup shares the holder's struct file (and therefore
-	 * its ib_ucontext IDR) so rdma_dump_uobj_dag's per-MR
-	 * QUERY_MR walk can resolve handles in the right ucontext
-	 * scope. -1 means dup failed -- not fatal; the MR walk
-	 * gracefully falls back to NLDEV-only field capture, which
-	 * means user_addr / access_flags will be absent from the
-	 * image and downstream RESTORE_MR may fail. We log so this
-	 * is visible if it ever fires in practice.
+	 * A miss means this context was opened after the early capture
+	 * pass ran (the pre-SEIZE coverage window) and so has no
+	 * captured uobjects -- its image record would be unrestorable.
+	 * Fail closed, consistent with the per-context coverage policy.
 	 */
 	{
-		int duped = fcntl(lfd, F_DUPFD_CLOEXEC, 0);
-		if (duped < 0) {
-			pr_warn("dump_uverbsfile: F_DUPFD_CLOEXEC of "
-				"holder uverbsfd (pid=%d uvfe=%#x) failed: "
-				"%s -- post-dump QUERY_MR walk will run "
-				"without user_addr/access_flags coverage\n",
-				p->pid, uve.id, strerror(errno));
-		}
-		if (rdma_record_dumped_ufile(p->pid, ibdev, uve.driver_id,
-					     uve.criu_driver, plugin,
-					     uve.id,
-					     uve.has_ctxn, uve.ctxn,
-					     duped)) {
-			pr_err("dump_uverbsfile: failed to record ufile id=%#x "
-			       "for post-dump uobj DAG walk\n", uve.id);
+		struct rdma_dumped_ufile *uf;
+
+		uf = rdma_find_dumped_ufile(p->pid, uve.has_ctxn, uve.ctxn);
+		if (!uf) {
+			pr_err("dump_uverbsfile: uverbs context pid=%d ctxn=%u "
+			       "id=%#x was not captured by the early uverbs-"
+			       "context pass (a context opened after the RDMA "
+			       "coverage check?); aborting\n",
+			       p->pid, uve.has_ctxn ? uve.ctxn : 0, uve.id);
 			goto out;
 		}
+		uf->uvfe_id = uve.id;
 	}
 
 	img = img_from_set(glob_imgset, CR_FD_FILES);
@@ -1071,39 +1256,6 @@ int rdma_dispatch_dump_uobj_qp(plugin_desc_t *plugin,
 		return 0;
 	}
 	return rc;
-}
-
-/*
- * QP-stage bracket dispatchers. See the hook docs in criu-plugin.h and
- * the declaration in rdma.h. Both are optional-hook no-op-success and
- * route to a single plugin (the one that CLAIMed the ibdev's context).
- */
-int rdma_dispatch_dump_pre_qp(plugin_desc_t *plugin, const char *ibdev,
-			      uint32_t kernel_driver_id, pid_t pid)
-{
-	CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP_t *fn;
-
-	if (!plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP])
-		return 0;
-
-	fn = plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP];
-	pr_debug("dump_pre_qp: dispatching to plugin '%s' (ibdev=%s pid=%d)\n",
-		 plugin->d->name, ibdev, (int)pid);
-	return fn(ibdev, kernel_driver_id, pid);
-}
-
-int rdma_dispatch_dump_post_qp(plugin_desc_t *plugin, const char *ibdev,
-			       uint32_t kernel_driver_id, pid_t pid)
-{
-	CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP_t *fn;
-
-	if (!plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP])
-		return 0;
-
-	fn = plugin->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP];
-	pr_debug("dump_post_qp: dispatching to plugin '%s' (ibdev=%s pid=%d)\n",
-		 plugin->d->name, ibdev, (int)pid);
-	return fn(ibdev, kernel_driver_id, pid);
 }
 
 /*

@@ -178,6 +178,90 @@ static void rxe_cdev_cache_drop_all(void)
 }
 
 /*
+ * Dump-side record of QPs we froze (FREEZE_DATAPATH(freeze=1)) during
+ * RDMA_DUMP_UOBJ_QP. With the reordered dump pipeline the freeze now
+ * precedes the memory snapshot, so a dump that does NOT end by killing
+ * the dumpee (criu dump --leave-running, a failed dump, or a failed
+ * post-dump script) would otherwise strand the source's QP datapath
+ * paused forever. fini(DUMP) consults criu_dumpee_will_resume() and,
+ * on those non-kill paths, replays FREEZE_DATAPATH(freeze=0) on each.
+ *
+ * We keep our own F_DUPFD_CLOEXEC of the dumpee's uverbs cdev fd (the
+ * QP-IDR holder) per frozen QP: criu closes the @lfd it handed the
+ * hook once capture is done, so it is not valid at fini time. Parked
+ * above RXE_CACHED_FD_FLOOR for the same reason as the restore cdev
+ * cache. Process-local, single-threaded dump phase, so no locking.
+ */
+struct rxe_frozen_qp {
+	int fd; /* high-numbered dup of the holder cdev */
+	uint32_t qp_handle; /* QP IDR handle in that ufile */
+	struct rxe_frozen_qp *next;
+};
+static struct rxe_frozen_qp *rxe_frozen_qps = NULL;
+
+/* defined later in the file (FREEZE_DATAPATH ioctl wrapper) */
+static int rxe_vfmig_freeze_datapath(int fd, uint32_t qp_handle, uint8_t freeze);
+
+static void rxe_frozen_qp_remember(int lfd, uint32_t qp_handle)
+{
+	struct rxe_frozen_qp *e;
+	int dup;
+
+	/*
+	 * A failed dup is non-fatal: we lose only the ability to
+	 * auto-resume this QP should the dump turn out non-kill, which
+	 * the resume path warns about. The dump itself proceeds.
+	 */
+	dup = fcntl(lfd, F_DUPFD_CLOEXEC, RXE_CACHED_FD_FLOOR);
+	if (dup < 0) {
+		pr_perror("rxe_frozen_qp_remember: F_DUPFD_CLOEXEC(fd=%d, handle=%u)",
+			  lfd, qp_handle);
+		return;
+	}
+
+	e = calloc(1, sizeof(*e));
+	if (!e) {
+		pr_perror("rxe_frozen_qp_remember(handle=%u)", qp_handle);
+		close(dup);
+		return;
+	}
+	e->fd = dup;
+	e->qp_handle = qp_handle;
+	e->next = rxe_frozen_qps;
+	rxe_frozen_qps = e;
+	pr_debug("rxe_frozen_qp: remembered handle=%u dupfd=%d\n", qp_handle, dup);
+}
+
+/*
+ * Drop the frozen-QP set, optionally resuming each QP first
+ * (FREEZE_DATAPATH(freeze=0)). @resume is driven by
+ * criu_dumpee_will_resume() at fini(DUMP). Closes every dup fd and
+ * frees the list regardless.
+ */
+static void rxe_frozen_qps_release(bool resume)
+{
+	struct rxe_frozen_qp *e, *next;
+
+	for (e = rxe_frozen_qps; e; e = next) {
+		next = e->next;
+		if (resume) {
+			int rc = rxe_vfmig_freeze_datapath(e->fd, e->qp_handle, 0);
+
+			if (rc)
+				pr_warn("rxe: fini: FREEZE_DATAPATH(freeze=0, handle=%u) "
+					"failed: %d (%s); source QP left paused\n",
+					e->qp_handle, rc, strerror(-rc));
+			else
+				pr_debug("rxe: fini: resumed QP handle=%u\n", e->qp_handle);
+		}
+		if (e->fd >= 0)
+			close(e->fd);
+		free(e);
+	}
+	rxe_frozen_qps = NULL;
+}
+
+/*
  * Resolve the kernel driver backing /sys/class/infiniband/<ibdev>.
  *
  * For PCI-backed ibdevs the canonical answer comes from readlink() on
@@ -289,6 +373,19 @@ static void rdma_rxe_plugin_fini(int stage, int ret)
 {
 	pr_info("fini (stage %d ret %d): was %s, %d rxe ibdev(s)\n", stage,
 		ret, rxe_active ? "active" : "inactive", rxe_dev_count);
+
+	/*
+	 * Resume any QPs we paused during DUMP_UOBJ_QP. The freeze now
+	 * precedes the memory snapshot (reordered dump pipeline), so on
+	 * the non-kill outcomes -- criu_dumpee_will_resume() true:
+	 * --leave-running, a failed dump, or a failed post-dump script --
+	 * we must unfreeze or the surviving source is stranded with a
+	 * paused datapath. On a successful migrate-and-kill dump we leave
+	 * them paused (the source is about to die). No-op for RESTORE and
+	 * when nothing was frozen.
+	 */
+	if (stage == CR_PLUGIN_STAGE__DUMP)
+		rxe_frozen_qps_release(criu_dumpee_will_resume());
 
 	/*
 	 * Drop the per-restore cdev fd cache. Holds dup()s of the
@@ -1153,19 +1250,49 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
 	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE_LOCAL \
 	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+/*
+ * B1 in-flight image PTR_OUTs (optional). Mirror of the kernel's
+ *   RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE = (1<<NS_SHIFT) + 3,
+ *   RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE = +4,
+ *   RXE_IB_ATTR_QUERY_QP_RESP_RES      = +5.
+ */
+#define RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 3)
+#define RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 4)
+#define RXE_IB_ATTR_QUERY_QP_RESP_RES_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 5)
+
+/*
+ * Per-image capacity we advertise on each optional PTR_OUT. struct
+ * ib_uverbs_attr::len is u16, so a single image attr -- and thus a
+ * single ring -- caps at 65535 bytes; deeper rings need chunking
+ * across calls (a kernel-side v1 follow-up). The kernel writes only
+ * the actual ring byte count (reported in blob.*_image_bytes), not
+ * the full capacity.
+ */
+#define RXE_QP_IMAGE_CAP_LOCAL 65535u
 
 /*
  * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
- * rxe_restore_qp_req (184 bytes): the RXE_IB_METHOD_VFMIG_QUERY_QP
- * RESP_BLOB payload, which is also the RESTORE_QP UHW_IN. CRIU is a
+ * rxe_restore_qp_req (232 bytes): the QUERY_QP RESP_BLOB payload,
+ * which is also the fixed header of the RESTORE_QP UHW_IN. CRIU is a
  * pure courier for these bytes -- dump captures them verbatim into
  * the per-uobj plugin_blob, restore replays them verbatim as UHW_IN
  * -- so the only fields this plugin reads are @qpn (the master-side
- * NLDEV-vs-QUERY_QP seam check) and @rq_vm_pgoff (the RESTORE_QP
- * UHW_OUT verify template). @av is the kernel's 88-byte struct
- * rxe_av; treated opaque here to avoid mirroring its nested
- * grh/sockaddr unions. Keep in sync with the kernel UAPI; remove
- * once host rdma-core ships the struct.
+ * NLDEV-vs-QUERY_QP seam check), @rq_vm_pgoff (the RESTORE_QP
+ * UHW_OUT verify template) and, for the in-flight (B1) path, the
+ * cursors / @*_image_bytes (to decide drained-vs-in-flight and to
+ * size the SQ/RQ/RES image tail concatenated after this header).
+ * @av is the kernel's 88-byte struct rxe_av; treated opaque here to
+ * avoid mirroring its nested grh/sockaddr unions.
+ *
+ * The trailing block (resp_aeth_syndrome .. res_image_bytes) is the
+ * B1 in-flight datapath state added by the kernel "restore in-flight
+ * QP datapath" change; it consumed the old reserved1 padding and kept
+ * the 8-byte reserved2 tail. All-zero (+ zero-length images) selects
+ * the kernel's drained / cursor-only fast path. Keep in sync with the
+ * kernel UAPI; remove once host rdma-core ships the struct.
  */
 struct rxe_restore_qp_req_local {
 	uint8_t		av[88];		/* opaque struct rxe_av */
@@ -1193,19 +1320,44 @@ struct rxe_restore_qp_req_local {
 	uint8_t		timeout;
 	uint8_t		port_num;
 	uint8_t		sq_sig_all;
-	uint8_t		reserved;
-	uint16_t	reserved1;
+	/* B1 in-flight datapath state (mirrors kernel rxe_restore_qp_req) */
+	uint8_t		resp_aeth_syndrome;
+	uint16_t	reserved;
+	uint32_t	sq_producer;
+	uint32_t	sq_consumer;
+	uint32_t	rq_producer;
+	uint32_t	rq_consumer;
+	uint32_t	resp_ack_psn;
+	int32_t		resp_opcode;
+	uint32_t	resp_status;
+	uint32_t	res_head;
+	uint32_t	res_tail;
+	uint32_t	sq_image_bytes;
+	uint32_t	rq_image_bytes;
+	uint32_t	res_image_bytes;
 	uint64_t	reserved2;
 };
 
-_Static_assert(sizeof(struct rxe_restore_qp_req_local) == 184,
-	"rxe_restore_qp_req_local must be 184 bytes (kernel UAPI)");
+_Static_assert(sizeof(struct rxe_restore_qp_req_local) == 232,
+	"rxe_restore_qp_req_local must be 232 bytes (kernel UAPI)");
 _Static_assert(offsetof(struct rxe_restore_qp_req_local, sq_vm_pgoff) == 88,
 	"rxe_restore_qp_req_local.sq_vm_pgoff offset drift");
 _Static_assert(offsetof(struct rxe_restore_qp_req_local, rq_vm_pgoff) == 96,
 	"rxe_restore_qp_req_local.rq_vm_pgoff offset drift");
 _Static_assert(offsetof(struct rxe_restore_qp_req_local, qpn) == 104,
 	"rxe_restore_qp_req_local.qpn offset drift");
+_Static_assert(offsetof(struct rxe_restore_qp_req_local, sq_producer) == 172,
+	"rxe_restore_qp_req_local.sq_producer offset drift");
+_Static_assert(offsetof(struct rxe_restore_qp_req_local, rq_producer) == 180,
+	"rxe_restore_qp_req_local.rq_producer offset drift");
+_Static_assert(offsetof(struct rxe_restore_qp_req_local, resp_ack_psn) == 188,
+	"rxe_restore_qp_req_local.resp_ack_psn offset drift");
+_Static_assert(offsetof(struct rxe_restore_qp_req_local, res_head) == 200,
+	"rxe_restore_qp_req_local.res_head offset drift");
+_Static_assert(offsetof(struct rxe_restore_qp_req_local, sq_image_bytes) == 208,
+	"rxe_restore_qp_req_local.sq_image_bytes offset drift");
+_Static_assert(offsetof(struct rxe_restore_qp_req_local, res_image_bytes) == 216,
+	"rxe_restore_qp_req_local.res_image_bytes offset drift");
 
 /*
  * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
@@ -1232,8 +1384,10 @@ _Static_assert(sizeof(struct rxe_create_qp_resp_local) == 32,
  * Issue RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH on @fd against
  * @qp_handle to pause (@freeze=1) or resume (@freeze=0) the QP's
  * req/resp/comp worker tasks. The dump path pauses before QUERY_QP
- * so the PSN/cursor snapshot is consistent; the dumpee is killed
- * post-checkpoint so the dump never resumes.
+ * so the PSN/cursor snapshot is consistent; on a migrate-and-kill
+ * dump the source is never resumed, while the non-kill outcomes
+ * (--leave-running / aborted dump) resume from fini() via
+ * rxe_frozen_qps_release().
  *
  * HANDLE is UVERBS_ATTR_IDR(UVERBS_OBJECT_QP) (len 0, handle in
  * attrs[].data); FREEZE is a PTR_IN(u8) carried inline in the data
@@ -1286,11 +1440,13 @@ static int rxe_vfmig_freeze_datapath(int fd, uint32_t qp_handle,
  */
 static int rxe_vfmig_query_qp(int fd, uint32_t qp_handle,
 			      struct rxe_restore_qp_req_local *blob_out,
-			      uint64_t *user_handle_out)
+			      uint64_t *user_handle_out,
+			      void *sq_img, void *rq_img, void *res_img,
+			      uint32_t img_cap)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;
-		struct ib_uverbs_attr attrs[3];
+		struct ib_uverbs_attr attrs[6];
 	} cmd = {};
 
 	cmd.hdr.object_id = RXE_IB_OBJECT_VFMIG_LOCAL;
@@ -1312,8 +1468,32 @@ static int rxe_vfmig_query_qp(int fd, uint32_t qp_handle,
 	cmd.attrs[2].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[2].data = (uintptr_t)user_handle_out;
 
-	cmd.hdr.num_attrs = 3;
-	cmd.hdr.length = sizeof(cmd.hdr) + 3 * sizeof(cmd.attrs[0]);
+	/*
+	 * Optional in-flight image PTR_OUTs. The kernel emits only the
+	 * applicable ones -- SQ always (queue_data_size > 0), RQ when the
+	 * QP has its own RQ (non-SRQ), RES for an RC QP with allocated
+	 * responder resources -- and reports the byte count it wrote in
+	 * the corresponding blob_out->*_image_bytes. A buffer smaller than
+	 * the ring fails the whole QUERY_QP with -ENOSPC, so advertise the
+	 * full @img_cap.
+	 */
+	cmd.attrs[3].attr_id = RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE_LOCAL;
+	cmd.attrs[3].len = img_cap;
+	cmd.attrs[3].flags = 0;
+	cmd.attrs[3].data = (uintptr_t)sq_img;
+
+	cmd.attrs[4].attr_id = RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE_LOCAL;
+	cmd.attrs[4].len = img_cap;
+	cmd.attrs[4].flags = 0;
+	cmd.attrs[4].data = (uintptr_t)rq_img;
+
+	cmd.attrs[5].attr_id = RXE_IB_ATTR_QUERY_QP_RESP_RES_LOCAL;
+	cmd.attrs[5].len = img_cap;
+	cmd.attrs[5].flags = 0;
+	cmd.attrs[5].data = (uintptr_t)res_img;
+
+	cmd.hdr.num_attrs = 6;
+	cmd.hdr.length = sizeof(cmd.hdr) + 6 * sizeof(cmd.attrs[0]);
 
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;
@@ -1332,8 +1512,10 @@ static int rxe_vfmig_query_qp(int fd, uint32_t qp_handle,
  * HW-generic dump path (standard QUERY_QP + NLDEV), not here.
  *
  * Kernel-mode QPs surface as -ENXIO from FREEZE/QUERY and are
- * skipped (no user datapath / wire state to migrate). The dumpee is
- * killed post-checkpoint, so the paused QP is never resumed.
+ * skipped (no user datapath / wire state to migrate). Frozen QPs are
+ * tracked for fini() so the non-kill dump outcomes
+ * (--leave-running / aborted dump) resume the source datapath; a
+ * migrate-and-kill dump leaves them paused.
  *
  * @kernel_driver_id / @pid are unused (the dispatcher already
  * guaranteed rxe QPs and QUERY_QP needs no side-table consult).
@@ -1349,7 +1531,10 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev,
 {
 	struct rxe_restore_qp_req_local blob = {};
 	uint64_t user_handle = 0;
+	uint8_t *sq_img = NULL, *rq_img = NULL, *res_img = NULL;
 	uint8_t *buf;
+	size_t total;
+	bool drained;
 	int rc;
 
 	(void)kernel_driver_id;
@@ -1370,19 +1555,38 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev,
 		return rc;
 	}
 
-	rc = rxe_vfmig_query_qp(lfd, ufile_handle, &blob, &user_handle);
+	/*
+	 * The QP is now paused. Track it (with our own holder-fd dup) so
+	 * fini() can resume it if the dump turns out non-kill -- do this
+	 * before the query, which may fail and bail out below while the
+	 * QP stays frozen.
+	 */
+	rxe_frozen_qp_remember(lfd, ufile_handle);
+
+	sq_img = malloc(RXE_QP_IMAGE_CAP_LOCAL);
+	rq_img = malloc(RXE_QP_IMAGE_CAP_LOCAL);
+	res_img = malloc(RXE_QP_IMAGE_CAP_LOCAL);
+	if (!sq_img || !rq_img || !res_img) {
+		pr_err("rxe: dump_uobj_qp: out of memory for QP image buffers "
+		       "(ufile_handle=%u)\n", ufile_handle);
+		rc = -ENOMEM;
+		goto out_imgs;
+	}
+
+	rc = rxe_vfmig_query_qp(lfd, ufile_handle, &blob, &user_handle,
+				sq_img, rq_img, res_img, RXE_QP_IMAGE_CAP_LOCAL);
 	if (rc) {
 		if (rc == -ENXIO) {
 			pr_debug("rxe: dump_uobj_qp: QUERY_QP(handle=%u) on "
 				 "ibdev=%s returned -ENXIO (kernel-mode "
 				 "QP); skipping per-uobject capture\n",
 				 ufile_handle, ibdev);
-			return -ENXIO;
+			goto out_imgs;
 		}
 		pr_err("rxe: dump_uobj_qp: QUERY_QP(handle=%u) on ibdev=%s "
 		       "failed: %d (%s)\n",
 		       ufile_handle, ibdev, rc, strerror(-rc));
-		return rc;
+		goto out_imgs;
 	}
 
 	/*
@@ -1397,7 +1601,8 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev,
 		       "RES_LQPN=%u disagrees with QUERY_QP blob.qpn=%u; "
 		       "structural inconsistency, aborting dump\n",
 		       ufile_handle, ibdev, qp_attrs->qp_num, blob.qpn);
-		return -EILSEQ;
+		rc = -EILSEQ;
+		goto out_imgs;
 	}
 
 	/*
@@ -1410,36 +1615,104 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev,
 	qp_attrs->has_user_handle = true;
 	qp_attrs->user_handle = user_handle;
 
-	buf = malloc(sizeof(blob));
+	/*
+	 * Drained-vs-in-flight (B1). A QP whose SQ/RQ cursors are level
+	 * and whose responder-resource ring is empty carries no in-flight
+	 * datapath state: zero the image_bytes and ship the fixed header
+	 * alone so the kernel restore takes its cursor-only fast path
+	 * (inlen == sizeof header). Otherwise concatenate the SQ/RQ/RES
+	 * images after the header in slice order SQ,RQ,RES -- the kernel
+	 * slices the RESTORE_QP UHW_IN tail by exactly the header's
+	 * *_image_bytes. SQ is always present on the in-flight path (its
+	 * byte count is the whole ring), even when only the RQ/responder
+	 * side is non-idle, because the tail slicing is positional.
+	 */
+	drained = blob.sq_producer == blob.sq_consumer &&
+		  (blob.rq_image_bytes == 0 ||
+		   blob.rq_producer == blob.rq_consumer) &&
+		  (blob.res_image_bytes == 0 ||
+		   blob.res_head == blob.res_tail);
+
+	if (drained) {
+		blob.sq_image_bytes = 0;
+		blob.rq_image_bytes = 0;
+		blob.res_image_bytes = 0;
+		total = sizeof(blob);
+	} else {
+		if (blob.sq_image_bytes > RXE_QP_IMAGE_CAP_LOCAL ||
+		    blob.rq_image_bytes > RXE_QP_IMAGE_CAP_LOCAL ||
+		    blob.res_image_bytes > RXE_QP_IMAGE_CAP_LOCAL) {
+			pr_err("rxe: dump_uobj_qp ufile_handle=%u: in-flight "
+			       "ring image exceeds the %u-byte uverbs attr "
+			       "cap (sq=%u rq=%u res=%u); deep-ring chunking "
+			       "is a kernel-side follow-up\n",
+			       ufile_handle, RXE_QP_IMAGE_CAP_LOCAL,
+			       blob.sq_image_bytes, blob.rq_image_bytes,
+			       blob.res_image_bytes);
+			rc = -E2BIG;
+			goto out_imgs;
+		}
+		total = sizeof(blob) + blob.sq_image_bytes +
+			blob.rq_image_bytes + blob.res_image_bytes;
+	}
+
+	buf = malloc(total);
 	if (!buf) {
 		pr_err("rxe: dump_uobj_qp: out of memory packing "
 		       "plugin_blob (%zu bytes) for ufile_handle=%u\n",
-		       sizeof(blob), ufile_handle);
-		return -ENOMEM;
+		       total, ufile_handle);
+		rc = -ENOMEM;
+		goto out_imgs;
 	}
 	memcpy(buf, &blob, sizeof(blob));
+	if (!drained) {
+		uint8_t *p = buf + sizeof(blob);
+
+		if (blob.sq_image_bytes) {
+			memcpy(p, sq_img, blob.sq_image_bytes);
+			p += blob.sq_image_bytes;
+		}
+		if (blob.rq_image_bytes) {
+			memcpy(p, rq_img, blob.rq_image_bytes);
+			p += blob.rq_image_bytes;
+		}
+		if (blob.res_image_bytes)
+			memcpy(p, res_img, blob.res_image_bytes);
+	}
 	plugin_blob->data = buf;
-	plugin_blob->len = sizeof(blob);
+	plugin_blob->len = total;
 
 	pr_debug("rxe: dump_uobj_qp ibdev=%s ufile_handle=%u: qpn=%u "
 		 "user_handle=0x%llx sq_vm_pgoff=%#" PRIx64 " "
-		 "rq_vm_pgoff=%#" PRIx64 " (cap/type/state via standard "
+		 "rq_vm_pgoff=%#" PRIx64 " %s (sq_img=%u rq_img=%u "
+		 "res_img=%u, blob=%zuB) (cap/type/state via standard "
 		 "QUERY_QP + NLDEV)\n",
 		 ibdev, ufile_handle, blob.qpn,
 		 (unsigned long long)user_handle, blob.sq_vm_pgoff,
-		 blob.rq_vm_pgoff);
-	return 0;
+		 blob.rq_vm_pgoff, drained ? "drained" : "in-flight",
+		 blob.sq_image_bytes, blob.rq_image_bytes,
+		 blob.res_image_bytes, total);
+	rc = 0;
+out_imgs:
+	free(sq_img);
+	free(rq_img);
+	free(res_img);
+	return rc;
 }
 
 /*
  * RDMA_RESTORE_UOBJ_QP_UHW_PACK hook (rxe).
  *
- * Reads the 184-byte rxe_restore_qp_req packed at dump time into
- * e->plugin_blob and shapes the RESTORE_QP UHW pair:
+ * Reads the rxe_restore_qp_req packed at dump time into e->plugin_blob
+ * and shapes the RESTORE_QP UHW pair:
  *
  *   - UHW_IN is the blob verbatim (every byte of rxe wire state the
  *     destination cannot re-derive from the generic RESTORE_QP
  *     method attrs travels here; rxe_restore_qp stamps it directly).
+ *     For an in-flight (B1) QP the blob is the 232-byte fixed header
+ *     followed by the SQ/RQ/RES ring images, in slice order; the
+ *     kernel locates each by the header's *_image_bytes. A drained QP
+ *     packs the header alone (kernel cursor-only fast path).
  *   - UHW_OUT is always present (sizeof rxe_create_qp_resp = 32).
  *     rxe_restore_qp rejects udata->outlen < sizeof(*uresp) before
  *     any work, so we always wire the receive buffer.
@@ -1467,22 +1740,45 @@ static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e,
 
 	if (!e->has_plugin_blob || e->plugin_blob.len == 0) {
 		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u with empty "
-		       "plugin_blob; image is missing the 184B "
-		       "rxe_restore_qp_req captured at dump via "
-		       "RXE_IB_METHOD_VFMIG_QUERY_QP. Re-dump against a "
-		       "kernel + plugin build that wire the QP dump hook.\n",
+		       "plugin_blob; image is missing the rxe_restore_qp_req "
+		       "header captured at dump via QUERY_QP. Re-dump against "
+		       "a kernel + plugin build that wire the QP dump hook.\n",
 		       e->has_ufile_handle ? e->ufile_handle : 0);
 		return -EINVAL;
 	}
-	if (e->plugin_blob.len != sizeof(struct rxe_restore_qp_req_local)) {
+	/*
+	 * At least the fixed header; the in-flight path appends the
+	 * SQ/RQ/RES image tail. Validate the blob length equals the
+	 * header plus exactly the header's declared image bytes so a
+	 * truncated/garbled image is caught here rather than as a
+	 * mid-restore -EINVAL from the kernel's tail slicer.
+	 */
+	if (e->plugin_blob.len < sizeof(struct rxe_restore_qp_req_local)) {
 		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u plugin_blob "
-		       "len=%zu, expected %zu (rxe_restore_qp_req)\n",
+		       "len=%zu, below the %zu-byte rxe_restore_qp_req "
+		       "header\n",
 		       e->has_ufile_handle ? e->ufile_handle : 0,
 		       e->plugin_blob.len,
 		       sizeof(struct rxe_restore_qp_req_local));
 		return -EINVAL;
 	}
 	pb = (const struct rxe_restore_qp_req_local *)e->plugin_blob.data;
+	{
+		size_t want = sizeof(struct rxe_restore_qp_req_local) +
+			      (size_t)pb->sq_image_bytes +
+			      (size_t)pb->rq_image_bytes +
+			      (size_t)pb->res_image_bytes;
+
+		if (e->plugin_blob.len != want) {
+			pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u "
+			       "plugin_blob len=%zu, expected %zu (232B "
+			       "header + sq=%u rq=%u res=%u image tail)\n",
+			       e->has_ufile_handle ? e->ufile_handle : 0,
+			       e->plugin_blob.len, want, pb->sq_image_bytes,
+			       pb->rq_image_bytes, pb->res_image_bytes);
+			return -EINVAL;
+		}
+	}
 
 	in = malloc(e->plugin_blob.len);
 	if (!in) {

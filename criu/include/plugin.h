@@ -12,6 +12,15 @@
 void cr_plugin_fini(int stage, int err);
 int cr_plugin_init(int stage);
 
+/*
+ * Dump-side: record whether the checkpointed task tree will keep
+ * running after this dump (read back by plugins via
+ * criu_dumpee_will_resume()). Set early from opts.final_state and
+ * refined in cr_dump_finish() once the final ret / post-dump-script
+ * outcome is known.
+ */
+void cr_plugin_dump_set_will_resume(bool will_resume);
+
 typedef struct {
 	struct list_head head;
 	struct list_head hook_chain[CR_PLUGIN_HOOK__MAX];

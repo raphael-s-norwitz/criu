@@ -64,27 +64,49 @@ int rdma_check_dump_coverage(struct pstree_item *root);
 int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
 
 /*
- * R3 dump-side per-uobject DAG walk.
+ * R3 dump-side per-uobject DAG walk, split into two halves so
+ * cr_dump_tasks() can place them on opposite sides of the datapath
+ * freeze + memory snapshot. Together they walk NLDEV per in-tree
+ * ibdev to enumerate the PD/CQ/QP/MR/SRQ uobjects under each in-tree
+ * ucontext and write one rdma_uobj_entry per uobject into
+ * rdma_uobj.img.
  *
- * Runs once at end-of-dump, after every pstree task has been
- * dumped. Walks NLDEV per in-tree ibdev to enumerate the PD/CQ/
- * QP/MR/SRQ uobjects under each in-tree ucontext, and writes one
- * rdma_uobj_entry per discovered uobject into rdma_uobj.img.
+ *   rdma_capture_uobj_dag()  -- order-sensitive. Enumerates uobjects
+ *       over NLDEV and runs the per-class plugin queries (mlx5
+ *       QUERY_QP needs a live command ring; rxe FREEZE_DATAPATH must
+ *       precede the memory copy). Packs each entry with ufile_id
+ *       deferred. Must run *before* the device is frozen and before
+ *       the dumpee's memory is copied -- it is invoked from the early
+ *       capture pass (rdma_capture_uverbs_contexts). Consumes the
+ *       holder_uctx_fd dups. Returns 0 / -1.
  *
- * S1.b scope: discovery and image emission only -- no restore-side
- * action consumes rdma_uobj.img yet (that lands in S1.c). Per-
- * uobject restore verbs come progressively across S2-S6 as kernel
- * support arrives, with the per-class tagging table in
- * linux/tools/testing/mlx5_vfmig/design/uobject_restore.md
- * gating which uobjects gain restore handlers when.
+ *   rdma_emit_uobj_dag()     -- order-insensitive. Serializes the
+ *       captured entries to rdma_uobj.img, binding ufile_id from the
+ *       (by-then assigned) uvfe_id. Runs after the per-task dump.
+ *       Returns 0 / -1, draining the capture list either way.
  *
- * No-op (returns 0 without opening rdma_uobj.img) when no in-tree
- * uverbs context was dumped, which is the common case for the vast
- * majority of CRIU dump targets (no RDMA workload).
- *
- * Returns 0 on success, -1 on netlink/image-emission failure.
+ * Both are no-ops when no in-tree uverbs context was captured, the
+ * common case for the vast majority of dump targets (no RDMA).
  */
-int rdma_dump_uobj_dag(void);
+int rdma_capture_uobj_dag(void);
+int rdma_emit_uobj_dag(void);
+
+/*
+ * Early uverbs-context capture pass.
+ *
+ * Runs in cr_dump_tasks() after the RDMA coverage/exclusivity/
+ * restorability checks and *before* checkpoint_devices() (the
+ * datapath freeze) and the memory snapshot. For every uverbs
+ * context held by the (already SEIZE-stopped) snapshot tree it
+ * dups the dumpee's uverbs cdev fd via pidfd_getfd, records it in
+ * rdma_dumped_ufiles, and runs the order-sensitive half of the
+ * uobject DAG (rdma_capture_uobj_dag) while the device is still
+ * live -- so mlx5 QUERY_QP hits a live command ring and rxe's
+ * in-hook FREEZE_DATAPATH lands before the memory copy.
+ *
+ * No-op for trees that hold no uverbs context. Returns 0 / -1.
+ */
+int rdma_capture_uverbs_contexts(struct pstree_item *root);
 
 /*
  * R3 restore-side per-uobject DAG read+verify pass.
@@ -376,28 +398,6 @@ int rdma_dispatch_dump_uobj_qp(plugin_desc_t *plugin,
 			       pid_t pid,
 			       RdmaQpAttrs *qp_attrs,
 			       ProtobufCBinaryData *plugin_blob);
-
-/*
- * QP-stage bracket dispatchers (snapshot-ordering thaw/re-freeze).
- * rdma_dispatch_dump_pre_qp() calls @plugin's
- * CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP immediately before the per-ibdev
- * RDMA_NL_RES_QP enumeration; rdma_dispatch_dump_post_qp() calls
- * CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP immediately after (and on the
- * QP-stage error path). A plugin that froze the device's datapath at
- * CHECKPOINT_DEVICES uses these to briefly thaw it for the (ring-
- * dependent) QP query and re-freeze afterwards; see the hook docs in
- * criu-plugin.h.
- *
- * Optional hook: a plugin that doesn't register it is a no-op success.
- * pre_qp returning non-zero is dump-fatal (a frozen device would drop
- * its QPs from the NLDEV walk); post_qp errors are logged but not
- * fatal. @plugin is the pointer cached on rdma_dumped_ufile.plugin at
- * CLAIM time; must not be NULL.
- */
-int rdma_dispatch_dump_pre_qp(plugin_desc_t *plugin, const char *ibdev,
-			      uint32_t kernel_driver_id, pid_t pid);
-int rdma_dispatch_dump_post_qp(plugin_desc_t *plugin, const char *ibdev,
-			       uint32_t kernel_driver_id, pid_t pid);
 
 /*
  * Per-PD dump-side dispatcher. Mirror of rdma_dispatch_dump_uobj_cq /

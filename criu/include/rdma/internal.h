@@ -125,4 +125,37 @@ struct rdma_std_qp_attrs {
 int rdma_uverbs_query_qp(int cmd_fd, uint32_t qp_handle,
 			 struct rdma_std_qp_attrs *out);
 
+/*
+ * Identity of a checkpointed uverbs context, resolved from the
+ * cdev's chrdev (major,minor) alone: the ibdev name, its backing
+ * kernel driver (name + RDMA_DRIVER_* id), the CRIU driver id of
+ * the plugin that wins CLAIM arbitration, and a cached pointer to
+ * that plugin. This is the fd-independent half of what
+ * dump_uverbsfile() computes per uverbs fd.
+ */
+struct rdma_uverbs_ctx_ident {
+	char ibdev[64];
+	char driver[64];
+	uint32_t driver_id;
+	uint32_t criu_driver;
+	plugin_desc_t *plugin;
+};
+
+/*
+ * uverbsfd.c: resolve a uverbs cdev (identified by its chrdev
+ * major/minor) to its ibdev / kernel-driver / criu-driver tuple and
+ * the claiming CRIU plugin, running CLAIM arbitration. Shared by
+ * dump_uverbsfile() (the per-fd dump path, which has an fd_parms)
+ * and the early uverbs-context capture pass (which has only a
+ * pidfd-acquired fd plus the cdev's rdev). All inputs are derivable
+ * from the chrdev alone, so neither caller needs a parasite.
+ *
+ * Returns 0 and fills @out on success; -1 with an actionable error
+ * logged on failure (unresolvable ibdev, unknown driver, no/ambiguous
+ * claiming plugin) -- a uverbs context CRIU can't attribute to a
+ * single plugin is unrestorable, so this fails the dump closed.
+ */
+int rdma_resolve_uverbs_cdev(unsigned int rdev_maj, unsigned int rdev_min,
+			     struct rdma_uverbs_ctx_ident *out);
+
 #endif /* __CR_RDMA_INTERNAL_H__ */

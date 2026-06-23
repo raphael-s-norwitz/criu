@@ -104,6 +104,27 @@ int criu_get_image_dir(void)
 	return get_service_fd(IMG_FD_OFF);
 }
 
+/*
+ * Dump-side "will the checkpointed task tree keep running after this
+ * dump?" flag. Set by cr_dump_tasks()/cr_dump_finish() from the same
+ * predicate pstree_switch_state() uses (--leave-running, or a failed
+ * dump / failed post-dump script rolling the tree back to running).
+ * Read by plugins via criu_dumpee_will_resume() (e.g. to decide
+ * whether to undo a dump-time datapath freeze vs. leave the source
+ * quiesced for migration hand-off). Defaults to false until set.
+ */
+static bool plugin_dump_will_resume;
+
+void cr_plugin_dump_set_will_resume(bool will_resume)
+{
+	plugin_dump_will_resume = will_resume;
+}
+
+bool criu_dumpee_will_resume(void)
+{
+	return plugin_dump_will_resume;
+}
+
 static int cr_lib_load(int stage, char *path)
 {
 	cr_plugin_desc_t *d;

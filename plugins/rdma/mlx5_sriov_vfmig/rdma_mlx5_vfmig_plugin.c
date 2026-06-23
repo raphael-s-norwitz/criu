@@ -188,16 +188,17 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 	 * Snapshot-ordering resume (design/snapshot_ordering_pause_
 	 * capture.md Part A). CHECKPOINT_DEVICES parked every tracked VF
 	 * backing the dumpee tree before its memory was copied; now that
-	 * the dump is done (or lost) bring the source datapath back. On a
-	 * successful dump we honor CRIU_VFMIG_KEEP_SUSPENDED=1 (leave the
-	 * source parked for migration / dump-then-destroy); on an aborted
-	 * dump (ret != 0) we always resume so a failed checkpoint never
-	 * strands a live process's VF stopped. No-op when the parked set
+	 * the dump is done (or lost) decide the source datapath's fate
+	 * from criu_dumpee_will_resume(): keep the VF parked only when
+	 * the dumpee will NOT keep running (a successful migrate-and-kill
+	 * dump, opts.final_state == TASK_DEAD). On --leave-running, an
+	 * aborted dump, or a failed post-dump script the predicate is
+	 * true and we resume, so a checkpoint that leaves the process
+	 * alive never strands its VF stopped. No-op when the parked set
 	 * is empty (no early hook ran / no tracked VFs / RESTORE stage).
 	 */
 	if (stage == CR_PLUGIN_STAGE__DUMP)
-		vfmig_resume_suspended_vfs(ret == 0 &&
-					   vfmig_keep_suspended_requested());
+		vfmig_resume_suspended_vfs(!criu_dumpee_will_resume());
 
 	/*
 	 * On restore, close the per-context cdev fds the eager init
@@ -386,10 +387,6 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
 			rdma_mlx5_vfmig_plugin_dump_uobj_cq)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP,
 			rdma_mlx5_vfmig_plugin_dump_uobj_qp)
-CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_PRE_QP,
-			rdma_mlx5_vfmig_plugin_dump_pre_qp)
-CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_POST_QP,
-			rdma_mlx5_vfmig_plugin_dump_post_qp)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK,
 			rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
