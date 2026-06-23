@@ -188,17 +188,24 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 	 * Snapshot-ordering resume (design/snapshot_ordering_pause_
 	 * capture.md Part A). CHECKPOINT_DEVICES parked every tracked VF
 	 * backing the dumpee tree before its memory was copied; now that
-	 * the dump is done (or lost) decide the source datapath's fate
-	 * from criu_dumpee_will_resume(): keep the VF parked only when
-	 * the dumpee will NOT keep running (a successful migrate-and-kill
-	 * dump, opts.final_state == TASK_DEAD). On --leave-running, an
-	 * aborted dump, or a failed post-dump script the predicate is
-	 * true and we resume, so a checkpoint that leaves the process
-	 * alive never strands its VF stopped. No-op when the parked set
-	 * is empty (no early hook ran / no tracked VFs / RESTORE stage).
+	 * the dump is done (or lost) bring the source datapath back --
+	 * unconditionally.
+	 *
+	 * Resuming is always safe here: the memory snapshot is already
+	 * taken (or the dump aborted), so the reason we parked is gone.
+	 * We resume even on a successful kill dump because CRIU does not
+	 * own VF teardown (the orchestrator's sriov_numvfs=0 does), and
+	 * leaving a VF in STOP makes that teardown walk a dead command
+	 * ring (~15-25 min of 60s timeouts; see snapshot_ordering_pause_
+	 * capture.md A.4). The only case that wants the source left parked
+	 * is a live-destination migration hand-off, which has no in-tree
+	 * flow yet and will need an explicit signal -- at which point this
+	 * passes that signal (gated on !criu_dumpee_will_resume()) instead
+	 * of false. No-op when the parked set is empty (no early hook ran /
+	 * no tracked VFs / RESTORE stage).
 	 */
 	if (stage == CR_PLUGIN_STAGE__DUMP)
-		vfmig_resume_suspended_vfs(!criu_dumpee_will_resume());
+		vfmig_resume_suspended_vfs(false);
 
 	/*
 	 * On restore, close the per-context cdev fds the eager init

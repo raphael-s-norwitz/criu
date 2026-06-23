@@ -395,11 +395,13 @@ void vfmig_claimed_clear(void)
  * (pf_bdf, vf_id) pairs this dump parked, so:
  *   - we suspend each VF exactly once (a VF can back several contexts
  *     across several pids), and
- *   - fini(DUMP) can resume them (vfmig_resume_suspended_vfs) -- the
- *     source is brought back to runnable whenever the dumpee keeps
- *     running (criu_dumpee_will_resume(): --leave-running, an aborted
- *     dump, or a failed post-dump script), and left parked only for a
- *     successful migrate-and-kill dump (opts.final_state == TASK_DEAD).
+ *   - fini(DUMP) resumes them all (vfmig_resume_suspended_vfs) -- the
+ *     snapshot is complete by then, so the source is unconditionally
+ *     brought back to runnable. We resume even on a successful kill
+ *     dump: CRIU does not own VF teardown, and leaving a VF in STOP
+ *     across the orchestrator's sriov_numvfs=0 makes teardown walk a
+ *     dead command ring. A live-destination migration that wants the
+ *     source left parked is a future explicit signal, not the default.
  * The kernel SAVE_VHCA_STATE is suspend-aware: for a VF already in this
  * set it skips its self-suspend and the resume-on-close, leaving the
  * resume to us. The kernel also force-resumes any still-parked VF at
@@ -573,13 +575,14 @@ int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid)
 
 /*
  * Resume (or deliberately leave parked) every VF this dump suspended.
- * Called from fini(DUMP). @keep_suspended (i.e. !criu_dumpee_will_
- * resume()) leaves the source parked for a successful migrate-and-kill
- * dump; otherwise -- --leave-running, an aborted dump, or a failed
- * post-dump script -- the source is brought back to runnable.
- * Best-effort: a failed RESUME
- * is logged but we still drop the tracking entry (the kernel's
- * SR-IOV-teardown force-resume is the backstop). Frees the parked set.
+ * Called from fini(DUMP). @keep_suspended leaves the source parked
+ * rather than resuming it; today callers always pass false (the
+ * snapshot is complete, so resuming is unconditionally correct -- see
+ * rdma_mlx5_vfmig_plugin_fini). The parameter is retained for the
+ * future live-destination migration hand-off, the only case that wants
+ * the source left quiesced. Best-effort: a failed RESUME is logged but
+ * we still drop the tracking entry (the kernel's SR-IOV-teardown
+ * force-resume is the backstop). Frees the parked set.
  */
 void vfmig_resume_suspended_vfs(bool keep_suspended)
 {
@@ -707,30 +710,24 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 	ss.vf_id = vf_id;
 
 	/*
-	 * SAVE flag policy. The source VF's post-dump fate is the
-	 * migration question "will the dumpee keep running?", answered by
-	 * criu_dumpee_will_resume() -- NOT a separate knob:
+	 * SAVE flag policy. Who resumes the source VF depends only on
+	 * whether it was parked at CHECKPOINT_DEVICES:
 	 *
 	 *   - parked at CHECKPOINT_DEVICES (the normal snapshot-ordering
-	 *     path): always KEEP_SUSPENDED so SAVE doesn't resume on
-	 *     close; fini's vfmig_resume_suspended_vfs() owns the resume
-	 *     decision for the whole tracked set.
-	 *   - not parked + migrate-and-kill (!criu_dumpee_will_resume()):
-	 *     KEEP_SUSPENDED -- a successful migrate leaves the source
-	 *     quiesced through kill, so it can't emit datapath traffic
-	 *     that diverges from the state handed to the destination.
-	 *   - not parked + will-resume (--leave-running / aborted dump):
-	 *     flags=0, kernel resumes the VF on save_fd close.
+	 *     path): KEEP_SUSPENDED so SAVE doesn't resume on close -- the
+	 *     VF is in fini's tracked set and fini's
+	 *     vfmig_resume_suspended_vfs() owns the (unconditional) resume.
+	 *   - not parked (fallback: early hook didn't run / fd enumeration
+	 *     missed it): flags=0 so the kernel resumes the VF on save_fd
+	 *     close, since it is NOT in fini's set and nothing else will.
 	 *
-	 * Note on teardown cost: leaving a VF in STOP across the
-	 * orchestrator's sriov_numvfs=0 makes pci_disable_sriov() walk the
-	 * VF's dead command ring (one ~60s MLX5_CMD_TIMEOUT per DESTROY,
-	 * ~15-25 min total; see snapshot_ordering_pause_capture.md A.4).
-	 * That is an orchestrator/kernel concern, not CRIU's: a successful
-	 * migrate-and-kill correctly leaves the source parked, and the
-	 * orchestrator must RESUME_VHCA (or the kernel must resume parked
-	 * VFs before per-VF teardown) ahead of destroy. CRIU only encodes
-	 * the migration intent here.
+	 * Either way the source ends up resumed. We do not leave a VF in
+	 * STOP across a dump: CRIU does not own VF teardown, and a parked
+	 * VF makes the orchestrator's sriov_numvfs=0 walk a dead command
+	 * ring (~15-25 min of 60s timeouts; see snapshot_ordering_pause_
+	 * capture.md A.4). Leaving the source quiesced for a live-
+	 * destination migration hand-off is a future explicit signal,
+	 * handled in fini, not here.
 	 */
 	if (vfmig_suspended_lookup(pf_bdf, vf_id)) {
 		/*
@@ -744,23 +741,17 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 		 * against an older suspend-unaware kernel.)
 		 */
 		ss.flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
-	} else if (!criu_dumpee_will_resume()) {
+	} else {
 		/*
 		 * Fallback: this VF was NOT pre-suspended at CHECKPOINT_
 		 * DEVICES (e.g. the early hook didn't run, or fd enumeration
-		 * missed it). SAVE will self-suspend now -- which means the
-		 * dumpee's memory for this VF was copied while its datapath
-		 * was still live (the stop-and-copy window this fix exists to
-		 * close). Warn, and keep the VF parked since the dumpee will
-		 * not keep running (migrate-and-kill); fini's resume owns the
-		 * non-kill paths. criu_dumpee_will_resume() reflects the
-		 * up-front opts.final_state intent at this mid-dump point.
+		 * missed it), so it is not in fini's resume set. SAVE will
+		 * self-suspend now -- which means the dumpee's memory for
+		 * this VF was copied while its datapath was still live (the
+		 * stop-and-copy window this fix exists to close). Leave
+		 * flags=0 so the kernel resumes this VF on save_fd close,
+		 * since nothing else will. Warn either way.
 		 */
-		pr_warn("vfmig: pf=%s vf_id=%u not parked at CHECKPOINT_DEVICES; "
-			"SAVE self-suspends -- memory snapshot for this VF may "
-			"be inconsistent with a live peer\n", pf_bdf, vf_id);
-		ss.flags = MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
-	} else {
 		pr_warn("vfmig: pf=%s vf_id=%u not parked at CHECKPOINT_DEVICES; "
 			"SAVE self-suspends + resumes on close -- memory "
 			"snapshot for this VF may be inconsistent with a live "

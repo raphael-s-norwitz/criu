@@ -230,9 +230,10 @@ void vfmig_drain_pending_in_fini(void);
  * mid-snapshot MR pages.
  *
  * vfmig_resume_suspended_vfs() issues MLX5_VFMIG_IOC_RESUME_VHCA on
- * every VF this dump parked. Called from fini(DUMP): @keep_suspended
- * leaves the VFs parked (migration / dump-then-destroy), otherwise the
- * source is resumed (default, and always on an aborted dump).
+ * every VF this dump parked. Called from fini(DUMP); callers pass
+ * @keep_suspended=false today (the snapshot is done, so resuming is
+ * unconditional). @keep_suspended is retained for the future live-
+ * destination migration hand-off that wants the source left quiesced.
  */
 void vfmig_suspended_clear(void);
 int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid);
