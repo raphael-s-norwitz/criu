@@ -113,6 +113,15 @@ static const int G_CQ_CQE = 16;
 static struct ibv_qp *g_qp;
 static uint32_t g_qp_num;
 /*
+ * Non-drained-SQ (HM_PD_CQ_QP_SQ) in-flight send buffer + its MR. One
+ * page registered LOCAL_WRITE; the SEND reads [SQ_INFLIGHT_SEND_OFF]
+ * and the post-restore recv lands into [SQ_INFLIGHT_RECV_OFF]. Kept
+ * alive across dump/restore so the post-restore check can post the
+ * matching recv and verify the replayed payload.
+ */
+static struct ibv_mr *g_sq_mr;
+static void *g_sq_buf;
+/*
  * Pre-dump MR: registered alongside g_pd when @g_mode covers MR
  * (currently rxe S4a). Needs survive across SAVE_VHCA_STATE /
  * dump and re-emerge in the destination ucontext at the same
@@ -245,6 +254,23 @@ enum holder_mode {
 	 * try to re-prove it from userspace.
 	 */
 	HM_PD_CQ_QP = 4,
+	/*
+	 * "pd_cq_qp_sq": same pre-dump shape as HM_PD_CQ_QP (PD + CQ +
+	 * self-loopback RC QP at RTS) plus a registered MR and one
+	 * SIGNALED SEND posted into the SQ but deliberately *left
+	 * outstanding* at snapshot -- no recv is posted, so with
+	 * rnr_retry=7 (infinite) the requester RNR-stalls and the WQE
+	 * stays in [sq_consumer, sq_producer). This is the non-drained-SQ
+	 * in-flight QP restore case (design/rxe_inflight_qp_restore.md
+	 * §6.2). On restore the QP is born datapath-frozen; the rxe CRIU
+	 * plugin's RESUME_DEVICES_LATE thaw (FREEZE_CONTEXT(freeze=0))
+	 * replays the rewound SQ window. Post-restore the holder posts the
+	 * matching recv and proves the replayed SEND completes (send +
+	 * recv WC SUCCESS) and moved the pre-dump payload bytes -- without
+	 * any fresh post_send. Distinct from pd_cq_qp, which drains before
+	 * READY and only proves the QP is destroyable.
+	 */
+	HM_PD_CQ_QP_SQ = 5,
 };
 static enum holder_mode g_mode = HM_PD;
 
@@ -878,6 +904,237 @@ static void run_post_restore_checks_pd_cq_qp(void)
 	write_status("OK");
 }
 
+/*
+ * Non-drained-SQ (HM_PD_CQ_QP_SQ) byte layout + identifiers. One
+ * registered page; the SEND SGE reads the first SQ_INFLIGHT_PAYLOAD
+ * bytes (stamped with the i^base pattern pre-dump) and the matching
+ * recv lands into a well-separated region so a partial/short transfer
+ * surfaces as a localised mismatch rather than overlapping the source.
+ */
+#define SQ_INFLIGHT_BASE     0x3cu
+#define SQ_INFLIGHT_PAYLOAD  64u
+#define SQ_INFLIGHT_SEND_OFF 0u
+#define SQ_INFLIGHT_RECV_OFF 2048u
+#define SQ_INFLIGHT_BUF_SZ   4096u
+#define SQ_INFLIGHT_SEND_WR  0x5105ull
+#define SQ_INFLIGHT_RECV_WR  0x5106ull
+
+static int sq_inflight_post_send(void)
+{
+	struct ibv_sge sge = {
+		.addr   = (uintptr_t)((uint8_t *)g_sq_buf + SQ_INFLIGHT_SEND_OFF),
+		.length = SQ_INFLIGHT_PAYLOAD,
+		.lkey   = g_sq_mr->lkey,
+	};
+	struct ibv_send_wr wr;
+	struct ibv_send_wr *bad = NULL;
+	memset(&wr, 0, sizeof(wr));
+	wr.wr_id      = SQ_INFLIGHT_SEND_WR;
+	wr.sg_list    = &sge;
+	wr.num_sge    = 1;
+	wr.opcode     = IBV_WR_SEND;
+	wr.send_flags = IBV_SEND_SIGNALED;
+	return ibv_post_send(g_qp, &wr, &bad);
+}
+
+static int sq_inflight_post_recv(void)
+{
+	struct ibv_sge sge = {
+		.addr   = (uintptr_t)((uint8_t *)g_sq_buf + SQ_INFLIGHT_RECV_OFF),
+		.length = SQ_INFLIGHT_PAYLOAD,
+		.lkey   = g_sq_mr->lkey,
+	};
+	struct ibv_recv_wr wr;
+	struct ibv_recv_wr *bad = NULL;
+	memset(&wr, 0, sizeof(wr));
+	wr.wr_id   = SQ_INFLIGHT_RECV_WR;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+	return ibv_post_recv(g_qp, &wr, &bad);
+}
+
+/*
+ * Post-restore checks for HM_PD_CQ_QP_SQ -- the non-drained-SQ
+ * in-flight replay test (design/rxe_inflight_qp_restore.md §6.2).
+ *
+ * Pre-dump the holder posted one SIGNALED SEND into the SQ and left it
+ * outstanding (no recv => RNR, rnr_retry=7 infinite), so the dump
+ * captured a genuinely non-drained SQ (sq_consumer != sq_producer) and
+ * the kernel restored the QP born datapath-frozen. The rxe CRIU
+ * plugin's RESUME_DEVICES_LATE hook has, by the time this runs, issued
+ * FREEZE_CONTEXT(freeze=0) -- which re-armed the requester and replayed
+ * the rewound SQ window. The replayed SEND is now RNR-retrying against
+ * our still-empty RQ.
+ *
+ * We post the matching recv; the replayed SEND then lands. Asserting
+ * BOTH a send completion and a recv completion (WC_SUCCESS) plus the
+ * payload bytes proves: (1) the in-flight SQ window survived
+ * dump/restore byte-for-byte, (2) the thaw actually replayed it (no
+ * fresh post_send was issued), and (3) the restored MR's lkey + pinned
+ * pages resolve on the rxe data path. A born-frozen QP that never
+ * thawed would time out here; a corrupt replay would surface as a
+ * non-SUCCESS WC or a byte mismatch.
+ */
+static void run_post_restore_checks_pd_cq_qp_sq(void)
+{
+	char msg[512];
+	struct ibv_wc wc;
+	uint8_t *send_region, *recv_region;
+	uint32_t recv_byte_len = 0;
+	int rc, i;
+	int got_send = 0, got_recv = 0;
+	ssize_t miss;
+
+	if (!g_pd || !g_cq || !g_qp || !g_sq_mr || !g_sq_buf) {
+		write_status("FAIL: post-restore(sq_inflight): a restored "
+			     "object reference (pd/cq/qp/mr/buf) is missing");
+		return;
+	}
+	if (g_qp->qp_num != g_qp_num) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: sq_inflight QP qp_num drifted across restore: "
+			 "%u (pre-dump) != %u (post-restore)",
+			 g_qp_num, g_qp->qp_num);
+		write_status(msg);
+		return;
+	}
+
+	rc = sq_inflight_post_recv();
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: sq_inflight ibv_post_recv post-restore: "
+			 "%d (%s)", rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+
+	/*
+	 * ~5s ceiling (500 * 10ms). A healthy RC self-loopback completes
+	 * in microseconds once the recv is posted; the long ceiling is for
+	 * a clear timeout error rather than an indefinite hang if the thaw
+	 * never replayed the SEND.
+	 */
+	for (i = 0; i < 500 && !(got_send && got_recv); i++) {
+		int n = ibv_poll_cq(g_cq, 1, &wc);
+
+		if (n < 0) {
+			write_status("FAIL: sq_inflight ibv_poll_cq < 0");
+			return;
+		}
+		if (n == 0) {
+			usleep(10000);
+			continue;
+		}
+		if (wc.status != IBV_WC_SUCCESS) {
+			snprintf(msg, sizeof(msg),
+				 "FAIL: sq_inflight wr_id=0x%llx wc.status=%d "
+				 "(%s) opcode=%d -- the replayed in-flight SEND "
+				 "did not complete cleanly post-restore (the "
+				 "born-frozen QP's rewound SQ window is broken)",
+				 (unsigned long long)wc.wr_id, wc.status,
+				 ibv_wc_status_str(wc.status), wc.opcode);
+			write_status(msg);
+			return;
+		}
+		if (wc.wr_id == SQ_INFLIGHT_SEND_WR) {
+			got_send = 1;
+		} else if (wc.wr_id == SQ_INFLIGHT_RECV_WR) {
+			got_recv = 1;
+			recv_byte_len = wc.byte_len;
+		}
+	}
+	if (!(got_send && got_recv)) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: sq_inflight timed out (send=%d recv=%d) -- the "
+			 "in-flight SEND did not replay after the restore thaw. "
+			 "The born-frozen QP never resumed, or "
+			 "FREEZE_CONTEXT(freeze=0) (RESUME_DEVICES_LATE) did not "
+			 "fire / did not reach this ucontext.",
+			 got_send, got_recv);
+		write_status(msg);
+		return;
+	}
+
+	send_region = (uint8_t *)g_sq_buf + SQ_INFLIGHT_SEND_OFF;
+	recv_region = (uint8_t *)g_sq_buf + SQ_INFLIGHT_RECV_OFF;
+	/*
+	 * Diagnostic: surface the recv byte_len and the *current* send
+	 * region contents (read straight from the restored holder VA).
+	 * This disambiguates a payload-zero failure: if send_region still
+	 * holds the i^base pattern then the holder's memory restored fine
+	 * and a zero/short delivery points at the kernel's replay (cursor
+	 * rewind / DMA resid), whereas a zeroed send_region points at the
+	 * MR-backed memory restore.
+	 */
+	printf("SQ_INFLIGHT_DIAG: recv_byte_len=%u send[0..3]=%02x%02x%02x%02x "
+	       "recv[0..3]=%02x%02x%02x%02x\n",
+	       recv_byte_len, send_region[0], send_region[1], send_region[2],
+	       send_region[3], recv_region[0], recv_region[1], recv_region[2],
+	       recv_region[3]);
+	fflush(stdout);
+
+	miss = verify_pattern(recv_region, SQ_INFLIGHT_PAYLOAD,
+			      SQ_INFLIGHT_BASE);
+	if (miss >= 0) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: sq_inflight byte verify: recv[%zd]=0x%02x "
+			 "expected 0x%02x (recv_byte_len=%u, send[0]=0x%02x) -- "
+			 "the replayed SEND completed but moved wrong/zero "
+			 "bytes. send[0]==pattern => kernel replay rewind/DMA "
+			 "resid bug; send[0]==0 => MR-backed memory restore lost "
+			 "the payload",
+			 miss, recv_region[miss],
+			 (uint8_t)(((size_t)miss) ^ SQ_INFLIGHT_BASE),
+			 recv_byte_len, send_region[0]);
+		write_status(msg);
+		return;
+	}
+
+	printf("SQ_INFLIGHT: ok qp=0x%x payload=%u replayed send+recv "
+	       "completed post-restore\n", g_qp_num, SQ_INFLIGHT_PAYLOAD);
+	fflush(stdout);
+
+	/* Dependency-ordered teardown: QP -> MR -> CQ -> PD. */
+	rc = ibv_destroy_qp(g_qp);
+	g_qp = NULL;
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: sq_inflight ibv_destroy_qp: %d (%s)",
+			 rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+	rc = ibv_dereg_mr(g_sq_mr);
+	g_sq_mr = NULL;
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: sq_inflight ibv_dereg_mr: %d (%s)",
+			 rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+	rc = ibv_destroy_cq(g_cq);
+	g_cq = NULL;
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: sq_inflight ibv_destroy_cq: %d (%s)",
+			 rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+	rc = ibv_dealloc_pd(g_pd);
+	g_pd = NULL;
+	if (rc) {
+		snprintf(msg, sizeof(msg),
+			 "FAIL: sq_inflight ibv_dealloc_pd: %d (%s)",
+			 rc, strerror(rc));
+		write_status(msg);
+		return;
+	}
+
+	write_status("OK");
+}
+
 static void run_post_restore_checks(void)
 {
 	struct ibv_device_attr dev_attr;
@@ -1200,9 +1457,11 @@ int main(int argc, char **argv)
 		g_mode = HM_PD_2CQ;
 	} else if (strcmp(mode, "pd_cq_qp") == 0) {
 		g_mode = HM_PD_CQ_QP;
+	} else if (strcmp(mode, "pd_cq_qp_sq") == 0) {
+		g_mode = HM_PD_CQ_QP_SQ;
 	} else {
-		fprintf(stderr, "unknown holder mode '%s' "
-				"(expected pd|pd_mr|pd_cq|pd_2cq|pd_cq_qp)\n",
+		fprintf(stderr, "unknown holder mode '%s' (expected "
+				"pd|pd_mr|pd_cq|pd_2cq|pd_cq_qp|pd_cq_qp_sq)\n",
 			mode);
 		return 2;
 	}
@@ -1310,12 +1569,14 @@ int main(int argc, char **argv)
 				g_cq_b_comp_vector, strerror(errno));
 			return 2;
 		}
-	} else if (g_mode == HM_PD_CQ_QP) {
+	} else if (g_mode == HM_PD_CQ_QP || g_mode == HM_PD_CQ_QP_SQ) {
 		/*
 		 * Pre-dump CQ + RC QP, advanced through INIT -> RTR ->
 		 * RTS via self-loopback. Reuses the phase_j_modify_*
 		 * helpers that already drive the same chain post-
-		 * restore in HM_PD_MR's Phase J.
+		 * restore in HM_PD_MR's Phase J. HM_PD_CQ_QP_SQ then
+		 * additionally registers an MR and posts one SEND it
+		 * leaves outstanding (see below).
 		 */
 		struct ibv_qp_init_attr qp_init = {0};
 		struct ibv_port_attr port_attr;
@@ -1392,6 +1653,50 @@ int main(int argc, char **argv)
 				"pd_cq_qp: modify RTS: %d (%s)\n",
 				err, strerror(err));
 			return 2;
+		}
+
+		if (g_mode == HM_PD_CQ_QP_SQ) {
+			/*
+			 * Register the in-flight MR and post one SIGNALED
+			 * SEND, then deliberately do NOT post a recv and do
+			 * NOT poll. With rnr_retry=7 (infinite, set in
+			 * phase_j_modify_rts) the self-loopback SEND
+			 * RNR-stalls -- it can never complete because our own
+			 * RQ is empty -- so it stays in [sq_consumer,
+			 * sq_producer) regardless of timing. The dump thus
+			 * captures a genuinely non-drained SQ; the matching
+			 * recv is posted only in the post-restore check, after
+			 * the thaw has replayed the rewound window.
+			 */
+			if (posix_memalign(&g_sq_buf, 4096,
+					   SQ_INFLIGHT_BUF_SZ) != 0 ||
+			    !g_sq_buf) {
+				fprintf(stderr,
+					"posix_memalign(%u) for sq_inflight "
+					"buf: %s\n", SQ_INFLIGHT_BUF_SZ,
+					strerror(errno));
+				return 2;
+			}
+			memset(g_sq_buf, 0, SQ_INFLIGHT_BUF_SZ);
+			fill_pattern((uint8_t *)g_sq_buf + SQ_INFLIGHT_SEND_OFF,
+				     SQ_INFLIGHT_PAYLOAD, SQ_INFLIGHT_BASE);
+			g_sq_mr = ibv_reg_mr(g_pd, g_sq_buf,
+					     SQ_INFLIGHT_BUF_SZ,
+					     IBV_ACCESS_LOCAL_WRITE);
+			if (!g_sq_mr) {
+				fprintf(stderr,
+					"ibv_reg_mr(sq_inflight): %s\n",
+					strerror(errno));
+				return 2;
+			}
+			err = sq_inflight_post_send();
+			if (err) {
+				fprintf(stderr,
+					"sq_inflight: ibv_post_send "
+					"(leave-outstanding): %d (%s)\n",
+					err, strerror(err));
+				return 2;
+			}
 		}
 	}
 
@@ -1529,7 +1834,8 @@ int main(int argc, char **argv)
 		       g_pd->handle,
 		       g_cq->handle, g_cq->cqe,
 		       g_cq_b->handle, g_cq_b->cqe, g_cq_b_comp_vector);
-	} else if (g_mode == HM_PD_CQ_QP && g_cq && g_qp) {
+	} else if ((g_mode == HM_PD_CQ_QP || g_mode == HM_PD_CQ_QP_SQ) &&
+		   g_cq && g_qp) {
 		/*
 		 * Expose pre-dump QP qp_num + ufile_handle so the
 		 * runner can cross-check identity continuity post-
@@ -1560,6 +1866,8 @@ int main(int argc, char **argv)
 				run_post_restore_checks_pd_cq();
 			else if (g_mode == HM_PD_CQ_QP)
 				run_post_restore_checks_pd_cq_qp();
+			else if (g_mode == HM_PD_CQ_QP_SQ)
+				run_post_restore_checks_pd_cq_qp_sq();
 			else
 				run_post_restore_checks();
 		}
@@ -1571,6 +1879,11 @@ int main(int argc, char **argv)
 	free(g_mr_alloc);
 	g_mr_alloc = NULL;
 	g_mr_buf = NULL;
+	if (g_sq_mr)
+		ibv_dereg_mr(g_sq_mr);
+	g_sq_mr = NULL;
+	free(g_sq_buf);
+	g_sq_buf = NULL;
 	/* Reverse-creation-order teardown so dependents fall before
 	 * their parents. QP -> CQ_b -> CQ_a -> PD. */
 	if (g_qp)

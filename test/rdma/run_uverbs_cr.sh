@@ -57,7 +57,7 @@ WORKDIR="$(mktemp -d /tmp/uverbs-cr.XXXXXX)"
 # would otherwise contend for /dev/infiniband/uverbsN. The pgrep
 # pattern matches the same argv shape we exec below for any of
 # the holder modes this script drives.
-pkill -KILL -fx "$PROG rxe0 .* (pd_mr|pd_cq)" 2>/dev/null || true
+pkill -KILL -fx "$PROG rxe0 .* (pd_mr|pd_cq|pd_2cq|pd_cq_qp|pd_cq_qp_sq)" 2>/dev/null || true
 
 cleanup() {
 	local pidfile p
@@ -534,6 +534,51 @@ run_pass() {
 		     "$(grep -E '^PHASE_J: ' "$LOG" | head -1)"
 	fi
 
+	if [[ "$RESULT" == "OK" && "$holder_mode" == "pd_cq_qp_sq" ]]; then
+		#
+		# 5b. Non-drained-SQ in-flight replay
+		#     (design/rxe_inflight_qp_restore.md §6.2).
+		#
+		# The holder posted a SEND into the SQ pre-dump and left it
+		# outstanding (RNR-stalled, no recv), so the dump captured a
+		# non-drained SQ. status=OK already means the post-restore
+		# recv drew BOTH a send and a recv WC_SUCCESS and the payload
+		# bytes matched -- i.e. the rewound SQ window survived
+		# dump/restore and replayed without a fresh post_send. The
+		# log grep is defense-in-depth on the status-vs-log invariant.
+		#
+		if ! grep -qE 'SQ_INFLIGHT: ok qp=0x[0-9a-f]+ payload=[1-9][0-9]* replayed send\+recv completed post-restore' \
+			"$LOG"; then
+			echo "FAIL: holder reported OK but holder.log has no" \
+			     "SQ_INFLIGHT: ok line -- status-vs-log invariant" \
+			     "broken (the in-flight completion print was" \
+			     "dropped or the check was bypassed)." >&2
+			echo "--- holder log tail ---" >&2
+			tail -40 "$LOG" >&2 || true
+			exit 1
+		fi
+		# The replay is driven by the rxe plugin's RESUME_DEVICES_LATE
+		# thaw (FREEZE_CONTEXT(freeze=0)). If it never fired, the
+		# born-frozen QP could not have replayed and the holder would
+		# have timed out -- but assert the thaw line too so a future
+		# regression that makes the SEND complete some other way (e.g.
+		# the kernel stops born-freezing) is caught loudly rather than
+		# silently passing for the wrong reason.
+		if ! grep -qE 'resume_late: thawed restored ucontext' \
+			"$DUMPDIR/restore.log"; then
+			echo "FAIL: pd_cq_qp_sq passed but restore.log shows" \
+			     "no rxe resume_late thaw -- the in-flight replay" \
+			     "trigger (FREEZE_CONTEXT freeze=0) never fired;" \
+			     "the SEND completed for the wrong reason." >&2
+			echo "--- restore log resume_late lines ---" >&2
+			grep -E 'resume_late' "$DUMPDIR/restore.log" >&2 || \
+				echo "(no resume_late lines at all)" >&2
+			exit 1
+		fi
+		echo "SQ in-flight replay:" \
+		     "$(grep -E '^SQ_INFLIGHT: ' "$LOG" | head -1)"
+	fi
+
 	if [[ "$RESULT" != "OK" ]]; then
 		echo "FAIL ($pass)"
 		# Holder runs the §S3b incremental-coverage acid test:
@@ -653,6 +698,40 @@ else
 	echo "[skip] pd_cq_qp pass disabled by UVERBS_CR_RUN_PD_CQ_QP=0."
 	echo "       Default is to run; this switch exists for kernels"
 	echo "       that pre-date rxe RESTORE_QP / VFMIG_QUERY_QP."
+fi
+# pd_cq_qp_sq -- the non-drained-SQ in-flight QP restore case
+# (design/rxe_inflight_qp_restore.md §6.2). Same shape as pd_cq_qp but
+# the holder posts a SIGNALED SEND it leaves outstanding at snapshot
+# (RNR-stalled, no recv), so the dump captures a non-drained SQ. On
+# restore the QP is born datapath-frozen and the rxe plugin's
+# RESUME_DEVICES_LATE thaw (FREEZE_CONTEXT freeze=0) replays the rewound
+# SQ window; the holder posts the matching recv post-restore and proves
+# the replayed SEND completes + moved the pre-dump payload, with no
+# fresh post_send. This is the pass that actually exercises the
+# born-frozen + thaw-and-replay datapath (pd_cq_qp only proves the
+# drained QP is destroyable).
+#
+# DEFAULT OFF (opt-in via UVERBS_CR_RUN_PD_CQ_QP_SQ=1): this pass
+# currently FAILS against the kernel in this tree -- it caught a real
+# rxe replay-rewind bug. The thaw replays the in-flight SEND (both
+# completions fire) but the rewound WQE's DMA cursor is not reset, so
+# the requester re-transmits a 0-byte payload (recv_byte_len=0) even
+# though the restored send buffer is byte-correct. Root cause:
+# rxe_qp_resume() (drivers/infiniband/sw/rxe/rxe_qp.c) kicks send_task
+# for the [sq_consumer, sq_producer) window without setting
+# qp->req.need_retry, so req_retry() (rxe_req.c) never resets
+# dma.resid/cur_sge/sge_offset + wqe_state_posted on the replayed WQEs.
+# Flip this default to 1 once the kernel fix lands and re-validate
+# (expect "SQ_INFLIGHT: ok ... " with recv_byte_len=64).
+if [[ "${UVERBS_CR_RUN_PD_CQ_QP_SQ:-0}" == "1" ]]; then
+	run_pass pd_cq_qp_sq pd_cq_qp_sq 0
+else
+	echo
+	echo "[skip] pd_cq_qp_sq pass disabled by default"
+	echo "       (UVERBS_CR_RUN_PD_CQ_QP_SQ=0). The non-drained-SQ"
+	echo "       in-flight replay exercises a kernel rewind path that is"
+	echo "       still being fixed (replay re-sends 0 bytes); opt in with"
+	echo "       UVERBS_CR_RUN_PD_CQ_QP_SQ=1 once the kernel fix lands."
 fi
 
 echo
