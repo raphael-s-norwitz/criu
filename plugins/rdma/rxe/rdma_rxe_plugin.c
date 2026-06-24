@@ -201,7 +201,7 @@ struct rxe_frozen_qp {
 static struct rxe_frozen_qp *rxe_frozen_qps = NULL;
 
 /* defined later in the file (FREEZE_DATAPATH ioctl wrapper) */
-static int rxe_vfmig_freeze_datapath(int fd, uint32_t qp_handle, uint8_t freeze);
+static int rxe_freeze_datapath(int fd, uint32_t qp_handle, uint8_t freeze);
 
 static void rxe_frozen_qp_remember(int lfd, uint32_t qp_handle)
 {
@@ -246,7 +246,7 @@ static void rxe_frozen_qps_release(bool resume)
 	for (e = rxe_frozen_qps; e; e = next) {
 		next = e->next;
 		if (resume) {
-			int rc = rxe_vfmig_freeze_datapath(e->fd, e->qp_handle, 0);
+			int rc = rxe_freeze_datapath(e->fd, e->qp_handle, 0);
 
 			if (rc)
 				pr_warn("rxe: fini: FREEZE_DATAPATH(freeze=0, handle=%u) "
@@ -850,7 +850,7 @@ static int rxe_chrdev_to_ibdev(dev_t rdev, char *out, size_t outsz)
  * No per-VMA join key is needed: source pgoff equals dest pgoff
  * once piece (1) lands, so UPDATE_VMA_MAP only substitutes the
  * fd. The source vm_pgoff each CQ's UHW_IN replays is sourced at
- * dump time from RXE_IB_METHOD_VFMIG_QUERY_CQ (rdma_rxe_plugin_
+ * dump time from RXE_IB_METHOD_QUERY_CQ (rdma_rxe_plugin_
  * dump_uobj_cq below), keyed by the CQ's ufile_handle -- not from
  * a /proc/<pid>/smaps VMA scrape, which could not tell a CQ ring
  * apart from a QP's SQ/RQ ring on a shared ufile.
@@ -908,34 +908,34 @@ static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
 }
 
 /*
- * UAPI shims for the rxe VFMIG dump-side uverbs object, mirrors of
+ * UAPI shims for the rxe migrate dump-side uverbs object, mirrors of
  *   include/uapi/rdma/rxe_user_ioctl_cmds.h
- *     enum rxe_ib_objects        { RXE_IB_OBJECT_VFMIG = (1<<NS_SHIFT) };
- *     enum rxe_ib_vfmig_methods  { ..._FREEZE_DATAPATH, ..._QUERY_QP,
+ *     enum rxe_ib_objects        { RXE_IB_OBJECT_MIGRATE = (1<<NS_SHIFT) };
+ *     enum rxe_ib_migrate_methods  { ..._FREEZE_DATAPATH, ..._QUERY_QP,
  *                                  ..._QUERY_CQ };
- *     enum rxe_ib_vfmig_query_cq_attrs { ..._HANDLE, ..._RESP_BLOB };
+ *     enum rxe_ib_query_cq_attrs { ..._HANDLE, ..._RESP_BLOB };
  *
  * UVERBS_ID_NS_SHIFT is 12 across the uverbs UAPI; pinned locally here
  * (matching the mlx5_vfmig plugin's UVERBS_ID_NS_SHIFT_LOCAL) so a
- * header drift can't silently shift these ids. RXE_IB_OBJECT_VFMIG is
+ * header drift can't silently shift these ids. RXE_IB_OBJECT_MIGRATE is
  * the first (and only) rxe driver object, so it sits at (1<<SHIFT)+0;
  * QUERY_CQ is the third method (FREEZE_DATAPATH=+0, QUERY_QP=+1,
  * QUERY_CQ=+2). Keep in sync with the kernel UAPI; remove once host
  * rdma-core ships rxe_user_ioctl_cmds.h.
  */
 #define RXE_UVERBS_ID_NS_SHIFT_LOCAL 12
-#define RXE_IB_OBJECT_VFMIG_LOCAL \
+#define RXE_IB_OBJECT_MIGRATE_LOCAL \
 	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
-#define RXE_IB_METHOD_VFMIG_QUERY_CQ_LOCAL \
+#define RXE_IB_METHOD_QUERY_CQ_LOCAL \
 	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
-#define RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL \
+#define RXE_IB_ATTR_QUERY_CQ_HANDLE_LOCAL \
 	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
-#define RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB_LOCAL \
+#define RXE_IB_ATTR_QUERY_CQ_RESP_BLOB_LOCAL \
 	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 
 /*
  * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
- * rxe_query_cq_resp (16 bytes): the RXE_IB_METHOD_VFMIG_QUERY_CQ
+ * rxe_query_cq_resp (16 bytes): the RXE_IB_METHOD_QUERY_CQ
  * PTR_OUT blob. @vm_pgoff is the CQ ring's mmap byte offset
  * (cq->queue->ip->info.offset); @cqe is the CQ's user-visible entry
  * count (cq->ibcq.cqe). Remove once host rdma-core ships the struct.
@@ -947,7 +947,7 @@ struct rxe_query_cq_resp_local {
 };
 
 /*
- * Issue RXE_IB_METHOD_VFMIG_QUERY_CQ on @fd against @cq_handle, the
+ * Issue RXE_IB_METHOD_QUERY_CQ on @fd against @cq_handle, the
  * dump-side counterpart of UVERBS_METHOD_RESTORE_CQ. @fd is criu's
  * dup of the dumpee's uverbs cdev fd (the holder of the CQ IDR), so
  * the security boundary is the ufile that owns the CQ. The kernel
@@ -963,7 +963,7 @@ struct rxe_query_cq_resp_local {
  *
  * Returns 0 on success, -errno on failure.
  */
-static int rxe_vfmig_query_cq(int fd, uint32_t cq_handle,
+static int rxe_query_cq(int fd, uint32_t cq_handle,
 			      struct rxe_query_cq_resp_local *resp_out)
 {
 	struct {
@@ -974,16 +974,16 @@ static int rxe_vfmig_query_cq(int fd, uint32_t cq_handle,
 	_Static_assert(sizeof(*resp_out) == 16,
 		"rxe_query_cq_resp_local must be 16 bytes (kernel UAPI)");
 
-	cmd.hdr.object_id = RXE_IB_OBJECT_VFMIG_LOCAL;
-	cmd.hdr.method_id = RXE_IB_METHOD_VFMIG_QUERY_CQ_LOCAL;
+	cmd.hdr.object_id = RXE_IB_OBJECT_MIGRATE_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_QUERY_CQ_LOCAL;
 	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
 
-	cmd.attrs[0].attr_id = RXE_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL;
+	cmd.attrs[0].attr_id = RXE_IB_ATTR_QUERY_CQ_HANDLE_LOCAL;
 	cmd.attrs[0].len = 0;
 	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[0].data = cq_handle;
 
-	cmd.attrs[1].attr_id = RXE_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB_LOCAL;
+	cmd.attrs[1].attr_id = RXE_IB_ATTR_QUERY_CQ_RESP_BLOB_LOCAL;
 	cmd.attrs[1].len = sizeof(*resp_out);
 	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[1].data = (uintptr_t)resp_out;
@@ -1045,7 +1045,7 @@ struct rxe_restore_cq_req_local {
 };
 
 /*
- * RDMA_DUMP_UOBJ_CQ hook (rxe). Issues RXE_IB_METHOD_VFMIG_QUERY_CQ
+ * RDMA_DUMP_UOBJ_CQ hook (rxe). Issues RXE_IB_METHOD_QUERY_CQ
  * on @lfd (criu's dup of the dumpee's uverbs cdev fd, the holder of
  * the CQ IDR) against @ufile_handle, packs the kernel-reported CQ
  * ring mmap offset as the 8-byte rxe_cq_plugin_blob into the entry-
@@ -1084,7 +1084,7 @@ static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev,
 	(void)kernel_driver_id;
 	(void)pid;
 
-	rc = rxe_vfmig_query_cq(lfd, ufile_handle, &resp);
+	rc = rxe_query_cq(lfd, ufile_handle, &resp);
 	if (rc) {
 		pr_err("rxe: dump_uobj_cq: QUERY_CQ(handle=%u) on ibdev=%s "
 		       "failed: %d (%s)\n",
@@ -1234,15 +1234,15 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
 }
 
 /*
- * UAPI shims for the rxe VFMIG QP dump verbs, mirrors of
+ * UAPI shims for the rxe migrate QP dump verbs, mirrors of
  *   include/uapi/rdma/rxe_user_ioctl_cmds.h
- *     enum rxe_ib_vfmig_methods {
- *         RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH = (1<<NS_SHIFT) + 0,
- *         RXE_IB_METHOD_VFMIG_QUERY_QP        = (1<<NS_SHIFT) + 1,
- *         RXE_IB_METHOD_VFMIG_QUERY_CQ        = (1<<NS_SHIFT) + 2 };
- *     enum rxe_ib_vfmig_freeze_datapath_attrs {
+ *     enum rxe_ib_migrate_methods {
+ *         RXE_IB_METHOD_FREEZE_DATAPATH = (1<<NS_SHIFT) + 0,
+ *         RXE_IB_METHOD_QUERY_QP        = (1<<NS_SHIFT) + 1,
+ *         RXE_IB_METHOD_QUERY_CQ        = (1<<NS_SHIFT) + 2 };
+ *     enum rxe_ib_freeze_datapath_attrs {
  *         ..._QP_HANDLE = (1<<NS_SHIFT) + 0, ..._FREEZE = +1 };
- *     enum rxe_ib_vfmig_query_qp_attrs {
+ *     enum rxe_ib_query_qp_attrs {
  *         RXE_IB_ATTR_QUERY_QP_HANDLE           = (1<<NS_SHIFT) + 0,
  *         RXE_IB_ATTR_QUERY_QP_RESP_BLOB        = +1,
  *         RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE = +2 };
@@ -1250,9 +1250,9 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
  * Same pinning rationale as the QUERY_CQ shims above; keep in sync
  * with the kernel UAPI, remove once host rdma-core ships the header.
  */
-#define RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH_LOCAL \
+#define RXE_IB_METHOD_FREEZE_DATAPATH_LOCAL \
 	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 0)
-#define RXE_IB_METHOD_VFMIG_QUERY_QP_LOCAL \
+#define RXE_IB_METHOD_QUERY_QP_LOCAL \
 	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 /*
  * RXE_IB_METHOD_FREEZE_CONTEXT is the fourth method in the migrate
@@ -1267,13 +1267,13 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
  * slot, attr id (1<<NS_SHIFT)+0. Keep in sync with the kernel UAPI;
  * remove once host rdma-core ships rxe_user_ioctl_cmds.h.
  */
-#define RXE_IB_METHOD_VFMIG_FREEZE_CONTEXT_LOCAL \
+#define RXE_IB_METHOD_FREEZE_CONTEXT_LOCAL \
 	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 3)
-#define RXE_IB_ATTR_VFMIG_FREEZE_CONTEXT_FREEZE_LOCAL \
+#define RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE_LOCAL \
 	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
-#define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE_LOCAL \
+#define RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE_LOCAL \
 	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
-#define RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE_LOCAL \
+#define RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE_LOCAL \
 	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define RXE_IB_ATTR_QUERY_QP_HANDLE_LOCAL \
 	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
@@ -1412,7 +1412,7 @@ _Static_assert(sizeof(struct rxe_create_qp_resp_local) == 32,
 	"rxe_create_qp_resp_local must be 32 bytes (kernel UAPI)");
 
 /*
- * Issue RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH on @fd against
+ * Issue RXE_IB_METHOD_FREEZE_DATAPATH on @fd against
  * @qp_handle to pause (@freeze=1) or resume (@freeze=0) the QP's
  * req/resp/comp worker tasks. The dump path pauses before QUERY_QP
  * so the PSN/cursor snapshot is consistent; on a migrate-and-kill
@@ -1425,7 +1425,7 @@ _Static_assert(sizeof(struct rxe_create_qp_resp_local) == 32,
  * slot. Kernel-mode QPs return -ENXIO. Returns 0 on success,
  * -errno on failure.
  */
-static int rxe_vfmig_freeze_datapath(int fd, uint32_t qp_handle,
+static int rxe_freeze_datapath(int fd, uint32_t qp_handle,
 				     uint8_t freeze)
 {
 	struct {
@@ -1433,16 +1433,16 @@ static int rxe_vfmig_freeze_datapath(int fd, uint32_t qp_handle,
 		struct ib_uverbs_attr attrs[2];
 	} cmd = {};
 
-	cmd.hdr.object_id = RXE_IB_OBJECT_VFMIG_LOCAL;
-	cmd.hdr.method_id = RXE_IB_METHOD_VFMIG_FREEZE_DATAPATH_LOCAL;
+	cmd.hdr.object_id = RXE_IB_OBJECT_MIGRATE_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_FREEZE_DATAPATH_LOCAL;
 	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
 
-	cmd.attrs[0].attr_id = RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_QP_HANDLE_LOCAL;
+	cmd.attrs[0].attr_id = RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE_LOCAL;
 	cmd.attrs[0].len = 0;
 	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[0].data = qp_handle;
 
-	cmd.attrs[1].attr_id = RXE_IB_ATTR_VFMIG_FREEZE_DATAPATH_FREEZE_LOCAL;
+	cmd.attrs[1].attr_id = RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE_LOCAL;
 	cmd.attrs[1].len = sizeof(uint8_t);
 	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[1].data = freeze;
@@ -1476,11 +1476,11 @@ static int rxe_freeze_context(int fd, uint8_t freeze)
 		struct ib_uverbs_attr attrs[1];
 	} cmd = {};
 
-	cmd.hdr.object_id = RXE_IB_OBJECT_VFMIG_LOCAL;
-	cmd.hdr.method_id = RXE_IB_METHOD_VFMIG_FREEZE_CONTEXT_LOCAL;
+	cmd.hdr.object_id = RXE_IB_OBJECT_MIGRATE_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_FREEZE_CONTEXT_LOCAL;
 	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
 
-	cmd.attrs[0].attr_id = RXE_IB_ATTR_VFMIG_FREEZE_CONTEXT_FREEZE_LOCAL;
+	cmd.attrs[0].attr_id = RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE_LOCAL;
 	cmd.attrs[0].len = sizeof(freeze);
 	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[0].data = freeze;
@@ -1494,7 +1494,7 @@ static int rxe_freeze_context(int fd, uint8_t freeze)
 }
 
 /*
- * Issue RXE_IB_METHOD_VFMIG_QUERY_QP on @fd against @qp_handle, the
+ * Issue RXE_IB_METHOD_QUERY_QP on @fd against @qp_handle, the
  * dump-side counterpart of UVERBS_METHOD_RESTORE_QP. The kernel fills
  * @blob_out (the full 184-byte rxe wire state, byte-equal to struct
  * rxe_restore_qp_req) and @user_handle_out (the async-event cookie
@@ -1507,7 +1507,7 @@ static int rxe_freeze_context(int fd, uint8_t freeze)
  * bogus handle returns -ENOENT from the IDR lookup. Returns 0 on
  * success, -errno on failure.
  */
-static int rxe_vfmig_query_qp(int fd, uint32_t qp_handle,
+static int rxe_query_qp(int fd, uint32_t qp_handle,
 			      struct rxe_restore_qp_req_local *blob_out,
 			      uint64_t *user_handle_out,
 			      void *sq_img, void *rq_img, void *res_img,
@@ -1518,8 +1518,8 @@ static int rxe_vfmig_query_qp(int fd, uint32_t qp_handle,
 		struct ib_uverbs_attr attrs[6];
 	} cmd = {};
 
-	cmd.hdr.object_id = RXE_IB_OBJECT_VFMIG_LOCAL;
-	cmd.hdr.method_id = RXE_IB_METHOD_VFMIG_QUERY_QP_LOCAL;
+	cmd.hdr.object_id = RXE_IB_OBJECT_MIGRATE_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_QUERY_QP_LOCAL;
 	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
 
 	cmd.attrs[0].attr_id = RXE_IB_ATTR_QUERY_QP_HANDLE_LOCAL;
@@ -1609,7 +1609,7 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev,
 	(void)kernel_driver_id;
 	(void)pid;
 
-	rc = rxe_vfmig_freeze_datapath(lfd, ufile_handle, 1);
+	rc = rxe_freeze_datapath(lfd, ufile_handle, 1);
 	if (rc == -ENXIO) {
 		pr_debug("rxe: dump_uobj_qp: FREEZE_DATAPATH(handle=%u) on "
 			 "ibdev=%s returned -ENXIO (kernel-mode QP); "
@@ -1642,7 +1642,7 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev,
 		goto out_imgs;
 	}
 
-	rc = rxe_vfmig_query_qp(lfd, ufile_handle, &blob, &user_handle,
+	rc = rxe_query_qp(lfd, ufile_handle, &blob, &user_handle,
 				sq_img, rq_img, res_img, RXE_QP_IMAGE_CAP_LOCAL);
 	if (rc) {
 		if (rc == -ENXIO) {
