@@ -65,7 +65,7 @@
  * predicate"). Same self-contained-inline pattern as the mlx5_vfmig
  * plugin uses for its alloc-ucontext-req surface, and as the kernel-
  * side reference exerciser
- * tools/testing/mlx5_vfmig/uobject_restore/pd_restore/pd_restore_probe_rxe.c
+ * tools/testing/criu_rdma/uobject_restore/pd_restore/pd_restore_probe_rxe.c
  * uses for the same reason.
  *
  * If the kernel UAPI evolves, keep this block in sync with:

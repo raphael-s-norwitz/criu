@@ -711,27 +711,22 @@ fi
 # born-frozen + thaw-and-replay datapath (pd_cq_qp only proves the
 # drained QP is destroyable).
 #
-# DEFAULT OFF (opt-in via UVERBS_CR_RUN_PD_CQ_QP_SQ=1): this pass
-# currently FAILS against the kernel in this tree -- it caught a real
-# rxe replay-rewind bug. The thaw replays the in-flight SEND (both
-# completions fire) but the rewound WQE's DMA cursor is not reset, so
-# the requester re-transmits a 0-byte payload (recv_byte_len=0) even
-# though the restored send buffer is byte-correct. Root cause:
-# rxe_qp_resume() (drivers/infiniband/sw/rxe/rxe_qp.c) kicks send_task
-# for the [sq_consumer, sq_producer) window without setting
-# qp->req.need_retry, so req_retry() (rxe_req.c) never resets
-# dma.resid/cur_sge/sge_offset + wqe_state_posted on the replayed WQEs.
-# Flip this default to 1 once the kernel fix lands and re-validate
-# (expect "SQ_INFLIGHT: ok ... " with recv_byte_len=64).
-if [[ "${UVERBS_CR_RUN_PD_CQ_QP_SQ:-0}" == "1" ]]; then
+# Requires a kernel with the rxe in-flight SQ rewind-replay support:
+#   - rxe_qp_resume() must arm req.need_retry so req_retry() resets the
+#     replayed WQEs' DMA cursors (else the SEND replays 0 bytes), and
+#   - rxe_qp_pause()/resume() must be idempotent (qp->dp_frozen) so the
+#     redundant per-ucontext thaw cannot leak a send_task reservation
+#     and hang ibv_destroy_qp() for the 50s pool-cleanup timeout.
+# Set UVERBS_CR_RUN_PD_CQ_QP_SQ=0 to skip on kernels that pre-date that
+# support. On a supported kernel expect "SQ_INFLIGHT: ok ..." with
+# recv_byte_len=64 and a clean destroy (no rxe WARNs in dmesg).
+if [[ "${UVERBS_CR_RUN_PD_CQ_QP_SQ:-1}" == "1" ]]; then
 	run_pass pd_cq_qp_sq pd_cq_qp_sq 0
 else
 	echo
-	echo "[skip] pd_cq_qp_sq pass disabled by default"
-	echo "       (UVERBS_CR_RUN_PD_CQ_QP_SQ=0). The non-drained-SQ"
-	echo "       in-flight replay exercises a kernel rewind path that is"
-	echo "       still being fixed (replay re-sends 0 bytes); opt in with"
-	echo "       UVERBS_CR_RUN_PD_CQ_QP_SQ=1 once the kernel fix lands."
+	echo "[skip] pd_cq_qp_sq pass disabled by UVERBS_CR_RUN_PD_CQ_QP_SQ=0"
+	echo "       (non-drained-SQ in-flight replay; needs the rxe rewind-"
+	echo "       replay + idempotent pause/resume kernel support)."
 fi
 
 echo
