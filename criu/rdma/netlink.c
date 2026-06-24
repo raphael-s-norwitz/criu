@@ -60,7 +60,7 @@
  * Compat shim for distros whose <rdma/rdma_netlink.h> pre-dates
  * upstream kernel commit 0601c496b413 ("RDMA/nldev: Expose ufile
  * handle alongside per-class restrack id", aka K8a in
- * linux/tools/testing/mlx5_vfmig/design/uobject_restore.md §7.5.1).
+ * linux/tools/testing/criu_rdma/design/uobject_restore.md §7.5.1).
  * The kernel emits the new u32 attribute by numeric value at
  * runtime; the build-side probe in scripts/feature-tests.mak only
  * checks whether the host header provides the symbolic name.

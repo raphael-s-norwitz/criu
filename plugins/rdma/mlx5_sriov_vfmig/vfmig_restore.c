@@ -270,7 +270,7 @@ static void vfmig_uuid_to_str(const uint8_t u[16], char out[VFMIG_UUID_STR_LEN])
  * surfaces at the call site with full diagnostic context (image's
  * source vf_id + matched dest vf_id + the operator-facing
  * "orchestrator stamped UUID on wrong slot" error message). See
- * KS7.3 in tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
+ * KS7.3 in tools/testing/criu_rdma/design/vf_prerestore_split.md
  * §3.5.3 for the contract and §3.5.3.1 for why same-`vf_id` is
  * the natural shape of the kernel/FW model (not a workaround).
  *
@@ -1195,7 +1195,7 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 			       "orchestrator must call "
 			       "MLX5_VFMIG_IOC_SET_VF_UUID with this UUID "
 			       "on a destination VF before restore. See "
-			       "KS7.3 in tools/testing/mlx5_vfmig/design/"
+			       "KS7.3 in tools/testing/criu_rdma/design/"
 			       "vf_prerestore_split.md §3.5.3.\n",
 			       e->ctxn, e->pf_bdf, e->vf_id, uuid_str);
 			goto err;
@@ -1227,7 +1227,7 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 			       "LOAD is not supported (kernel's per-VF "
 			       "IOVA window is `vf_id`-keyed; FW "
 			       "E-Switch `vport_num` is `vf_id+1`-keyed). "
-			       "See KS7.3 in tools/testing/mlx5_vfmig/"
+			       "See KS7.3 in tools/testing/criu_rdma/"
 			       "design/vf_prerestore_split.md §3.5.3.1.\n",
 			       e->ctxn, e->pf_bdf, e->vf_id, uuid_str,
 			       dest_pf_bdf, dest_vf_id, e->vf_id);
@@ -1566,7 +1566,7 @@ int vfmig_restore_init_all_vfs(void)
 
 /*
  * Exported entry point for the standalone mlx5_vfmig_restore_vf
- * binary spec'd in tools/testing/mlx5_vfmig/design/
+ * binary spec'd in tools/testing/criu_rdma/design/
  * vf_prerestore_split.md §6.1.
  *
  * Drives Phase A (read mlx5_vfmig.img + per-VF discovery +

@@ -19,8 +19,8 @@
  * distribution's rdma-core-devel package, so building criu against
  * them would require contributors to run `make headers_install`
  * from a bleeding-edge kernel tree. The companion kernel reference
- * exerciser (tools/testing/mlx5_vfmig/mlx5_vfmig_uctx.c) inlines
- * the same surface for the same reason.
+ * exerciser (tools/testing/criu_rdma/tools/ucontext_vendor_verbs.c)
+ * inlines the same surface for the same reason.
  *
  * If the kernel UAPI evolves, keep the constants in sync with:
  *   include/uapi/rdma/ib_user_ioctl_cmds.h    (UVERBS_ID_NS_SHIFT)
@@ -48,8 +48,8 @@
  *     building criu against them would require contributors to run
  *     `make headers_install` from a bleeding-edge kernel tree. The
  *     companion kernel reference exerciser
- *     (tools/testing/mlx5_vfmig/mlx5_vfmig_uctx.c) inlines the same
- *     surface for the same reason.
+ *     (tools/testing/criu_rdma/tools/ucontext_vendor_verbs.c) inlines
+ *     the same surface for the same reason.
  *   - mlx5_ib_alloc_ucontext_req_v2 has been stable ABI for years.
  *
  * If the kernel UAPI evolves, keep this block in sync with:

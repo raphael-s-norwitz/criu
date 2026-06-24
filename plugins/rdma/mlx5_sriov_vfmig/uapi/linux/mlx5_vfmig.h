@@ -124,7 +124,7 @@ struct mlx5_vfmig_get_vhca_id {
  *                iterates eligible PFs/VFs and matches by UUID to
  *                bind a saved-state image to a destination VF.
  *                See KS7.3 in
- *                tools/testing/mlx5_vfmig/design/vf_prerestore_split.md
+ *                tools/testing/criu_rdma/design/vf_prerestore_split.md
  *                §3.5 for the dump-side / restore-side contract.
  *                Returned as all-zeros on out-of-range vf_id.
  *

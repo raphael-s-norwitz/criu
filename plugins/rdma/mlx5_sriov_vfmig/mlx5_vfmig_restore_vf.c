@@ -12,7 +12,7 @@
  * path can't: setting per-VF MAC addresses on the bound netdev,
  * pinning ARP entries before the workload's first post_send, etc.
  *
- * See tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §6.1
+ * See tools/testing/criu_rdma/design/vf_prerestore_split.md §6.1
  * for the architectural rationale and §3 / §6.3 for the soft-
  * fallback contract that lets `criu restore` later detect this
  * pre-binding and skip its own LOAD/bind path.
@@ -168,7 +168,7 @@ static void usage(FILE *out, const char *argv0)
 "Exit status: 0 on success (every VF in the image is now bound and\n"
 "ibdev-up on this host), non-zero on any error.\n"
 "\n"
-"See tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §6.1 for\n"
+"See tools/testing/criu_rdma/design/vf_prerestore_split.md §6.1 for\n"
 "the architectural rationale.\n",
 		argv0, DEFAULT_PLUGIN_PATH);
 }

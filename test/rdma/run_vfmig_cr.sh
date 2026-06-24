@@ -143,7 +143,7 @@ set -euo pipefail
 
 PF="${PF:-0000:08:00.0}"
 CRIU="${CRIU:-/usr/local/sbin/criu}"
-VFMIG_TOOL="${VFMIG_TOOL:-/opt/builds/linux/tools/testing/mlx5_vfmig/tools/mlx5_vfmig}"
+VFMIG_TOOL="${VFMIG_TOOL:-/opt/builds/linux/tools/testing/criu_rdma/tools/mlx5_vfmig}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROG="$HERE/uverbs_ctx_holder"
 WORKDIR="$(mktemp -d /tmp/vfmig-cr-XXXXXX)"
@@ -171,7 +171,7 @@ VF_BDF_DEST=
 # and the restore path matches dumped images to destination VFs by
 # this UUID -- so the harness has to play the orchestrator role and
 # stamp the same UUID on both sides of the cycle. See KS7.3 in
-# tools/testing/mlx5_vfmig/design/vf_prerestore_split.md §3.5 for
+# tools/testing/criu_rdma/design/vf_prerestore_split.md §3.5 for
 # the full contract.
 PASS_VF_UUID=
 DMESG_SINCE_KTIME=
@@ -775,12 +775,12 @@ run_pass() {
         # tolerance) and the RESTORE_UCONTEXT devx_uid relax
         # landed, plus the empirical confirmation that
         # DESTROY_QP/CQ/MKEY honor cross-uid (kernel
-        # tools/testing/mlx5_vfmig/uobject_restore/{qp,cq,mr}_
+        # tools/testing/criu_rdma/uobject_restore/{qp,cq,mr}_
         # destroy_matrix harnesses). The CRIU plugin's per-QP
         # dump hook no longer refuses on meta.devx_uid != 0 or
         # on lib_uar_dyn=true; the v0 critical path (default
         # libmlx5 auto-DEVX source) round-trips cleanly. See
-        # tools/testing/mlx5_vfmig/design/pd_registration_wipe.md
+        # tools/testing/criu_rdma/design/pd_registration_wipe.md
         # for the full architectural argument.
         pass_fail "criu dump failed"
     }

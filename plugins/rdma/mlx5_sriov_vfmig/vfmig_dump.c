@@ -698,7 +698,7 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id,
 		       "16-byte identity on this PF cdev before the "
 		       "workload binds the VF, so CRIU's restore path can "
 		       "match the dumped image to a destination VF by "
-		       "UUID. See KS7.3 in tools/testing/mlx5_vfmig/design/"
+		       "UUID. See KS7.3 in tools/testing/criu_rdma/design/"
 		       "vf_prerestore_split.md for the contract.\n",
 		       pf_bdf, vf_id);
 		close(cdev_fd);
@@ -1350,7 +1350,7 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 	 * post-restore teardown.
 	 *
 	 * Empirical investigation (kernel-side
-	 * tools/testing/mlx5_vfmig/uobject_restore/qp_destroy_matrix,
+	 * tools/testing/criu_rdma/uobject_restore/qp_destroy_matrix,
 	 * cq_destroy_matrix, mr_destroy_matrix, dealloc_pd_chain on
 	 * FW 28.48.1000) refuted that hypothesis:
 	 *
@@ -1383,7 +1383,7 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 	 *       registration tables and is uid-blind.
 	 *
 	 * See drivers/infiniband/hw/mlx5/vfmig_uctx.c and
-	 * tools/testing/mlx5_vfmig/design/pd_registration_wipe.md
+	 * tools/testing/criu_rdma/design/pd_registration_wipe.md
 	 * for the kernel-side artefacts. This hook now just records
 	 * the source's devx_uid for diagnostics; the dump proceeds.
 	 *
@@ -1413,7 +1413,7 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev,
 			 "RESTORE_UCONTEXT devx_uid check + "
 			 "mlx5_ib_dealloc_pd vfmig_restored gate "
 			 "make this safe; see "
-			 "tools/testing/mlx5_vfmig/design/"
+			 "tools/testing/criu_rdma/design/"
 			 "pd_registration_wipe.md)\n",
 			 ufile_handle, ibdev);
 		uctx_meta.devx_uid = 0;

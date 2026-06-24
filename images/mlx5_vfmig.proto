@@ -261,7 +261,7 @@ message mlx5_vfmig_state_entry {
 	 * orchestrator-assignable on the destination), so a
 	 * missing UUID is unrecoverable.
 	 *
-	 * See KS7.3 in tools/testing/mlx5_vfmig/design/
+	 * See KS7.3 in tools/testing/criu_rdma/design/
 	 * vf_prerestore_split.md §3.5 for the full lifecycle
 	 * (orchestrator-stamps-on-provision, kernel-clears-on-
 	 * sriov-numvfs=0, CRIU-reads-only).

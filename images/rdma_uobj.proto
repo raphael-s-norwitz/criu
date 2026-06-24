@@ -6,7 +6,7 @@
  * captured at dump and replayed at restore.
  *
  * Sequenced under the design described in
- *   linux/tools/testing/mlx5_vfmig/DESIGN_R3_uobj_restore.md
+ *   linux/tools/testing/criu_rdma/design/uobject_restore.md
  * Builds on top of uverbs_file_entry (uverbsfd.proto): every
  * rdma_uobj_entry refers back to the parent uverbs_file_entry.id
  * via ufile_id, and per-driver plugin state per uobject lives in

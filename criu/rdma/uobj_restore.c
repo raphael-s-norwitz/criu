@@ -496,7 +496,7 @@ static int uobj_ufile_group_check_xrefs(struct uobj_ufile_group *g)
  * UHW_PACK error.
  *
  * Wire-format references:
- *   tools/testing/mlx5_vfmig/uobject_restore/pd_restore/
+ *   tools/testing/criu_rdma/uobject_restore/pd_restore/
  *     pd_restore_probe_rxe.c::do_restore_pd        (rxe shape)
  *     pd_restore_probe_mlx5_vfmig.c::do_restore_pd (mlx5 shape, UHW)
  */

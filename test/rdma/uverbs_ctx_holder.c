@@ -20,7 +20,7 @@
  * DEALLOC_PD on the adopted PD with status BAD_RES_STATE because the
  * dependents are still alive; uverbs_destroy_uobject parks the uobj
  * waiting for a future RESTORE_{CQ,QP,MR} cascade to drain it. See
- * linux/tools/testing/mlx5_vfmig/design/uobject_restore.md §9.1 S3b
+ * linux/tools/testing/criu_rdma/design/uobject_restore.md §9.1 S3b
  * "v0 dealloc-ordering invariant" and the kernel-side regression test
  * pd_restore_probe_mlx5_vfmig subtest 7 for the canonical kernel-
  * level capture of that invariant. The CRIU-tree test deliberately
@@ -1205,7 +1205,7 @@ static void run_post_restore_checks(void)
 	 * the lightest-weight path; the kernel issues FW CREATE_MKEY
 	 * with mkc.pd = adopted_pdn. This is the verb the kernel-side
 	 * pd_adopt empirical test validated (see
-	 * tools/testing/mlx5_vfmig/uobject_restore/pd_adopt/) and what
+	 * tools/testing/criu_rdma/uobject_restore/pd_adopt/) and what
 	 * pd_restore_probe_mlx5_vfmig confirms via PROBE_PD; running
 	 * it before CREATE_QP isolates the FW-gate question from any
 	 * libibverbs/libmlx5-side complexity in QP construction.

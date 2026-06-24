@@ -50,7 +50,7 @@
  * mlx5_ib_alloc_ucontext_req_v2.flags. The legacy write() path is
  * the only way to get the flag to mlx5_ib's alloc_ucontext handler.
  *
- * The companion test in tools/testing/mlx5_vfmig/mlx5_vfmig_uctx.c
+ * The companion test in tools/testing/criu_rdma/tools/ucontext_vendor_verbs.c
  * uses the same approach and is the reference for the wire layout.
  *
  * @flags carries MLX5_IB_ALLOC_UCTX_* bits.
@@ -528,7 +528,7 @@ int vfmig_query_cq(int fd,
 	 * directly from attrs[].data. Setting len = sizeof(u32) the way
 	 * a PTR_IN(u32) attr does trips the dispatcher's `if (uattr->len
 	 * != 0) return -EINVAL` guard before our handler runs. The
-	 * matching probe is tools/testing/mlx5_vfmig/.../cq_query_probe.
+	 * matching probe is tools/testing/criu_rdma/.../cq_query_probe.
 	 */
 	cmd.attrs[0].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL;
 	cmd.attrs[0].len = 0;

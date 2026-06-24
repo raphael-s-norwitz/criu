@@ -1126,7 +1126,7 @@ static int dump_uverbsfile_cc_precheck(int lfd, uint32_t driver_id,
 		       "-EOPNOTSUPP. Aborting the dump now to surface "
 		       "the limitation explicitly. Track the kernel "
 		       "S8 RESTORE_COMP_CHANNEL work in "
-		       "tools/testing/mlx5_vfmig/design/uobject_restore.md "
+		       "tools/testing/criu_rdma/design/uobject_restore.md "
 		       "?S8.\n", ibdev, ctxn, total);
 		return -1;
 	}
