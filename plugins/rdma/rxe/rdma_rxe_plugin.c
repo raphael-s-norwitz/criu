@@ -932,18 +932,42 @@ static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
 	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_ATTR_QUERY_CQ_RESP_BLOB_LOCAL \
 	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+/*
+ * Optional CQE-ring image PTR_OUT, mirror of the kernel's
+ *   RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE = (1<<NS_SHIFT) + 2.
+ * The CQ analogue of QUERY_QP's SQ/RQ image attrs: the kernel writes
+ * the raw CQE slot region (queue_data_size bytes) here and reports the
+ * count in rxe_query_cq_resp::cqe_image_bytes.
+ */
+#define RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE_LOCAL \
+	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+
+/*
+ * Capacity advertised on the optional CQE image PTR_OUT. struct
+ * ib_uverbs_attr::len is u16, so a single CQ ring image caps at 65535
+ * bytes (same constraint and deep-ring follow-up as RXE_QP_IMAGE_CAP_LOCAL);
+ * the kernel writes only the actual ring byte count.
+ */
+#define RXE_CQ_IMAGE_CAP_LOCAL 65535u
 
 /*
  * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
- * rxe_query_cq_resp (16 bytes): the RXE_IB_METHOD_QUERY_CQ
+ * rxe_query_cq_resp (32 bytes): the RXE_IB_METHOD_QUERY_CQ
  * PTR_OUT blob. @vm_pgoff is the CQ ring's mmap byte offset
  * (cq->queue->ip->info.offset); @cqe is the CQ's user-visible entry
- * count (cq->ibcq.cqe). Remove once host rdma-core ships the struct.
+ * count (cq->ibcq.cqe); @producer / @consumer are the live ring
+ * cursors (QUEUE_TYPE_TO_CLIENT); @cqe_image_bytes is the CQE slot
+ * region length (queue_data_size), with the raw ring image carried in
+ * the optional RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE attr. Remove once
+ * host rdma-core ships the struct.
  */
 struct rxe_query_cq_resp_local {
 	uint64_t vm_pgoff;
 	uint32_t cqe;
-	uint32_t reserved;
+	uint32_t producer;
+	uint32_t consumer;
+	uint32_t cqe_image_bytes;
+	uint32_t reserved[2];
 };
 
 /*
@@ -951,10 +975,13 @@ struct rxe_query_cq_resp_local {
  * dump-side counterpart of UVERBS_METHOD_RESTORE_CQ. @fd is criu's
  * dup of the dumpee's uverbs cdev fd (the holder of the CQ IDR), so
  * the security boundary is the ufile that owns the CQ. The kernel
- * fills @resp_out with the CQ ring's mmap offset + entry count read
- * straight from the live CQ -- the authoritative source that retires
- * the old /proc/<pid>/smaps cdev-VMA FIFO scrape (which a mixed
- * CQ+QP ufile would corrupt, since QP rings are cdev VMAs too).
+ * fills @resp_out with the CQ ring's mmap offset + entry count + the
+ * live ring cursors read straight from the live CQ -- the authoritative
+ * source that retires the old /proc/<pid>/smaps cdev-VMA FIFO scrape
+ * (which a mixed CQ+QP ufile would corrupt, since QP rings are cdev
+ * VMAs too). When @cqe_img / @img_cap are provided the kernel also
+ * emits the raw CQE-ring image (the unreaped completions) into
+ * @cqe_img, reporting the byte count in @resp_out->cqe_image_bytes.
  *
  * HANDLE is UVERBS_ATTR_IDR(UVERBS_OBJECT_CQ); the kernel enforces
  * len == 0 for the IDR class and reads the handle from attrs[].data
@@ -964,32 +991,51 @@ struct rxe_query_cq_resp_local {
  * Returns 0 on success, -errno on failure.
  */
 static int rxe_query_cq(int fd, uint32_t cq_handle,
-			      struct rxe_query_cq_resp_local *resp_out)
+			      struct rxe_query_cq_resp_local *resp_out,
+			      void *cqe_img, uint32_t img_cap)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;
-		struct ib_uverbs_attr attrs[2];
+		struct ib_uverbs_attr attrs[3];
 	} cmd = {};
+	unsigned int n = 0;
 
-	_Static_assert(sizeof(*resp_out) == 16,
-		"rxe_query_cq_resp_local must be 16 bytes (kernel UAPI)");
+	_Static_assert(sizeof(*resp_out) == 32,
+		"rxe_query_cq_resp_local must be 32 bytes (kernel UAPI)");
 
 	cmd.hdr.object_id = RXE_IB_OBJECT_MIGRATE_LOCAL;
 	cmd.hdr.method_id = RXE_IB_METHOD_QUERY_CQ_LOCAL;
 	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
 
-	cmd.attrs[0].attr_id = RXE_IB_ATTR_QUERY_CQ_HANDLE_LOCAL;
-	cmd.attrs[0].len = 0;
-	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[0].data = cq_handle;
+	cmd.attrs[n].attr_id = RXE_IB_ATTR_QUERY_CQ_HANDLE_LOCAL;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = cq_handle;
+	n++;
 
-	cmd.attrs[1].attr_id = RXE_IB_ATTR_QUERY_CQ_RESP_BLOB_LOCAL;
-	cmd.attrs[1].len = sizeof(*resp_out);
-	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[1].data = (uintptr_t)resp_out;
+	cmd.attrs[n].attr_id = RXE_IB_ATTR_QUERY_CQ_RESP_BLOB_LOCAL;
+	cmd.attrs[n].len = sizeof(*resp_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)resp_out;
+	n++;
 
-	cmd.hdr.num_attrs = 2;
-	cmd.hdr.length = sizeof(cmd.hdr) + 2 * sizeof(cmd.attrs[0]);
+	/*
+	 * Optional in-flight CQE-ring image PTR_OUT (mirrors QUERY_QP's
+	 * SQ/RQ image attrs). The kernel writes queue_data_size bytes and
+	 * reports the count in resp_out->cqe_image_bytes; a buffer smaller
+	 * than the ring fails the whole QUERY_CQ with -ENOSPC, so advertise
+	 * the full @img_cap.
+	 */
+	if (cqe_img && img_cap) {
+		cmd.attrs[n].attr_id = RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE_LOCAL;
+		cmd.attrs[n].len = img_cap;
+		cmd.attrs[n].flags = 0;
+		cmd.attrs[n].data = (uintptr_t)cqe_img;
+		n++;
+	}
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
 
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;
@@ -1000,17 +1046,35 @@ static int rxe_query_cq(int fd, uint32_t cq_handle,
  * Schema for the rxe-private CQ entry in the per-uobj
  * RdmaUobjEntry.plugin_blob byte slice.
  *
- * Just an 8-byte source vm_pgoff (in BYTES, matching kernel UAPI's
- * rxe_restore_cq_req::vm_pgoff which is byte-offset despite its
- * name -- compared against vma->vm_pgoff << PAGE_SHIFT in rxe_mmap).
+ * @vm_pgoff is the source CQ ring mmap byte offset (in BYTES, matching
+ * kernel UAPI's rxe_restore_cq_req::vm_pgoff which is byte-offset
+ * despite its name -- compared against vma->vm_pgoff << PAGE_SHIFT in
+ * rxe_mmap). The remaining fields carry the in-flight CQE-ring state so
+ * unreaped completions survive C/R, mirroring the QP SQ/RQ image path:
  *
- * Rationale for owning the schema in the plugin (not via a per-
- * driver proto): the field is one fixed-size scalar; a protobuf
- * sub-message would be overkill, and the plugin is the only
- * producer + consumer. criu/rdma core treats the bytes as opaque.
+ *   @producer / @consumer  the source CQ ring cursors reported by
+ *       QUERY_CQ (QUEUE_TYPE_TO_CLIENT: rxe owns the producer, the
+ *       client owns the consumer). Replayed into rxe_restore_cq_req so
+ *       the restored ring's unreaped CQEs are visible to ibv_poll_cq.
+ *   @cqe_image_bytes  byte length of the captured CQE slot region
+ *       (queue_data_size). When non-zero the raw ring image is appended
+ *       to this header in the plugin_blob byte slice, exactly like the
+ *       QP header + SQ/RQ image tail; the destination blits it back.
+ *       Zero => empty/drained CQ (producer == consumer), cursor-only.
+ *   @reserved  pads to 8-byte alignment; must be zero.
+ *
+ * Unlike the QP blob (which is the kernel rxe_restore_qp_req verbatim,
+ * since QUERY_QP and RESTORE_QP share that struct), QUERY_CQ and
+ * RESTORE_CQ use distinct structs, so this is a plugin-private schema
+ * that the restore hook re-shapes into rxe_restore_cq_req. criu/rdma
+ * core treats the bytes as opaque.
  */
 struct rxe_cq_plugin_blob_local {
 	uint64_t vm_pgoff;
+	uint32_t producer;
+	uint32_t consumer;
+	uint32_t cqe_image_bytes;
+	uint32_t reserved;
 };
 
 /*
@@ -1019,19 +1083,24 @@ struct rxe_cq_plugin_blob_local {
  *     struct rxe_create_cq_resp { struct mminfo mi; };
  *     struct rxe_restore_cq_req {
  *         __aligned_u64 vm_pgoff;
- *         __aligned_u64 reserved;
+ *         __u32 producer;
+ *         __u32 consumer;
+ *         __u32 cqe_image_bytes;
+ *         __u32 reserved;
  *     };
  *
  * These used to live in criu/rdma/uobj_restore.c when core knew
  * the rxe UHW shape; they moved here when the per-driver UHW
  * pack/verify hooks took over (see
- * RDMA_RESTORE_UOBJ_CQ_UHW_PACK/_VERIFY in criu-plugin.h). The
- * @reserved tail on the IN side is the inline-attr-trap mitigation
- * the kernel UAPI carries (uverbs_fill_udata's len <= sizeof(u64)
- * inline path otherwise reads attr.data verbatim instead of
- * copying from userspace; sizing strictly above 8 bytes takes the
- * pointer path through ib_copy_from_udata). Keep in sync with the
- * upstream UAPI; remove once host rdma-core ships these structs.
+ * RDMA_RESTORE_UOBJ_CQ_UHW_PACK/_VERIFY in criu-plugin.h). The fixed
+ * struct stays strictly larger than sizeof(__u64) so the uverbs ioctl
+ * dispatcher takes the pointer path (a UHW_IN attr with len <= 8 is
+ * treated as inline -- the kernel reads attr.data verbatim instead of
+ * copying from userspace, clobbering @vm_pgoff). The in-flight CQE ring
+ * image, when present, is appended after this header in the UHW_IN tail,
+ * located by @cqe_image_bytes (exactly like rxe_restore_qp_req + SQ
+ * image). Keep in sync with the upstream UAPI; remove once host
+ * rdma-core ships these structs.
  */
 struct rxe_create_cq_resp_local {
 	uint64_t	mi_offset;	/* mmap cookie (vm_pgoff << PAGE_SHIFT) */
@@ -1041,17 +1110,27 @@ struct rxe_create_cq_resp_local {
 
 struct rxe_restore_cq_req_local {
 	uint64_t	vm_pgoff;
-	uint64_t	reserved;	/* must be zero */
+	uint32_t	producer;
+	uint32_t	consumer;
+	uint32_t	cqe_image_bytes;
+	uint32_t	reserved;	/* must be zero */
 };
+
+_Static_assert(sizeof(struct rxe_restore_cq_req_local) == 24,
+	"rxe_restore_cq_req_local must be 24 bytes (kernel UAPI)");
 
 /*
  * RDMA_DUMP_UOBJ_CQ hook (rxe). Issues RXE_IB_METHOD_QUERY_CQ
  * on @lfd (criu's dup of the dumpee's uverbs cdev fd, the holder of
  * the CQ IDR) against @ufile_handle, packs the kernel-reported CQ
- * ring mmap offset as the 8-byte rxe_cq_plugin_blob into the entry-
- * level plugin_blob the caller attaches onto RdmaUobjEntry.
- * plugin_blob, and stamps comp_vector=0 / flags=0 (rxe has only one
- * comp vector and no non-zero create-CQ flags in v0).
+ * ring mmap offset, ring cursors and (for an in-flight CQ) the raw
+ * CQE ring image as the rxe_cq_plugin_blob header + image tail into
+ * the entry-level plugin_blob the caller attaches onto
+ * RdmaUobjEntry.plugin_blob, and stamps comp_vector=0 / flags=0 (rxe
+ * has only one comp vector and no non-zero create-CQ flags in v0).
+ * Capturing the cursors + unreaped CQEs (not just the mmap offset)
+ * is what lets ibv_poll_cq see pre-dump completions after restore,
+ * mirroring the QP SQ/RQ image round-trip.
  *
  * QUERY_CQ supersedes the old /proc/<pid>/smaps cdev-VMA FIFO
  * (PROCESS_DEVICE_VMA -> rdma_record/pop_cdev_vma_offset). That
@@ -1078,18 +1157,29 @@ static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev,
 {
 	struct rxe_query_cq_resp_local resp = {};
 	struct rxe_cq_plugin_blob_local pb = {};
+	uint8_t *cqe_img = NULL;
 	uint8_t *buf;
+	size_t total;
+	bool drained;
 	int rc;
 
 	(void)kernel_driver_id;
 	(void)pid;
 
-	rc = rxe_query_cq(lfd, ufile_handle, &resp);
+	cqe_img = malloc(RXE_CQ_IMAGE_CAP_LOCAL);
+	if (!cqe_img) {
+		pr_err("rxe: dump_uobj_cq: out of memory for CQE image buffer "
+		       "(ufile_handle=%u)\n", ufile_handle);
+		return -ENOMEM;
+	}
+
+	rc = rxe_query_cq(lfd, ufile_handle, &resp, cqe_img,
+			  RXE_CQ_IMAGE_CAP_LOCAL);
 	if (rc) {
 		pr_err("rxe: dump_uobj_cq: QUERY_CQ(handle=%u) on ibdev=%s "
 		       "failed: %d (%s)\n",
 		       ufile_handle, ibdev, rc, strerror(-rc));
-		return rc;
+		goto out_img;
 	}
 
 	/*
@@ -1105,20 +1195,67 @@ static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev,
 		       "RES_CQE=%u disagrees with QUERY_CQ cqe=%u; "
 		       "structural inconsistency, aborting dump\n",
 		       ufile_handle, ibdev, cq_attrs->cqe_count, resp.cqe);
-		return -EILSEQ;
+		rc = -EILSEQ;
+		goto out_img;
 	}
 
 	pb.vm_pgoff = resp.vm_pgoff;
-	buf = malloc(sizeof(pb));
+	pb.producer = resp.producer;
+	pb.consumer = resp.consumer;
+
+	/*
+	 * Drained-vs-in-flight (mirrors the QP SQ/RQ image decision). A CQ
+	 * whose cursors are level (QUEUE_TYPE_TO_CLIENT: producer == consumer)
+	 * holds no unreaped completions, so ship the cursor-only header alone
+	 * and let the destination seed the (empty) ring without a blit.
+	 * Otherwise concatenate the CQE ring image after the header; the
+	 * destination locates it by pb.cqe_image_bytes, exactly like the QP
+	 * header + SQ image tail.
+	 */
+	drained = resp.producer == resp.consumer;
+	if (drained) {
+		pb.cqe_image_bytes = 0;
+		total = sizeof(pb);
+	} else {
+		/*
+		 * The restore UHW_IN is shipped as a single uverbs attr whose
+		 * ib_uverbs_attr::len is u16 (RXE_CQ_IMAGE_CAP_LOCAL), so the
+		 * 24-byte rxe_restore_cq_req header + the image must fit within
+		 * it. Reject (loudly) rather than silently truncate; deep-ring
+		 * chunking is a kernel-side follow-up (same limitation as the
+		 * QP image path).
+		 */
+		uint32_t max_img = RXE_CQ_IMAGE_CAP_LOCAL -
+			(uint32_t)sizeof(struct rxe_restore_cq_req_local);
+
+		if (resp.cqe_image_bytes > max_img) {
+			pr_err("rxe: dump_uobj_cq ufile_handle=%u: in-flight "
+			       "CQE ring image (%u bytes) exceeds the %u-byte "
+			       "shippable cap (u16 UHW_IN attr minus the "
+			       "%zu-byte header); deep-ring chunking is a "
+			       "kernel-side follow-up\n",
+			       ufile_handle, resp.cqe_image_bytes, max_img,
+			       sizeof(struct rxe_restore_cq_req_local));
+			rc = -E2BIG;
+			goto out_img;
+		}
+		pb.cqe_image_bytes = resp.cqe_image_bytes;
+		total = sizeof(pb) + resp.cqe_image_bytes;
+	}
+
+	buf = malloc(total);
 	if (!buf) {
 		pr_err("rxe: dump_uobj_cq: out of memory packing "
 		       "plugin_blob (%zu bytes) for ufile_handle=%u\n",
-		       sizeof(pb), ufile_handle);
-		return -ENOMEM;
+		       total, ufile_handle);
+		rc = -ENOMEM;
+		goto out_img;
 	}
 	memcpy(buf, &pb, sizeof(pb));
+	if (!drained && pb.cqe_image_bytes)
+		memcpy(buf + sizeof(pb), cqe_img, pb.cqe_image_bytes);
 	plugin_blob->data = buf;
-	plugin_blob->len = sizeof(pb);
+	plugin_blob->len = total;
 
 	cq_attrs->has_comp_vector = true;
 	cq_attrs->comp_vector = 0;
@@ -1126,23 +1263,34 @@ static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev,
 	cq_attrs->flags = 0;
 
 	pr_debug("rxe: dump_uobj_cq ibdev=%s ufile_handle=%u: "
-		 "vm_pgoff=%#" PRIx64 " cqe=%u comp_vector=0 flags=0\n",
-		 ibdev, ufile_handle, pb.vm_pgoff, resp.cqe);
-	return 0;
+		 "vm_pgoff=%#" PRIx64 " cqe=%u %s (prod=%u cons=%u "
+		 "cqe_img=%u, blob=%zuB) comp_vector=0 flags=0\n",
+		 ibdev, ufile_handle, pb.vm_pgoff, resp.cqe,
+		 drained ? "drained" : "in-flight", pb.producer, pb.consumer,
+		 pb.cqe_image_bytes, total);
+	rc = 0;
+out_img:
+	free(cqe_img);
+	return rc;
 }
 
 /*
  * RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook (rxe).
  *
- * Reads the source vm_pgoff packed at dump time into
- * e->plugin_blob and shapes the UHW pair for rxe's RESTORE_CQ:
+ * Reads the source vm_pgoff, ring cursors and (for an in-flight CQ)
+ * the CQE ring image packed at dump time into e->plugin_blob and
+ * shapes the UHW pair for rxe's RESTORE_CQ:
  *
  *   - UHW_OUT is always present (sizeof rxe_create_cq_resp_local =
  *     16). rxe_restore_cq rejects (udata->outlen < sizeof(*uresp))
  *     before any of the actual restore work runs, so we always
  *     wire the receive buffer even when we don't intend to inspect
  *     it.
- *   - UHW_IN is present only when the dumped vm_pgoff is non-zero.
+ *   - UHW_IN is present only when the dumped vm_pgoff is non-zero. It
+ *     is the 24-byte rxe_restore_cq_req header (vm_pgoff + cursors +
+ *     cqe_image_bytes) followed, for an in-flight CQ, by the raw CQE
+ *     ring image; the kernel blits the image and seeds the cursors so
+ *     unreaped completions are visible to ibv_poll_cq after restore.
  *     Absent UHW_IN -> kernel falls back to its monotonic counter
  *     (legal but typically misses the dumped vm_pgoff -- the
  *     failure mode that motivated this whole UHW_IN dance, see
@@ -1169,24 +1317,52 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
 	struct rxe_restore_cq_req_local *in = NULL;
 	struct rxe_create_cq_resp_local *out = NULL;
 	const struct rxe_cq_plugin_blob_local *pb;
+	const uint8_t *image = NULL;
+	uint32_t producer = 0, consumer = 0, cqe_image_bytes = 0;
 	uint64_t vm_pgoff = 0;
 
 	if (!e || !uhw)
 		return -EINVAL;
 
 	if (e->has_plugin_blob && e->plugin_blob.len > 0) {
-		if (e->plugin_blob.len !=
+		size_t want;
+
+		if (e->plugin_blob.len <
 		    sizeof(struct rxe_cq_plugin_blob_local)) {
 			pr_err("rxe: RESTORE_CQ_UHW_PACK ufile_handle=%u "
-			       "plugin_blob len=%zu, expected %zu "
-			       "(rxe_cq_plugin_blob)\n",
+			       "plugin_blob len=%zu, below the %zu-byte "
+			       "rxe_cq_plugin_blob header\n",
 			       e->has_ufile_handle ? e->ufile_handle : 0,
 			       e->plugin_blob.len,
 			       sizeof(struct rxe_cq_plugin_blob_local));
 			return -EINVAL;
 		}
 		pb = (const struct rxe_cq_plugin_blob_local *)e->plugin_blob.data;
+		/*
+		 * Validate the blob length equals the header plus exactly the
+		 * header's declared CQE image bytes so a truncated/garbled
+		 * image is caught here rather than as a mid-restore -EINVAL
+		 * from the kernel's tail slicer (mirrors the QP pack check).
+		 */
+		want = sizeof(struct rxe_cq_plugin_blob_local) +
+		       (size_t)pb->cqe_image_bytes;
+		if (e->plugin_blob.len != want) {
+			pr_err("rxe: RESTORE_CQ_UHW_PACK ufile_handle=%u "
+			       "plugin_blob len=%zu, expected %zu (%zuB header "
+			       "+ cqe_img=%u tail)\n",
+			       e->has_ufile_handle ? e->ufile_handle : 0,
+			       e->plugin_blob.len, want,
+			       sizeof(struct rxe_cq_plugin_blob_local),
+			       pb->cqe_image_bytes);
+			return -EINVAL;
+		}
 		vm_pgoff = pb->vm_pgoff;
+		producer = pb->producer;
+		consumer = pb->consumer;
+		cqe_image_bytes = pb->cqe_image_bytes;
+		if (cqe_image_bytes)
+			image = (const uint8_t *)e->plugin_blob.data +
+				sizeof(struct rxe_cq_plugin_blob_local);
 	}
 
 	/*
@@ -1212,20 +1388,36 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e,
 	uhw->verify_len = vm_pgoff ? sizeof(out->mi_offset) : 0;
 
 	if (vm_pgoff) {
-		in = malloc(sizeof(*in));
-		if (!in) {
+		size_t inlen = sizeof(*in) + cqe_image_bytes;
+		uint8_t *inbuf = malloc(inlen);
+
+		if (!inbuf) {
 			free(out);
 			uhw->out_buf = NULL;
 			uhw->out_len = 0;
 			uhw->verify_len = 0;
 			pr_err("rxe: RESTORE_CQ_UHW_PACK out of memory "
-			       "(in_buf %zu bytes)\n", sizeof(*in));
+			       "(in_buf %zu bytes)\n", inlen);
 			return -ENOMEM;
 		}
+		/*
+		 * UHW_IN is the 24-byte rxe_restore_cq_req header followed by
+		 * the CQE ring image (when in-flight); the kernel locates the
+		 * image by req.cqe_image_bytes and blits it back, then seeds
+		 * the cursors via rxe_cq_seed_ring. A drained CQ packs the
+		 * header alone (cqe_image_bytes == 0, kernel cursor-only seed).
+		 */
+		in = (struct rxe_restore_cq_req_local *)inbuf;
+		memset(in, 0, sizeof(*in));
 		in->vm_pgoff = vm_pgoff;
+		in->producer = producer;
+		in->consumer = consumer;
+		in->cqe_image_bytes = cqe_image_bytes;
 		in->reserved = 0;
-		uhw->in_buf = in;
-		uhw->in_len = sizeof(*in);
+		if (cqe_image_bytes && image)
+			memcpy(inbuf + sizeof(*in), image, cqe_image_bytes);
+		uhw->in_buf = inbuf;
+		uhw->in_len = inlen;
 	} else {
 		uhw->in_buf = NULL;
 		uhw->in_len = 0;
