@@ -150,6 +150,32 @@ WORKDIR="$(mktemp -d /tmp/vfmig-cr-XXXXXX)"
 
 SRIOV_NUMVFS="/sys/bus/pci/devices/$PF/sriov_numvfs"
 
+# --- Cross-host datapath barrier (D1/R1) knobs -----------------------
+#
+# The mlx5_vfmig plugin runs a symmetric in-plugin peer-to-peer barrier
+# when it finds a rendezvous descriptor at
+# $VFMIG_RZ_DIR/<vf_uuid-hex>.desc. This single-host harness stands in
+# for the second host with vfmig_barrier_peer, which speaks the exact
+# same wire protocol (plugins/.../vfmig_barrier_wire.h) and completes
+# one READY exchange per phase.
+#
+# UVERBS_CR_BARRIER=1 (default) makes every positive pass run through
+# the barrier flow (descriptor present -> SUSPEND(INITIATOR) / D1 /
+# SUSPEND(RESPONDER) on dump, RESUME(INITIATOR) after R1 on restore).
+# A dedicated legacy pass (PASS_NO_BARRIER=1) forces the descriptor
+# absent so the byte-identical fused fallback stays regression-covered
+# on every run. Negative (EXPECT_RESTORE_FAIL) passes never arm the
+# barrier -- their restore aborts before RESUME_DEVICES_LATE.
+UVERBS_CR_BARRIER="${UVERBS_CR_BARRIER:-1}"
+BARRIER_PEER="${BARRIER_PEER:-$HERE/vfmig_barrier_peer}"
+# Must match plugins/rdma/mlx5_sriov_vfmig/vfmig_internal.h VFMIG_RZ_DIR.
+VFMIG_RZ_DIR="${VFMIG_RZ_DIR:-/run/criu-vfmig/rendezvous}"
+# Loopback control endpoints: DUT (plugin) vs PEER (stub). Sequential
+# passes reuse these; both sides set SO_REUSEADDR.
+BARRIER_DUT_EP="${BARRIER_DUT_EP:-127.0.0.1:24601}"
+BARRIER_PEER_EP="${BARRIER_PEER_EP:-127.0.0.1:24602}"
+BARRIER_TIMEOUT_MS="${BARRIER_TIMEOUT_MS:-15000}"
+
 # Per-pass state (set by run_pass before any code that needs them).
 PASS_NAME=
 PASS_DIR=
@@ -175,6 +201,11 @@ VF_BDF_DEST=
 # the full contract.
 PASS_VF_UUID=
 DMESG_SINCE_KTIME=
+# Per-pass barrier state (set in run_pass when the barrier is armed).
+PASS_USE_BARRIER=0
+BARRIER_DESC=
+BARRIER_SESSION=
+BARRIER_PEER_PID=
 
 record_dmesg_mark() {
     DMESG_SINCE_KTIME="$(awk '{print $1}' /proc/uptime)"
@@ -182,6 +213,12 @@ record_dmesg_mark() {
 
 cleanup() {
     local pidfile p
+    # Reap a barrier peer stub and drop the rendezvous descriptor if a
+    # pass bailed (pass_fail/exit) mid-barrier.
+    if [[ -n "${BARRIER_PEER_PID:-}" ]]; then
+        kill "$BARRIER_PEER_PID" 2>/dev/null || true
+    fi
+    [[ -n "${BARRIER_DESC:-}" ]] && rm -f "$BARRIER_DESC"
     # Kill any holder/restored process we tracked across all passes.
     for pidfile in "$WORKDIR"/*/holder.pid "$WORKDIR"/*/restored.pid; do
         [[ -f "$pidfile" ]] || continue
@@ -673,6 +710,79 @@ pass_fail() {
 # PASS. pd_cq/pd_2cq don't carry that axis so the assertion is
 # skipped for those modes.
 #
+# --- Barrier helpers -------------------------------------------------
+#
+# The descriptor is keyed by the raw 16-byte VF UUID rendered as 32 hex
+# chars -- i.e. PASS_VF_UUID with the hyphens stripped, which is exactly
+# what the plugin's uuid_to_hex() produces. Written once before dump and
+# left in place: the plugin reads it again on restore (ensure_p2p at
+# bind + the RESUME_DEVICES_LATE hook), all keyed off the same UUID.
+barrier_desc_path() {
+    local hex="${PASS_VF_UUID//-/}"
+    echo "$VFMIG_RZ_DIR/$hex.desc"
+}
+
+barrier_write_desc() {
+    BARRIER_DESC="$(barrier_desc_path)"
+    BARRIER_SESSION="vfmig-cr-$$-$PASS_NAME"
+    mkdir -p "$VFMIG_RZ_DIR"
+    cat >"$BARRIER_DESC" <<EOF
+session=$BARRIER_SESSION
+vf_uuid=${PASS_VF_UUID//-/}
+listen=$BARRIER_DUT_EP
+peer=$BARRIER_PEER_EP
+timeout_ms=$BARRIER_TIMEOUT_MS
+retry_ms=200
+EOF
+    echo "barrier: wrote rendezvous descriptor $BARRIER_DESC" \
+         "(session=$BARRIER_SESSION dut=$BARRIER_DUT_EP peer=$BARRIER_PEER_EP)"
+    sed 's/^/  desc| /' "$BARRIER_DESC"
+}
+
+# Launch the stand-in peer for one phase (D1 on dump, R1 on restore).
+# The stub is the mirror endpoint: it listens on the DUT's peer= and
+# targets the DUT's listen=, so the shared tie-break yields exactly one
+# connection. Runs concurrently with criu; reaped by barrier_wait_peer.
+barrier_start_peer() {
+    local phase="$1"
+    "$BARRIER_PEER" \
+        --listen "$BARRIER_PEER_EP" \
+        --peer "$BARRIER_DUT_EP" \
+        --session "$BARRIER_SESSION" \
+        --phase "$phase" \
+        --timeout-ms "$BARRIER_TIMEOUT_MS" \
+        >"$PASS_DIR/barrier_peer_$phase.log" 2>&1 &
+    BARRIER_PEER_PID=$!
+    echo "barrier: started peer stub for $phase (pid=$BARRIER_PEER_PID)"
+}
+
+barrier_wait_peer() {
+    local phase="$1" rc=0
+    [[ -n "$BARRIER_PEER_PID" ]] || return 0
+    wait "$BARRIER_PEER_PID" || rc=$?
+    BARRIER_PEER_PID=
+    if [[ "$rc" != "0" ]]; then
+        echo "FAIL ($PASS_NAME): barrier peer stub for $phase exited rc=$rc" \
+             "-- the plugin's $phase rendezvous did not complete" >&2
+        sed 's/^/  peer| /' "$PASS_DIR/barrier_peer_$phase.log" >&2 || true
+        pass_fail "barrier $phase rendezvous failed"
+    fi
+    echo "barrier: $phase rendezvous OK"
+    sed 's/^/  peer| /' "$PASS_DIR/barrier_peer_$phase.log" || true
+}
+
+# Kill a still-running stub and drop the descriptor. Safe to call
+# unconditionally at pass teardown.
+barrier_teardown() {
+    if [[ -n "$BARRIER_PEER_PID" ]]; then
+        kill "$BARRIER_PEER_PID" 2>/dev/null || true
+        wait "$BARRIER_PEER_PID" 2>/dev/null || true
+        BARRIER_PEER_PID=
+    fi
+    [[ -n "$BARRIER_DESC" ]] && rm -f "$BARRIER_DESC"
+    BARRIER_DESC=
+}
+
 run_pass() {
     PASS_NAME="$1"
     local holder_mode="$2"
@@ -701,6 +811,29 @@ run_pass() {
     echo "==============================================="
     echo " pass=$PASS_NAME unaligned=$unaligned vf_uuid=$PASS_VF_UUID"
     echo "==============================================="
+
+    # Resolve barrier mode for this pass. Armed by default (the new
+    # flow), but never for the negative refuse passes (restore aborts
+    # before RESUME_DEVICES_LATE, so there is no R1 to complete) and
+    # never when PASS_NO_BARRIER=1 forces the legacy fused fallback.
+    PASS_USE_BARRIER=0
+    BARRIER_DESC=
+    BARRIER_SESSION=
+    BARRIER_PEER_PID=
+    if [[ "$UVERBS_CR_BARRIER" == "1" && \
+          "${EXPECT_RESTORE_FAIL:-0}" != "1" && \
+          "${PASS_NO_BARRIER:-0}" != "1" ]]; then
+        [[ -x "$BARRIER_PEER" ]] || {
+            echo "FAIL ($PASS_NAME): barrier armed but missing" \
+                 "$BARRIER_PEER -- 'make -C $HERE' (or set" \
+                 "UVERBS_CR_BARRIER=0)" >&2
+            exit 1
+        }
+        PASS_USE_BARRIER=1
+        echo "barrier: ARMED for pass=$PASS_NAME"
+    else
+        echo "barrier: not armed for pass=$PASS_NAME (legacy fused path)"
+    fi
 
     # ---- Phase A: source VF provisioning ------------------------------
     provision_vf "Phase A ($PASS_NAME)"
@@ -764,6 +897,15 @@ run_pass() {
     fi
 
     # ---- Phase C: criu dump -------------------------------------------
+    # Arm the D1 barrier: write the descriptor (consumed by the plugin
+    # on both dump and restore) and launch the stand-in peer so the
+    # plugin's CHECKPOINT_DEVICES rendezvous has someone to complete
+    # against. The stub retries/accepts until the plugin's endpoint is
+    # up, so launch order vs criu is not load-bearing.
+    if [[ "$PASS_USE_BARRIER" == "1" ]]; then
+        barrier_write_desc
+        barrier_start_peer D1
+    fi
     echo "=== Phase C ($PASS_NAME): criu dump ==="
     echo "criu dump -t $HOLDER_PID -D $DUMPDIR -v4"
     "$CRIU" dump -t "$HOLDER_PID" -D "$DUMPDIR" -v4 -o dump.log --shell-job $CRIU_LIB_FLAG || {
@@ -791,6 +933,12 @@ run_pass() {
     echo "dump OK; image dir contents:"
     ls -la "$DUMPDIR" | sed 's/^/  /'
 
+    # D1 must have completed inside the dump; reap the peer stub and
+    # fail the pass if it didn't rendezvous.
+    if [[ "$PASS_USE_BARRIER" == "1" ]]; then
+        barrier_wait_peer D1
+    fi
+
     # ---- Phase D + E: teardown + reprovision --------------------------
     reprovision_vf_for_restore
 
@@ -806,6 +954,14 @@ run_pass() {
     fi
 
     # ---- Phase F: criu restore ----------------------------------------
+    # Arm the R1 barrier: the descriptor is already on disk from the
+    # dump side (same VF UUID), and the plugin parks the initiator at
+    # bind (ensure_p2p) then runs the R1 rendezvous in
+    # RESUME_DEVICES_LATE before RESUME(INITIATOR). Launch the peer so
+    # that late hook completes.
+    if [[ "$PASS_USE_BARRIER" == "1" ]]; then
+        barrier_start_peer R1
+    fi
     echo "=== Phase F ($PASS_NAME): criu restore ==="
     local restore_rc=0
     "$CRIU" restore -D "$DUMPDIR" -v4 -o restore.log -d \
@@ -927,6 +1083,12 @@ run_pass() {
     }
     RESTORED_PID="$(cat "$RESTORED_PIDFILE")"
     echo "restored pid=$RESTORED_PID"
+
+    # Restore succeeded => the RESUME_DEVICES_LATE R1 rendezvous must
+    # have completed. Reap the peer stub and confirm.
+    if [[ "$PASS_USE_BARRIER" == "1" ]]; then
+        barrier_wait_peer R1
+    fi
 
     # Multi-VF positive assertion (KS7.3 §3.5.3): when the
     # harness provisioned more than one slot on the
@@ -1224,6 +1386,7 @@ run_pass() {
         kill -0 "$RESTORED_PID" 2>/dev/null || break
         sleep 0.1
     done
+    barrier_teardown
     echo "pass=$PASS_NAME: PASS"
 }
 
@@ -1357,6 +1520,8 @@ run_pass() {
 #   UVERBS_CR_RUN_PD_2CQ=1   PF=... ./run_vfmig_cr.sh   # incl. multi-CQ
 #   UVERBS_CR_RUN_KS7_3=0    PF=... ./run_vfmig_cr.sh   # no KS7.3 coverage
 #   UVERBS_CR_RUN_PRERESTORE=0 PF=... ./run_vfmig_cr.sh # no soft-fallback pass
+#   UVERBS_CR_BARRIER=0      PF=... ./run_vfmig_cr.sh   # legacy fused path only
+#   UVERBS_CR_RUN_LEGACY=0   PF=... ./run_vfmig_cr.sh   # drop the legacy pass
 #
 if [[ "${UVERBS_CR_RUN_PD_MR:-1}" == "1" ]]; then
     run_pass pd_mr_aligned   pd_mr 0
@@ -1379,6 +1544,20 @@ else
     echo "       that pre-date the S5 B-series mlx5_ib_restore_cq"
     echo "       registration in mlx5_ib_dev_ops, where a pd_cq"
     echo "       pass would only ever fail with -EOPNOTSUPP."
+fi
+# Dedicated legacy (fused suspend/resume) regression. Forces the
+# rendezvous descriptor absent (PASS_NO_BARRIER=1) so the plugin takes
+# the byte-identical non-barrier fallback -- the single-host / non-CRIU
+# contract the barrier work promised not to disturb. Only meaningful
+# when the barrier is otherwise armed by default; with
+# UVERBS_CR_BARRIER=0 every pass is already legacy, so this is skipped.
+if [[ "$UVERBS_CR_BARRIER" == "1" && "${UVERBS_CR_RUN_LEGACY:-1}" == "1" ]]; then
+    PASS_NO_BARRIER=1 run_pass pd_cq_legacy pd_cq 0
+elif [[ "$UVERBS_CR_BARRIER" != "1" ]]; then
+    echo
+    echo "[skip] dedicated legacy pass -- barrier already disabled"
+    echo "       globally (UVERBS_CR_BARRIER=0), so every pass exercises"
+    echo "       the fused fallback."
 fi
 if [[ "${UVERBS_CR_RUN_PD_2CQ:-0}" == "1" ]]; then
     run_pass pd_2cq          pd_2cq 0

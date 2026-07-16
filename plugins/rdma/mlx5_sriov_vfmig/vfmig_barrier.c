@@ -43,6 +43,7 @@
 
 #include "criu-log.h"
 
+#include "vfmig_barrier_wire.h"
 #include "vfmig_internal.h"
 
 #ifdef LOG_PREFIX
@@ -52,19 +53,6 @@
 
 #define VFMIG_BARRIER_DEFAULT_TIMEOUT_MS 30000
 #define VFMIG_BARRIER_DEFAULT_RETRY_MS	 200
-#define VFMIG_BARRIER_MAGIC		 0x564d4231u /* "VMB1" */
-#define VFMIG_BARRIER_VERSION		 1
-
-/* Fixed-layout wire record exchanged both ways on each edge. */
-struct vfmig_barrier_msg {
-	uint32_t magic;
-	uint16_t version;
-	uint16_t listen_port;
-	char	 phase[4];		/* "D1" / "R1", NUL-padded */
-	char	 session[64];		/* NUL-padded */
-	uint8_t	 vf_uuid[16];
-	char	 listen_ip[64];		/* sender's listen ip, NUL-padded */
-};
 
 /* ---------------- descriptor parsing ---------------- */
 

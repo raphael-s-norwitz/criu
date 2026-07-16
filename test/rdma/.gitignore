@@ -1,1 +1,3 @@
 uverbs_ctx_holder
+vfmig_barrier_peer
+rdma_rxe_test_exclusive_plugin.so
