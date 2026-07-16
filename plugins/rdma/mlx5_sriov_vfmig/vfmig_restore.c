@@ -166,6 +166,18 @@ struct vfmig_restored_vf {
 	char vf_bdf[64];
 	char dest_ibdev[64];
 	char dest_cdev_path[PATH_MAX];
+	/*
+	 * Cross-host barrier state (design/barrier_criu_design.md). When a
+	 * per-VHCA rendezvous descriptor exists, @barrier_mode is set and
+	 * @rz is cached at bind time: ensure_p2p() parks the initiator
+	 * (RUNNING -> RUNNING_P2P) and the RESUME_DEVICES_LATE hook runs the
+	 * R1 barrier then RESUME(INITIATOR) once (@initiator_resumed dedups
+	 * the per-pstree-item hook invocations). Absent descriptor => legacy
+	 * (initiator stays live from bind; both flags stay false).
+	 */
+	bool barrier_mode;
+	bool initiator_resumed;
+	struct vfmig_rendezvous rz;
 };
 static struct vfmig_restored_vf *vfmig_restored_vfs;
 
@@ -1086,6 +1098,43 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 }
 
 /*
+ * Bring a freshly-bound VF to the barrier hold state. If a per-VHCA
+ * rendezvous descriptor exists (barrier mode) the VF's initiator is
+ * parked (RUNNING -> RUNNING_P2P) so it stays quiesced across the
+ * process unfreeze until the RESUME_DEVICES_LATE barrier releases it;
+ * the loaded descriptor is cached on @v for that hook. Absent
+ * descriptor => legacy: leave the initiator live (resumed at bind),
+ * no late-hook action. SUSPEND(INITIATOR) is idempotent, so this is a
+ * no-op if the VF was already parked by a prior prerestore run.
+ *
+ * Returns 0 (both barrier and legacy), -1 on a malformed descriptor or
+ * a failed park (fail closed rather than leave an ambiguous state).
+ */
+static int vfmig_ensure_p2p(struct vfmig_restored_vf *v)
+{
+	int rc = vfmig_rendezvous_load(v->vf_uuid, &v->rz);
+
+	if (rc < 0)
+		return -1;
+	if (rc == 1) {
+		v->barrier_mode = false;
+		return 0;	/* legacy: no descriptor, initiator stays live */
+	}
+
+	v->barrier_mode = true;
+	if (vfmig_dp_suspend(v->pf_bdf, v->vf_id,
+			     MLX5_VFMIG_DIR_FLAG_INITIATOR)) {
+		pr_err("vfmig: barrier: pf=%s vf_id=%u: failed to park "
+		       "initiator (RUNNING_P2P)\n", v->pf_bdf, v->vf_id);
+		return -1;
+	}
+	pr_info("vfmig: barrier: pf=%s vf_id=%u parked initiator "
+		"(RUNNING_P2P), awaiting R1 at RESUME_DEVICES_LATE\n",
+		v->pf_bdf, v->vf_id);
+	return 0;
+}
+
+/*
  * Common phase A for both the plugin's restore-side init() and
  * the standalone prerestore binary's mlx5_vfmig_plugin_restore_vf_only()
  * symbol entry point.
@@ -1333,6 +1382,15 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 			uuid_str, e->pf_bdf, e->vf_id,
 			v->pf_bdf, v->vf_id, v->vf_bdf,
 			v->dest_ibdev, v->dest_cdev_path);
+
+		/*
+		 * Park the initiator for the cross-host barrier (no-op in
+		 * legacy mode). Applies to both the prerestore binary and
+		 * criu's inline-bind path; idempotent when a prior prerestore
+		 * already parked this VF.
+		 */
+		if (vfmig_ensure_p2p(v))
+			goto err;
 	}
 
 	/*
@@ -1562,6 +1620,74 @@ err:
 int vfmig_restore_init_all_vfs(void)
 {
 	return vfmig_restore_init_all_vfs_internal(true);
+}
+
+/*
+ * RESUME_DEVICES_LATE hook -- the restore half of the cross-host
+ * barrier (design/barrier_criu_design.md R1). Runs from the criu
+ * master after PIE has restored every MR/ring VMA, while the tasks are
+ * still stopped on rt_sigreturn (before finalize_restore_detach), so
+ * the initiator is released only after the rendezvous, with no
+ * running-but-parked window.
+ *
+ * For each barrier-mode VF (initiator parked at bind by ensure_p2p):
+ * run the R1 rendezvous, then RESUME(INITIATOR) RUNNING_P2P -> RUNNING.
+ * The hook is invoked once per alive pstree item but the restored-VF
+ * set is host-global, so @initiator_resumed dedups to one release per
+ * VF. Legacy VFs (no descriptor) were never parked and are skipped.
+ *
+ * On a barrier/resume failure we leave the initiator parked
+ * (RUNNING_P2P is the RC-safe hold: responder live, retries cover the
+ * sender) and surface -1. NB: cr-restore.c does not abort the restore
+ * on a RESUME_DEVICES_LATE error, so a failure here degrades to a
+ * live-but-cannot-egress VF rather than a torn-down restore; the
+ * orchestrator must health-check and recover. Hard-aborting from this
+ * point would need a criu-core change to honor the hook's return.
+ */
+int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid)
+{
+	struct vfmig_restored_vf *v;
+	int pending = 0, released = 0, failed = 0;
+
+	(void)pid;
+
+	if (!vfmig_active)
+		return -ENOTSUP;
+
+	for (v = vfmig_restored_vfs; v; v = v->next)
+		if (v->barrier_mode && !v->initiator_resumed)
+			pending++;
+	if (!pending)
+		return 0;	/* legacy-only tree, or already released */
+
+	for (v = vfmig_restored_vfs; v; v = v->next) {
+		if (!v->barrier_mode || v->initiator_resumed)
+			continue;
+
+		if (vfmig_barrier_run(&v->rz, VFMIG_BARRIER_PHASE_RESTORE)) {
+			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous "
+			       "failed; leaving initiator parked "
+			       "(RUNNING_P2P)\n", v->pf_bdf, v->vf_id);
+			failed++;
+			continue;
+		}
+		if (vfmig_dp_resume(v->pf_bdf, v->vf_id,
+				    MLX5_VFMIG_DIR_FLAG_INITIATOR)) {
+			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u "
+			       "RESUME(INITIATOR) failed\n",
+			       v->pf_bdf, v->vf_id);
+			failed++;
+			continue;
+		}
+		v->initiator_resumed = true;
+		released++;
+		pr_info("vfmig: barrier[R1]: pf=%s vf_id=%u initiator "
+			"resumed -> RUNNING\n", v->pf_bdf, v->vf_id);
+	}
+
+	pr_info("vfmig: RESUME_DEVICES_LATE: released=%d failed=%d\n",
+		released, failed);
+	return failed ? -1 : 0;
 }
 
 /*

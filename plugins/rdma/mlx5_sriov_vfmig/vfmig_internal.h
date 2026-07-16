@@ -199,6 +199,64 @@ void vfmig_clear_image_dir_override(void);
 extern bool vfmig_active;
 
 /*
+ * vfmig_barrier.c -- per-VHCA cross-host rendezvous descriptor + the
+ * symmetric in-plugin datapath-state barrier (design/barrier_criu_
+ * design.md). The descriptor is a host-local key=value file, a property
+ * of the provisioned VHCA, written by the pre-restore binary /
+ * orchestrator; its absence means legacy (no barrier). The barrier is a
+ * peer-to-peer READY rendezvous run inside the CHECKPOINT_DEVICES (D1)
+ * and RESUME_DEVICES_LATE (R1) hooks, using CRIU's own sockets.
+ */
+#define VFMIG_RZ_MAX_PEERS 15
+#define VFMIG_RZ_DIR	   "/run/criu-vfmig/rendezvous"
+
+/* Barrier phase labels (on the wire and in logs). */
+#define VFMIG_BARRIER_PHASE_DUMP    "D1"
+#define VFMIG_BARRIER_PHASE_RESTORE "R1"
+
+struct vfmig_rz_endpoint {
+	char	 ip[64];	/* IPv4/IPv6 literal or hostname */
+	uint16_t port;
+};
+
+struct vfmig_rendezvous {
+	char			 session[64];	/* per-migration id */
+	uint8_t			 vf_uuid[16];	/* this VHCA's identity */
+	struct vfmig_rz_endpoint listen;	/* our control endpoint */
+	struct vfmig_rz_endpoint peers[VFMIG_RZ_MAX_PEERS];
+	size_t			 n_peers;
+	int			 timeout_ms;	/* whole-barrier deadline */
+	int			 retry_ms;	/* connect backoff */
+};
+
+/*
+ * Load the rendezvous descriptor for @vf_uuid from
+ * VFMIG_RZ_DIR/<uuid-hex>.desc. Returns 0 loaded (barrier mode, *out
+ * populated), 1 absent (legacy mode, *out untouched), -1 malformed or
+ * unreadable (fail closed).
+ */
+int vfmig_rendezvous_load(const uint8_t vf_uuid[16],
+			  struct vfmig_rendezvous *out);
+
+/*
+ * Run the cross-host P2P barrier described by @rz at @phase (one of
+ * VFMIG_BARRIER_PHASE_*). Blocks until every peer has exchanged a
+ * matching READY at this phase, or the descriptor timeout elapses.
+ * Returns 0 on success, -1 on timeout/error.
+ */
+int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase);
+
+/*
+ * vfmig_dpstate.c -- shared SUSPEND/RESUME_VHCA ioctl helpers.
+ * @dir_flags is 0 (fused RUNNING<->STOP) or a subset of
+ * MLX5_VFMIG_DIR_FLAG_* for a single ladder edge (INITIATOR:
+ * RUNNING<->P2P, RESPONDER: P2P<->STOP). Both idempotent; each opens
+ * /dev/mlx5_vfmig/<pf_bdf> for the one ioctl. Return 0 or -1.
+ */
+int vfmig_dp_suspend(const char *pf_bdf, uint32_t vf_id, uint32_t dir_flags);
+int vfmig_dp_resume(const char *pf_bdf, uint32_t vf_id, uint32_t dir_flags);
+
+/*
  * vfmig_dump.c -- dump-side state lists, capture orchestration,
  * source devx_uid resolver, dump+VMA hooks, fini-time drain.
  *
@@ -305,6 +363,13 @@ int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd,
  */
 int vfmig_restore_init_all_vfs(void);
 void vfmig_restore_fini_close_all(void);
+
+/*
+ * RESUME_DEVICES_LATE hook: the restore-side (R1) cross-host barrier.
+ * Runs the rendezvous then RESUME(INITIATOR) for every barrier-mode VF
+ * parked at bind by ensure_p2p. -ENOTSUP when the plugin is inactive.
+ */
+int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid);
 
 int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path,
 					  const uint64_t addr,

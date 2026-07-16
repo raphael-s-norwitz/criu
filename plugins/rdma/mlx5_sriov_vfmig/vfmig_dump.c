@@ -452,10 +452,11 @@ void vfmig_suspended_clear(void)
 	vfmig_suspended_head = NULL;
 }
 
-/* Issue RESUME_VHCA on one parked VF (best-effort). */
-static int vfmig_resume_one_vf(const char *pf_bdf, uint32_t vf_id)
+/* Read the orchestrator-stamped vf_uuid for one VF (QUERY_VF). */
+static int vfmig_query_vf_uuid(const char *pf_bdf, uint32_t vf_id,
+			       uint8_t out[16])
 {
-	struct mlx5_vfmig_resume_vhca rv;
+	struct mlx5_vfmig_query_vf qv;
 	char cdev_path[PATH_MAX];
 	int fd, rc;
 
@@ -463,51 +464,74 @@ static int vfmig_resume_one_vf(const char *pf_bdf, uint32_t vf_id)
 		 MLX5_VFMIG_DEV_DIR, pf_bdf);
 	fd = open(cdev_path, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
-		pr_perror("vfmig: resume: open(%s)", cdev_path);
+		pr_perror("vfmig: query_vf_uuid: open(%s)", cdev_path);
 		return -1;
 	}
-	memset(&rv, 0, sizeof(rv));
-	rv.vf_id = vf_id;
-	rc = ioctl(fd, MLX5_VFMIG_IOC_RESUME_VHCA, &rv);
+	memset(&qv, 0, sizeof(qv));
+	qv.vf_id = vf_id;
+	rc = ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, &qv);
 	close(fd);
 	if (rc) {
-		pr_perror("vfmig: RESUME_VHCA(pf=%s vf_id=%u)", pf_bdf, vf_id);
+		pr_perror("vfmig: QUERY_VF(pf=%s vf_id=%u)", pf_bdf, vf_id);
 		return -1;
 	}
+	memcpy(out, qv.vf_uuid, 16);
 	return 0;
 }
 
-/* Raw SUSPEND_VHCA ioctl on one VF (no parked-set bookkeeping). */
-static int vfmig_suspend_vhca_ioctl(const char *pf_bdf, uint32_t vf_id)
-{
-	struct mlx5_vfmig_suspend_vhca sv;
-	char cdev_path[PATH_MAX];
-	int fd, rc;
-
-	snprintf(cdev_path, sizeof(cdev_path), "%s/%s",
-		 MLX5_VFMIG_DEV_DIR, pf_bdf);
-	fd = open(cdev_path, O_RDWR | O_CLOEXEC);
-	if (fd < 0) {
-		pr_perror("vfmig: suspend: open(%s)", cdev_path);
-		return -1;
-	}
-	memset(&sv, 0, sizeof(sv));
-	sv.vf_id = vf_id;
-	rc = ioctl(fd, MLX5_VFMIG_IOC_SUSPEND_VHCA, &sv);
-	close(fd);
-	if (rc) {
-		pr_perror("vfmig: SUSPEND_VHCA(pf=%s vf_id=%u)", pf_bdf, vf_id);
-		return -1;
-	}
-	return 0;
-}
-
-/* Issue SUSPEND_VHCA on one VF and record it in the parked set. */
+/*
+ * Quiesce one VF to STOP and record it in the parked set. In barrier
+ * mode (a per-VHCA rendezvous descriptor exists) the fused suspend is
+ * split around the D1 rendezvous: SUSPEND(INITIATOR) -> RUNNING_P2P,
+ * then block until every peer's initiator is parked, then
+ * SUSPEND(RESPONDER) -> STOP -- so no peer responder is killed while a
+ * peer initiator can still originate. Legacy mode (no descriptor) keeps
+ * the single fused SUSPEND -> STOP. A barrier/step failure rolls the VF
+ * back to RUNNING and fails the dump (never leave STOP-with-a-live-peer).
+ */
 static int vfmig_suspend_one_vf(const char *ibdev, const char *pf_bdf,
 				uint32_t vf_id)
 {
-	if (vfmig_suspend_vhca_ioctl(pf_bdf, vf_id))
+	struct vfmig_rendezvous rz;
+	uint8_t vf_uuid[16];
+	int mode;
+
+	/*
+	 * Resolve barrier mode by vf_uuid -> descriptor. If we can't read
+	 * the uuid, treat as legacy (the capture path will refuse an
+	 * unstamped VF anyway); a malformed descriptor fails closed.
+	 */
+	if (vfmig_query_vf_uuid(pf_bdf, vf_id, vf_uuid))
+		mode = 1;
+	else
+		mode = vfmig_rendezvous_load(vf_uuid, &rz);
+	if (mode < 0)
 		return -1;
+
+	if (mode == 1) {
+		/* Legacy fused RUNNING -> STOP (all-or-nothing). */
+		if (vfmig_dp_suspend(pf_bdf, vf_id, 0))
+			return -1;
+	} else {
+		/* Barrier: INITIATOR -> [D1] -> RESPONDER. */
+		if (vfmig_dp_suspend(pf_bdf, vf_id,
+				     MLX5_VFMIG_DIR_FLAG_INITIATOR))
+			return -1;
+		if (vfmig_barrier_run(&rz, VFMIG_BARRIER_PHASE_DUMP)) {
+			pr_err("vfmig: barrier[D1]: pf=%s vf_id=%u rendezvous "
+			       "failed; resuming and failing dump\n",
+			       pf_bdf, vf_id);
+			(void)vfmig_dp_resume(pf_bdf, vf_id, 0);
+			return -1;
+		}
+		if (vfmig_dp_suspend(pf_bdf, vf_id,
+				     MLX5_VFMIG_DIR_FLAG_RESPONDER)) {
+			(void)vfmig_dp_resume(pf_bdf, vf_id, 0);
+			return -1;
+		}
+		pr_info("vfmig: barrier[D1]: pf=%s vf_id=%u parked -> STOP\n",
+			pf_bdf, vf_id);
+	}
 
 	if (vfmig_suspended_add(ibdev, pf_bdf, vf_id)) {
 		/*
@@ -519,7 +543,7 @@ static int vfmig_suspend_one_vf(const char *ibdev, const char *pf_bdf,
 		pr_err("vfmig: checkpoint: OOM tracking suspended pf=%s "
 		       "vf_id=%u; rolling back suspend and failing dump\n",
 		       pf_bdf, vf_id);
-		(void)vfmig_resume_one_vf(pf_bdf, vf_id);
+		(void)vfmig_dp_resume(pf_bdf, vf_id, 0);
 		return -1;
 	}
 
@@ -593,7 +617,7 @@ void vfmig_resume_suspended_vfs(bool keep_suspended)
 		n = p->next;
 		if (keep_suspended) {
 			kept++;
-		} else if (vfmig_resume_one_vf(p->pf_bdf, p->vf_id)) {
+		} else if (vfmig_dp_resume(p->pf_bdf, p->vf_id, 0)) {
 			failed++;
 		} else {
 			pr_info("vfmig: resumed pf=%s vf_id=%u datapath\n",

@@ -320,34 +320,55 @@ struct mlx5_vfmig_set_tracked {
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x07, struct mlx5_vfmig_set_tracked)
 
 /*
+ * Direction selector for MLX5_VFMIG_IOC_SUSPEND_VHCA / RESUME_VHCA @flags.
+ * Mirrors the kernel UAPI (include/uapi/linux/mlx5_vfmig.h). The firmware
+ * VHCA migration FSM has three states on a RUNNING <-> RUNNING_P2P <-> STOP
+ * ladder, moved by per-direction SUSPEND/RESUME:
+ *   RUNNING       both directions live
+ *   RUNNING_P2P   responder answers peers; initiator quiesced; cmd ring live
+ *   STOP          fully parked; cmd ring dead
+ * Edges: SUSPEND(INITIATOR) RUNNING->P2P, SUSPEND(RESPONDER) P2P->STOP,
+ * RESUME(RESPONDER) STOP->P2P, RESUME(INITIATOR) P2P->RUNNING.
+ *
+ * @flags picks which direction(s) an ioctl drives:
+ *   0                    == INITIATOR|RESPONDER == both, the legacy fused
+ *                           pair (RUNNING<->STOP in one call), all-or-nothing
+ *                           on partial failure.
+ *   INITIATOR            SUSPEND: RUNNING->P2P;  RESUME: P2P->RUNNING
+ *   RESPONDER            SUSPEND: P2P->STOP;     RESUME: STOP->P2P
+ * An out-of-order directional step is rejected -EINVAL; an already-satisfied
+ * request is a no-op (returns 0, no firmware traffic).
+ */
+#define MLX5_VFMIG_DIR_FLAG_INITIATOR	(1u << 0)
+#define MLX5_VFMIG_DIR_FLAG_RESPONDER	(1u << 1)
+#define MLX5_VFMIG_DIR_FLAG_ALL \
+	(MLX5_VFMIG_DIR_FLAG_INITIATOR | MLX5_VFMIG_DIR_FLAG_RESPONDER)
+
+/*
  * MLX5_VFMIG_IOC_SUSPEND_VHCA:
- *   Quiesce VF @vf_id's datapath by issuing SUSPEND_VHCA(INITIATOR)
- *   followed by SUSPEND_VHCA(RESPONDER) on its vhca_id (PF-issued,
- *   other_function=1). This is the "pause" half of the stop-and-copy
- *   snapshot-ordering fix: CRIU calls it at the early CHECKPOINT_DEVICES
- *   hook, BEFORE the dumpee's memory is copied, so no peer RDMA
- *   WRITE/SEND (and no VF self-DMA) lands in pinned MR pages mid-
+ *   Quiesce VF @vf_id's datapath toward STOP on its vhca_id (PF-issued,
+ *   other_function=1). With @flags == 0 this issues SUSPEND_VHCA(INITIATOR)
+ *   then SUSPEND_VHCA(RESPONDER) as before; @flags may instead select a
+ *   single ladder step (see MLX5_VFMIG_DIR_FLAG_* above). This is the
+ *   "pause" half of the snapshot-ordering fix: CRIU calls it at the early
+ *   CHECKPOINT_DEVICES hook, BEFORE the dumpee's memory is copied, so no
+ *   peer RDMA WRITE/SEND (and no VF self-DMA) lands in pinned MR pages mid-
  *   snapshot. The heavy state capture stays in the late
  *   MLX5_VFMIG_IOC_SAVE_VHCA_STATE.
  *
- *   Latches the per-VF vfmig_suspended bit. Idempotent: returns 0 with
- *   no firmware traffic if the VF is already suspended. The VF may be
- *   bound or unbound. Requires the migratable cap, same gate as SAVE.
+ *   Updates the per-VF vfmig_dp_state. Idempotent: returns 0 with no
+ *   firmware traffic if the requested depth is already reached. The VF may
+ *   be bound or unbound. Requires the migratable cap, same gate as SAVE.
  *
- *   Relationship to SAVE_VHCA_STATE: if the VF is already suspended via
- *   this ioctl, a subsequent SAVE skips its in-SAVE SUSPEND pair and
- *   does NOT auto-resume on save_fd close -- the caller owns the resume
- *   via MLX5_VFMIG_IOC_RESUME_VHCA. If SAVE is used standalone (no prior
- *   SUSPEND), it self-suspends and resumes on close as before.
- *
- *   Returns 0 on success; -EINVAL if @vf_id is out of range or @flags
- *   is non-zero; -EOPNOTSUPP if the VF is not migration-enabled;
- *   -ENODEV if the PF is gone; any negative firmware-error code if a
- *   SUSPEND step fails.
+ *   Returns 0 on success; -EINVAL if @vf_id is out of range, @flags has
+ *   unknown bits, or the requested step is out of order for the current
+ *   state; -EOPNOTSUPP if the VF is not migration-enabled; -ENODEV if the
+ *   PF is gone; any negative firmware-error code if a SUSPEND step fails
+ *   (fused is rolled back; directional latches the reached depth).
  */
 struct mlx5_vfmig_suspend_vhca {
 	__u32 vf_id;	/* in  */
-	__u32 flags;	/* in: must be 0 */
+	__u32 flags;	/* in: 0 or a subset of MLX5_VFMIG_DIR_FLAG_* */
 	__u32 reserved[2];
 };
 #define MLX5_VFMIG_IOC_SUSPEND_VHCA \
@@ -355,27 +376,29 @@ struct mlx5_vfmig_suspend_vhca {
 
 /*
  * MLX5_VFMIG_IOC_RESUME_VHCA:
- *   Un-quiesce VF @vf_id's datapath by issuing RESUME_VHCA(RESPONDER)
- *   followed by RESUME_VHCA(INITIATOR) (reverse order of suspend). This
+ *   Un-quiesce VF @vf_id's datapath toward RUNNING. With @flags == 0 this
+ *   issues RESUME_VHCA(RESPONDER) then RESUME_VHCA(INITIATOR) (reverse order
+ *   of suspend); @flags may instead select a single ladder step (see
+ *   MLX5_VFMIG_DIR_FLAG_* above -- e.g. RESPONDER brings STOP -> RUNNING_P2P
+ *   so a peer's responder is live before its initiator is released). This
  *   is the "resume" half of the snapshot-ordering fix:
- *     - on the source after dump completes (or is aborted), to bring
- *       the VF back to runnable;
- *     - on the destination at RESUME_DEVICES_LATE, after a
- *       MARK_RESTORED { DEFER_RESUME } + bind has applied
- *       LOAD_VHCA_STATE and left the VHCA parked, once all MR/ring VMAs
- *       are restored.
+ *     - on the source after dump completes (or is aborted), to bring the VF
+ *       back to runnable;
+ *     - on the destination at RESUME_DEVICES_LATE, after all MR/ring VMAs
+ *       are restored, to release the parked initiator.
  *
- *   Clears the per-VF vfmig_suspended / vfmig_defer_resume bits.
- *   Idempotent: returns 0 with no firmware traffic if the VF is not
- *   currently suspended.
+ *   Updates the per-VF vfmig_dp_state and clears vfmig_defer_resume.
+ *   Idempotent: returns 0 with no firmware traffic if the requested depth is
+ *   already reached.
  *
- *   Returns 0 on success; -EINVAL if @vf_id is out of range or @flags
- *   is non-zero; -ENODEV if the PF is gone; any negative firmware-error
- *   code if a RESUME step fails.
+ *   Returns 0 on success; -EINVAL if @vf_id is out of range, @flags has
+ *   unknown bits, or the requested step is out of order for the current
+ *   state; -ENODEV if the PF is gone; any negative firmware-error code if a
+ *   RESUME step fails (fused is rolled back; directional latches the depth).
  */
 struct mlx5_vfmig_resume_vhca {
 	__u32 vf_id;	/* in  */
-	__u32 flags;	/* in: must be 0 */
+	__u32 flags;	/* in: 0 or a subset of MLX5_VFMIG_DIR_FLAG_* */
 	__u32 reserved[2];
 };
 #define MLX5_VFMIG_IOC_RESUME_VHCA \
