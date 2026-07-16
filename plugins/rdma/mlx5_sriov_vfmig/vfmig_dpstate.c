@@ -3,8 +3,8 @@
  *
  * Shared datapath-state (SUSPEND/RESUME_VHCA) ioctl helpers for the
  * rdma_mlx5_vfmig plugin. Both the dump path (CHECKPOINT_DEVICES
- * two-phase pause, fini resume) and the restore path (ensure_p2p park,
- * RESUME_DEVICES_LATE unpark) drive the firmware RUNNING <-> RUNNING_P2P
+ * two-phase pause, fini resume) and the restore path (the
+ * RESUME_DEVICES_LATE R1 park+release) drive the firmware RUNNING <-> RUNNING_P2P
  * <-> STOP ladder through these two entry points; keeping them in one
  * place means every caller opens /dev/mlx5_vfmig/<pf_bdf> the same way
  * and passes the same MLX5_VFMIG_DIR_FLAG_* direction selector.
