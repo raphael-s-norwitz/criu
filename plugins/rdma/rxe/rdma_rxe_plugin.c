@@ -956,10 +956,10 @@ static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
  * PTR_OUT blob. @vm_pgoff is the CQ ring's mmap byte offset
  * (cq->queue->ip->info.offset); @cqe is the CQ's user-visible entry
  * count (cq->ibcq.cqe); @producer / @consumer are the live ring
- * cursors (QUEUE_TYPE_TO_CLIENT); @cqe_image_bytes is the CQE slot
- * region length (queue_data_size), with the raw ring image carried in
- * the optional RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE attr. Remove once
- * host rdma-core ships the struct.
+ * cursors (QUEUE_TYPE_TO_CLIENT); @cqe_image_bytes is the byte length of
+ * the in-flight [consumer, producer) CQE subspan, with that subspan image
+ * carried in the optional RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE attr. Remove
+ * once host rdma-core ships the struct.
  */
 struct rxe_query_cq_resp_local {
 	uint64_t vm_pgoff;
@@ -1021,10 +1021,11 @@ static int rxe_query_cq(int fd, uint32_t cq_handle,
 
 	/*
 	 * Optional in-flight CQE-ring image PTR_OUT (mirrors QUERY_QP's
-	 * SQ/RQ image attrs). The kernel writes queue_data_size bytes and
-	 * reports the count in resp_out->cqe_image_bytes; a buffer smaller
-	 * than the ring fails the whole QUERY_CQ with -ENOSPC, so advertise
-	 * the full @img_cap.
+	 * SQ/RQ image attrs). The kernel writes only the in-flight
+	 * [consumer, producer) subspan and reports its byte count in
+	 * resp_out->cqe_image_bytes; a buffer smaller than that subspan
+	 * fails the whole QUERY_CQ with -ENOSPC, so advertise the full
+	 * @img_cap.
 	 */
 	if (cqe_img && img_cap) {
 		cmd.attrs[n].attr_id = RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE_LOCAL;
@@ -1056,10 +1057,11 @@ static int rxe_query_cq(int fd, uint32_t cq_handle,
  *       QUERY_CQ (QUEUE_TYPE_TO_CLIENT: rxe owns the producer, the
  *       client owns the consumer). Replayed into rxe_restore_cq_req so
  *       the restored ring's unreaped CQEs are visible to ibv_poll_cq.
- *   @cqe_image_bytes  byte length of the captured CQE slot region
- *       (queue_data_size). When non-zero the raw ring image is appended
- *       to this header in the plugin_blob byte slice, exactly like the
- *       QP header + SQ/RQ image tail; the destination blits it back.
+ *   @cqe_image_bytes  byte length of the captured in-flight CQE subspan
+ *       ((producer - consumer) rounded through the ring, one slot each).
+ *       When non-zero the raw subspan image is appended to this header in
+ *       the plugin_blob byte slice, exactly like the QP header + SQ/RQ
+ *       image tail; the destination scatters it back to the source slots.
  *       Zero => empty/drained CQ (producer == consumer), cursor-only.
  *   @reserved  pads to 8-byte alignment; must be zero.
  *
@@ -1884,9 +1886,10 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev,
 	 * (inlen == sizeof header). Otherwise concatenate the SQ/RQ/RES
 	 * images after the header in slice order SQ,RQ,RES -- the kernel
 	 * slices the RESTORE_QP UHW_IN tail by exactly the header's
-	 * *_image_bytes. SQ is always present on the in-flight path (its
-	 * byte count is the whole ring), even when only the RQ/responder
-	 * side is non-idle, because the tail slicing is positional.
+	 * *_image_bytes. Each image is only the in-flight [consumer, producer)
+	 * subspan (QUERY_QP no longer ships the whole ring), so an individual
+	 * *_image_bytes may be 0 on the in-flight path when only one side is
+	 * non-idle; the positional tail slicing handles a zero-length slice.
 	 */
 	drained = blob.sq_producer == blob.sq_consumer &&
 		  (blob.rq_image_bytes == 0 ||
