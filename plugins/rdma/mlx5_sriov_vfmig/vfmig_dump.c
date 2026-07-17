@@ -508,6 +508,18 @@ static int vfmig_suspend_one_vf(const char *ibdev, const char *pf_bdf,
 	if (mode < 0)
 		return -1;
 
+	/*
+	 * Bisect knob: force legacy fused suspend even with a descriptor
+	 * present, to isolate whether the directional D1 split (vs fused)
+	 * is what regresses post-restore UMR on the destination.
+	 */
+	if (mode == 0 && !vfmig_d1_barrier_enabled()) {
+		pr_info("vfmig: barrier[D1]: pf=%s vf_id=%u descriptor present "
+			"but VFMIG_D1_BARRIER=0 -- using legacy fused suspend\n",
+			pf_bdf, vf_id);
+		mode = 1;
+	}
+
 	if (mode == 1) {
 		/* Legacy fused RUNNING -> STOP (all-or-nothing). */
 		if (vfmig_dp_suspend(pf_bdf, vf_id, 0))

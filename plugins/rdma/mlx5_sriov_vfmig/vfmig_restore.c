@@ -1680,6 +1680,8 @@ int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid)
 		return 0;	/* legacy-only tree, or already released */
 
 	for (v = vfmig_restored_vfs; v; v = v->next) {
+		bool park = vfmig_r1_park_enabled();
+
 		if (!v->barrier_mode || v->initiator_resumed)
 			continue;
 
@@ -1690,9 +1692,17 @@ int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid)
 		 * ring here is safe -- nothing between this park and the
 		 * RESUME below needs it. SUSPEND(INITIATOR) is idempotent, so
 		 * a retry after a prior barrier failure just re-parks.
+		 *
+		 * Bisect knob (VFMIG_R1_PARK=0): skip the park/unpark cycle
+		 * and run the rendezvous only, to isolate whether the park is
+		 * what leaves the VF datapath-live but UMR-incapable (fresh
+		 * reg_mr wedging in mlx5r_umr_post_send_wait post-restore).
+		 * The app is frozen until after this hook, so the rendezvous
+		 * alone still gates every peer's unfreeze on all peers being
+		 * up; only the pre-queued-WQE egress-hold is dropped.
 		 */
-		if (vfmig_dp_suspend(v->pf_bdf, v->vf_id,
-				     MLX5_VFMIG_DIR_FLAG_INITIATOR)) {
+		if (park && vfmig_dp_suspend(v->pf_bdf, v->vf_id,
+					     MLX5_VFMIG_DIR_FLAG_INITIATOR)) {
 			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u failed to "
 			       "park initiator (RUNNING -> RUNNING_P2P) before "
 			       "rendezvous\n", v->pf_bdf, v->vf_id);
@@ -1702,13 +1712,14 @@ int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid)
 
 		if (vfmig_barrier_run(&v->rz, VFMIG_BARRIER_PHASE_RESTORE)) {
 			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous "
-			       "failed; leaving initiator parked "
-			       "(RUNNING_P2P)\n", v->pf_bdf, v->vf_id);
+			       "failed; %s\n", v->pf_bdf, v->vf_id,
+			       park ? "leaving initiator parked (RUNNING_P2P)"
+				    : "no park to unwind (VFMIG_R1_PARK=0)");
 			failed++;
 			continue;
 		}
-		if (vfmig_dp_resume(v->pf_bdf, v->vf_id,
-				    MLX5_VFMIG_DIR_FLAG_INITIATOR)) {
+		if (park && vfmig_dp_resume(v->pf_bdf, v->vf_id,
+					    MLX5_VFMIG_DIR_FLAG_INITIATOR)) {
 			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u "
 			       "RESUME(INITIATOR) failed\n",
 			       v->pf_bdf, v->vf_id);
@@ -1717,8 +1728,10 @@ int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid)
 		}
 		v->initiator_resumed = true;
 		released++;
-		pr_info("vfmig: barrier[R1]: pf=%s vf_id=%u initiator "
-			"resumed -> RUNNING\n", v->pf_bdf, v->vf_id);
+		pr_info("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous done, "
+			"initiator %s -> RUNNING (pre-unfreeze)\n",
+			v->pf_bdf, v->vf_id,
+			park ? "resumed" : "left untouched");
 	}
 
 	pr_info("vfmig: RESUME_DEVICES_LATE: released=%d failed=%d\n",

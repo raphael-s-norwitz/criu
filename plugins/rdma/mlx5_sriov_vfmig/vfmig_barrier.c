@@ -54,6 +54,42 @@
 #define VFMIG_BARRIER_DEFAULT_TIMEOUT_MS 30000
 #define VFMIG_BARRIER_DEFAULT_RETRY_MS	 200
 
+/* ---------------- bisect knobs (env, cached + logged once) ---------------- */
+
+/*
+ * Read a default-on boolean env knob exactly once. "0" (and only "0")
+ * disables; anything else (unset, "1", garbage) keeps the shipped default.
+ * @cache is a tri-state: -1 = unread, 0/1 = resolved.
+ */
+static bool vfmig_env_flag_default_on(const char *name, int *cache)
+{
+	const char *v;
+
+	if (*cache >= 0)
+		return *cache;
+
+	v = getenv(name);
+	*cache = (v && !strcmp(v, "0")) ? 0 : 1;
+	if (!*cache)
+		pr_info("vfmig: barrier: %s=0 -- disabled for this run "
+			"(bisect knob)\n", name);
+	return *cache;
+}
+
+bool vfmig_d1_barrier_enabled(void)
+{
+	static int cache = -1;
+
+	return vfmig_env_flag_default_on("VFMIG_D1_BARRIER", &cache);
+}
+
+bool vfmig_r1_park_enabled(void)
+{
+	static int cache = -1;
+
+	return vfmig_env_flag_default_on("VFMIG_R1_PARK", &cache);
+}
+
 /* ---------------- descriptor parsing ---------------- */
 
 static void uuid_to_hex(const uint8_t uuid[16], char out[33])

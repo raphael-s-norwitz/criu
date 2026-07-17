@@ -247,6 +247,25 @@ int vfmig_rendezvous_load(const uint8_t vf_uuid[16],
 int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase);
 
 /*
+ * Bisect knobs (env, read once + logged) for isolating which half of the
+ * barrier regresses post-restore UMR-backed verbs (e.g. reg_mr wedging in
+ * mlx5r_umr_post_send_wait). Both default to the shipped behavior; set to
+ * "0" to drop that half while keeping the descriptor/rendezvous otherwise.
+ *
+ *   VFMIG_D1_BARRIER (default 1): when 0, the dump path uses the legacy
+ *       fused SUSPEND -> STOP instead of the directional
+ *       SUSPEND(INITIATOR) -> [D1] -> SUSPEND(RESPONDER) split (no D1
+ *       rendezvous). Tests whether the directional dump-suspend ordering
+ *       corrupts the saved VHCA state.
+ *   VFMIG_R1_PARK (default 1): when 0, the restore late hook runs the R1
+ *       rendezvous only, skipping the SUSPEND(INITIATOR)/RESUME(INITIATOR)
+ *       park/unpark cycle. Tests whether the R1 park is what leaves the
+ *       restored VF datapath-live but UMR-incapable.
+ */
+bool vfmig_d1_barrier_enabled(void);
+bool vfmig_r1_park_enabled(void);
+
+/*
  * vfmig_dpstate.c -- shared SUSPEND/RESUME_VHCA ioctl helpers.
  * @dir_flags is 0 (fused RUNNING<->STOP) or a subset of
  * MLX5_VFMIG_DIR_FLAG_* for a single ladder edge (INITIATOR:
