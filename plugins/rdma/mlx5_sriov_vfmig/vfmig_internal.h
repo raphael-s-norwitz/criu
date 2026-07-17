@@ -366,10 +366,10 @@ void vfmig_restore_fini_close_all(void);
 
 /*
  * RESUME_DEVICES_LATE hook: the restore-side (R1) cross-host barrier.
- * For every barrier-mode VF, parks the initiator (RUNNING -> RUNNING_P2P),
- * runs the rendezvous, then RESUME(INITIATOR). The initiator is left
- * RUNNING across the rest of restore (vfmig_barrier_arm() does not park
- * at bind); the park/release straddle the rendezvous here.
+ * For every barrier-mode VF, runs the rendezvous only -- no datapath
+ * toggle. The initiator was resumed once at bind and stays RUNNING across
+ * the whole restore; re-parking a restored initiator wedges UMR, so the
+ * hook must not SUSPEND/RESUME it (see the definition's comment).
  * -ENOTSUP when the plugin is inactive.
  */
 int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid);

@@ -170,17 +170,15 @@ struct vfmig_restored_vf {
 	 * Cross-host barrier state (design/barrier_criu_design.md). When a
 	 * per-VHCA rendezvous descriptor exists, @barrier_mode is set and
 	 * @rz is cached at bind time by vfmig_barrier_arm(). The initiator
-	 * is deliberately left RUNNING across the whole restore (its command
-	 * ring is needed for GET_CONTEXT and the PIE RESTORE_MR/QP replay);
-	 * only the RESUME_DEVICES_LATE hook touches the datapath, parking the
-	 * initiator (RUNNING -> RUNNING_P2P) immediately before the R1
-	 * barrier and releasing it (RESUME(INITIATOR)) once the rendezvous
-	 * completes (@initiator_resumed dedups the per-pstree-item hook
-	 * invocations). Absent descriptor => legacy (no barrier; both flags
-	 * stay false).
+	 * is resumed once at bind (single monotonic bring-up) and stays
+	 * RUNNING across the whole restore; the RESUME_DEVICES_LATE hook runs
+	 * only the R1 rendezvous and does NOT touch the datapath (re-toggling
+	 * a restored initiator wedges UMR -- see the hook comment).
+	 * @barrier_done dedups the per-pstree-item hook invocations. Absent
+	 * descriptor => legacy (no barrier; both flags stay false).
 	 */
 	bool barrier_mode;
-	bool initiator_resumed;
+	bool barrier_done;
 	struct vfmig_rendezvous rz;
 };
 static struct vfmig_restored_vf *vfmig_restored_vfs;
@@ -1114,10 +1112,10 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
  * ring (the current FW does not keep it live in RUNNING_P2P), so
  * parking at bind deadlocks the restore -- ALLOC_TRANSPORT_DOMAIN times
  * out at GET_CONTEXT. The initiator therefore stays RUNNING across the
- * command-issuing restore and is parked only in the R1 hook, right
- * around the rendezvous, after PIE has restored memory. This keeps
- * RESUME(INITIATOR) (which flushes queued WQEs) after the MR/ring VMAs
- * are in place, per R1 condition (c) in barrier_criu_design.md.
+ * whole restore; the R1 hook (RESUME_DEVICES_LATE) runs the rendezvous
+ * only and never re-toggles the datapath, because re-parking an
+ * already-RUNNING restored initiator wedges the first post-restore
+ * reg_mr in UMR (see the RESUME_DEVICES_LATE hook comment).
  *
  * Returns 0 (both barrier and legacy), -1 on a malformed descriptor.
  */
@@ -1135,7 +1133,8 @@ static int vfmig_barrier_arm(struct vfmig_restored_vf *v)
 	v->barrier_mode = true;
 	pr_info("vfmig: barrier: pf=%s vf_id=%u armed (rendezvous descriptor "
 		"loaded); initiator stays RUNNING across restore, "
-		"parked+released at R1 (RESUME_DEVICES_LATE)\n",
+		"R1 rendezvous only at RESUME_DEVICES_LATE (no datapath "
+		"toggle)\n",
 		v->pf_bdf, v->vf_id);
 	return 0;
 }
@@ -1636,37 +1635,53 @@ int vfmig_restore_init_all_vfs(void)
  * master after PIE has restored every MR/ring VMA, while the tasks are
  * still stopped on rt_sigreturn (before finalize_restore_detach).
  *
- * In barrier mode the initiator was left RUNNING across the whole
- * restore (its command ring is needed for GET_CONTEXT and the PIE
- * RESTORE_MR/QP replay -- see vfmig_barrier_arm()), so the datapath
- * park/release is done here, tightly around the rendezvous:
+ * This hook runs the R1 rendezvous ONLY -- it does not touch the
+ * datapath. The restored initiator was already resumed exactly once, as
+ * a single monotonic STOP -> RUNNING_P2P -> RUNNING bring-up, inside the
+ * bind-time apply_pending_load (kernel vfmig.c), and it stays RUNNING
+ * from bind through GET_CONTEXT, the PIE RESTORE_MR/QP replay, and this
+ * hook.
  *
- *   SUSPEND(INITIATOR)  RUNNING -> RUNNING_P2P   (park; PIE done, so no
- *                                                 more command work runs
- *                                                 before the release)
- *   R1 rendezvous       block until every peer is here
- *   RESUME(INITIATOR)   RUNNING_P2P -> RUNNING   (queued WQEs flush into
- *                                                 now-restored memory, to
- *                                                 a peer past R1)
+ * Why no park/unpark here (was: SUSPEND(INITIATOR) -> rdv ->
+ * RESUME(INITIATOR)): a *second* initiator toggle on an already-restored,
+ * already-RUNNING VHCA is a confirmed firmware footgun. Both directional
+ * commands return success and dp_state latches back to RUNNING, but the
+ * FW requester/SQ engine on a restored VHCA is not actually re-armed, so
+ * the kernel's internal UMR QP -- lazily created on the first post-restore
+ * reg_mr -- never gets its first SQ WQE processed and reg_mr wedges
+ * forever in mlx5r_umr_post_send_wait() (untimed wait_for_completion) =>
+ * D-state. Confirmed by E2E bisect (park on => UMR hang; park off => pass)
+ * and by the kernel team (see scratch/kernel_handoff_r1_umr_wedge.md). A
+ * single monotonic bring-up is fine; RUNNING -> P2P -> RUNNING is not.
  *
- * The park+release straddle the rendezvous so no initiator egresses
- * (queued-WQE flush) until every peer has reached R1. The hook is
- * invoked once per alive pstree item but the restored-VF set is
- * host-global, so @initiator_resumed dedups to one release per VF.
+ * Invariant caveat: with no restore-side park, "no initiator originates
+ * before every peer's responder is up" is held only *in practice*, on two
+ * premises -- the source SQ was drained by SUSPEND(INITIATOR) at dump, and
+ * the app stays frozen until after this hook -- so nothing egresses before
+ * R1 regardless. Holding it *structurally* (rendezvous strictly between
+ * RESUME(RESPONDER) and RESUME(INITIATOR), or the initiator parked through
+ * PIE) is unreachable on today's kernel: the two RESUMEs are fused inside
+ * apply_pending_load with no hook between them, DEFER_RESUME cannot persist
+ * past the bind probe (mlx5_function_open QUERYs a STOPPED VHCA and fails),
+ * and RUNNING_P2P does not keep the VF command ring serviceable. Both are
+ * kernel/FW follow-ups; see the design doc and kernel handoff.
+ *
+ * The hook is invoked once per alive pstree item but the restored-VF set
+ * is host-global, so @barrier_done dedups to one rendezvous per VF.
  * Legacy VFs (no descriptor) are skipped.
  *
- * On a park/barrier/resume failure we leave the initiator parked
- * (RUNNING_P2P is the RC-safe hold: responder live, retries cover the
- * sender) and surface -1. NB: cr-restore.c does not abort the restore
- * on a RESUME_DEVICES_LATE error, so a failure here degrades to a
- * live-but-cannot-egress VF rather than a torn-down restore; the
- * orchestrator must health-check and recover. Hard-aborting from this
- * point would need a criu-core change to honor the hook's return.
+ * On a rendezvous failure the VF stays RUNNING (there is no safe
+ * restore-side hold available -- see above) and we surface -1. NB:
+ * cr-restore.c does not abort the restore on a RESUME_DEVICES_LATE error,
+ * so a failure here degrades to a running-but-uncoordinated VF rather than
+ * a torn-down restore; the orchestrator must health-check and recover.
+ * Hard-aborting from this point would need a criu-core change to honor
+ * the hook's return.
  */
 int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid)
 {
 	struct vfmig_restored_vf *v;
-	int pending = 0, released = 0, failed = 0;
+	int pending = 0, done = 0, failed = 0;
 
 	(void)pid;
 
@@ -1674,55 +1689,31 @@ int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid)
 		return -ENOTSUP;
 
 	for (v = vfmig_restored_vfs; v; v = v->next)
-		if (v->barrier_mode && !v->initiator_resumed)
+		if (v->barrier_mode && !v->barrier_done)
 			pending++;
 	if (!pending)
-		return 0;	/* legacy-only tree, or already released */
+		return 0;	/* legacy-only tree, or already done */
 
 	for (v = vfmig_restored_vfs; v; v = v->next) {
-		if (!v->barrier_mode || v->initiator_resumed)
+		if (!v->barrier_mode || v->barrier_done)
 			continue;
-
-		/*
-		 * Park the initiator now, immediately before the rendezvous.
-		 * All FW command work (GET_CONTEXT, PIE RESTORE_MR/QP) is
-		 * complete by RESUME_DEVICES_LATE, so quiescing the command
-		 * ring here is safe -- nothing between this park and the
-		 * RESUME below needs it. SUSPEND(INITIATOR) is idempotent, so
-		 * a retry after a prior barrier failure just re-parks.
-		 */
-		if (vfmig_dp_suspend(v->pf_bdf, v->vf_id,
-				     MLX5_VFMIG_DIR_FLAG_INITIATOR)) {
-			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u failed to "
-			       "park initiator (RUNNING -> RUNNING_P2P) before "
-			       "rendezvous\n", v->pf_bdf, v->vf_id);
-			failed++;
-			continue;
-		}
 
 		if (vfmig_barrier_run(&v->rz, VFMIG_BARRIER_PHASE_RESTORE)) {
 			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous "
-			       "failed; leaving initiator parked "
-			       "(RUNNING_P2P)\n", v->pf_bdf, v->vf_id);
-			failed++;
-			continue;
-		}
-		if (vfmig_dp_resume(v->pf_bdf, v->vf_id,
-				    MLX5_VFMIG_DIR_FLAG_INITIATOR)) {
-			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u "
-			       "RESUME(INITIATOR) failed\n",
+			       "failed; VF left RUNNING (no safe hold)\n",
 			       v->pf_bdf, v->vf_id);
 			failed++;
 			continue;
 		}
-		v->initiator_resumed = true;
-		released++;
-		pr_info("vfmig: barrier[R1]: pf=%s vf_id=%u initiator "
-			"resumed -> RUNNING\n", v->pf_bdf, v->vf_id);
+		v->barrier_done = true;
+		done++;
+		pr_info("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous done "
+			"(initiator already RUNNING)\n",
+			v->pf_bdf, v->vf_id);
 	}
 
-	pr_info("vfmig: RESUME_DEVICES_LATE: released=%d failed=%d\n",
-		released, failed);
+	pr_info("vfmig: RESUME_DEVICES_LATE: done=%d failed=%d\n",
+		done, failed);
 	return failed ? -1 : 0;
 }
 
