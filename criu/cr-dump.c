@@ -51,6 +51,7 @@
 #include "shmem.h"
 #include "sk-inet.h"
 #include "pstree.h"
+#include "rdma.h"
 #include "mount.h"
 #include "tty.h"
 #include "net.h"
@@ -2211,6 +2212,23 @@ int cr_dump_tasks(pid_t pid)
 	 */
 
 	if (collect_pstree())
+		goto err;
+
+	/*
+	 * Pre-suspend RDMA coverage check.
+	 *
+	 * Runs immediately after collect_pstree() rather than before
+	 * SIGSTOP because we need the pid set the iterator gives us. The
+	 * freeze window between collect_pstree()'s SEIZE and this check
+	 * is microseconds (one netlink dump + plugin arbitration), and on
+	 * failure cr_dump_finish() switches the tree back to TASK_ALIVE
+	 * so the snapshot target survives a coverage rejection. This is
+	 * an optimisation over the dump_uverbsfile() per-fd check: it
+	 * surfaces the same "no plugin claims this context" error with
+	 * the entire tree in view, so the operator gets one actionable
+	 * error instead of one per offending fd.
+	 */
+	if (rdma_check_dump_coverage(root_item))
 		goto err;
 
 	if (checkpoint_devices())
