@@ -2231,6 +2231,16 @@ int cr_dump_tasks(pid_t pid)
 	if (rdma_check_dump_coverage(root_item))
 		goto err;
 
+	/*
+	 * Cross-tree RDMA exclusivity: refuse to silently break
+	 * non-snapshot pids that share an exclusive RDMA device with the
+	 * snapshot tree. Runs after coverage so we already know every
+	 * snapshot-tree context has a claiming plugin to ask. See
+	 * criu/rdma/precheck.c for the policy + a TOCTOU note.
+	 */
+	if (rdma_check_cross_tree_exclusivity(root_item))
+		goto err;
+
 	if (checkpoint_devices())
 		goto err;
 
