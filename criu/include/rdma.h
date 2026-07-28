@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+struct pstree_item;
+
 extern const struct fdtype_ops uverbs_dump_ops;
 extern const struct fdtype_ops uverbs_async_eventfd_dump_ops;
 
@@ -12,6 +14,19 @@ extern struct collect_image_info uverbsfd_cinfo;
 extern struct collect_image_info uverbsasyncevfd_cinfo;
 
 bool is_async_eventfd(char *link);
+
+/*
+ * Pre-suspend RDMA dump-coverage check (criu/rdma/precheck.c).
+ *
+ * For every live RDMA context held by a snapshot-tree pid, confirms
+ * exactly one loaded plugin claims the underlying device, so a tree
+ * holding a context no plugin can restore is rejected up front (with
+ * the whole pstree in view) instead of mid-dump, fd by fd. Runs right
+ * after collect_pstree(), before the freeze deepens. Fails closed on
+ * netlink errors. Returns 0 if every tree context is covered, -1
+ * otherwise.
+ */
+int rdma_check_dump_coverage(struct pstree_item *root);
 
 /*
  * RDMA plugin claim arbitration (criu/rdma/plugin_api.c):
