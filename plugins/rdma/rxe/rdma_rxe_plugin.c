@@ -1,11 +1,14 @@
 /*
- * CRIU RDMA RXE plugin -- presence detection.
+ * CRIU RDMA RXE plugin -- presence detection and context claim.
  *
- * This is the first slice of plugin coverage for RDMA: at criu startup it
- * walks /sys/class/infiniband/ and decides whether the host has any ibdev
- * backed by the soft-RoCE (rxe) driver. The decision is logged and stashed
- * for later commits to consume; no checkpoint/restore hooks are wired in
- * yet.
+ * The first slice of plugin coverage for RDMA: at criu startup it walks
+ * /sys/class/infiniband/ and decides whether the host has any ibdev
+ * backed by the soft-RoCE (rxe) driver. That presence decision then
+ * gates the per-context claim hook (CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_
+ * CONTEXT), through which this plugin tells criu core it owns dump and
+ * restore for rxe uverbs contexts. The actual dump/restore hooks are
+ * wired in later commits; here we establish presence + claim + the
+ * static sharing/provided-driver identity core arbitrates on.
  *
  * Why a separate plugin per RDMA "CRIU driver" (instead of a single
  * monolithic rdma plugin):
@@ -31,9 +34,14 @@
 #include "criu-log.h"
 #include "plugin.h"
 
+#include "images/rdma_criu.pb-c.h"
+
+#include <rdma/ib_user_ioctl_verbs.h>
+
 #include <dirent.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -47,9 +55,9 @@
 #define IBDEV_SYSFS_DIR "/sys/class/infiniband"
 
 /*
- * Plugin activity is process-local state, queried via
- * rdma_rxe_plugin_is_active() once a later commit wires up the per-context
- * claim API. Until then it's purely diagnostic.
+ * Plugin activity is process-local state set by init() and read by the
+ * per-context claim hook: an inactive plugin (no rxe ibdev on this host)
+ * declines every context.
  */
 static bool rxe_active = false;
 static int rxe_dev_count = 0;
@@ -155,9 +163,9 @@ static int rdma_rxe_plugin_init(int stage)
 
 	/*
 	 * Returning zero unconditionally so the .so stays loaded even when
-	 * inactive: the dump-time arbitration added in a later commit still
-	 * wants the plugin queryable so it can report "no, I do not claim
-	 * this context" and let the missing-coverage error name us.
+	 * inactive: the dump-time arbitration (rdma_arbitrate_plugin_claim)
+	 * still wants the plugin queryable so it can report "no, I do not
+	 * claim this context" and let the missing-coverage error name us.
 	 */
 	return 0;
 }
@@ -168,5 +176,71 @@ static void rdma_rxe_plugin_fini(int stage, int ret)
 		ret, rxe_active ? "active" : "inactive", rxe_dev_count);
 }
 
+/*
+ * Per-context claim hook (CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT).
+ *
+ * Invoked at dump time for every uverbs context the target process
+ * holds, and again at restore time as a "does the destination's
+ * plugin set still cover this image?" check. Returns the plugin's
+ * RdmaCriuDriver value (RCD_RXE) iff:
+ *
+ *   - the plugin is active on this host (rxe_active is set, i.e.
+ *     init() found at least one rxe ibdev present);
+ *   - AND the context's kernel driver is RDMA_DRIVER_RXE.
+ *
+ * Either condition failing -> return RCD_UNKNOWN to decline the
+ * context. Negative returns are reserved for "I would normally
+ * claim this but a probe failed" (none of which apply to rxe; rxe
+ * has no host-side gate beyond the driver being loaded). The plugin
+ * set arbitration in criu/rdma/plugin_api.c (rdma_arbitrate_plugin_
+ * claim) enforces exactly-one-claim across all loaded RDMA plugins.
+ */
+static int rdma_rxe_plugin_claim_uverbs_context(const char *ibdev, uint32_t kernel_driver_id)
+{
+	if (!rxe_active) {
+		pr_debug("claim(%s, kdrv=%u): plugin inactive, declining\n", ibdev, kernel_driver_id);
+		return RDMA_CRIU_DRIVER__RCD_UNKNOWN;
+	}
+	if (kernel_driver_id != RDMA_DRIVER_RXE) {
+		pr_debug("claim(%s, kdrv=%u): kernel driver is not RDMA_DRIVER_RXE (%u), declining\n", ibdev,
+			 kernel_driver_id, (uint32_t)RDMA_DRIVER_RXE);
+		return RDMA_CRIU_DRIVER__RCD_UNKNOWN;
+	}
+
+	pr_info("claim(%s, kdrv=%u): claiming as RCD_RXE\n", ibdev, kernel_driver_id);
+	return RDMA_CRIU_DRIVER__RCD_RXE;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
+			rdma_rxe_plugin_claim_uverbs_context)
+
+/*
+ * RDMA provided driver: RCD_RXE.
+ *
+ * The static twin of the RCD_RXE claim return value above. Tells the
+ * restore-side cdev-open dispatcher (added later) that this plugin is
+ * the one to call when an image's UverbsFileEntry.criu_driver names
+ * RCD_RXE.
+ */
+CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER(RDMA_CRIU_DRIVER__RCD_RXE);
+
+/*
+ * RDMA sharing policy: SHAREABLE.
+ *
+ * rxe is a software provider whose per-uverbs-context state lives
+ * entirely inside the kernel module's per-fd objects (uobjs, GIDs,
+ * QP numbers etc.). Snapshotting and restoring one process's context
+ * on rxe<N> does not touch the kernel state of any other live owner
+ * of rxe<N>: there is no shared device-wide register file to
+ * reconfigure, no firmware to flash, no DMA mappings to invalidate.
+ *
+ * The cross-tree exclusivity check (added with the pre-suspend
+ * netlink pass) reads this declaration and skips other pids holding
+ * rxe<N> contexts. Without it the safe default would be EXCLUSIVE and
+ * we would refuse to dump any rxe-using process while another
+ * rxe-using process exists on the same ibdev -- the wrong call for a
+ * software provider.
+ */
+CR_PLUGIN_DECLARE_RDMA_SHARING(CR_RDMA_SHARING_SHAREABLE);
