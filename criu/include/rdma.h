@@ -14,6 +14,19 @@ extern struct collect_image_info uverbsasyncevfd_cinfo;
 bool is_async_eventfd(char *link);
 
 /*
+ * RDMA plugin claim arbitration (criu/rdma/plugin_api.c):
+ *
+ *   rdma_arbitrate_plugin_claim()
+ *       Iterates every plugin registered for
+ *       CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT and returns the
+ *       single claiming plugin's RdmaCriuDriver value, 0 (=
+ *       RCD_UNKNOWN) on no claim, or a negative errno on conflict /
+ *       probe failure. *claimer_name receives the plugin name on a
+ *       successful claim (may be NULL if the caller doesn't care).
+ */
+int rdma_arbitrate_plugin_claim(const char *ibdev, uint32_t kernel_driver_id, const char **claimer_name);
+
+/*
  * RDMA driver-name resolution (criu/rdma/driver.c):
  *
  *   rdma_driver_name_from_ibdev()
