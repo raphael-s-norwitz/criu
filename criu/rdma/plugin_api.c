@@ -144,3 +144,74 @@ int rdma_plugin_sharing_policy_by_name(const char *plugin_name)
 	pr_debug("plugin '%s' not found in loaded list; defaulting to EXCLUSIVE\n", plugin_name);
 	return CR_RDMA_SHARING_EXCLUSIVE;
 }
+
+/*
+ * Restore-side uverbs-cdev open dispatch.
+ *
+ * Walk the loaded plugin list and dispatch the OPEN_UVERBS_CDEV hook to
+ * the single plugin whose cr_rdma_provided_driver constant matches the
+ * image's criu_driver. Keying by criu_driver -- not by hook-chain order
+ * -- is the restore-side replay of the dump-time exactly-one-claim
+ * guarantee: the hook chain holds every plugin that registered the hook
+ * in unspecified order, so a blind "call the first one" would happily
+ * hand an rxe cdev to an mlx5 plugin (or vice versa) when both .so are
+ * loaded.
+ *
+ * Failure modes (all hard):
+ *   - image has no criu_driver (too old): fail.
+ *   - two plugins declare the same provided-driver: operator's plugin
+ *     set is inconsistent; we cannot know which the image was dumped
+ *     against.
+ *   - no plugin matches: the destination is missing the source's
+ *     plugin (uverbsfd_validate_claim should have caught this; defence
+ *     in depth).
+ * The matching plugin's hook owns its own pr_err on failure.
+ */
+int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+	const char *winner_name = NULL;
+	CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV_t *fn;
+
+	if (!uvfe->has_criu_driver) {
+		pr_err("uverbsfd id %#x: no criu_driver in image; cannot dispatch OPEN_UVERBS_CDEV. Image too old.\n",
+		       uvfe->id);
+		return -1;
+	}
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		if (!this->d->hooks[CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV])
+			continue;
+		p = (const int *)dlsym(this->dlhandle, CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != uvfe->criu_driver)
+			continue;
+
+		if (winner) {
+			pr_err("uverbsfd id %#x: multiple plugins declare cr_rdma_provided_driver=%d ('%s' and '%s'); "
+			       "operator's plugin set is inconsistent.\n",
+			       uvfe->id, (int)uvfe->criu_driver, winner_name, this->d->name);
+			return -1;
+		}
+		winner = this;
+		winner_name = this->d->name;
+	}
+
+	if (!winner) {
+		pr_err("uverbsfd id %#x: no loaded RDMA plugin exports cr_rdma_provided_driver=%d for ibdev=%s. "
+		       "Restore cannot proceed without a plugin to open the destination cdev.\n",
+		       uvfe->id, (int)uvfe->criu_driver, uvfe->ib_dev ?: "?");
+		return -1;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV];
+	pr_debug("uverbsfd id %#x: dispatching OPEN_UVERBS_CDEV to plugin '%s' (criu_driver=%d ibdev=%s)\n", uvfe->id,
+		 winner_name, (int)uvfe->criu_driver, uvfe->ib_dev ?: "?");
+	return fn(uvfe);
+}
