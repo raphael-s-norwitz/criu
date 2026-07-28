@@ -20,6 +20,20 @@ CONFIG-DEFINES		+= -DDEFAULT_CONFIG_FILENAME='"default.conf"'
 CONFIG-DEFINES		+= -DUSER_CONFIG_DIR='".criu/"'
 
 #
+# Plugin search path. Track Makefile.install's PLUGINDIR so the binary's
+# compiled-in default plugin dir is exactly where `make install` copies
+# the plugins, regardless of PREFIX. Without this, PREFIX=/usr/local
+# (the upstream default) silently produces a binary that searches
+# /usr/lib/criu/ while plugins land in /usr/local/lib/criu/.
+#
+# PLUGINDIR is exported by Makefile.install for the normal top-level
+# build; fall back to the historical default when criu/Makefile is
+# invoked directly (e.g. by out-of-tree IDE tooling) so the build
+# doesn't break.
+PLUGINDIR		?= /usr/lib/criu
+CONFIG-DEFINES		+= -DCR_PLUGIN_DEFAULT='"$(PLUGINDIR)/"'
+
+#
 # General flags.
 CFLAGS			+= -fno-strict-aliasing
 CFLAGS			+= -iquote criu/include
