@@ -75,6 +75,7 @@ proto-obj-y	+= apparmor.o
 proto-obj-y	+= rseq.o
 proto-obj-y	+= pidfd.o
 proto-obj-y	+= uverbsfd.o
+proto-obj-y	+= rdma_criu.o
 
 CFLAGS		+= -iquote $(obj)/
 
