@@ -299,36 +299,64 @@ const struct fdtype_ops uverbs_dump_ops = {
 
 /* struct uverbsfd_file_info is forward-declared near uverbsasyncevfd_open() */
 
-static int
-ib_uverbs_get_context_ioctl(int cmd_fd, uint32_t driver_id)
+/*
+ * Restore-time counterpart of dump_uverbsfile()'s arbitration step.
+ *
+ * Re-run the per-plugin claim() probe against the restoring host's
+ * loaded plugin set and confirm the plugin that would claim this ibdev
+ * right now matches the one recorded in the image. Catches operator
+ * misconfiguration before the cdev is opened:
+ *
+ *   (a) image carries criu_driver=RCD_X but the destination has no
+ *       plugin returning RCD_X for this ibdev (e.g. the matching
+ *       plugin .so was never installed on the destination);
+ *   (b) the destination has a *different* plugin claiming this ibdev
+ *       than the source did -- refuse to silently swap plugins;
+ *   (c) the plugin is present but declines (a host-side gate the
+ *       source had is missing on the destination).
+ *
+ * Abort here rather than let the open dispatcher hand the cdev to a
+ * plugin the image was not dumped against.
+ */
+static int uverbsfd_validate_claim(const UverbsFileEntry *uvfe)
 {
-	struct {
-		struct ib_uverbs_ioctl_hdr hdr;
-		struct ib_uverbs_attr attrs[2];
-	} buf;
+	const char *claimer = NULL;
+	int rcd;
 
-	memset(&buf, 0, sizeof(buf));
+	if (!uvfe->has_criu_driver) {
+		pr_err("uverbsfd id %#x has no criu_driver in image; image predates plugin-claim arbitration. "
+		       "Re-dump with current criu.\n",
+		       uvfe->id);
+		return -1;
+	}
 
-	buf.hdr.object_id = UVERBS_OBJECT_DEVICE;
-	buf.hdr.method_id = UVERBS_METHOD_GET_CONTEXT;
-	buf.hdr.driver_id = driver_id;
-	buf.hdr.reserved1 = 0;
-	buf.hdr.reserved2 = 0;
+	rcd = rdma_arbitrate_plugin_claim(uvfe->ib_dev ?: "?", uvfe->driver_id, &claimer);
+	if (rcd < 0) {
+		pr_err("uverbsfd id %#x: arbitration failed at restore: %d\n", uvfe->id, rcd);
+		return -1;
+	}
+	if (rcd == RDMA_CRIU_DRIVER__RCD_UNKNOWN) {
+		pr_err("uverbsfd id %#x: no RDMA plugin on this host claims ibdev=%s driver=%s. Image was dumped with "
+		       "criu_driver=%d; install the matching plugin before restoring.\n",
+		       uvfe->id, uvfe->ib_dev ?: "?", uvfe->driver_name ?: "?", (int)uvfe->criu_driver);
+		return -1;
+	}
+	if ((int)uvfe->criu_driver != rcd) {
+		pr_err("uverbsfd id %#x: image was dumped under criu_driver=%d but plugin '%s' (rcd=%d) claims "
+		       "ibdev=%s on this host. Refusing to silently swap plugins between dump and restore.\n",
+		       uvfe->id, (int)uvfe->criu_driver, claimer, rcd, uvfe->ib_dev ?: "?");
+		return -1;
+	}
 
-	buf.hdr.num_attrs = 0;
-	buf.hdr.length = sizeof(buf.hdr);
-
-	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &buf.hdr) != 0)
-		return -errno;
-
+	pr_info("uverbsfd id %#x: restore claim OK (plugin '%s' rcd=%d ibdev=%s)\n", uvfe->id, claimer, rcd,
+		uvfe->ib_dev ?: "?");
 	return 0;
 }
 
 static int uverbsfd_open(struct file_desc *d, int *new_fd)
 {
 	struct uverbsfd_file_info *ui;
-	uint32_t driver_id;
-	int fd, ret;
+	int fd;
 
 	ui = container_of(d, struct uverbsfd_file_info, d);
 
@@ -345,31 +373,41 @@ static int uverbsfd_open(struct file_desc *d, int *new_fd)
 		       ui->uvfe->id);
 		return -1;
 	}
-	driver_id = ui->uvfe->driver_id;
+
+	/*
+	 * Confirm a plugin on this host claims the context and matches the
+	 * one the image was dumped under before we touch the kernel.
+	 */
+	if (uverbsfd_validate_claim(ui->uvfe))
+		return -1;
 
 	pr_info("Opening uverbsfd id %#x ibdev=%s driver=%s(%u) ctxn %u\n",
 		ui->uvfe->id,
 		ui->uvfe->ib_dev ?: "?",
 		ui->uvfe->driver_name ?: "?",
-		driver_id,
+		ui->uvfe->driver_id,
 		ui->uvfe->has_ctxn ? ui->uvfe->ctxn : 0);
 
-	fd = open_reg_by_id(ui->uvfe->id);
+	/*
+	 * Resolve and open the destination cdev via the claiming plugin
+	 * rather than open_reg_by_id(). The image's reg_file_entry carries
+	 * the source's cdev path, but the same ibdev may live at a
+	 * different minor on the destination (cross-host move, reboot probe
+	 * order, rdma link churn). The plugin maps ibdev -> current cdev
+	 * and hands back an fd that already has a kernel ucontext on it, so
+	 * uverbsfd_open() does not issue GET_CONTEXT itself (the kernel
+	 * rejects two GET_CONTEXTs on one struct file). The source-recorded
+	 * reg_file_entry stays in the image as a `crit decode` diagnostic
+	 * but nothing on restore opens it.
+	 */
+	fd = rdma_dispatch_open_uverbs_cdev(ui->uvfe);
 	if (fd < 0)
 		return -1;
-
-	ret = ib_uverbs_get_context_ioctl(fd, driver_id);
-	if (ret)
-		goto out_get_context;
 
 	ctxn_uverbsfd_id_map[ui->uvfe->ctxn] = ui->uvfe->id;
 
 	*new_fd = fd;
 	return 0;
-
-out_get_context:
-	close(fd);
-	return -1;
 }
 
 static struct file_desc_ops uverbs_desc_ops = {

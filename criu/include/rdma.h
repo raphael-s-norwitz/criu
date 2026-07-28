@@ -64,6 +64,24 @@ int rdma_arbitrate_plugin_claim(const char *ibdev, uint32_t kernel_driver_id, co
 int rdma_plugin_sharing_policy_by_name(const char *plugin_name);
 
 /*
+ * Restore-side uverbs-cdev open dispatch (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_open_uverbs_cdev()
+ *       Invokes CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV on the single
+ *       loaded plugin whose exported cr_rdma_provided_driver matches
+ *       the image's UverbsFileEntry.criu_driver, returning the fd
+ *       (>= 0, already carrying a kernel ucontext) the plugin opens,
+ *       or -1 on no/ambiguous match or hook failure.
+ *
+ * The pb-c header is pulled in directly rather than forward-declared
+ * because the generated struct tag (struct UverbsFileEntry vs
+ * struct _UverbsFileEntry) is not stable across protobuf-c versions;
+ * only the typedef name is.
+ */
+#include "images/uverbsfd.pb-c.h"
+int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe);
+
+/*
  * RDMA driver-name resolution (criu/rdma/driver.c):
  *
  *   rdma_driver_name_from_ibdev()
