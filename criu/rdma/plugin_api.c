@@ -8,14 +8,18 @@
  * CONTEXT, and enforces an exactly-one-claim policy here.
  *
  * Public surface (declared in criu/include/rdma.h):
- *   rdma_arbitrate_plugin_claim()
+ *   rdma_arbitrate_plugin_claim()          -- "which plugin owns this?"
+ *   rdma_plugin_sharing_policy_by_name()   -- "is that plugin's device
+ *                                             safe to share?"
  *
- * No shared static state: the arbitration is a pure function of the
- * (ibdev, kernel_driver_id) pair and the set of loaded plugins.
+ * No shared static state: both are pure functions of their inputs and
+ * the set of loaded plugins.
  */
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "common/list.h"
 #include "criu-plugin.h"
@@ -83,4 +87,60 @@ int rdma_arbitrate_plugin_claim(const char *ibdev, uint32_t kernel_driver_id,
 	if (claimer_name)
 		*claimer_name = winner_name;
 	return winner;
+}
+
+/*
+ * Look up a plugin's RDMA sharing policy by name.
+ *
+ * The companion to rdma_arbitrate_plugin_claim(): arbitration answers
+ * "which plugin owns ibdev D?" via the hook chain, this answers "does
+ * that plugin consider D safe to share with non-snapshot pids?" via a
+ * dlsym of CR_PLUGIN_RDMA_SHARING_POLICY_SYM ("cr_rdma_sharing_policy",
+ * a const int) on the plugin's dlhandle. We match by name because the
+ * arbitration helper already hands the caller the claimer's name, and
+ * that's the most stable identity we share across the hook chain and
+ * the dlhandle list.
+ *
+ * Returns CR_RDMA_SHARING_EXCLUSIVE if:
+ *   - plugin_name is NULL
+ *   - the plugin can't be located (shouldn't happen post-arbitration)
+ *   - the plugin doesn't export the symbol
+ *   - the symbol's value is not a recognised enum value
+ *
+ * That's deliberate: every "I don't know" path fails closed, so a
+ * plugin that forgot to declare its policy is treated as EXCLUSIVE
+ * rather than silently allowing a share that might corrupt a
+ * non-snapshot peer.
+ */
+int rdma_plugin_sharing_policy_by_name(const char *plugin_name)
+{
+	plugin_desc_t *this;
+
+	if (!plugin_name)
+		return CR_RDMA_SHARING_EXCLUSIVE;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->d->name)
+			continue;
+		if (strcmp(this->d->name, plugin_name) != 0)
+			continue;
+		if (!this->dlhandle)
+			return CR_RDMA_SHARING_EXCLUSIVE;
+		p = (const int *)dlsym(this->dlhandle, CR_PLUGIN_RDMA_SHARING_POLICY_SYM);
+		if (!p) {
+			pr_debug("plugin '%s' does not export %s; defaulting to EXCLUSIVE\n", plugin_name,
+				 CR_PLUGIN_RDMA_SHARING_POLICY_SYM);
+			return CR_RDMA_SHARING_EXCLUSIVE;
+		}
+		if (*p != CR_RDMA_SHARING_SHAREABLE && *p != CR_RDMA_SHARING_EXCLUSIVE) {
+			pr_warn("plugin '%s' %s = %d is not a recognised enum value; defaulting to EXCLUSIVE\n",
+				plugin_name, CR_PLUGIN_RDMA_SHARING_POLICY_SYM, *p);
+			return CR_RDMA_SHARING_EXCLUSIVE;
+		}
+		return *p;
+	}
+	pr_debug("plugin '%s' not found in loaded list; defaulting to EXCLUSIVE\n", plugin_name);
+	return CR_RDMA_SHARING_EXCLUSIVE;
 }
