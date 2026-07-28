@@ -6,6 +6,21 @@ message uverbs_file_entry {
 	required uint32		id		= 1;
 	optional string		ib_dev		= 2;
 	optional uint32		ctxn		= 3;
+	/*
+	 * Kernel module name backing this ibdev (e.g. "rxe", "mlx5_core").
+	 * Source of truth for which provider claims the context on restore.
+	 * Always populated on dump; restore fails loudly if the field is
+	 * missing or names a driver criu does not know how to talk to.
+	 */
+	optional string		driver_name	= 4;
+	/*
+	 * RDMA_DRIVER_* enum value matching driver_name. Hint for the
+	 * restore fast path -- restore re-validates against driver_name
+	 * if this field is absent or if the resolved enum value would
+	 * disagree with driver_name's expansion in the restoring criu's
+	 * headers (kernel UAPI enum can grow).
+	 */
+	optional uint32		driver_id	= 5;
 };
 
 message uverbs_async_ev_file_entry {
