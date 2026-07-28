@@ -21,6 +21,17 @@ message uverbs_file_entry {
 	 * headers (kernel UAPI enum can grow).
 	 */
 	optional uint32		driver_id	= 5;
+	/*
+	 * RdmaCriuDriver (images/rdma_criu.proto) value naming the CRIU
+	 * plugin that won claim arbitration for this context at dump time.
+	 * Orthogonal to driver_id (the kernel module): driver_id says
+	 * "which module backs this ibdev", criu_driver says "which plugin
+	 * owns dump+restore for it". Restore dispatches the uverbs cdev
+	 * open to the single loaded plugin whose cr_rdma_provided_driver
+	 * matches this value, and re-validates that the same plugin still
+	 * claims the ibdev on the destination.
+	 */
+	optional uint32		criu_driver	= 6;
 };
 
 message uverbs_async_ev_file_entry {

@@ -93,6 +93,32 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT = 16,
 
+	/*
+	 * RDMA restore-side uverbs cdev open. Invoked once per uverbs
+	 * cdev being restored, on the single plugin whose exported
+	 * cr_rdma_provided_driver constant matches the image's recorded
+	 * UverbsFileEntry.criu_driver (see CR_PLUGIN_DECLARE_RDMA_
+	 * PROVIDED_DRIVER below). Loser plugins are not called.
+	 *
+	 * The plugin resolves the destination cdev for the recorded
+	 * ibdev (the source minor may not survive a cross-host / reboot
+	 * / rdma-link-churn move, so it maps ibdev name -> current cdev
+	 * via sysfs) and hands back an fd that ALREADY has a kernel
+	 * ucontext established on it -- the uniform contract that lets
+	 * uverbsfd_open() avoid issuing a second GET_CONTEXT (the kernel
+	 * rejects two GET_CONTEXTs on one struct file). For providers
+	 * that support CRIU restore-mode ucontexts (rxe today), the
+	 * plugin opens in restore mode so the per-uobject RESTORE_<TYPE>
+	 * verbs are unblocked.
+	 *
+	 * Args:  uvfe -- the dumped UverbsFileEntry, full image record
+	 *        including ib_dev, driver_name, driver_id, criu_driver.
+	 * Return: an open fd (>= 0) with a ucontext on it, or -1. CRIU
+	 *         owns the returned fd; the plugin must not hold its own
+	 *         reference after returning.
+	 */
+	CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV = 17,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -116,6 +142,18 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RESTORE_INIT, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__DUMP_DEVICES_LATE, int id);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__UPDATE_INETSK, uint32_t family, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *ibdev, uint32_t kernel_driver_id);
+/*
+ * Pull in the protobuf-c definition of UverbsFileEntry directly. A
+ * forward-declared struct tag would be cheaper but isn't portable:
+ * protoc-c versions disagree on whether the generated struct is named
+ * `struct UverbsFileEntry` or `struct _UverbsFileEntry`. Only the
+ * typedef name is stable across generator versions, so the trampoline
+ * decl below stays consistent with both the core dispatcher and the
+ * plugin OPEN_UVERBS_CDEV implementations regardless of which protoc-c
+ * built images/uverbsfd.pb-c.h.
+ */
+#include "images/uverbsfd.pb-c.h"
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const UverbsFileEntry *uvfe);
 
 /*
  * RDMA sharing policy.
