@@ -68,6 +68,31 @@ enum {
 
 	CR_PLUGIN_HOOK__UPDATE_INETSK = 15,
 
+	/*
+	 * RDMA per-context plugin claim. Invoked at dump time for every
+	 * uverbs cdev about to be checkpointed, once per loaded RDMA-class
+	 * plugin. The plugin returns the RdmaCriuDriver value identifying
+	 * itself if (and only if) it intends to own dump+restore for this
+	 * context, or the sentinel value RCD_UNKNOWN (0) if it doesn't
+	 * claim it. The arbitration helper in criu/rdma/plugin_api.c
+	 * (rdma_arbitrate_plugin_claim) enforces "exactly one plugin
+	 * claims"; zero or multiple claims is a hard dump failure.
+	 *
+	 * Distinct from the existing per-fd hooks (DUMP_EXT_FILE etc.)
+	 * because it runs *per uverbs context*, doesn't have an fd id
+	 * yet at call time, and is read-only / side-effect-free --
+	 * plugins may issue cheap probe ioctls (e.g. MLX5_VFMIG_IOC_
+	 * QUERY_VF) but must not mutate state.
+	 *
+	 * Args:  ibdev (e.g. "rxe0", "mlx5_2"), kernel_driver_id
+	 *        (RDMA_DRIVER_* enum value as resolved from sysfs).
+	 * Return: RdmaCriuDriver value > 0 to claim, RCD_UNKNOWN to
+	 *         decline. Returning a negative errno indicates the
+	 *         plugin would normally claim but failed to probe, and
+	 *         is treated as a dump error (different from "decline").
+	 */
+	CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT = 16,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -90,6 +115,77 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__POST_FORKING, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RESTORE_INIT, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__DUMP_DEVICES_LATE, int id);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__UPDATE_INETSK, uint32_t family, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *ibdev, uint32_t kernel_driver_id);
+
+/*
+ * RDMA sharing policy.
+ *
+ * RDMA-class plugins SHOULD export a const int symbol named
+ *   "cr_rdma_sharing_policy"
+ * with one of the values below, telling criu whether snapshotting
+ * (and later restoring) one process's contexts on a device this
+ * plugin owns is safe in the presence of other, non-snapshot-tree
+ * processes that also hold contexts on the same device.
+ *
+ *   CR_RDMA_SHARING_SHAREABLE  (= 0)
+ *       Per-context state is fully isolated. Snapshotting one
+ *       owner's context on device D and restoring it elsewhere
+ *       does not perturb other live owners of device D on this
+ *       host. Soft-RoCE (rxe) is the canonical example: rxe is
+ *       a software provider whose per-uverbs-context state lives
+ *       in the kernel module's per-fd objects, not in shared
+ *       device-wide registers.
+ *
+ *   CR_RDMA_SHARING_EXCLUSIVE  (= 1)
+ *       Snapshot+restore of any context on device D implies
+ *       reconfiguring shared device-wide state. Other live owners
+ *       of D would lose access. mlx5 SR-IOV VF migration is the
+ *       canonical example: vfmig snapshots and restores the
+ *       entire VF as one unit, and any non-snapshot context on
+ *       that VF is destroyed by the restore.
+ *
+ * If a plugin does not export this symbol, criu treats it as
+ * EXCLUSIVE -- safe default. The cross-tree exclusivity check
+ * (added with the pre-suspend netlink pass) hard-fails the dump if
+ * it finds a non-snapshot-tree pid holding a context on a device
+ * that any snapshot-tree pid also uses, when the claiming plugin's
+ * policy is EXCLUSIVE.
+ */
+enum {
+	CR_RDMA_SHARING_SHAREABLE = 0,
+	CR_RDMA_SHARING_EXCLUSIVE = 1,
+};
+
+#define CR_PLUGIN_RDMA_SHARING_POLICY_SYM "cr_rdma_sharing_policy"
+
+#define CR_PLUGIN_DECLARE_RDMA_SHARING(__value) \
+	const int cr_rdma_sharing_policy = (__value)
+
+/*
+ * RDMA provided driver -- the RdmaCriuDriver enum value (RCD_RXE,
+ * RCD_MLX5_SRIOV_VFMIG, ...) that this plugin claims and serves.
+ *
+ * RDMA-class plugins export a const int symbol named
+ *   "cr_rdma_provided_driver"
+ * carrying the same RdmaCriuDriver value the plugin returns from its
+ * CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT implementation. It is the
+ * static twin of the CLAIM return value: CLAIM answers "do I own this
+ * live context?" at dump time, this symbol answers "am I the plugin
+ * that owns images tagged with driver X?" at restore time. The
+ * restore-side cdev-open dispatcher (added later) uses it to pick the
+ * one plugin whose provided-driver matches an image's recorded
+ * criu_driver -- walking the hook chain alone is not enough, since
+ * every RDMA plugin registers the same hook ids.
+ *
+ * A plugin that does not export this symbol is treated as "claims
+ * nothing" (RCD_UNKNOWN) by the open dispatcher and is skipped: a
+ * plugin without a provided-driver declaration cannot be safely
+ * matched to an image record.
+ */
+#define CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM "cr_rdma_provided_driver"
+
+#define CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER(__value) \
+	const int cr_rdma_provided_driver = (__value)
 
 enum {
 	CR_PLUGIN_STAGE__DUMP,

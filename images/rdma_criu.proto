@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: MIT
+
+syntax = "proto2";
+
+/*
+ * Identifier for which CRIU plugin is responsible for save/restore of
+ * a given RDMA resource (uverbs context, PD, MR, CQ, QP, ...).
+ *
+ * This is intentionally orthogonal to the kernel-side RDMA_DRIVER_*
+ * enum carried in driver_id / driver_name on uverbs_file_entry: the
+ * kernel driver name says "what module backs this ibdev"
+ * (rxe / mlx5_core / bnxt_re / ...), this enum says "which CRIU code
+ * path will own dump and restore for this resource". The two are
+ * 1:N: a single mlx5_core ibdev can be served by host-driven
+ * SAVE/LOAD via mlx5_vfmig today, by future fw-assisted IB-resource
+ * replay, or by a vfio_mlx5_pci-shaped guest-mode strategy, and
+ * each of those is a separate plugin .so. Selection happens at dump
+ * time via the per-plugin claim() hook (see CR_PLUGIN_HOOK__
+ * RDMA_CLAIM_UVERBS_CONTEXT in criu-plugin.h); the winner's enum
+ * value is stamped into the image so restore can dispatch directly.
+ *
+ * Kept in its own .proto rather than tucked under uverbsfd.proto
+ * because per-resource image entries (PDs, MRs, CQs, QPs once those
+ * land) will all want to tag themselves with the same enum, and they
+ * shouldn't have to import uverbsfd.proto just to get at it.
+ *
+ * Adding a new enumerant: pick the next free integer, name the new
+ * plugin's .so after the lower-cased symbol minus the
+ * RDMA_CRIU_DRIVER__ prefix (e.g. RDMA_CRIU_DRIVER__BNXT_RE -> a
+ * plugin shipped at plugins/rdma/bnxt_re/, claim hook returning
+ * RDMA_CRIU_DRIVER__BNXT_RE on a match). UNKNOWN must stay = 0 so
+ * "field absent" and "no plugin claims" decode the same way.
+ */
+/*
+ * Names are RCD_-prefixed because proto2 enum values share a global
+ * namespace across all .proto files compiled together; UNKNOWN/RXE
+ * etc are not safe as bare names, and the prefix needs to be distinct
+ * from "RDMA_CRIU_DRIVER__" (the protobuf-c-generated C prefix) to
+ * keep generated identifiers from double-prefixing into illegibility.
+ */
+enum rdma_criu_driver {
+	RCD_UNKNOWN	= 0;
+	RCD_RXE		= 1;
+	/*
+	 * mlx5 SR-IOV VF-migration enumerants (RCD_MLX5_SRIOV_VFMIG et al.)
+	 * are added with the mlx5 plugin in a later round; the enum is
+	 * append-only, so they slot in at the next free integer without
+	 * disturbing RCD_RXE.
+	 */
+};
