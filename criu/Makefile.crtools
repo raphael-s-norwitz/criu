@@ -60,6 +60,7 @@ obj-y			+= protobuf.o
 obj-y			+= pstree.o
 obj-y			+= rbtree.o
 obj-y			+= rdma/driver.o
+obj-y			+= rdma/netlink.o
 obj-y			+= rdma/plugin_api.o
 obj-y			+= rdma/uverbsfd.o
 obj-y			+= rst-malloc.o
