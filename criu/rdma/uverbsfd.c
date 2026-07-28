@@ -20,6 +20,7 @@
 
 #include "images/fdinfo.pb-c.h"
 #include "images/uverbsfd.pb-c.h"
+#include "images/rdma_criu.pb-c.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "rdma: "
@@ -203,8 +204,10 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
 	FileEntry fe = FILE_ENTRY__INIT;
 	struct cr_img *img;
+	const char *claimer = NULL;
 	char ibdev[64];
 	char driver[64];
+	int rcd;
 	int ret = -1;
 
 	uve.id = id;
@@ -248,8 +251,31 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 		goto out;
 	}
 
-	pr_info("Dumping uverbs char device %d with id %#x ibdev=%s driver=%s id=%u",
-		lfd, id, ibdev, driver, uve.driver_id);
+	/*
+	 * Stamp which CRIU plugin owns this context. The pre-suspend
+	 * coverage check already ran the same arbitration whole-tree and
+	 * passed, so this is expected to succeed; re-running it here binds
+	 * the winning plugin's RdmaCriuDriver into the per-context image so
+	 * restore can dispatch the cdev open by criu_driver without
+	 * re-deriving it. Fail loudly on the (racy) miss rather than write
+	 * an image no plugin could restore.
+	 */
+	rcd = rdma_arbitrate_plugin_claim(ibdev, uve.driver_id, &claimer);
+	if (rcd < 0) {
+		pr_err("Plugin arbitration failed for ibdev=%s driver=%s: %d\n", ibdev, driver, rcd);
+		goto out;
+	}
+	if (rcd == RDMA_CRIU_DRIVER__RCD_UNKNOWN) {
+		pr_err("No RDMA CRIU plugin claims ibdev=%s driver=%s (RDMA_DRIVER id=%u). Refusing to checkpoint a "
+		       "context that no plugin can restore.\n",
+		       ibdev, driver, uve.driver_id);
+		goto out;
+	}
+	uve.criu_driver = rcd;
+	uve.has_criu_driver = true;
+
+	pr_info("Dumping uverbs char device %d with id %#x ibdev=%s driver=%s id=%u claimed by plugin '%s'", lfd, id,
+		ibdev, driver, uve.driver_id, claimer);
 	if (uve.has_ctxn)
 		pr_info(" ctxn %u", uve.ctxn);
 	pr_info("\n");
