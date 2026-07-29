@@ -2275,6 +2275,15 @@ int cr_dump_tasks(pid_t pid)
 			goto err;
 	}
 
+	/*
+	 * R3 per-uobject DAG. Runs now that every task has been dumped, so
+	 * dump_uverbsfile() has recorded every checkpointed uverbs context
+	 * (with its assigned image id). Walks NLDEV once per in-tree ibdev
+	 * and writes rdma_uobj.img. No-op for trees with no RDMA contexts.
+	 */
+	if (rdma_dump_uobj_dag())
+		goto err;
+
 	ret = run_plugins(DUMP_DEVICES_LATE, pid);
 	if (ret && ret != -ENOTSUP)
 		goto err;
