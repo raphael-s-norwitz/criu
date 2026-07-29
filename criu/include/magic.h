@@ -103,6 +103,7 @@
 #define PIDFD_MAGIC	     0x54435556 /* Ufa */
 #define UVERBS_FILE_MAGIC    0x56463721 /* Elektrostal */
 #define UVERBSAE_FILE_MAGIC  0x56463775 /* Mytishchi */
+#define RDMA_UOBJ_MAGIC	     0x56463789 /* Reutov */
 
 #define IFADDR_MAGIC	RAW_IMAGE_MAGIC
 #define ROUTE_MAGIC	RAW_IMAGE_MAGIC
