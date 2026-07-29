@@ -58,6 +58,38 @@ int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
 int rdma_dump_uobj_dag(void);
 
 /*
+ * R3 restore-side read+collect pass on rdma_uobj.img
+ * (criu/rdma/uobj_restore.c). Called once early in restore: reads
+ * every rdma_uobj_entry, groups them by ufile_id, and verifies basic
+ * internal consistency (one hw_driver_id per ufile). No restore action
+ * -- the per-uobject verbs are issued later, per cdev fd, by
+ * rdma_restore_uobj_dag_for_ufile().
+ *
+ * No-op (returns 0) when the image is absent (no in-tree RDMA at dump
+ * time). Returns -1 on a read or internal-consistency error.
+ */
+int rdma_collect_uobj_dag(void);
+
+/*
+ * R3 restore-side per-ufile RESTORE_<TYPE> dispatcher
+ * (criu/rdma/uobj_restore.c). Called by uverbsfd_open() after the
+ * loaded RDMA plugin hands back an open uverbs cdev fd carrying a
+ * restore-mode kernel ucontext. Walks the per-@ufile_id DAG group
+ * collected earlier and installs each uobject at the ufile_handle the
+ * dump captured.
+ *
+ * v0 scope (rxe PD): the actual UVERBS_METHOD_RESTORE_PD verb lands in
+ * the next commit; here the dispatcher builds the per-ufile handle map
+ * and walks the PD entries as a no-op replay so the bare-context
+ * round-trip is unaffected.
+ *
+ * @kernel_driver_id is the kernel's RDMA_DRIVER_* enum (what the
+ * UVERBS_OBJECT_RESTORE ioctl header matches). No-op (returns 0) when
+ * @ufile_id has no DAG group. Returns -1 on the first restore failure.
+ */
+int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver_id);
+
+/*
  * RDMA plugin queries (criu/rdma/plugin_api.c):
  *
  *   rdma_arbitrate_plugin_claim()
