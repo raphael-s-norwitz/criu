@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: MIT
+
+/*
+ * Per-uobject image schema for R3: the per-context DAG of ib_uobjects
+ * (PD / CQ / QP / MR / SRQ / AH / completion-channel-fd / async-event-fd)
+ * captured at dump and replayed at restore.
+ *
+ * Sequenced under the design described in
+ *   linux/tools/testing/criu_rdma/design/uobject_restore.md
+ * Builds on top of uverbs_file_entry (uverbsfd.proto): every
+ * rdma_uobj_entry refers back to the parent uverbs_file_entry.id via
+ * ufile_id, and per-driver plugin state per uobject lives in the opaque
+ * plugin_blob (recommended encoding: a per-plugin .proto, but criu core
+ * never parses these bytes).
+ *
+ * v0 scope: this milestone (T1.1, rxe PD) emits only R3UT_PD records.
+ * The r3_uobj_type enum reserves the remaining integers so the wire
+ * format stays stable as follow-on milestones add per-class attribute
+ * messages (rdma_cq/qp/mr/srq_attrs), the xref graph, and their
+ * rdma_uobj_entry fields. Additions are append-only; field numbers
+ * are pre-assigned here to match the final layout.
+ *
+ * Image layout written by criu/rdma/uobj_dump.c at dump time:
+ *
+ *   <img-dir>/rdma_uobj.img
+ *       Sequence of length-prefixed rdma_uobj_entry records, one per
+ *       ib_uobject discovered across all dumped uverbs files. Records
+ *       are not ordered; the restore side topo-sorts via the xref
+ *       graph (once edges exist). Each record carries enough identity
+ *       (ufile_id + type + ufile_handle + restrack_id) to be its own
+ *       join key.
+ *
+ * Two distinct identifiers per uobject -- both load-bearing:
+ *
+ *   ufile_handle: small integer (typically 0..N), per-uverbs-file id
+ *                 space. This is what user code sees as e.g. pd->handle
+ *                 or qp->handle. Restore must install the new
+ *                 ib_uobject at the same value so user code's saved
+ *                 handles remain valid.
+ *
+ *   restrack_id:  per-ibdev integer assigned by the rdma_restrack
+ *                 subsystem. Surfaced via NLDEV (rdma resource show) as
+ *                 the per-resource `id`, and used by NLDEV's own
+ *                 cross-resource references (PDN-of-QP, CQN-of-QP, ...).
+ *                 R3 uses it as the xref edge target. Note this *is*
+ *                 user-visible via NLDEV: any consumer caching by
+ *                 restrack_id breaks silently across restore (fresh ids
+ *                 on the destination ibdev). Documented in the design
+ *                 doc as a known externally-visible identity
+ *                 discontinuity.
+ */
+
+syntax = "proto2";
+
+import "rdma_criu.proto";
+
+/*
+ * UVERBS_OBJECT_* coverage. v0 (this milestone, rxe PD) defines only
+ * the type it emits. Follow-on milestones append their types
+ * (R3UT_CQ, R3UT_QP, R3UT_MR, ...) at fresh integers as they start
+ * emitting them: proto2 enums are append-only, and nothing decodes an
+ * rdma_uobj.img yet (v0 is unreleased), so there is nothing for a
+ * pre-reserved value to protect. Image consumers must still tolerate
+ * unknown values (a future criu may emit a type this criu predates).
+ *
+ * Names are R3UT_-prefixed because proto2 enum values share a global
+ * namespace across the criu image schema; a bare PD would collide.
+ */
+enum r3_uobj_type {
+	R3UT_UNKNOWN			= 0;
+	R3UT_PD				= 1;
+};
+
+/* ---------------- per-class hw-agnostic attribute messages ---------------- */
+
+/*
+ * PD has no wire-visible identity and only carries access-style flags
+ * (currently empty for v0; PD allocation is access-flag-less in IB
+ * verbs). FW pdn lives in plugin_blob, not here.
+ */
+message rdma_pd_attrs {
+	optional uint32		alloc_flags		= 1;
+};
+
+/* ---------------- top-level per-uobject record ---------------- */
+
+/*
+ * One per discovered ib_uobject across all dumped uverbs files.
+ *
+ * Identity:
+ *   ufile_id      cross-references uverbs_file_entry.id; names the
+ *                 owning ucontext.
+ *   hw_driver_id  mirror of the parent uverbs_file_entry.criu_driver
+ *                 for image-inspection convenience (so `crit decode
+ *                 rdma_uobj.img` can render plugin attribution without
+ *                 a join).
+ *   type          which uobject class this record carries.
+ *   ufile_handle  small per-ufile id user code holds (e.g. pd->handle);
+ *                 restore installs the new ib_uobject at this value.
+ *                 Comes from NLDEV RES_HANDLE (K8a kernel), so optional
+ *                 on older kernels.
+ *   restrack_id   per-ibdev id; xref edge target once edges exist.
+ *                 Available from NLDEV for PD (RES_PDN).
+ *
+ * Payload:
+ *   EXACTLY ONE of the per-class sub-messages matches `type`. v0 emits
+ *   only `pd`. The remaining per-class fields (cq/qp/mr/srq/ah/cc/aef)
+ *   and the xref graph are added in their milestones at pre-assigned
+ *   field numbers.
+ *
+ *   plugin_blob is the per-plugin opaque hw-specific state (FW pdn, FW
+ *   mkey, ...). Encoding is plugin-defined; criu core never parses this
+ *   field. Empty from the rxe PD path (rxe PD has no FW state).
+ */
+message rdma_uobj_entry {
+	required uint32			ufile_id	= 1;
+	required rdma_criu_driver	hw_driver_id	= 2;
+	required r3_uobj_type		type		= 3;
+	optional uint32			ufile_handle	= 4;
+	optional uint32			restrack_id	= 5;
+
+	/* HW-agnostic per-class attrs. EXACTLY ONE matches `type`. */
+	optional rdma_pd_attrs		pd		= 10;
+	/* 11..17 reserved: cq/qp/mr/srq/ah/cc/aef (follow-on milestones). */
+
+	/* 30 reserved: repeated rdma_uobj_xref xref (edge graph). */
+
+	/*
+	 * Plugin-specific opaque blob (FW state). Emitted empty by the
+	 * rxe PD path; first real consumer is the mlx5 PD milestone.
+	 */
+	optional bytes			plugin_blob	= 40;
+};
