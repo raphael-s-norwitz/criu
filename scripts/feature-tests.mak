@@ -191,3 +191,13 @@ int main(void)
 	return (int)RDMA_NLDEV_ATTR_RES_HANDLE;
 }
 endef
+
+define FEATURE_TEST_UVERBS_OBJECT_RESTORE
+
+#include <rdma/ib_user_ioctl_cmds.h>
+
+int main(void)
+{
+	return (int)UVERBS_OBJECT_RESTORE;
+}
+endef
