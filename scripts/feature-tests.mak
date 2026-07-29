@@ -173,3 +173,21 @@ int main(void)
 	return 0;
 }
 endef
+
+define FEATURE_TEST_RDMA_NLDEV_ATTR_RES_HANDLE
+
+#include <rdma/rdma_netlink.h>
+
+int main(void)
+{
+	/*
+	 * Distro-installed rdma-core may pre-date the kernel commit that
+	 * adds RDMA_NLDEV_ATTR_RES_HANDLE (the per-uobject ufile-handle
+	 * attribute the R3 dump path consumes alongside the existing PDN/
+	 * CQN/QPN/MRN/SRQN restrack ids). Probe for the symbol so a
+	 * matching compat fallback in criu/rdma/netlink.c can fire when
+	 * the host headers are still old.
+	 */
+	return (int)RDMA_NLDEV_ATTR_RES_HANDLE;
+}
+endef
