@@ -57,15 +57,37 @@
 #include "rdma_netlink.h"
 
 /*
- * libnl3's nla_parse stores attribute pointers in a caller-supplied
- * table indexed by nla_type, bounded by @maxtype. The context dump
- * only reads attrs well below RDMA_NLDEV_ATTR_MAX (DEV_INDEX,
- * DEV_NAME, RES_CTX, RES_CTX_ENTRY, RES_PID, RES_CTXN), so a table
- * sized to the host header's enum tail covers everything we parse.
- * The per-resource walkers added later carry their own compat shims
- * for the newer CRIU-extended attribute slots.
+ * Compat shim for distros whose <rdma/rdma_netlink.h> pre-dates
+ * upstream kernel commit 0601c496b413 ("RDMA/nldev: Expose ufile
+ * handle alongside per-class restrack id", aka K8a in
+ * linux/tools/testing/criu_rdma/design/uobject_restore.md 7.5.1).
+ * The kernel emits the new u32 attribute by numeric value at runtime;
+ * the build-side probe in scripts/feature-tests.mak only checks
+ * whether the host header provides the symbolic name.
+ *
+ * The hard-coded value (105) matches the upstream enum slot the kernel
+ * patch added; changing it would require an in-lockstep kernel-side
+ * change. Drop this whole block once the distro rdma-core that ships
+ * the symbol is the build's minimum.
  */
-#define CRIU_RDMA_NLDEV_ATTR_TBSZ RDMA_NLDEV_ATTR_MAX
+#ifndef CONFIG_HAS_RDMA_NLDEV_ATTR_RES_HANDLE
+#define RDMA_NLDEV_ATTR_RES_HANDLE 105
+#endif
+
+/*
+ * libnl3's nla_parse stores attribute pointers in a caller-supplied
+ * table indexed by nla_type, bounded by the @maxtype argument. We size
+ * that argument off RDMA_NLDEV_ATTR_MAX, which on older host headers
+ * (pre-K8a) is < RDMA_NLDEV_ATTR_RES_HANDLE -- so a literal
+ * RDMA_NLDEV_ATTR_MAX cap silently drops the new attr and stack-
+ * overruns reads past tb[]. Take the max of the host enum tail and
+ * (compat constant + 1) to keep both the table and the parse range
+ * large enough on either kernel. RES_HANDLE is the highest CRIU-
+ * extended slot the PD walker reads, so we anchor the cap there;
+ * follow-on walkers that read higher slots re-anchor this macro.
+ */
+#define CRIU_RDMA_NLDEV_ATTR_TBSZ \
+	(RDMA_NLDEV_ATTR_MAX > (RDMA_NLDEV_ATTR_RES_HANDLE + 1) ? RDMA_NLDEV_ATTR_MAX : (RDMA_NLDEV_ATTR_RES_HANDLE + 1))
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "rdma_netlink: "
@@ -372,4 +394,207 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg)
 	close(sk);
 	free_dev_list(devs.head);
 	return ret;
+}
+
+int rdma_nl_for_each_ibdev(rdma_nl_ibdev_cb_t cb, void *arg)
+{
+	struct dev_collect_ctx devs;
+	struct nl_dev *d;
+	int sk, ret;
+
+	if (!cb)
+		return -EINVAL;
+
+	sk = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_RDMA);
+	if (sk < 0) {
+		pr_perror("socket(NETLINK_RDMA) failed");
+		return -errno;
+	}
+
+	ret = collect_devs(sk, &devs);
+	close(sk);
+	if (ret < 0)
+		return ret;
+
+	for (d = devs.head; d != NULL; d = d->next) {
+		ret = cb(d->dev_index, d->ibdev, arg);
+		if (ret != 0)
+			break;
+	}
+
+	free_dev_list(devs.head);
+	return ret;
+}
+
+/*
+ * Per-resource walker.
+ *
+ * The kernel exposes an RDMA_NLDEV_CMD_RES_<TYPE>_GET that dumps every
+ * non-kernel resource of that type on a given ibdev (DEV_INDEX is
+ * mandatory). The reply layout is uniform: one nlmsg per device
+ * containing a top-level RDMA_NLDEV_ATTR_RES_<TYPE> nested table,
+ * inside which sit zero or more RES_<TYPE>_ENTRY nested children, each
+ * carrying that resource's per-attr leaves.
+ *
+ * v0 wires only PD; CQ/QP/MR/SRQ arms are added in their milestones as
+ * the res_types table and the parse switch grow.
+ */
+struct res_walk_ctx {
+	rdma_nl_res_cb_t user_cb;
+	void *user_arg;
+	enum rdma_nl_res_type type;
+	uint32_t dev_index;
+	const char *ibdev;
+	int cb_ret;
+};
+
+/*
+ * Per-type metadata: which CMD code drives the dump, which top-level
+ * NLDEV attribute IDs nest the entry list and the entries inside it,
+ * and which kernel attr carries the resource's restrack_id.
+ *
+ * Keep the order matching enum rdma_nl_res_type so a switch can be
+ * collapsed to indexed array access.
+ */
+static const struct res_type_info {
+	uint16_t cmd;
+	uint16_t list_attr;	/* RDMA_NLDEV_ATTR_RES_<TYPE>	    */
+	uint16_t entry_attr;	/* RDMA_NLDEV_ATTR_RES_<TYPE>_ENTRY */
+	uint16_t restrack_attr; /* RDMA_NLDEV_ATTR_RES_PDN/...	    */
+	const char *name;
+} res_types[] = {
+	[RDMA_NL_RES_PD] = { RDMA_NLDEV_CMD_RES_PD_GET, RDMA_NLDEV_ATTR_RES_PD, RDMA_NLDEV_ATTR_RES_PD_ENTRY,
+			     RDMA_NLDEV_ATTR_RES_PDN, "pd" },
+};
+
+/*
+ * Parse one RES_<TYPE>_ENTRY nested attribute into @e. Reads
+ * everything fill_res_<type>_entry currently emits per type; the
+ * caller's switch on @e->type already determines which union arm the
+ * per-leaf code populates.
+ */
+static int parse_res_entry(struct nlattr *entry, const struct res_type_info *info, struct rdma_nl_res_entry *e)
+{
+	struct nlattr *tb[CRIU_RDMA_NLDEV_ATTR_TBSZ];
+
+	if (nla_parse(tb, CRIU_RDMA_NLDEV_ATTR_TBSZ - 1, nla_data(entry), nla_len(entry), NULL) < 0)
+		return -1;
+
+	if (info->restrack_attr && tb[info->restrack_attr]) {
+		e->has_restrack_id = true;
+		e->restrack_id = nla_get_u32(tb[info->restrack_attr]);
+	}
+	if (tb[RDMA_NLDEV_ATTR_RES_CTXN]) {
+		e->has_ctxn = true;
+		e->ctxn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_CTXN]);
+	}
+	if (tb[RDMA_NLDEV_ATTR_RES_PID]) {
+		e->has_pid = true;
+		e->pid = (pid_t)nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_PID]);
+	}
+	/*
+	 * RES_HANDLE is the per-uobject ib_uobject->id (the user-visible
+	 * ufile handle) emitted alongside the per-class restrack id by
+	 * the kernel patch K8a -- see compat shim above and
+	 * design/uobject_restore.md 7.5.1. Only present on user-created
+	 * resources (kernel-internal restrack entries -- no ib_uobject
+	 * backing -- omit it by construction); has_ufile_handle stays
+	 * false on older kernels and gates downstream consumers (the R3
+	 * dump path that emits the target handle into rdma_uobj.img).
+	 */
+	if (tb[RDMA_NLDEV_ATTR_RES_HANDLE]) {
+		e->has_ufile_handle = true;
+		e->ufile_handle = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_HANDLE]);
+	}
+
+	switch (e->type) {
+	case RDMA_NL_RES_PD:
+		if (tb[RDMA_NLDEV_ATTR_RES_USECNT])
+			e->pd.usecnt = nla_get_u64(tb[RDMA_NLDEV_ATTR_RES_USECNT]);
+		break;
+	}
+	return 0;
+}
+
+static int res_per_msg_cb(struct nlmsghdr *hdr, void *arg)
+{
+	struct res_walk_ctx *rw = arg;
+	const struct res_type_info *info = &res_types[rw->type];
+	struct nlattr *tb[CRIU_RDMA_NLDEV_ATTR_TBSZ];
+	struct nlattr *list, *entry;
+	int rem;
+
+	if (nlmsg_parse(hdr, 0, tb, CRIU_RDMA_NLDEV_ATTR_TBSZ - 1, NULL) < 0)
+		return 0;
+
+	list = tb[info->list_attr];
+	if (!list)
+		return 0;
+
+	nla_for_each_nested(entry, list, rem) {
+		struct rdma_nl_res_entry e = { 0 };
+		int r;
+
+		if (nla_type(entry) != info->entry_attr)
+			continue;
+
+		e.type = rw->type;
+		e.dev_index = rw->dev_index;
+		snprintf(e.ibdev, sizeof(e.ibdev), "%.*s", (int)(sizeof(e.ibdev) - 1), rw->ibdev);
+
+		if (parse_res_entry(entry, info, &e) != 0)
+			continue;
+
+		r = rw->user_cb(&e, rw->user_arg);
+		if (r != 0) {
+			rw->cb_ret = r;
+			return r;
+		}
+	}
+
+	return 0;
+}
+
+int rdma_nl_for_each_resource(uint32_t dev_index, const char *ibdev, enum rdma_nl_res_type type, rdma_nl_res_cb_t cb,
+			      void *arg)
+{
+	const struct res_type_info *info;
+	struct res_walk_ctx rw;
+	struct {
+		struct nlattr nla;
+		uint32_t val;
+	} __attribute__((aligned(NLA_ALIGNTO))) req_attr;
+	int sk, ret;
+
+	if (!cb || (unsigned)type >= ARRAY_SIZE(res_types))
+		return -EINVAL;
+
+	info = &res_types[type];
+
+	sk = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_RDMA);
+	if (sk < 0) {
+		pr_perror("socket(NETLINK_RDMA) failed");
+		return -errno;
+	}
+
+	rw.user_cb = cb;
+	rw.user_arg = arg;
+	rw.type = type;
+	rw.dev_index = dev_index;
+	rw.ibdev = ibdev;
+	rw.cb_ret = 0;
+
+	req_attr.nla.nla_type = RDMA_NLDEV_ATTR_DEV_INDEX;
+	req_attr.nla.nla_len = NLA_HDRLEN + sizeof(uint32_t);
+	req_attr.val = dev_index;
+
+	ret = rdma_nl_dump(sk, RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, info->cmd), &req_attr, sizeof(req_attr), res_per_msg_cb,
+			   &rw);
+	close(sk);
+
+	if (ret < 0) {
+		pr_warn("res %s dump for ibdev %s (idx=%u) failed: %d\n", info->name, ibdev, dev_index, ret);
+		return ret;
+	}
+	return rw.cb_ret;
 }
