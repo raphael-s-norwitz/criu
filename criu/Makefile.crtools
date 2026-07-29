@@ -64,6 +64,7 @@ obj-y			+= rdma/netlink.o
 obj-y			+= rdma/plugin_api.o
 obj-y			+= rdma/precheck.o
 obj-y			+= rdma/uobj_dump.o
+obj-y			+= rdma/uobj_restore.o
 obj-y			+= rdma/uverbsfd.o
 obj-y			+= rst-malloc.o
 obj-y			+= seccomp.o
