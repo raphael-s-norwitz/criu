@@ -44,6 +44,20 @@ int rdma_check_dump_coverage(struct pstree_item *root);
 int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
 
 /*
+ * R3 per-uobject DAG dump (criu/rdma/uobj_dump.c). Runs once at
+ * end-of-dump, after every pstree task has been dumped (so
+ * dump_uverbsfile() has recorded every checkpointed uverbs context).
+ * For each dumped context, asks NLDEV to enumerate its uobjects and
+ * writes one rdma_uobj_entry per uobject to rdma_uobj.img.
+ *
+ * v0 scope (rxe PD): emits R3UT_PD records only. No-op (and writes no
+ * image) for trees that hold no RDMA contexts. Returns 0 on success or
+ * a no-op skip, -1 on any netlink / image-write failure (fails the
+ * dump closed, consistent with the pre-suspend coverage gate).
+ */
+int rdma_dump_uobj_dag(void);
+
+/*
  * RDMA plugin queries (criu/rdma/plugin_api.c):
  *
  *   rdma_arbitrate_plugin_claim()

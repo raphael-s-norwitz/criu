@@ -70,6 +70,7 @@
 #include "images/apparmor.pb-c.h"
 #include "images/pidfd.pb-c.h"
 #include "images/uverbsfd.pb-c.h"
+#include "images/rdma_uobj.pb-c.h"
 
 struct cr_pb_message_desc cr_pb_descs[PB_MAX];
 

@@ -286,6 +286,16 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 
 	img = img_from_set(glob_imgset, CR_FD_FILES);
 	ret = pb_write_one(img, &fe, PB_FILE);
+	if (ret)
+		goto out;
+
+	/*
+	 * Record this context for the end-of-dump uobject DAG walk
+	 * (rdma_dump_uobj_dag): it joins NLDEV-enumerated uobjects back to
+	 * their owning ufile by ctxn, so it needs the (ctxn, uvfe_id,
+	 * criu_driver, ibdev) tuple we just committed to the image.
+	 */
+	ret = rdma_note_dumped_ufile(uve.id, uve.has_ctxn, uve.ctxn, rcd, p->pid, ibdev);
 out:
 	xfree(uve.ib_dev);
 	xfree(uve.driver_name);

@@ -108,6 +108,7 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 	FD_ENTRY(PIDFD,		"pidfd"),
 	FD_ENTRY(UVERBS_FILE,	"uverbs-file"),
 	FD_ENTRY(UVERBSAE_FILE,	"uverbsasyncevent-file"),
+	FD_ENTRY(RDMA_UOBJ,	"rdma-uobj"),
 
 	[CR_FD_STATS] = {
 		.fmt	= "stats-%s",
