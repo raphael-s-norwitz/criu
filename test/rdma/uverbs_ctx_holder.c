@@ -8,10 +8,17 @@
  * context, so a single ibv_open_device exercises both code paths in
  * criu/rdma/uverbsfd.c (uverbsfd + uverbsasyncevfd).
  *
- * Then blocks until SIGTERM. SIGUSR1 re-queries the device and writes
- * "OK" or "FAIL: ..." to the status file given on the command line.
- * The runner script uses SIGUSR1 after restore to confirm the context
- * is still functional.
+ * If HOLDER_ALLOC_PD is set in the environment, also allocate a PD so
+ * the dump captures (and restore reinstalls) a PD uobject -- the rxe
+ * RESTORE_PD dev gate.
+ *
+ * Then blocks until SIGTERM. SIGUSR1 re-queries the device and, when a
+ * PD was allocated, functionally exercises the (post-restore) PD by
+ * registering + deregistering a small MR against it -- reg_mr looks the
+ * PD up by its ufile handle, so success proves the kernel PD survived
+ * the round-trip at the same handle. Writes "OK" or "FAIL: ..." to the
+ * status file. The runner uses SIGUSR1 after restore to confirm the
+ * context (and PD) are still functional.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -24,6 +31,7 @@
 #include <infiniband/verbs.h>
 
 static struct ibv_context *g_ctx;
+static struct ibv_pd *g_pd;
 static const char *g_status_path;
 static volatile sig_atomic_t g_terminate;
 static volatile sig_atomic_t g_query;
@@ -38,6 +46,29 @@ static void on_sigusr1(int sig)
 {
 	(void)sig;
 	g_query = 1;
+}
+
+/*
+ * Prove the restored PD is a live kernel object: reg_mr resolves the
+ * PD by its ufile handle, so a successful register + deregister means
+ * RESTORE_PD reinstalled the uobject at the handle userspace still
+ * holds. Returns 0 on success, -1 on failure (msg filled).
+ */
+static int verify_pd(char *msg, size_t msglen)
+{
+	static char buf[4096] __attribute__((aligned(4096)));
+	struct ibv_mr *mr;
+
+	mr = ibv_reg_mr(g_pd, buf, sizeof(buf), IBV_ACCESS_LOCAL_WRITE);
+	if (!mr) {
+		snprintf(msg, msglen, "FAIL: ibv_reg_mr on restored PD: %s", strerror(errno));
+		return -1;
+	}
+	if (ibv_dereg_mr(mr)) {
+		snprintf(msg, msglen, "FAIL: ibv_dereg_mr: %s", strerror(errno));
+		return -1;
+	}
+	return 0;
 }
 
 static void write_status(const char *line)
@@ -96,27 +127,41 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
+	if (getenv("HOLDER_ALLOC_PD")) {
+		g_pd = ibv_alloc_pd(g_ctx);
+		if (!g_pd) {
+			fprintf(stderr, "ibv_alloc_pd: %s\n", strerror(errno));
+			return 2;
+		}
+	}
+
 	signal(SIGTERM, on_sigterm);
 	signal(SIGINT, on_sigterm);
 	signal(SIGUSR1, on_sigusr1);
 
-	printf("READY pid=%d ctx=%s async_fd=%d\n", getpid(), devname, g_ctx->async_fd);
+	printf("READY pid=%d ctx=%s async_fd=%d pd=%d\n", getpid(), devname, g_ctx->async_fd,
+	       g_pd ? (int)g_pd->handle : -1);
 	fflush(stdout);
 	write_status("READY");
 
 	while (!g_terminate) {
 		if (g_query) {
 			struct ibv_device_attr a;
+			char msg[128];
 
 			g_query = 0;
 			if (ibv_query_device(g_ctx, &a))
 				write_status("FAIL: ibv_query_device after signal");
+			else if (g_pd && verify_pd(msg, sizeof(msg)))
+				write_status(msg);
 			else
 				write_status("OK");
 		}
 		pause();
 	}
 
+	if (g_pd)
+		ibv_dealloc_pd(g_pd);
 	ibv_close_device(g_ctx);
 	return 0;
 }
