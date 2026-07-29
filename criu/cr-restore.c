@@ -55,6 +55,7 @@
 #include "pstree.h"
 #include "net.h"
 #include "tty.h"
+#include "rdma.h"
 #include "cpu.h"
 #include "file-lock.h"
 #include "vdso.h"
@@ -240,6 +241,16 @@ static int crtools_prepare_shared(void)
 		return -1;
 
 	if (prepare_files())
+		return -1;
+
+	/*
+	 * R3 (per-uobject DAG) read+verify pass on rdma_uobj.img. Runs
+	 * after prepare_files() collected the uverbsfd file_descs, so the
+	 * per-ufile groups line up with the contexts that will be opened.
+	 * No-op if the dump carries no RDMA uobjects; the per-uobject
+	 * restore verbs are issued later, per cdev fd, from uverbsfd_open().
+	 */
+	if (rdma_collect_uobj_dag())
 		return -1;
 
 	/* We might want to remove ghost files on failed restore */

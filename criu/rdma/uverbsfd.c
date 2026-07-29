@@ -414,6 +414,23 @@ static int uverbsfd_open(struct file_desc *d, int *new_fd)
 	if (fd < 0)
 		return -1;
 
+	/*
+	 * R3 per-uobject restore. The plugin handed back a cdev with a
+	 * restore-mode ucontext on it; replay every uobject the dump
+	 * captured under this ufile by issuing the matching RESTORE_<TYPE>
+	 * verb. PD only for now (the verb itself lands next); no-op when
+	 * the dump produced no rdma_uobj.img coverage for this ufile_id,
+	 * which matches the pre-R3 bare-context baseline.
+	 *
+	 * driver_id is the kernel's RDMA_DRIVER_* enum (what the
+	 * UVERBS_OBJECT_RESTORE ioctl header matches), distinct from the
+	 * per-plugin RdmaCriuDriver the DAG group caches as hw_driver_id.
+	 */
+	if (rdma_restore_uobj_dag_for_ufile(fd, ui->uvfe->id, ui->uvfe->driver_id)) {
+		close(fd);
+		return -1;
+	}
+
 	ctxn_uverbsfd_id_map[ui->uvfe->ctxn] = ui->uvfe->id;
 
 	*new_fd = fd;
