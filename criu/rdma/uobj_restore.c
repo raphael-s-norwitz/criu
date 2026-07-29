@@ -31,6 +31,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
+
+#include <rdma/rdma_user_ioctl_cmds.h>
+#include <rdma/ib_user_ioctl_cmds.h>
 
 #include "common/compiler.h"
 #include "common/list.h"
@@ -44,6 +48,32 @@
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "rdma: "
+
+/*
+ * UAPI lag shim for UVERBS_OBJECT_RESTORE / UVERBS_METHOD_RESTORE_PD /
+ * UVERBS_ATTR_RESTORE_PD_HANDLE.
+ *
+ * Upstream kernel include/uapi/rdma/ib_user_ioctl_cmds.h carries
+ *   UVERBS_OBJECT_RESTORE         = 18
+ *   UVERBS_METHOD_RESTORE_PD      = 0    (within OBJECT_RESTORE)
+ *   UVERBS_ATTR_RESTORE_PD_HANDLE = 0    (within METHOD_RESTORE_PD)
+ *
+ * The kernel matches by integer at wire time, never by enumerator
+ * name, so a stable numeric copy here is enough to talk to a kernel
+ * that has the support; a too-old kernel returns -EOPNOTSUPP for the
+ * unknown object_id, which is the already-handled "kernel too old"
+ * signal. Drop the shim once the build's minimum rdma-core ships these
+ * symbols.
+ */
+#ifndef UVERBS_OBJECT_RESTORE
+#define UVERBS_OBJECT_RESTORE 18
+#endif
+#ifndef UVERBS_METHOD_RESTORE_PD
+#define UVERBS_METHOD_RESTORE_PD 0
+#endif
+#ifndef UVERBS_ATTR_RESTORE_PD_HANDLE
+#define UVERBS_ATTR_RESTORE_PD_HANDLE 0
+#endif
 
 struct uobj_collected {
 	RdmaUobjEntry *e;
@@ -198,13 +228,51 @@ static int handle_map_add(struct uobj_handle_map *m, uint32_t handle)
 }
 
 /*
- * Restore one PD. v0 stub: the UVERBS_METHOD_RESTORE_PD verb lands in
- * the next commit. For now we validate the entry carries the handle
- * restore needs and record it, so the dispatch scaffolding (and the
- * handle map) is exercised without touching the kernel.
+ * Issue UVERBS_METHOD_RESTORE_PD on @cmd_fd, asking the kernel to mint
+ * a PD uobject at the caller-chosen ufile handle @target_handle.
+ *
+ * rxe (v0): the handle is the only input. rxe's kernel-side
+ * restore_pd handler reads no driver-private UHW -- a PD carries no FW
+ * state -- so no plugin blob is packed. (mlx5 will add a UHW_IN
+ * carrying the source FW pdn via its own plugin hook in a later
+ * milestone; core stays driver-agnostic.)
+ *
+ * The handle rides inline in the attr's data field: uverbs treats a
+ * PTR_IN whose len <= sizeof(data) as an immediate.
+ *
+ * Returns 0 on success or -errno on ioctl failure (a too-old kernel
+ * returns -EOPNOTSUPP for the unknown UVERBS_OBJECT_RESTORE).
+ */
+static int rdma_send_restore_pd(int cmd_fd, uint32_t kernel_driver_id, uint32_t target_handle)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[1];
+	} cmd = {};
+
+	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_PD;
+	cmd.hdr.driver_id = kernel_driver_id;
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd.hdr) + sizeof(cmd.attrs);
+
+	cmd.attrs[0].attr_id = UVERBS_ATTR_RESTORE_PD_HANDLE;
+	cmd.attrs[0].len = sizeof(uint32_t);
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = target_handle;
+
+	return ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0 ? -errno : 0;
+}
+
+/*
+ * Restore one PD: reinstall an ib_uobject at the ufile_handle the dump
+ * captured, then record that handle so later uobject types can resolve
+ * their parent-PD xref through the map.
  */
 static int uobj_restore_pd(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobjEntry *e, struct uobj_handle_map *m)
 {
+	int rc;
+
 	if (!e->has_ufile_handle) {
 		pr_err("uobj DAG: PD entry (restrack_id=%u) has no ufile_handle; cannot restore (dump ran on a "
 		       "pre-K8a kernel)\n",
@@ -212,8 +280,13 @@ static int uobj_restore_pd(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 		return -1;
 	}
 
-	pr_debug("uobj DAG: would RESTORE_PD handle=%u on cmd_fd=%d driver=%u (verb not wired yet)\n", e->ufile_handle,
-		 cmd_fd, kernel_driver_id);
+	rc = rdma_send_restore_pd(cmd_fd, kernel_driver_id, e->ufile_handle);
+	if (rc) {
+		pr_err("uobj DAG: RESTORE_PD handle=%u on cmd_fd=%d driver=%u failed: %d (%s)\n", e->ufile_handle,
+		       cmd_fd, kernel_driver_id, rc, strerror(rc < 0 ? -rc : rc));
+		return -1;
+	}
+	pr_debug("uobj DAG: RESTORE_PD handle=%u ok (cmd_fd=%d driver=%u)\n", e->ufile_handle, cmd_fd, kernel_driver_id);
 
 	return handle_map_add(m, e->ufile_handle);
 }
