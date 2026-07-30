@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <sys/sysmacros.h>
@@ -207,6 +208,7 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	const char *claimer = NULL;
 	char ibdev[64];
 	char driver[64];
+	int uctx_fd = -1;
 	int rcd;
 	int ret = -1;
 
@@ -294,8 +296,20 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	 * (rdma_dump_uobj_dag): it joins NLDEV-enumerated uobjects back to
 	 * their owning ufile by ctxn, so it needs the (ctxn, uvfe_id,
 	 * criu_driver, ibdev) tuple we just committed to the image.
+	 *
+	 * Also stash an O_CLOEXEC dup of lfd. lfd is the parasite-drained
+	 * (SCM_RIGHTS) fd -- the dumpee's real struct file, sharing its
+	 * ucontext IDR -- so the MR walk can QUERY_MR against it for the
+	 * user_addr / iova / access_flags NLDEV never exposes. The dup
+	 * outlives this callback (lfd is closed right after) and the walk
+	 * owns it. A dup failure yields -1: the walk then fails closed for
+	 * any MR on this context rather than emitting an unrestorable MR.
 	 */
-	ret = rdma_note_dumped_ufile(uve.id, uve.has_ctxn, uve.ctxn, rcd, p->pid, ibdev);
+	uctx_fd = fcntl(lfd, F_DUPFD_CLOEXEC, 0);
+	if (uctx_fd < 0)
+		pr_warn("Can't dup uverbs cdev fd for MR QUERY on ibdev=%s: %m\n", ibdev);
+
+	ret = rdma_note_dumped_ufile(uve.id, uve.has_ctxn, uve.ctxn, rcd, uve.driver_id, p->pid, ibdev, uctx_fd);
 out:
 	xfree(uve.ib_dev);
 	xfree(uve.driver_name);

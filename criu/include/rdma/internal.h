@@ -40,6 +40,18 @@ int rdma_ibdev_from_chrdev(unsigned int maj, unsigned int min,
  * @uvfe_id is the per-context image id (UverbsFileEntry.id) already
  * assigned by dump_uverbsfile() -- the single-pass walker reads it
  * directly (no late-bind), so it becomes each rdma_uobj_entry.ufile_id.
+ *
+ * @kernel_driver_id is the RDMA_DRIVER_* id of the ibdev backing this
+ * context; the QUERY_MR ioctl dispatcher validates it against the
+ * per-ucontext driver id, so the MR walk must pass it verbatim.
+ *
+ * @holder_uctx_fd is an O_CLOEXEC dup of the dumpee's uverbs cdev fd,
+ * captured in dump_uverbsfile() from the parasite-drained (SCM_RIGHTS)
+ * lfd -- i.e. the dumpee's real struct file, sharing its ucontext IDR,
+ * not a fresh re-open. rdma_dump_uobj_dag() issues QUERY_MR on it to
+ * harvest each MR's user_addr / iova / access_flags (fields NLDEV does
+ * not expose) and closes it during cleanup. -1 means "not stashed"
+ * (the dup failed); the MR walk then cannot query and fails closed.
  */
 struct rdma_dumped_ufile {
 	pid_t pid;
@@ -47,19 +59,23 @@ struct rdma_dumped_ufile {
 	bool has_ctxn;
 	uint32_t uvfe_id;
 	uint32_t criu_driver;
+	uint32_t kernel_driver_id;
 	uint32_t dev_index; /* filled lazily in rdma_dump_uobj_dag */
 	bool has_dev_index;
 	char ibdev[64];
+	int holder_uctx_fd;
 	struct list_head link;
 };
 extern struct list_head rdma_dumped_ufiles;
 
 /*
  * Record a just-dumped uverbs context for the end-of-dump uobject DAG
- * walk. Copies @ibdev; takes ownership of nothing. Returns 0 on
- * success, -1 on allocation failure.
+ * walk. Copies @ibdev; takes ownership of @holder_uctx_fd (closed by
+ * rdma_dump_uobj_dag(), or immediately here on allocation failure).
+ * Returns 0 on success, -1 on allocation failure.
  */
 int rdma_note_dumped_ufile(uint32_t uvfe_id, bool has_ctxn, uint32_t ctxn,
-			   uint32_t criu_driver, pid_t pid, const char *ibdev);
+			   uint32_t criu_driver, uint32_t kernel_driver_id,
+			   pid_t pid, const char *ibdev, int holder_uctx_fd);
 
 #endif /* __CR_RDMA_INTERNAL_H__ */
