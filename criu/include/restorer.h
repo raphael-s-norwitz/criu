@@ -143,6 +143,49 @@ struct restore_vma_io {
 
 #define RIO_SIZE(niovs) (sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec))
 
+/*
+ * Per-MR record consumed by the pie restorer to issue
+ * UVERBS_METHOD_RESTORE_MR after the user VMAs have been laid out at
+ * their original VAs by the restorer blob (see restore_rdma_mr in
+ * criu/pie/restorer.c).
+ *
+ * Why this can't run from CRIU master (criu/rdma/uobj_restore.c, where
+ * PDs are restored): rxe's restore_mr ends up in ib_umem_get ->
+ * pin_user_pages_fast(addr, ...) against current->mm. Simple anon-
+ * private VMAs are not premapped at their original VA by master's
+ * prepare_mappings -- their content sits in vma_io until the pie blob
+ * mmaps them at sigreturn_restore time -- so issuing RESTORE_MR earlier
+ * returns -EFAULT. Deferring to the pie, after VMAs are in place, is
+ * the fix.
+ *
+ * Field semantics mirror the pie encoder's wire-format contract: attrs
+ * whose declared len <= sizeof(u64) pass their value inline in
+ * attr->data, not a pointer to it.
+ *
+ * @cmd_fd is a per-MR high-fd dup of the destination ucontext's uverbs
+ * cdev (rdma_prepare_rdma_mrs reserves it via fcntl(F_DUPFD_CLOEXEC,
+ * 1 << 14) to stay above the user-fd range the per-task file restorer
+ * needs and below service_fd_base). The pie helper closes it after the
+ * ioctl so it does not leak into the restored task's fd table.
+ *
+ * rxe MR carries no driver-private UHW, so v0 has no plugin blob here;
+ * mlx5's FW mkey_index UHW plugs in via its own hook in a later
+ * milestone.
+ */
+struct rst_rdma_mr {
+	int cmd_fd;
+	u32 ufile_id; /* diagnostics only */
+	u32 kernel_driver_id;
+	u32 target_handle;
+	u32 parent_pd_handle;
+	u64 addr;
+	u64 length;
+	u64 iova;
+	u32 access_flags;
+	u32 lkey_hint;
+	u32 rkey_hint;
+};
+
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
@@ -185,6 +228,9 @@ struct task_restore_args {
 
 	struct rst_aio_ring *rings;
 	unsigned int rings_n;
+
+	struct rst_rdma_mr *rdma_mrs;
+	unsigned int rdma_mrs_n;
 
 	struct rlimit64 *rlims;
 	unsigned int rlims_n;

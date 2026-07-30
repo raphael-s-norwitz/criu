@@ -669,6 +669,15 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (prepare_aios(current, ta))
 		return -1;
 
+	/*
+	 * Drain the MRs queued by prepare_fds()'s uverbs cdev restore into
+	 * the pie restorer args. Issued from the pie (not here) because
+	 * RESTORE_MR pins the MR's user pages, which only exist once the
+	 * pie has laid out the VMAs at their original VAs.
+	 */
+	if (rdma_prepare_rdma_mrs(ta))
+		return -1;
+
 	if (fixup_sysv_shmems())
 		return -1;
 
@@ -3388,6 +3397,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	RST_MEM_FIXUP_PPTR(task_args->vmas);
 	RST_MEM_FIXUP_PPTR(task_args->rings);
+	RST_MEM_FIXUP_PPTR(task_args->rdma_mrs);
 	RST_MEM_FIXUP_PPTR(task_args->tcp_socks);
 	RST_MEM_FIXUP_PPTR(task_args->timerfd);
 	RST_MEM_FIXUP_PPTR(task_args->posix_timers);
