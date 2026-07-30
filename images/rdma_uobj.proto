@@ -13,12 +13,13 @@
  * plugin_blob (recommended encoding: a per-plugin .proto, but criu core
  * never parses these bytes).
  *
- * v0 scope: rxe PD (R3UT_PD) and rxe MR (R3UT_MR, with a single
- * R3XR_PARENT_PD edge). Follow-on milestones append their types
- * (R3UT_CQ, R3UT_QP, ...), xref roles, and per-class attribute
- * messages at fresh integers as they start emitting them. proto2
- * enums/fields are append-only and nothing decodes an rdma_uobj.img
- * yet (v0 is unreleased), so only exercised values are defined here.
+ * v0 scope: rxe PD (R3UT_PD), rxe MR (R3UT_MR, with a single
+ * R3XR_PARENT_PD edge), and rxe CQ (R3UT_CQ). Follow-on milestones
+ * append their types (R3UT_QP, ...), xref roles, and per-class
+ * attribute messages at fresh integers as they start emitting them.
+ * proto2 enums/fields are append-only and nothing decodes an
+ * rdma_uobj.img yet (v0 is unreleased), so only exercised values are
+ * defined here.
  *
  * Image layout written by criu/rdma/uobj_dump.c at dump time:
  *
@@ -55,13 +56,13 @@ syntax = "proto2";
 import "rdma_criu.proto";
 
 /*
- * UVERBS_OBJECT_* coverage. v0 (this milestone, rxe PD) defines only
- * the type it emits. Follow-on milestones append their types
- * (R3UT_CQ, R3UT_QP, R3UT_MR, ...) at fresh integers as they start
- * emitting them: proto2 enums are append-only, and nothing decodes an
- * rdma_uobj.img yet (v0 is unreleased), so there is nothing for a
- * pre-reserved value to protect. Image consumers must still tolerate
- * unknown values (a future criu may emit a type this criu predates).
+ * UVERBS_OBJECT_* coverage. v0 defines only the types it emits (rxe
+ * PD, MR, CQ). Follow-on milestones append their types (R3UT_QP, ...)
+ * at fresh integers as they start emitting them: proto2 enums are
+ * append-only, and nothing decodes an rdma_uobj.img yet (v0 is
+ * unreleased), so there is nothing for a pre-reserved value to
+ * protect. Image consumers must still tolerate unknown values (a
+ * future criu may emit a type this criu predates).
  *
  * Names are R3UT_-prefixed because proto2 enum values share a global
  * namespace across the criu image schema; a bare PD would collide.
@@ -70,6 +71,7 @@ enum r3_uobj_type {
 	R3UT_UNKNOWN			= 0;
 	R3UT_PD				= 1;
 	R3UT_MR				= 2;
+	R3UT_CQ				= 3;
 };
 
 /*
@@ -137,6 +139,31 @@ message rdma_mr_attrs {
 	optional uint64		iova			= 12;
 };
 
+/*
+ * CQ hw-agnostic state. The driver-private CQ payload (rxe: the source
+ * ring vm_pgoff) is NOT a field here -- it lives in the per-uobj
+ * entry-level @plugin_blob, packed by the per-driver plugin's
+ * RDMA_DUMP_UOBJ_CQ hook and re-shaped into the RESTORE_CQ UHW at
+ * restore. comp_channel binding is out of v0 scope: a CQ bound to a
+ * completion channel is rejected at dump time (the kernel RESTORE_CQ
+ * hard-rejects COMP_CHANNEL), so the same shape covers "no channel"
+ * uniformly.
+ *
+ * Field provenance (rxe v0):
+ *   cqe_count     NLDEV fill_res_cq_entry (RES_CQE; always present).
+ *   comp_vector   not in NLDEV; the plugin fills it via
+ *                 RDMA_DUMP_UOBJ_CQ (rxe: hard-zero -- soft-RoCE has a
+ *                 single vector). The kernel verb takes comp_vector as
+ *                 a core MANDATORY attr at restore, so absent == 0.
+ *   flags         not in NLDEV; plugin-filled. Mirrors
+ *                 `enum ib_create_cq_flags`. Optional.
+ */
+message rdma_cq_attrs {
+	optional uint32		cqe_count		= 1;
+	optional uint32		comp_vector		= 2;
+	optional uint32		flags			= 3;
+};
+
 /* ---------------- top-level per-uobject record ---------------- */
 
 /*
@@ -159,13 +186,15 @@ message rdma_mr_attrs {
  *
  * Payload:
  *   EXACTLY ONE of the per-class sub-messages matches `type`. v0 emits
- *   only `pd`. The remaining per-class fields (cq/qp/mr/srq/ah/cc/aef)
- *   and the xref graph are added in their milestones at pre-assigned
- *   field numbers.
+ *   `pd`, `mr`, and `cq`. The remaining per-class fields
+ *   (qp/srq/ah/cc/aef) and further xref roles are added in their
+ *   milestones at pre-assigned field numbers.
  *
  *   plugin_blob is the per-plugin opaque hw-specific state (FW pdn, FW
  *   mkey, ...). Encoding is plugin-defined; criu core never parses this
- *   field. Empty from the rxe PD path (rxe PD has no FW state).
+ *   field. Empty from the rxe PD/MR paths (rxe has no FW state there);
+ *   the rxe CQ path is its first real user -- it carries the source
+ *   ring vm_pgoff that RESTORE_CQ replays.
  */
 message rdma_uobj_entry {
 	required uint32			ufile_id	= 1;
@@ -176,8 +205,9 @@ message rdma_uobj_entry {
 
 	/* HW-agnostic per-class attrs. EXACTLY ONE matches `type`. */
 	optional rdma_pd_attrs		pd		= 10;
+	optional rdma_cq_attrs		cq		= 11;
 	optional rdma_mr_attrs		mr		= 13;
-	/* 11,12,14..17 reserved: cq/qp/srq/ah/cc/aef (follow-on milestones). */
+	/* 12,14..17 reserved: qp/srq/ah/cc/aef (follow-on milestones). */
 
 	/* Typed edges into other uobjects in the same ufile. v0: MR's PD. */
 	repeated rdma_uobj_xref		xref		= 30;
