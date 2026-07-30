@@ -68,9 +68,9 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
  * on a given ibdev and surface the hw-agnostic attrs the kernel emits
  * via NLDEV today.
  *
- * v0 scopes this to PD only (the T1.1 milestone); CQ/QP/MR/SRQ arms
- * land in their own milestones as the enum and the per-type leaf union
- * grow (append-only, so the e->pd.* access pattern below stays stable).
+ * v0 wires PD (T1.1) and MR (T1.2); CQ/QP/SRQ arms land in their own
+ * milestones as the enum and the per-type leaf union grow (append-only,
+ * so the e->pd.* / e->mr.* access pattern below stays stable).
  *
  * Each per-resource walker takes a single ibdev (named by dev_index,
  * the same kernel-side index returned by rdma_nl_for_each_context).
@@ -82,6 +82,15 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
  * Field availability for PD tracks the kernel's fill_res_pd_entry:
  *   pd.usecnt; restrack_id (RES_PDN), ctxn (RES_CTXN), pid (RES_PID)
  *   always set for user PDs.
+ *
+ * Field availability for MR tracks the kernel's fill_res_mr_entry:
+ *   restrack_id (RES_MRN) and mr.mrlen (RES_MRLEN) always set;
+ *   mr.lkey/mr.rkey (RES_LKEY/RES_RKEY) only with CAP_NET_ADMIN (CRIU
+ *   as root); mr.pdn (RES_PDN, the parent PD's restrack id -- the
+ *   R3XR_PARENT_PD xref target) and ufile_handle (RES_HANDLE) set for
+ *   user MRs. Note fill_res_mr_entry emits NO ctxn and NO iova: the
+ *   owning ucontext is derived by joining mr.pdn to the PD walk's
+ *   restrack_id, and iova/virt_addr/access_flags come from QUERY_MR.
  *
  * Per-uobject ufile_handle (the per-ufile obj->id user code holds in
  * its restored memory) is emitted by the kernel for every
@@ -102,6 +111,7 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
  */
 enum rdma_nl_res_type {
 	RDMA_NL_RES_PD,
+	RDMA_NL_RES_MR,
 };
 
 struct rdma_nl_res_entry {
@@ -129,6 +139,16 @@ struct rdma_nl_res_entry {
 		struct {
 			uint64_t usecnt;
 		} pd;
+		struct {
+			bool has_mrlen;
+			uint64_t mrlen;
+			bool has_lkey;
+			uint32_t lkey;
+			bool has_rkey;
+			uint32_t rkey;
+			bool has_pdn;
+			uint32_t pdn; /* parent PD restrack id (R3XR_PARENT_PD target) */
+		} mr;
 	};
 };
 
