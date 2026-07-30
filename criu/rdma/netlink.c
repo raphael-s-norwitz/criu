@@ -436,8 +436,8 @@ int rdma_nl_for_each_ibdev(rdma_nl_ibdev_cb_t cb, void *arg)
  * inside which sit zero or more RES_<TYPE>_ENTRY nested children, each
  * carrying that resource's per-attr leaves.
  *
- * v0 wires only PD; CQ/QP/MR/SRQ arms are added in their milestones as
- * the res_types table and the parse switch grow.
+ * v0 wires PD (T1.1) and MR (T1.2); CQ/QP/SRQ arms are added in their
+ * milestones as the res_types table and the parse switch grow.
  */
 struct res_walk_ctx {
 	rdma_nl_res_cb_t user_cb;
@@ -465,6 +465,8 @@ static const struct res_type_info {
 } res_types[] = {
 	[RDMA_NL_RES_PD] = { RDMA_NLDEV_CMD_RES_PD_GET, RDMA_NLDEV_ATTR_RES_PD, RDMA_NLDEV_ATTR_RES_PD_ENTRY,
 			     RDMA_NLDEV_ATTR_RES_PDN, "pd" },
+	[RDMA_NL_RES_MR] = { RDMA_NLDEV_CMD_RES_MR_GET, RDMA_NLDEV_ATTR_RES_MR, RDMA_NLDEV_ATTR_RES_MR_ENTRY,
+			     RDMA_NLDEV_ATTR_RES_MRN, "mr" },
 };
 
 /*
@@ -511,6 +513,30 @@ static int parse_res_entry(struct nlattr *entry, const struct res_type_info *inf
 	case RDMA_NL_RES_PD:
 		if (tb[RDMA_NLDEV_ATTR_RES_USECNT])
 			e->pd.usecnt = nla_get_u64(tb[RDMA_NLDEV_ATTR_RES_USECNT]);
+		break;
+	case RDMA_NL_RES_MR:
+		if (tb[RDMA_NLDEV_ATTR_RES_MRLEN]) {
+			e->mr.has_mrlen = true;
+			e->mr.mrlen = nla_get_u64(tb[RDMA_NLDEV_ATTR_RES_MRLEN]);
+		}
+		/* lkey/rkey only present when the dumper holds CAP_NET_ADMIN. */
+		if (tb[RDMA_NLDEV_ATTR_RES_LKEY]) {
+			e->mr.has_lkey = true;
+			e->mr.lkey = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_LKEY]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_RKEY]) {
+			e->mr.has_rkey = true;
+			e->mr.rkey = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_RKEY]);
+		}
+		/*
+		 * Parent PD's restrack id -- the R3XR_PARENT_PD xref target.
+		 * fill_res_mr_entry emits it only for user MRs, which is
+		 * exactly the set CRIU restores.
+		 */
+		if (tb[RDMA_NLDEV_ATTR_RES_PDN]) {
+			e->mr.has_pdn = true;
+			e->mr.pdn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_PDN]);
+		}
 		break;
 	}
 	return 0;
