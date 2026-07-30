@@ -12,17 +12,28 @@
  * the dump captures (and restore reinstalls) a PD uobject -- the rxe
  * RESTORE_PD dev gate.
  *
- * Then blocks until SIGTERM. SIGUSR1 re-queries the device and, when a
- * PD was allocated, functionally exercises the (post-restore) PD by
- * registering + deregistering a small MR against it -- reg_mr looks the
- * PD up by its ufile handle, so success proves the kernel PD survived
- * the round-trip at the same handle. Writes "OK" or "FAIL: ..." to the
- * status file. The runner uses SIGUSR1 after restore to confirm the
- * context (and PD) are still functional.
+ * If HOLDER_ALLOC_MR is set (implies a PD), also register a persistent
+ * MR over a known-pattern buffer -- the rxe RESTORE_MR dev gate. The
+ * MR outlives the dump so restore must drive UVERBS_METHOD_RESTORE_MR
+ * (from the pie) to reinstall it at its ufile handle.
+ *
+ * Then blocks until SIGTERM. SIGUSR1 re-queries the device and, per
+ * mode, functionally exercises the post-restore state:
+ *   - PD mode: register + deregister a small MR against the PD (reg_mr
+ *     resolves the PD by its ufile handle, so success proves the kernel
+ *     PD survived at the same handle).
+ *   - MR mode: verify the registered buffer's content survived, then
+ *     deregister the persistent MR -- dereg resolves the MR by its
+ *     ufile handle, so success proves RESTORE_MR reinstalled the
+ *     uobject. Byte-identical lkey/rkey are guaranteed kernel-side by
+ *     the pie's RESP==hint assertion.
+ * Writes "OK" or "FAIL: ..." to the status file. The runner uses
+ * SIGUSR1 after restore to confirm the context is still functional.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,9 +43,33 @@
 
 static struct ibv_context *g_ctx;
 static struct ibv_pd *g_pd;
+static struct ibv_mr *g_mr;
+static uint32_t g_mr_lkey, g_mr_rkey;
 static const char *g_status_path;
 static volatile sig_atomic_t g_terminate;
 static volatile sig_atomic_t g_query;
+
+/* Persistent-MR buffer: page-aligned anon (.bss) so the pie lays the
+ * VMA out at its original VA before RESTORE_MR pins it. */
+static unsigned char g_mr_buf[8192] __attribute__((aligned(4096)));
+
+static void fill_pattern(unsigned char *b, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		b[i] = (unsigned char)(i * 7 + 0x11);
+}
+
+static int check_pattern(const unsigned char *b, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		if (b[i] != (unsigned char)(i * 7 + 0x11))
+			return -1;
+	return 0;
+}
 
 static void on_sigterm(int sig)
 {
@@ -68,6 +103,29 @@ static int verify_pd(char *msg, size_t msglen)
 		snprintf(msg, msglen, "FAIL: ibv_dereg_mr: %s", strerror(errno));
 		return -1;
 	}
+	return 0;
+}
+
+/*
+ * Prove the restored MR is a live kernel object at its original handle.
+ * First check the buffer content the MR was registered over survived
+ * the round-trip (RESTORE_MR pins exactly this VA in the pie). Then
+ * deregister the persistent MR: dereg resolves the MR by its ufile
+ * handle, so success means RESTORE_MR reinstalled the uobject; a skipped
+ * or failed restore leaves no MR at the handle and dereg fails.
+ */
+static int verify_mr(char *msg, size_t msglen)
+{
+	if (check_pattern(g_mr_buf, sizeof(g_mr_buf))) {
+		snprintf(msg, msglen, "FAIL: MR buffer content mismatch after restore");
+		return -1;
+	}
+	if (ibv_dereg_mr(g_mr)) {
+		snprintf(msg, msglen, "FAIL: ibv_dereg_mr on restored MR (lkey=0x%x rkey=0x%x): %s", g_mr_lkey,
+			 g_mr_rkey, strerror(errno));
+		return -1;
+	}
+	g_mr = NULL;
 	return 0;
 }
 
@@ -127,7 +185,8 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	if (getenv("HOLDER_ALLOC_PD")) {
+	/* MR mode implies a PD (the MR's parent). */
+	if (getenv("HOLDER_ALLOC_PD") || getenv("HOLDER_ALLOC_MR")) {
 		g_pd = ibv_alloc_pd(g_ctx);
 		if (!g_pd) {
 			fprintf(stderr, "ibv_alloc_pd: %s\n", strerror(errno));
@@ -135,12 +194,24 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (getenv("HOLDER_ALLOC_MR")) {
+		fill_pattern(g_mr_buf, sizeof(g_mr_buf));
+		g_mr = ibv_reg_mr(g_pd, g_mr_buf, sizeof(g_mr_buf),
+				  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+		if (!g_mr) {
+			fprintf(stderr, "ibv_reg_mr: %s\n", strerror(errno));
+			return 2;
+		}
+		g_mr_lkey = g_mr->lkey;
+		g_mr_rkey = g_mr->rkey;
+	}
+
 	signal(SIGTERM, on_sigterm);
 	signal(SIGINT, on_sigterm);
 	signal(SIGUSR1, on_sigusr1);
 
-	printf("READY pid=%d ctx=%s async_fd=%d pd=%d\n", getpid(), devname, g_ctx->async_fd,
-	       g_pd ? (int)g_pd->handle : -1);
+	printf("READY pid=%d ctx=%s async_fd=%d pd=%d mr_lkey=0x%x mr_rkey=0x%x\n", getpid(), devname, g_ctx->async_fd,
+	       g_pd ? (int)g_pd->handle : -1, g_mr_lkey, g_mr_rkey);
 	fflush(stdout);
 	write_status("READY");
 
@@ -152,7 +223,9 @@ int main(int argc, char **argv)
 			g_query = 0;
 			if (ibv_query_device(g_ctx, &a))
 				write_status("FAIL: ibv_query_device after signal");
-			else if (g_pd && verify_pd(msg, sizeof(msg)))
+			else if (g_mr && verify_mr(msg, sizeof(msg)))
+				write_status(msg);
+			else if (!g_mr && g_pd && verify_pd(msg, sizeof(msg)))
 				write_status(msg);
 			else
 				write_status("OK");
@@ -160,6 +233,8 @@ int main(int argc, char **argv)
 		pause();
 	}
 
+	if (g_mr)
+		ibv_dereg_mr(g_mr);
 	if (g_pd)
 		ibv_dealloc_pd(g_pd);
 	ibv_close_device(g_ctx);
