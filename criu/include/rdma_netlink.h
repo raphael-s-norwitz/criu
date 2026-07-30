@@ -68,9 +68,10 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
  * on a given ibdev and surface the hw-agnostic attrs the kernel emits
  * via NLDEV today.
  *
- * v0 wires PD (T1.1) and MR (T1.2); CQ/QP/SRQ arms land in their own
- * milestones as the enum and the per-type leaf union grow (append-only,
- * so the e->pd.* / e->mr.* access pattern below stays stable).
+ * v0 wires PD (T1.1), MR (T1.2), and CQ (T1.3); QP/SRQ arms land in
+ * their own milestones as the enum and the per-type leaf union grow
+ * (append-only, so the e->pd.* / e->mr.* / e->cq.* access pattern
+ * below stays stable).
  *
  * Each per-resource walker takes a single ibdev (named by dev_index,
  * the same kernel-side index returned by rdma_nl_for_each_context).
@@ -92,6 +93,12 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
  *   owning ucontext is derived by joining mr.pdn to the PD walk's
  *   restrack_id, and iova/virt_addr/access_flags come from QUERY_MR.
  *
+ * Field availability for CQ tracks the kernel's fill_res_cq_entry:
+ *   restrack_id (RES_CQN), cq.cqe (RES_CQE), ctxn (RES_CTXN) and
+ *   ufile_handle (RES_HANDLE) are all set for user CQs. The
+ *   driver-private CQ ring vm_pgoff is NOT in NLDEV -- the R3 CQ dump
+ *   reads it per-handle via the plugin's QUERY_CQ.
+ *
  * Per-uobject ufile_handle (the per-ufile obj->id user code holds in
  * its restored memory) is emitted by the kernel for every
  * user-created resource as of upstream commit 0601c496b413 (K8a,
@@ -112,6 +119,7 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
 enum rdma_nl_res_type {
 	RDMA_NL_RES_PD,
 	RDMA_NL_RES_MR,
+	RDMA_NL_RES_CQ,
 };
 
 struct rdma_nl_res_entry {
@@ -149,6 +157,9 @@ struct rdma_nl_res_entry {
 			bool has_pdn;
 			uint32_t pdn; /* parent PD restrack id (R3XR_PARENT_PD target) */
 		} mr;
+		struct {
+			uint32_t cqe; /* RES_CQE: user-visible CQ entry count */
+		} cq;
 	};
 };
 

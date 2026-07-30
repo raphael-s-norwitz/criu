@@ -436,8 +436,8 @@ int rdma_nl_for_each_ibdev(rdma_nl_ibdev_cb_t cb, void *arg)
  * inside which sit zero or more RES_<TYPE>_ENTRY nested children, each
  * carrying that resource's per-attr leaves.
  *
- * v0 wires PD (T1.1) and MR (T1.2); CQ/QP/SRQ arms are added in their
- * milestones as the res_types table and the parse switch grow.
+ * v0 wires PD (T1.1), MR (T1.2), and CQ (T1.3); QP/SRQ arms are added
+ * in their milestones as the res_types table and the parse switch grow.
  */
 struct res_walk_ctx {
 	rdma_nl_res_cb_t user_cb;
@@ -467,6 +467,8 @@ static const struct res_type_info {
 			     RDMA_NLDEV_ATTR_RES_PDN, "pd" },
 	[RDMA_NL_RES_MR] = { RDMA_NLDEV_CMD_RES_MR_GET, RDMA_NLDEV_ATTR_RES_MR, RDMA_NLDEV_ATTR_RES_MR_ENTRY,
 			     RDMA_NLDEV_ATTR_RES_MRN, "mr" },
+	[RDMA_NL_RES_CQ] = { RDMA_NLDEV_CMD_RES_CQ_GET, RDMA_NLDEV_ATTR_RES_CQ, RDMA_NLDEV_ATTR_RES_CQ_ENTRY,
+			     RDMA_NLDEV_ATTR_RES_CQN, "cq" },
 };
 
 /*
@@ -537,6 +539,11 @@ static int parse_res_entry(struct nlattr *entry, const struct res_type_info *inf
 			e->mr.has_pdn = true;
 			e->mr.pdn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_PDN]);
 		}
+		break;
+	case RDMA_NL_RES_CQ:
+		/* user-visible CQ entry count; the ring vm_pgoff comes from QUERY_CQ. */
+		if (tb[RDMA_NLDEV_ATTR_RES_CQE])
+			e->cq.cqe = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_CQE]);
 		break;
 	}
 	return 0;
