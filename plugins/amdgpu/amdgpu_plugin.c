@@ -464,10 +464,20 @@ int amdgpu_plugin_handle_device_vma(int fd, const struct stat *st_buf)
 	struct stat st_kfd;
 	int ret = 0;
 
+	/*
+	 * /dev/kfd absent => no AMD GPU on this host => this VMA is
+	 * never going to belong to us. Return -ENOTSUP so the
+	 * HANDLE_DEVICE_VMA chain in proc_parse.c keeps walking and
+	 * gives the next registered plugin a chance to claim the
+	 * VMA. Returning the raw stat() errno here would short-
+	 * circuit the chain with a fatal verdict and break dumps of
+	 * any process that holds a non-AMD device VMA (e.g. an RDMA
+	 * uverbs cdev mapping) on a host without an AMD GPU.
+	 */
 	ret = stat(AMDGPU_KFD_DEVICE, &st_kfd);
 	if (ret == -1) {
-		pr_perror("stat error for /dev/kfd");
-		return ret;
+		pr_debug("amdgpu_plugin: %s absent, declining VMA\n", AMDGPU_KFD_DEVICE);
+		return -ENOTSUP;
 	}
 
 	/* If input device is KFD return device as supported */
@@ -476,9 +486,14 @@ int amdgpu_plugin_handle_device_vma(int fd, const struct stat *st_buf)
 		return 0;
 	}
 
-	/* Determine if input is a DRM device and therefore is supported */
+	/*
+	 * Not a KFD VMA. Try the DRM render-node path; that helper
+	 * already uses -ENOTSUP for "not my device", which we just
+	 * propagate to the next plugin in the chain. Any other
+	 * non-zero return is a real failure -- log it.
+	 */
 	ret = amdgpu_plugin_drm_handle_device_vma(fd, st_buf);
-	if (ret)
+	if (ret && ret != -ENOTSUP)
 		pr_err("Can't handle VMAs of input device - %s\n",
 		       strerror(-ret));
 
