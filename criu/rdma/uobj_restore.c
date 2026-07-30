@@ -19,14 +19,20 @@
  *                      Lives for the rest of the restore (freed at
  *                      process exit by design -- no release entry).
  *
- * v0 scope (rxe PD): collect + group + verify + a PD-entry walk that
- * builds the per-ufile kernel-handle map. The actual
- * UVERBS_METHOD_RESTORE_PD verb lands in the next commit; until then
- * the walk is a no-op replay, so a bare-context (no-PD) dump restores
- * exactly as before. CQ/QP/MR/SRQ arms follow in their milestones.
+ * v0 scope (rxe PD + MR): collect + group, then a dependency-ordered
+ * per-ufile walk -- PDs first (RESTORE_PD, synchronous on cmd_fd),
+ * then MRs. An MR carries no ctxn and references its parent PD by the
+ * source restrack id, so the walk resolves that edge to the parent's
+ * destination handle through the per-ufile (type, restrack_id) ->
+ * ufile_handle map the PD pass builds. The RESTORE_MR ioctl itself is
+ * deferred to the pie restorer (it must run in the target's restored
+ * address space so the MR's user_addr pages are pinnable); this file
+ * only prepares/validates the MR here and the pie handoff lands in the
+ * next commit. CQ/QP/SRQ arms follow in their milestones.
  */
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -202,30 +208,53 @@ out:
 }
 
 /*
- * Per-ufile kernel-handle map. Restore installs each uobject at the
- * ufile_handle the dump recorded; as later uobject types (CQ/QP/...)
- * come online they resolve their xref edges (parent PD, send/recv CQ)
- * through this map. PD has no incoming edges, so v0 only writes it.
+ * Per-ufile handle map: (uobj type, source restrack_id) -> the
+ * destination ufile_handle the uobject was reinstalled at. Restore
+ * installs each uobject at the ufile_handle the dump recorded (source
+ * handle == destination handle), and children resolve their xref edges
+ * -- v0: an MR's parent PD -- to the parent's handle through this map.
+ * PD has no incoming edges but is a target, so the PD pass writes it
+ * and the MR pass reads it.
  */
+struct uobj_handle_map_entry {
+	R3UobjType type;
+	uint32_t restrack_id;
+	uint32_t ufile_handle;
+};
+
 struct uobj_handle_map {
-	uint32_t *handles;
+	struct uobj_handle_map_entry *e;
 	size_t n;
 	size_t cap;
 };
 
-static int handle_map_add(struct uobj_handle_map *m, uint32_t handle)
+static int handle_map_add(struct uobj_handle_map *m, R3UobjType type, uint32_t restrack_id, uint32_t ufile_handle)
 {
 	if (m->n == m->cap) {
 		size_t newcap = m->cap ? m->cap * 2 : 16;
-		void *p = xrealloc(m->handles, newcap * sizeof(*m->handles));
+		void *p = xrealloc(m->e, newcap * sizeof(*m->e));
 
 		if (!p)
 			return -1;
-		m->handles = p;
+		m->e = p;
 		m->cap = newcap;
 	}
-	m->handles[m->n++] = handle;
+	m->e[m->n].type = type;
+	m->e[m->n].restrack_id = restrack_id;
+	m->e[m->n].ufile_handle = ufile_handle;
+	m->n++;
 	return 0;
+}
+
+static bool handle_map_lookup(const struct uobj_handle_map *m, R3UobjType type, uint32_t restrack_id, uint32_t *out)
+{
+	for (size_t i = 0; i < m->n; i++) {
+		if (m->e[i].type == type && m->e[i].restrack_id == restrack_id) {
+			*out = m->e[i].ufile_handle;
+			return true;
+		}
+	}
+	return false;
 }
 
 /*
@@ -267,7 +296,7 @@ static int rdma_send_restore_pd(int cmd_fd, uint32_t kernel_driver_id, uint32_t 
 
 /*
  * Restore one PD: reinstall an ib_uobject at the ufile_handle the dump
- * captured, then record that handle so later uobject types can resolve
+ * captured, then record (PD, restrack_id) -> handle so MRs can resolve
  * their parent-PD xref through the map.
  */
 static int uobj_restore_pd(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobjEntry *e, struct uobj_handle_map *m)
@@ -280,6 +309,11 @@ static int uobj_restore_pd(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 		       e->has_restrack_id ? e->restrack_id : 0);
 		return -1;
 	}
+	if (!e->has_restrack_id) {
+		pr_err("uobj DAG: PD entry (handle=%u) has no restrack_id; MR xrefs could not resolve it\n",
+		       e->ufile_handle);
+		return -1;
+	}
 
 	rc = rdma_send_restore_pd(cmd_fd, kernel_driver_id, e->ufile_handle);
 	if (rc) {
@@ -289,7 +323,64 @@ static int uobj_restore_pd(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 	}
 	pr_debug("uobj DAG: RESTORE_PD handle=%u ok (cmd_fd=%d driver=%u)\n", e->ufile_handle, cmd_fd, kernel_driver_id);
 
-	return handle_map_add(m, e->ufile_handle);
+	return handle_map_add(m, R3_UOBJ_TYPE__R3UT_PD, e->restrack_id, e->ufile_handle);
+}
+
+/*
+ * Resolve an MR's parent PD to the destination handle it was restored
+ * at (via the R3XR_PARENT_PD xref) and validate the entry. The
+ * RESTORE_MR ioctl itself is deferred to the pie restorer -- it must
+ * run in the target's restored address space so the MR's user_addr
+ * pages are present and pinnable -- so this master-side step only
+ * prepares/validates. The pie handoff (rst_rdma_mr record + issue)
+ * lands in the next commit; until then an MR-carrying image restores
+ * its PDs but not its MRs.
+ */
+static int uobj_prepare_mr(const RdmaUobjEntry *e, const struct uobj_handle_map *m)
+{
+	uint32_t parent_pd_handle = 0;
+	bool have_parent = false;
+
+	if (!e->has_ufile_handle) {
+		pr_err("uobj DAG: MR entry (restrack_id=%u) has no ufile_handle; cannot restore\n",
+		       e->has_restrack_id ? e->restrack_id : 0);
+		return -1;
+	}
+	if (!e->mr) {
+		pr_err("uobj DAG: MR entry handle=%u carries no mr attrs\n", e->ufile_handle);
+		return -1;
+	}
+
+	for (size_t k = 0; k < e->n_xref; k++) {
+		const RdmaUobjXref *xr = e->xref[k];
+
+		if (xr->role != R3_XREF_ROLE__R3XR_PARENT_PD)
+			continue;
+		if (xr->target_type != R3_UOBJ_TYPE__R3UT_PD) {
+			pr_err("uobj DAG: MR handle=%u parent xref has non-PD target_type %u\n", e->ufile_handle,
+			       xr->target_type);
+			return -1;
+		}
+		if (!handle_map_lookup(m, R3_UOBJ_TYPE__R3UT_PD, xr->target_restrack_id, &parent_pd_handle)) {
+			pr_err("uobj DAG: MR handle=%u parent PD (restrack_id=%u) not restored / unresolvable\n",
+			       e->ufile_handle, xr->target_restrack_id);
+			return -1;
+		}
+		have_parent = true;
+		break;
+	}
+	if (!have_parent) {
+		pr_err("uobj DAG: MR handle=%u has no R3XR_PARENT_PD xref\n", e->ufile_handle);
+		return -1;
+	}
+
+	pr_info("uobj DAG: MR handle=%u prepared: parent_pd_handle=%u va=%#" PRIx64 " len=%" PRIu64
+		" access=%#x lkey=%#x rkey=%#x iova=%#" PRIx64 " (RESTORE_MR deferred to pie)\n",
+		e->ufile_handle, parent_pd_handle, (uint64_t)(e->mr->has_virt_addr ? e->mr->virt_addr : 0),
+		(uint64_t)(e->mr->has_length ? e->mr->length : 0), e->mr->has_access_flags ? e->mr->access_flags : 0,
+		e->mr->has_lkey ? e->mr->lkey : 0, e->mr->has_rkey ? e->mr->rkey : 0,
+		(uint64_t)(e->mr->has_iova ? e->mr->iova : 0));
+	return 0;
 }
 
 int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver_id)
@@ -304,23 +395,40 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 		return 0;
 	}
 
-	pr_info("uobj DAG: restoring ufile_id=%#x (%d uobjs) on cmd_fd=%d\n", ufile_id, g->n_total, cmd_fd);
+	pr_info("uobj DAG: restoring ufile_id=%#x (%d uobjs: pd=%d other=%d) on cmd_fd=%d\n", ufile_id, g->n_total,
+		g->n_pd, g->n_other, cmd_fd);
+
+	/*
+	 * Dependency order: PDs first (xref targets, no incoming edges),
+	 * then the uobjects that reference them. v0 has a single edge kind
+	 * (MR -> parent PD), so a type-ranked two-pass walk is a sufficient
+	 * topo-sort; a general Kahn walk lands if/when intra-class edges do.
+	 */
+	list_for_each_entry(c, &g->entries, link) {
+		if (c->e->type != R3_UOBJ_TYPE__R3UT_PD)
+			continue;
+		ret = uobj_restore_pd(cmd_fd, kernel_driver_id, c->e, &map);
+		if (ret)
+			goto out;
+	}
 
 	list_for_each_entry(c, &g->entries, link) {
 		switch (c->e->type) {
 		case R3_UOBJ_TYPE__R3UT_PD:
-			ret = uobj_restore_pd(cmd_fd, kernel_driver_id, c->e, &map);
+			break; /* restored in the first pass */
+		case R3_UOBJ_TYPE__R3UT_MR:
+			ret = uobj_prepare_mr(c->e, &map);
 			break;
 		default:
-			pr_err("uobj DAG: ufile_id=%#x has unsupported uobj type %d; only PD is restorable in v0\n",
-			       ufile_id, c->e->type);
+			pr_err("uobj DAG: ufile_id=%#x has unsupported uobj type %d\n", ufile_id, c->e->type);
 			ret = -1;
 			break;
 		}
 		if (ret)
-			break;
+			goto out;
 	}
 
-	xfree(map.handles);
+out:
+	xfree(map.e);
 	return ret;
 }
