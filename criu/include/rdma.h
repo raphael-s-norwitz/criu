@@ -89,6 +89,24 @@ int rdma_collect_uobj_dag(void);
  */
 int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver_id);
 
+struct task_restore_args;
+
+/*
+ * R3 restore-side pie handoff (criu/rdma/uobj_restore.c). Called once
+ * from the sigreturn-args prep in cr-restore.c, after every ufile's DAG
+ * has been dispatched (PDs restored, MRs queued). Bursts the queued MRs
+ * into the RM_PRIVATE restorer-args pool as ta->rdma_mrs[], each owning
+ * a high-fd dup of its ucontext cdev; the pie blob issues RESTORE_MR
+ * for them after the user VMAs are laid out at their original VAs (the
+ * user_addr pages must be present for the kernel's pin_user_pages_fast).
+ *
+ * Always anchors ta->rdma_mrs at the current RM_PRIVATE cursor (even
+ * with nothing queued) so the pool stays consistent across the
+ * prepare_* sequence. Returns 0 on success (including the no-MR fast
+ * path), -1 on a missing-field / unresolved-parent / dup / alloc error.
+ */
+int rdma_prepare_rdma_mrs(struct task_restore_args *ta);
+
 /*
  * RDMA plugin queries (criu/rdma/plugin_api.c):
  *

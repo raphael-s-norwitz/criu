@@ -936,6 +936,160 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 }
 
 /*
+ * Issue UVERBS_METHOD_RESTORE_MR for one MR queued by the master-side
+ * dispatch (criu/rdma/uobj_restore.c::rdma_prepare_rdma_mrs). Runs from
+ * inside the pie blob after the user VMAs have been laid out at their
+ * original addresses, so rxe's pin_user_pages_fast(addr, ...) succeeds
+ * against the destination task's mm. See criu/include/restorer.h::
+ * struct rst_rdma_mr for the timing rationale.
+ *
+ * The wire encoding mirrors the master's RESTORE_PD encoder: PTR_IN /
+ * FLAGS_IN attrs whose declared len <= sizeof(u64) pass the value
+ * inline in attr->data. Constants and structs are duplicated (shim
+ * below) rather than shared because the pie blob compiles nostdlib with
+ * a minimal include surface.
+ */
+#include <rdma/ib_user_verbs.h>
+#include <rdma/ib_user_ioctl_cmds.h>
+#include <rdma/rdma_user_ioctl_cmds.h>
+
+#ifndef UVERBS_OBJECT_RESTORE
+#define UVERBS_OBJECT_RESTORE 18
+#endif
+#ifndef UVERBS_METHOD_RESTORE_MR
+#define UVERBS_METHOD_RESTORE_MR 1
+#endif
+#ifndef UVERBS_ATTR_RESTORE_MR_HANDLE
+#define UVERBS_ATTR_RESTORE_MR_HANDLE	    0
+#define UVERBS_ATTR_RESTORE_MR_PD_HANDLE    1
+#define UVERBS_ATTR_RESTORE_MR_ADDR	    2
+#define UVERBS_ATTR_RESTORE_MR_LENGTH	    3
+#define UVERBS_ATTR_RESTORE_MR_IOVA	    4
+#define UVERBS_ATTR_RESTORE_MR_ACCESS_FLAGS 5
+#define UVERBS_ATTR_RESTORE_MR_LKEY_HINT    6
+#define UVERBS_ATTR_RESTORE_MR_RKEY_HINT    7
+#define UVERBS_ATTR_RESTORE_MR_RESP_LKEY    8
+#define UVERBS_ATTR_RESTORE_MR_RESP_RKEY    9
+#endif
+
+static int restore_rdma_mr(struct rst_rdma_mr *r)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[10];
+	} cmd = {};
+	uint32_t resp_lkey = 0, resp_rkey = 0;
+	unsigned int n = 0;
+	int ret;
+
+	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_MR;
+	cmd.hdr.driver_id = r->kernel_driver_id;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_HANDLE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->target_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_PD_HANDLE;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->parent_pd_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_ADDR;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->addr;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_LENGTH;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->length;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_IOVA;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->iova;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_ACCESS_FLAGS;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->access_flags;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_LKEY_HINT;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->lkey_hint;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RKEY_HINT;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->rkey_hint;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RESP_LKEY;
+	cmd.attrs[n].len = sizeof(resp_lkey);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp_lkey;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_RESP_RKEY;
+	cmd.attrs[n].len = sizeof(resp_rkey);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp_rkey;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	ret = sys_ioctl(r->cmd_fd, RDMA_VERBS_IOCTL, (unsigned long)&cmd);
+	/*
+	 * Always close the per-MR cdev dup so it doesn't leak into the
+	 * restored task's fd table -- the user task already has the cdev at
+	 * its source-side fd number via CRIU's per-task file restore; this
+	 * dup is purely a transit fd for the ioctl above.
+	 */
+	sys_close(r->cmd_fd);
+	if (ret < 0) {
+		/*
+		 * The pie printf is compel's minimal one: %s/%d/%x/%p/%u with
+		 * the 'l' modifier, no '#' alt-form; %x already prefixes 0x.
+		 */
+		pr_err("RDMA: ufile_id=%x RESTORE_MR(target_handle=%u, parent_pd_handle=%u, addr=%lx, length=%lu, "
+		       "iova=%lx, access=%x, lkey_hint=%x, rkey_hint=%x, driver_id=%u) failed: %d\n",
+		       r->ufile_id, r->target_handle, r->parent_pd_handle, (unsigned long)r->addr,
+		       (unsigned long)r->length, (unsigned long)r->iova, r->access_flags, r->lkey_hint, r->rkey_hint,
+		       r->kernel_driver_id, ret);
+		return -1;
+	}
+
+	/*
+	 * Identity assertion: rxe honours the lkey/rkey hints exactly, so
+	 * RESP_LKEY/_RKEY must equal the hints byte-for-byte. A mismatch
+	 * means the wire-visible identity shifted -- any peer holding the
+	 * old rkey, or any libibverbs cache holding the old lkey, is now
+	 * stale -- a driver-side regression to catch loudly.
+	 */
+	if (resp_lkey != r->lkey_hint || resp_rkey != r->rkey_hint) {
+		pr_err("RDMA: ufile_id=%x RESTORE_MR(target_handle=%u): kernel installed lkey/rkey (%x/%x) differs from "
+		       "hints (%x/%x); identity hint not honoured\n",
+		       r->ufile_id, r->target_handle, resp_lkey, resp_rkey, r->lkey_hint, r->rkey_hint);
+		return -1;
+	}
+
+	pr_info("RDMA: ufile_id=%x RESTORE_MR(target_handle=%u, lkey=%x, rkey=%x, driver_id=%u) ok\n", r->ufile_id,
+		r->target_handle, resp_lkey, resp_rkey, r->kernel_driver_id);
+	return 0;
+}
+
+/*
  * This restores aio ring header, content, head and in-kernel position
  * of tail. To set tail, we write to /dev/null and use the fact this
  * operation is synchronous for the device. Also, we unmap temporary
@@ -2001,6 +2155,20 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	for (i = 0; i < args->rings_n; i++)
 		if (restore_aio_ring(&args->rings[i]) < 0)
+			goto core_restore_end;
+
+	/*
+	 * RDMA MR restore. Same "needs the user mm laid out at its final
+	 * VAs" rationale as AIO rings: rxe's RESTORE_MR pins the MR's user
+	 * buffer via pin_user_pages_fast against current->mm, which only
+	 * succeeds once the anon-private VMAs have been mmap'd at their
+	 * source-side addresses (the pie blob's job, just above). Issued
+	 * here so any -EFAULT surfaces against a fully-laid-out mm.
+	 */
+	if (args->rdma_mrs_n)
+		pr_info("RDMA: pie restorer: dispatching %u MR(s)\n", args->rdma_mrs_n);
+	for (i = 0; i < args->rdma_mrs_n; i++)
+		if (restore_rdma_mr(&args->rdma_mrs[i]) < 0)
 			goto core_restore_end;
 
 	/*

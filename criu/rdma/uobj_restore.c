@@ -27,17 +27,22 @@
  * ufile_handle map the PD pass builds. The RESTORE_MR ioctl itself is
  * deferred to the pie restorer (it must run in the target's restored
  * address space so the MR's user_addr pages are pinnable); this file
- * only prepares/validates the MR here and the pie handoff lands in the
- * next commit. CQ/QP/SRQ arms follow in their milestones.
+ * prepares each MR here -- resolves its parent handle and queues a
+ * fully-populated record -- and rdma_prepare_rdma_mrs() later bursts
+ * the queue into the pie restorer's RM_PRIVATE args, where
+ * restore_rdma_mr issues the ioctl post-VMA. CQ/QP/SRQ arms follow in
+ * their milestones.
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 #include <rdma/rdma_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_cmds.h>
@@ -48,9 +53,18 @@
 #include "log.h"
 #include "protobuf.h"
 #include "rdma.h"
+#include "restorer.h"
+#include "rst-malloc.h"
 #include "xmalloc.h"
 
 #include "images/rdma_uobj.pb-c.h"
+
+/*
+ * High-fd floor for the per-MR cdev dups handed to the pie restorer:
+ * above the user-fd range CRIU's per-task file restorer reinstalls into
+ * and below service_fd_base. The pie closes each after its RESTORE_MR.
+ */
+#define RDMA_PIE_CMD_FD_MIN (1 << 14)
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "rdma: "
@@ -326,27 +340,61 @@ static int uobj_restore_pd(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 }
 
 /*
- * Resolve an MR's parent PD to the destination handle it was restored
- * at (via the R3XR_PARENT_PD xref) and validate the entry. The
- * RESTORE_MR ioctl itself is deferred to the pie restorer -- it must
- * run in the target's restored address space so the MR's user_addr
- * pages are present and pinnable -- so this master-side step only
- * prepares/validates. The pie handoff (rst_rdma_mr record + issue)
- * lands in the next commit; until then an MR-carrying image restores
- * its PDs but not its MRs.
+ * MRs resolved in Phase A (the per-ufile dispatch) but issued in the
+ * pie restorer. The RESTORE_MR ioctl must run in the target's restored
+ * address space -- rxe pins the MR's user_addr pages via
+ * pin_user_pages_fast against current->mm, and those pages are not laid
+ * out until the pie blob mmaps the VMAs at sigreturn_restore time -- so
+ * the dispatch queues a fully-resolved record here and
+ * rdma_prepare_rdma_mrs() drains it into the restorer args later.
+ * Each record owns a high-fd dup of the ucontext cdev; the pie closes
+ * it after the ioctl.
  */
-static int uobj_prepare_mr(const RdmaUobjEntry *e, const struct uobj_handle_map *m)
+struct rdma_pending_mr {
+	uint32_t ufile_id;
+	uint32_t kernel_driver_id;
+	uint32_t target_handle;
+	uint32_t parent_pd_handle;
+	uint64_t addr;
+	uint64_t length;
+	uint64_t iova;
+	uint32_t access_flags;
+	uint32_t lkey;
+	uint32_t rkey;
+	int cmd_fd_dup;
+	struct list_head link;
+};
+
+static LIST_HEAD(rdma_pending_mrs);
+
+/*
+ * Resolve an MR's parent PD to the destination handle it was restored
+ * at (via the R3XR_PARENT_PD xref), validate the full RESTORE_MR field
+ * set, dup the ucontext cdev to a high fd for the pie, and queue the
+ * record. The ioctl itself is deferred to the pie (see struct
+ * rdma_pending_mr).
+ */
+static int uobj_prepare_mr(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver_id, const RdmaUobjEntry *e,
+			   const struct uobj_handle_map *m)
 {
 	uint32_t parent_pd_handle = 0;
 	bool have_parent = false;
+	const RdmaMrAttrs *attrs = e->mr;
+	struct rdma_pending_mr *p;
+	int dup_fd;
 
 	if (!e->has_ufile_handle) {
 		pr_err("uobj DAG: MR entry (restrack_id=%u) has no ufile_handle; cannot restore\n",
 		       e->has_restrack_id ? e->restrack_id : 0);
 		return -1;
 	}
-	if (!e->mr) {
-		pr_err("uobj DAG: MR entry handle=%u carries no mr attrs\n", e->ufile_handle);
+	if (!attrs || !attrs->has_virt_addr || !attrs->has_length || !attrs->has_iova || !attrs->has_access_flags ||
+	    !attrs->has_lkey || !attrs->has_rkey) {
+		pr_err("uobj DAG: MR handle=%u missing RESTORE_MR fields (have va=%d len=%d iova=%d access=%d lkey=%d "
+		       "rkey=%d); image dumped against a kernel without QUERY_MR user_addr/access_flags\n",
+		       e->ufile_handle, attrs ? attrs->has_virt_addr : 0, attrs ? attrs->has_length : 0,
+		       attrs ? attrs->has_iova : 0, attrs ? attrs->has_access_flags : 0, attrs ? attrs->has_lkey : 0,
+		       attrs ? attrs->has_rkey : 0);
 		return -1;
 	}
 
@@ -373,12 +421,40 @@ static int uobj_prepare_mr(const RdmaUobjEntry *e, const struct uobj_handle_map 
 		return -1;
 	}
 
-	pr_info("uobj DAG: MR handle=%u prepared: parent_pd_handle=%u va=%#" PRIx64 " len=%" PRIu64
-		" access=%#x lkey=%#x rkey=%#x iova=%#" PRIx64 " (RESTORE_MR deferred to pie)\n",
-		e->ufile_handle, parent_pd_handle, (uint64_t)(e->mr->has_virt_addr ? e->mr->virt_addr : 0),
-		(uint64_t)(e->mr->has_length ? e->mr->length : 0), e->mr->has_access_flags ? e->mr->access_flags : 0,
-		e->mr->has_lkey ? e->mr->lkey : 0, e->mr->has_rkey ? e->mr->rkey : 0,
-		(uint64_t)(e->mr->has_iova ? e->mr->iova : 0));
+	/*
+	 * Per-MR dup so each record owns its transit fd and the pie can
+	 * close them independently. cmd_fd is the plugin-opened ucontext
+	 * cdev; the dup rides above the user-fd reuse range.
+	 */
+	dup_fd = fcntl(cmd_fd, F_DUPFD_CLOEXEC, RDMA_PIE_CMD_FD_MIN);
+	if (dup_fd < 0) {
+		pr_err("uobj DAG: MR handle=%u: F_DUPFD_CLOEXEC of cdev fd for pie failed: %m\n", e->ufile_handle);
+		return -1;
+	}
+
+	p = xzalloc(sizeof(*p));
+	if (!p) {
+		close(dup_fd);
+		return -1;
+	}
+	p->ufile_id = ufile_id;
+	p->kernel_driver_id = kernel_driver_id;
+	p->target_handle = e->ufile_handle;
+	p->parent_pd_handle = parent_pd_handle;
+	p->addr = attrs->virt_addr;
+	p->length = attrs->length;
+	p->iova = attrs->iova;
+	p->access_flags = attrs->access_flags;
+	p->lkey = attrs->lkey;
+	p->rkey = attrs->rkey;
+	p->cmd_fd_dup = dup_fd;
+	INIT_LIST_HEAD(&p->link);
+	list_add_tail(&p->link, &rdma_pending_mrs);
+
+	pr_info("uobj DAG: MR handle=%u queued for pie: parent_pd_handle=%u va=%#" PRIx64 " len=%" PRIu64
+		" access=%#x lkey=%#x rkey=%#x iova=%#" PRIx64 "\n",
+		e->ufile_handle, parent_pd_handle, (uint64_t)attrs->virt_addr, (uint64_t)attrs->length,
+		attrs->access_flags, attrs->lkey, attrs->rkey, (uint64_t)attrs->iova);
 	return 0;
 }
 
@@ -416,7 +492,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 		case R3_UOBJ_TYPE__R3UT_PD:
 			break; /* restored in the first pass */
 		case R3_UOBJ_TYPE__R3UT_MR:
-			ret = uobj_prepare_mr(c->e, &map);
+			ret = uobj_prepare_mr(cmd_fd, ufile_id, kernel_driver_id, c->e, &map);
 			break;
 		default:
 			pr_err("uobj DAG: ufile_id=%#x has unsupported uobj type %d\n", ufile_id, c->e->type);
@@ -430,4 +506,46 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 out:
 	xfree(map.e);
 	return ret;
+}
+
+int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
+{
+	struct rdma_pending_mr *p, *n;
+
+	/*
+	 * Anchor ta->rdma_mrs at the current RM_PRIVATE cursor before
+	 * knowing whether anything lands here, so the pool cursor stays
+	 * consistent across the whole prepare_* sequence on the no-MR path.
+	 */
+	ta->rdma_mrs = (struct rst_rdma_mr *)rst_mem_align_cpos(RM_PRIVATE);
+	ta->rdma_mrs_n = 0;
+
+	list_for_each_entry_safe(p, n, &rdma_pending_mrs, link) {
+		struct rst_rdma_mr *r = rst_mem_alloc(sizeof(*r), RM_PRIVATE);
+
+		if (!r) {
+			pr_err("uobj DAG: rst_mem_alloc(RM_PRIVATE) for MR handle=%u failed\n", p->target_handle);
+			close(p->cmd_fd_dup);
+			return -1;
+		}
+		r->cmd_fd = p->cmd_fd_dup;
+		r->ufile_id = p->ufile_id;
+		r->kernel_driver_id = p->kernel_driver_id;
+		r->target_handle = p->target_handle;
+		r->parent_pd_handle = p->parent_pd_handle;
+		r->addr = p->addr;
+		r->length = p->length;
+		r->iova = p->iova;
+		r->access_flags = p->access_flags;
+		r->lkey_hint = p->lkey;
+		r->rkey_hint = p->rkey;
+		ta->rdma_mrs_n++;
+
+		list_del(&p->link);
+		xfree(p);
+	}
+
+	if (ta->rdma_mrs_n)
+		pr_info("uobj DAG: staged %u MR(s) for pie RESTORE_MR\n", ta->rdma_mrs_n);
+	return 0;
 }
