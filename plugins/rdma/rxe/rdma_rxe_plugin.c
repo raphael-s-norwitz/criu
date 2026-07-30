@@ -49,6 +49,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #ifdef LOG_PREFIX
@@ -385,12 +386,115 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 	return fd;
 }
 
+/*
+ * Map a char-device (maj:min) to the ibdev name it serves, via
+ * /sys/dev/char/<maj>:<min>/ibdev. Returns 0 and fills @out on a
+ * uverbs cdev; -1 for any non-uverbs chrdev (the sysfs attr is
+ * absent). Used by the HANDLE_DEVICE_VMA claim below, which only
+ * has the VMA's st_rdev to work from.
+ */
+static int rxe_chrdev_to_ibdev(dev_t rdev, char *out, size_t outsz)
+{
+	char path[PATH_MAX];
+	int fd;
+	ssize_t n;
+
+	snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/ibdev",
+		 major(rdev), minor(rdev));
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = read(fd, out, outsz - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == ' '))
+		n--;
+	out[n] = '\0';
+	return n > 0 ? 0 : -1;
+}
+
+/*
+ * Predicate behind HANDLE_DEVICE_VMA: does this VMA's @st resolve to
+ * an rxe-driven uverbs cdev? On a match, writes the ibdev name (e.g.
+ * "rxe0") to @ibdev_out and returns 0; on any decline returns
+ * -ENOTSUP and leaves @ibdev_out untouched.
+ */
+static int rxe_match_cdev_vma(const struct stat *st, char *ibdev_out,
+			      size_t ibdev_sz)
+{
+	char ibdev[64];
+	char drv[64];
+
+	if (!rxe_active)
+		return -ENOTSUP;
+	if (!S_ISCHR(st->st_mode))
+		return -ENOTSUP;
+
+	if (rxe_chrdev_to_ibdev(st->st_rdev, ibdev, sizeof(ibdev)))
+		return -ENOTSUP;
+	if (!resolve_ibdev_driver(ibdev, drv, sizeof(drv)))
+		return -ENOTSUP;
+	if (strcmp(drv, "rxe") != 0)
+		return -ENOTSUP;
+
+	if (ibdev_out && ibdev_sz)
+		snprintf(ibdev_out, ibdev_sz, "%.*s",
+			 (int)(ibdev_sz - 1), ibdev);
+	return 0;
+}
+
+/*
+ * Per-VMA dump-side hook (CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA).
+ *
+ * rxe ibverbs userspace memory-maps slices of /dev/infiniband/uverbsN
+ * for the per-uobject in-kernel queues it exposes: the CQ CQE ring
+ * (the first such VMA, surfaced by the CQ dev gate) and, later, the
+ * QP send/recv rings and the SRQ ring. CRIU's proc_parse sees the
+ * S_ISCHR mapping and asks every loaded plugin "is this VMA yours?";
+ * without us claiming it the dump aborts with "Can't handle
+ * non-regular mapping".
+ *
+ * Symmetric with the restore-side rdma_rxe_plugin_open_uverbs_cdev
+ * path: a chrdev is ours iff /sys/dev/char/<maj>:<min>/ibdev names an
+ * ibdev whose driver resolves to "rxe". On a mixed-provider host this
+ * declines mlx5 cdev VMAs so the mlx5 plugin's own hook can claim
+ * them.
+ *
+ * Returns 0 on a successful claim; -ENOTSUP on any decline (so
+ * run_plugins() keeps walking to other plugins, or falls through to
+ * proc_parse's "Can't handle non-regular mapping" if none claim).
+ * Never returns any other negative value: a non-ENOTSUP negative
+ * short-circuits run_plugins() and would prevent any later plugin
+ * from claiming a VMA we merely failed to inspect.
+ *
+ * @fd is unused: we resolve off @st->st_rdev only.
+ */
+static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
+{
+	char ibdev[64];
+	int rc;
+
+	(void)fd;
+
+	rc = rxe_match_cdev_vma(st, ibdev, sizeof(ibdev));
+	if (rc)
+		return rc;
+
+	pr_info("handle_vma(%s): claiming uverbs-cdev mapping "
+		"(rxe per-uobject queue: CQ ring / QP rings / SRQ)\n",
+		ibdev);
+	return 0;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
 			rdma_rxe_plugin_claim_uverbs_context)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV,
 			rdma_rxe_plugin_open_uverbs_cdev)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA,
+			rdma_rxe_plugin_handle_device_vma)
 
 /*
  * RDMA provided driver: RCD_RXE.
