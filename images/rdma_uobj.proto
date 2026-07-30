@@ -13,12 +13,12 @@
  * plugin_blob (recommended encoding: a per-plugin .proto, but criu core
  * never parses these bytes).
  *
- * v0 scope: this milestone (T1.1, rxe PD) emits only R3UT_PD records.
- * The r3_uobj_type enum reserves the remaining integers so the wire
- * format stays stable as follow-on milestones add per-class attribute
- * messages (rdma_cq/qp/mr/srq_attrs), the xref graph, and their
- * rdma_uobj_entry fields. Additions are append-only; field numbers
- * are pre-assigned here to match the final layout.
+ * v0 scope: rxe PD (R3UT_PD) and rxe MR (R3UT_MR, with a single
+ * R3XR_PARENT_PD edge). Follow-on milestones append their types
+ * (R3UT_CQ, R3UT_QP, ...), xref roles, and per-class attribute
+ * messages at fresh integers as they start emitting them. proto2
+ * enums/fields are append-only and nothing decodes an rdma_uobj.img
+ * yet (v0 is unreleased), so only exercised values are defined here.
  *
  * Image layout written by criu/rdma/uobj_dump.c at dump time:
  *
@@ -69,6 +69,32 @@ import "rdma_criu.proto";
 enum r3_uobj_type {
 	R3UT_UNKNOWN			= 0;
 	R3UT_PD				= 1;
+	R3UT_MR				= 2;
+};
+
+/*
+ * Edge label in the per-ucontext DAG: a typed reference from one
+ * uobject to another. The set grows per milestone -- only edges an
+ * emitted type actually uses are defined. v0 (rxe PD + MR) needs a
+ * single edge: an MR's parent PD. Unknown roles are tolerable on
+ * decode (skip the edge with a warning) for forward compatibility.
+ */
+enum r3_xref_role {
+	R3XR_UNKNOWN			= 0;
+	R3XR_PARENT_PD			= 1;
+};
+
+/*
+ * One typed reference from a source uobject to a target uobject. The
+ * (target_type, target_restrack_id) pair uniquely identifies the
+ * target inside the same image. Restore resolves it to the
+ * destination-side ufile_handle via the per-ufile handle map built up
+ * as uobjects are restored in topo order (parents before children).
+ */
+message rdma_uobj_xref {
+	required r3_xref_role	role			= 1;
+	required r3_uobj_type	target_type		= 2;
+	required uint32		target_restrack_id	= 3;
 };
 
 /* ---------------- per-class hw-agnostic attribute messages ---------------- */
@@ -80,6 +106,35 @@ enum r3_uobj_type {
  */
 message rdma_pd_attrs {
 	optional uint32		alloc_flags		= 1;
+};
+
+/*
+ * MR hw-agnostic state. virt_addr/length/access_flags reproduce the
+ * user's ibv_reg_mr() arguments; the restore side re-feeds them to
+ * UVERBS_METHOD_RESTORE_MR. lkey/rkey are wire-visible identity hints
+ * the kernel restore handler honours (rxe re-installs the MR at the
+ * matching pool slot so the source's keys survive the round-trip;
+ * see kernel commit "RDMA/rxe: honour lkey/rkey hint in restore_mr").
+ * iova may differ from virt_addr when the MR was registered with an
+ * explicit IOVA.
+ *
+ * Field provenance (rxe v0):
+ *   length, lkey, rkey         NLDEV fill_res_mr_entry (RES_MRLEN /
+ *                              RES_LKEY / RES_RKEY; lkey/rkey require
+ *                              CAP_NET_ADMIN, which CRIU holds as root).
+ *                              Also echoed authoritatively by QUERY_MR.
+ *   virt_addr, iova,           not emitted by fill_res_mr_entry --
+ *   access_flags               captured via the extended
+ *                              UVERBS_METHOD_QUERY_MR (RESP_USER_ADDR /
+ *                              RESP_IOVA / RESP_ACCESS_FLAGS).
+ */
+message rdma_mr_attrs {
+	optional uint64		virt_addr		= 1;
+	optional uint64		length			= 2;
+	optional uint32		access_flags		= 3;
+	optional uint32		lkey			= 10;	/* identity hint */
+	optional uint32		rkey			= 11;	/* identity hint */
+	optional uint64		iova			= 12;
 };
 
 /* ---------------- top-level per-uobject record ---------------- */
@@ -121,9 +176,11 @@ message rdma_uobj_entry {
 
 	/* HW-agnostic per-class attrs. EXACTLY ONE matches `type`. */
 	optional rdma_pd_attrs		pd		= 10;
-	/* 11..17 reserved: cq/qp/mr/srq/ah/cc/aef (follow-on milestones). */
+	optional rdma_mr_attrs		mr		= 13;
+	/* 11,12,14..17 reserved: cq/qp/srq/ah/cc/aef (follow-on milestones). */
 
-	/* 30 reserved: repeated rdma_uobj_xref xref (edge graph). */
+	/* Typed edges into other uobjects in the same ufile. v0: MR's PD. */
+	repeated rdma_uobj_xref		xref		= 30;
 
 	/*
 	 * Plugin-specific opaque blob (FW state). Emitted empty by the
