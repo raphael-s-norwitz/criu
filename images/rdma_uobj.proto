@@ -196,16 +196,18 @@ message rdma_qp_cap {
  * (R3XR_PARENT_PD / R3XR_SEND_CQ / R3XR_RECV_CQ) resolved by
  * restrack id, mirroring how the MR path carries its parent PD.
  *
- * The driver-private QP wire state the destination cannot re-derive
+ * Most driver-private QP wire state the destination cannot re-derive
  * (AV, live req/comp/resp cursors, ssn, transport knobs, the SQ/RQ
- * ring mmap offsets, and the async-event user_handle) is NOT here:
- * it lives in the entry-level @plugin_blob, packed by the owning
- * plugin's QUERY_QP hook, exactly like the CQ ring vm_pgoff. That
- * hook and the matching fields (av = 16, user_handle = 40, ...) are
- * appended with the QP-query milestone at the numbers the design
- * reserves, so nothing else here needs pre-declaring.
+ * ring mmap offsets) is NOT here: it lives in the entry-level
+ * @plugin_blob, packed by the owning plugin's QUERY_QP hook, exactly
+ * like the CQ ring vm_pgoff. The one exception is user_handle, which
+ * is core-consumed (RESTORE_QP takes it as a MANDATORY core attr) so
+ * it is a hw-agnostic field here even though its provenance is the
+ * per-driver QUERY_QP. The modify-chain fields (av = 16, ...) are
+ * appended in their milestone at the numbers the design reserves, so
+ * nothing else here needs pre-declaring.
  *
- * Field provenance (rxe, this milestone):
+ * Field provenance (rxe):
  *   qp_type       NLDEV fill_res_qp_entry (RES_TYPE).
  *   state         NLDEV (RES_STATE).
  *   qp_num        NLDEV (RES_LQPN, the local QP number).
@@ -217,6 +219,8 @@ message rdma_qp_cap {
  *   cap           standard IB_USER_VERBS_CMD_QUERY_QP verb
  *                 (init_attr->cap); not NLDEV-visible, but hw-agnostic
  *                 and core-issued (no plugin). Optional.
+ *   user_handle   per-driver QUERY_QP (rxe: RXE_IB_METHOD_QUERY_QP's
+ *                 RESP_USER_HANDLE); not NLDEV-visible. Optional.
  */
 message rdma_qp_attrs {
 	optional uint32		qp_type			= 1;	/* RC/UC/UD/...   */
@@ -227,6 +231,16 @@ message rdma_qp_attrs {
 	optional uint32		sq_psn			= 13;
 	optional uint32		rq_psn			= 14;
 	optional uint32		port_num		= 27;
+
+	/*
+	 * Userspace async-event cookie: the tag the source passed as
+	 * ibv_create_qp()'s qp_context, mirrored by ib_uverbs_create_qp
+	 * into ibqp->uobject->user_handle. Not NLDEV-queryable; sourced
+	 * via the per-driver QUERY_QP dispatch. RESTORE_QP takes it as a
+	 * MANDATORY core attr and re-stamps the new uobject's user_handle,
+	 * so library code that caches the tag survives the round-trip.
+	 */
+	optional uint64		user_handle		= 40;
 };
 
 /* ---------------- top-level per-uobject record ---------------- */
