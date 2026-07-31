@@ -25,12 +25,14 @@
  * ring VMA onto the restored, ucontext-bearing cdev fd).
  *
  * If HOLDER_ALLOC_QP is set (implies a PD and a CQ), also create an RC
- * QP sharing that CQ for send + recv completions -- the dump-side QP
- * discovery gate. NLDEV surfaces the QP with its parent-PD and both
- * CQ-binding restrack ids, which the R3 dump walker turns into an
- * R3UT_QP entry with R3XR_PARENT_PD / R3XR_SEND_CQ / R3XR_RECV_CQ
- * xrefs. (Restore of the QP is a later milestone; this holder mode
- * exercises the dump/discovery path only.)
+ * QP sharing that CQ for send + recv completions -- the rxe RESTORE_QP
+ * dev gate. NLDEV surfaces the QP with its parent-PD and both CQ-binding
+ * restrack ids, which the R3 dump walker turns into an R3UT_QP entry
+ * with R3XR_PARENT_PD / R3XR_SEND_CQ / R3XR_RECV_CQ xrefs plus the
+ * plugin's captured wire state; restore drives UVERBS_METHOD_RESTORE_QP
+ * (master-side, re-registering the SQ/RQ ring pending-mmap slots at the
+ * source vm_pgoffs) plus the plugin's UPDATE_VMA_MAP hook (remapping the
+ * two ring VMAs onto the restored ucontext-bearing cdev).
  *
  * Then blocks until SIGTERM. SIGUSR1 re-queries the device and, per
  * mode, functionally exercises the post-restore state:
@@ -47,12 +49,18 @@
  *     drained CQ returns 0 cleanly), then ibv_destroy_cq -- which
  *     resolves the CQ by its ufile handle, proving RESTORE_CQ
  *     reinstalled the uobject.
+ *   - QP mode: ibv_query_qp the restored QP (resolves it by ufile handle
+ *     and reads its state back from the kernel), then ibv_destroy_qp --
+ *     which likewise resolves by handle, proving RESTORE_QP reinstalled
+ *     the uobject at the source qpn. The QP is destroyed before its CQ
+ *     (a live QP pins its CQs).
  * Writes "OK" or "FAIL: ..." to the status file. The runner uses
  * SIGUSR1 after restore to confirm the context is still functional.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,6 +186,39 @@ static int verify_cq(char *msg, size_t msglen)
 	return 0;
 }
 
+/*
+ * Prove the restored QP is a live kernel object at its original handle
+ * and qpn. ibv_query_qp resolves the QP by its ufile handle and reads
+ * its state back from the kernel (rxe issues the standard QUERY_QP
+ * verb), so success means RESTORE_QP reinstalled the uobject. The qpn is
+ * checked against the pre-dump value the ibv_qp still carries in
+ * restored memory -- the kernel installs the QP at the source qpn and
+ * core fails the restore on divergence, so this is the userspace echo of
+ * that identity contract. ibv_destroy_qp then tears it down (must run
+ * before the CQ it shares is destroyed, since a live QP pins its CQs).
+ */
+static int verify_qp(char *msg, size_t msglen)
+{
+	struct ibv_qp_attr attr = {};
+	struct ibv_qp_init_attr iattr = {};
+	uint32_t qpn = g_qp->qp_num;
+
+	if (ibv_query_qp(g_qp, &attr, IBV_QP_STATE | IBV_QP_CAP, &iattr)) {
+		snprintf(msg, msglen, "FAIL: ibv_query_qp on restored QP (qpn=%u): %s", qpn, strerror(errno));
+		return -1;
+	}
+	if (qpn == 0) {
+		snprintf(msg, msglen, "FAIL: restored QP has qpn 0");
+		return -1;
+	}
+	if (ibv_destroy_qp(g_qp)) {
+		snprintf(msg, msglen, "FAIL: ibv_destroy_qp on restored QP (qpn=%u): %s", qpn, strerror(errno));
+		return -1;
+	}
+	g_qp = NULL;
+	return 0;
+}
+
 static void write_status(const char *line)
 {
 	FILE *f;
@@ -293,18 +334,30 @@ int main(int argc, char **argv)
 		if (g_query) {
 			struct ibv_device_attr a;
 			char msg[128];
+			/* PD-only mode iff no child objects were created. */
+			bool pd_only = g_pd && !g_mr && !g_cq && !g_qp;
+			int rc = 0;
 
 			g_query = 0;
-			if (ibv_query_device(g_ctx, &a))
+			if (ibv_query_device(g_ctx, &a)) {
 				write_status("FAIL: ibv_query_device after signal");
-			else if (g_mr && verify_mr(msg, sizeof(msg)))
-				write_status(msg);
-			else if (g_cq && verify_cq(msg, sizeof(msg)))
-				write_status(msg);
-			else if (!g_mr && g_pd && verify_pd(msg, sizeof(msg)))
-				write_status(msg);
-			else
-				write_status("OK");
+			} else {
+				/*
+				 * Teardown-safe order: a live QP pins its CQ(s),
+				 * so verify (and destroy) it before the CQ; the
+				 * PD is a leaf every child depends on, so it is
+				 * checked last and only in pure PD mode.
+				 */
+				if (rc == 0 && g_qp)
+					rc = verify_qp(msg, sizeof(msg));
+				if (rc == 0 && g_mr)
+					rc = verify_mr(msg, sizeof(msg));
+				if (rc == 0 && g_cq)
+					rc = verify_cq(msg, sizeof(msg));
+				if (rc == 0 && pd_only)
+					rc = verify_pd(msg, sizeof(msg));
+				write_status(rc ? msg : "OK");
+			}
 		}
 		pause();
 	}
