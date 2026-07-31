@@ -148,7 +148,58 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ = 18,
 
+	/*
+	 * RDMA per-CQ restore-side UHW shaping. Dispatched by core's
+	 * rdma_send_restore_cq() (criu/rdma/uobj_restore.c), once per
+	 * R3UT_CQ image entry, to the plugin whose cr_rdma_provided_driver
+	 * matches the entry's criu_driver (same by-driver keying as
+	 * RDMA_DUMP_UOBJ_CQ / RDMA_OPEN_UVERBS_CDEV).
+	 *
+	 * The UVERBS_METHOD_RESTORE_CQ verb's driver-agnostic half (target
+	 * handle, cqe, comp_vector, flags, resp_cqe) is built by core; this
+	 * hook translates the plugin-private RdmaUobjEntry.plugin_blob it
+	 * emitted at dump time into the driver's UHW_IN (rxe: the 24-byte
+	 * rxe_restore_cq_req header + the unreaped-CQE image tail) and
+	 * declares the UHW_OUT size the kernel's udata->outbuf requires
+	 * (rxe: sizeof(rxe_create_cq_resp)). The plugin owns @uhw's
+	 * malloc'd in_buf/out_buf; core frees both after the ioctl. A
+	 * plugin may also pre-fill out_buf with an expected byte template
+	 * and set verify_len > 0 to have core memcmp the kernel's UHW_OUT
+	 * echo against it post-ioctl.
+	 *
+	 * Return: 0 on success, negative errno on failure (aborts the
+	 * restore of this ufile).
+	 */
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK = 19,
+
 	CR_PLUGIN_HOOK__MAX
+};
+
+/*
+ * Driver-private UHW (udata) staging for a restore verb, filled by a
+ * plugin's RDMA_RESTORE_UOBJ_*_UHW_PACK hook and consumed by the core
+ * rdma_send_restore_* that dispatched it:
+ *
+ *   in_buf/in_len    UHW_IN payload (the driver's create-verb udata
+ *                    input, reconstructed from the per-uobj plugin_blob).
+ *                    NULL/0 -> no UHW_IN attr emitted.
+ *   out_buf/out_len  UHW_OUT receive area size the kernel requires. When
+ *                    out_len > 0 core allocates a separate writeable
+ *                    buffer for the kernel to stamp; out_buf itself may
+ *                    hold an expected byte template for verification.
+ *   verify_len       If > 0 (and <= out_len) core memcmp's the first
+ *                    verify_len bytes of the kernel's UHW_OUT echo
+ *                    against out_buf and fails -EPROTO on mismatch.
+ *
+ * The plugin owns any in_buf/out_buf allocations; core frees both
+ * (and its own receive buffer) after the ioctl completes.
+ */
+struct rdma_uhw_spec {
+	void *in_buf;
+	size_t in_len;
+	void *out_buf;
+	size_t out_len;
+	size_t verify_len;
 };
 
 #define DECLARE_PLUGIN_HOOK_ARGS(__hook, ...) typedef int(__hook##_t)(__VA_ARGS__)
@@ -193,6 +244,8 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const UverbsFile
 #include "images/rdma_uobj.pb-c.h"
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ, const char *ibdev, uint32_t kernel_driver_id, int lfd,
 			 uint32_t ufile_handle, pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK, const RdmaUobjEntry *e,
+			 struct rdma_uhw_spec *uhw);
 
 /*
  * RDMA sharing policy.

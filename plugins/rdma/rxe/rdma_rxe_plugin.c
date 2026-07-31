@@ -571,6 +571,23 @@ struct rxe_cq_plugin_blob {
 	uint32_t cqe_image_bytes;
 	uint32_t reserved;
 };
+_Static_assert(sizeof(struct rxe_cq_plugin_blob) == 24,
+	       "rxe_cq_plugin_blob must be 24 bytes (field-identical to kernel rxe_restore_cq_req)");
+
+/*
+ * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::mminfo
+ * (== rxe_create_cq_resp, 16 bytes): the RESTORE_CQ UHW_OUT the kernel's
+ * rxe_restore_cq publishes (udata->outbuf must be at least this size).
+ * @mi_offset is the destination ring's mmap byte offset, which rxe
+ * replays from the UHW_IN vm_pgoff -- so the restore hook seeds it as an
+ * 8-byte echo-verify template. Remove once host rdma-core ships it.
+ */
+struct rxe_create_cq_resp_local {
+	uint64_t mi_offset;
+	uint32_t mi_size;
+	uint32_t mi_pad;
+};
+_Static_assert(sizeof(struct rxe_create_cq_resp_local) == 16, "rxe_create_cq_resp_local must be 16 bytes (kernel UAPI)");
 
 /*
  * Issue RXE_IB_METHOD_QUERY_CQ on @fd (criu's dup of the dumpee's
@@ -735,6 +752,82 @@ out:
 	return rc;
 }
 
+/*
+ * RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook (rxe). The restore-time twin of
+ * rdma_rxe_plugin_dump_uobj_cq(): reshapes the per-CQ plugin_blob it
+ * emitted into the UVERBS_METHOD_RESTORE_CQ udata that core issues.
+ *
+ * UHW_IN is the plugin_blob verbatim -- its 24-byte header is field-
+ * identical to the kernel rxe_restore_cq_req (vm_pgoff / producer /
+ * consumer / cqe_image_bytes / reserved), and the tail is already the
+ * in-flight [consumer, producer) CQE subspan the kernel blits back and
+ * whose cursors it seeds via rxe_cq_seed_ring. UHW_OUT is a 16-byte
+ * rxe_create_cq_resp receive area (the kernel's udata->outbuf minimum)
+ * pre-seeded with the requested vm_pgoff so core memcmp-verifies the
+ * kernel echoed the same ring offset back. Core owns and frees both
+ * buffers after the ioctl.
+ *
+ * The blob length is validated to equal the header plus exactly its
+ * declared image bytes, so a truncated/garbled image is caught here
+ * rather than as a mid-restore -EINVAL from the kernel's tail slicer.
+ */
+static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
+{
+	const struct rxe_cq_plugin_blob *pb;
+	struct rxe_create_cq_resp_local *out;
+	uint64_t vm_pgoff;
+	size_t want;
+	void *inbuf;
+
+	if (!e || !uhw)
+		return -EINVAL;
+
+	if (!e->has_plugin_blob || e->plugin_blob.len < sizeof(*pb)) {
+		pr_err("rxe: RESTORE_CQ_UHW_PACK ufile_handle=%u: plugin_blob len=%zu below the %zu-byte header\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, e->has_plugin_blob ? e->plugin_blob.len : (size_t)0,
+		       sizeof(*pb));
+		return -EINVAL;
+	}
+	pb = (const struct rxe_cq_plugin_blob *)e->plugin_blob.data;
+	want = sizeof(*pb) + (size_t)pb->cqe_image_bytes;
+	if (e->plugin_blob.len != want) {
+		pr_err("rxe: RESTORE_CQ_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected %zu (%zuB header + "
+		       "cqe_img=%u tail)\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, e->plugin_blob.len, want, sizeof(*pb),
+		       pb->cqe_image_bytes);
+		return -EINVAL;
+	}
+	vm_pgoff = pb->vm_pgoff;
+
+	out = malloc(sizeof(*out));
+	if (!out) {
+		pr_err("rxe: RESTORE_CQ_UHW_PACK out of memory (out_buf %zu bytes)\n", sizeof(*out));
+		return -ENOMEM;
+	}
+	memset(out, 0, sizeof(*out));
+	out->mi_offset = vm_pgoff;
+	uhw->out_buf = out;
+	uhw->out_len = sizeof(*out);
+	uhw->verify_len = vm_pgoff ? sizeof(out->mi_offset) : 0;
+
+	inbuf = malloc(e->plugin_blob.len);
+	if (!inbuf) {
+		free(out);
+		uhw->out_buf = NULL;
+		uhw->out_len = 0;
+		uhw->verify_len = 0;
+		pr_err("rxe: RESTORE_CQ_UHW_PACK out of memory (in_buf %zu bytes)\n", e->plugin_blob.len);
+		return -ENOMEM;
+	}
+	memcpy(inbuf, e->plugin_blob.data, e->plugin_blob.len);
+	uhw->in_buf = inbuf;
+	uhw->in_len = e->plugin_blob.len;
+
+	pr_debug("rxe: RESTORE_CQ_UHW_PACK ufile_handle=%u vm_pgoff=%#" PRIx64 " image_bytes=%u (uhw_in=%zu uhw_out=%zu)\n",
+		 e->has_ufile_handle ? e->ufile_handle : 0, vm_pgoff, pb->cqe_image_bytes, uhw->in_len, uhw->out_len);
+	return 0;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
@@ -745,6 +838,8 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA,
 			rdma_rxe_plugin_handle_device_vma)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
 			rdma_rxe_plugin_dump_uobj_cq)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
+			rdma_rxe_plugin_restore_uobj_cq_uhw_pack)
 
 /*
  * RDMA provided driver: RCD_RXE.

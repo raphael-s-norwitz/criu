@@ -19,19 +19,22 @@
  *                      Lives for the rest of the restore (freed at
  *                      process exit by design -- no release entry).
  *
- * v0 scope (rxe PD + MR): collect + group, then a dependency-ordered
- * per-ufile walk -- PDs first (RESTORE_PD, synchronous on cmd_fd),
- * then MRs. An MR carries no ctxn and references its parent PD by the
- * source restrack id, so the walk resolves that edge to the parent's
- * destination handle through the per-ufile (type, restrack_id) ->
- * ufile_handle map the PD pass builds. The RESTORE_MR ioctl itself is
- * deferred to the pie restorer (it must run in the target's restored
- * address space so the MR's user_addr pages are pinnable); this file
- * prepares each MR here -- resolves its parent handle and queues a
- * fully-populated record -- and rdma_prepare_rdma_mrs() later bursts
- * the queue into the pie restorer's RM_PRIVATE args, where
- * restore_rdma_mr issues the ioctl post-VMA. CQ/QP/SRQ arms follow in
- * their milestones.
+ * v0 scope (rxe PD + MR + CQ): collect + group, then a dependency-
+ * ordered per-ufile walk. Roots first -- PDs and CQs (RESTORE_PD /
+ * RESTORE_CQ, synchronous on cmd_fd) -- then MRs. An MR carries no ctxn
+ * and references its parent PD by the source restrack id, so the walk
+ * resolves that edge to the parent's destination handle through the
+ * per-ufile (type, restrack_id) -> ufile_handle map the PD pass builds.
+ * The RESTORE_MR ioctl itself is deferred to the pie restorer (it must
+ * run in the target's restored address space so the MR's user_addr
+ * pages are pinnable); this file prepares each MR here -- resolves its
+ * parent handle and queues a fully-populated record -- and
+ * rdma_prepare_rdma_mrs() later bursts the queue into the pie restorer's
+ * RM_PRIVATE args, where restore_rdma_mr issues the ioctl post-VMA. A CQ
+ * carries driver-private ring state whose UHW the owning plugin reshapes
+ * (RESTORE_UOBJ_CQ_UHW_PACK); the verb runs master-side because rxe
+ * registers a kernel-ring mmap slot the pie's VMA pass then maps. QP/SRQ
+ * arms follow in their milestones.
  */
 
 #include <errno.h>
@@ -40,6 +43,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -50,6 +54,7 @@
 #include "common/config.h"
 #include "common/compiler.h"
 #include "common/list.h"
+#include "criu-plugin.h"
 #include "image.h"
 #include "log.h"
 #include "protobuf.h"
@@ -94,6 +99,39 @@
 #endif
 #ifndef UVERBS_ATTR_RESTORE_PD_HANDLE
 #define UVERBS_ATTR_RESTORE_PD_HANDLE 0
+#endif
+
+/*
+ * UAPI lag shim for UVERBS_METHOD_RESTORE_CQ and its attributes
+ * (enum uverbs_methods_restore / uverbs_attrs_restore_cq in the kernel's
+ * include/uapi/rdma/ib_user_ioctl_cmds.h). Same numeric-copy rationale
+ * as the RESTORE_PD block above: the kernel matches by integer, so this
+ * is enough to drive a kernel that has the support; a too-old kernel
+ * returns -EOPNOTSUPP for the unknown method. The COMP_CHANNEL / EVENT_FD
+ * attrs are intentionally omitted -- v0 rejects CC-bound CQs at dump time
+ * (see dump_uverbsfile_cc_precheck) and lets the kernel default the async
+ * file, so core never emits them.
+ */
+#ifndef UVERBS_METHOD_RESTORE_CQ
+#define UVERBS_METHOD_RESTORE_CQ 2
+#endif
+#ifndef UVERBS_ATTR_RESTORE_CQ_HANDLE
+#define UVERBS_ATTR_RESTORE_CQ_HANDLE 0
+#endif
+#ifndef UVERBS_ATTR_RESTORE_CQ_CQE
+#define UVERBS_ATTR_RESTORE_CQ_CQE 1
+#endif
+#ifndef UVERBS_ATTR_RESTORE_CQ_USER_HANDLE
+#define UVERBS_ATTR_RESTORE_CQ_USER_HANDLE 2
+#endif
+#ifndef UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR
+#define UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR 3
+#endif
+#ifndef UVERBS_ATTR_RESTORE_CQ_FLAGS
+#define UVERBS_ATTR_RESTORE_CQ_FLAGS 4
+#endif
+#ifndef UVERBS_ATTR_RESTORE_CQ_RESP_CQE
+#define UVERBS_ATTR_RESTORE_CQ_RESP_CQE 7
 #endif
 
 struct uobj_collected {
@@ -341,6 +379,184 @@ static int uobj_restore_pd(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 }
 
 /*
+ * Issue UVERBS_METHOD_RESTORE_CQ on @cmd_fd from CRIU master, minting a
+ * CQ uobject at the caller-chosen ufile handle.
+ *
+ * Core owns only the driver-agnostic attributes: the target handle, the
+ * requested cqe count and comp_vector (from the R3UT_CQ image entry, the
+ * hw-agnostic fields the dump-side plugin filled), an optional flags
+ * word, a user_handle, and the mandatory RESP_CQE sink. The driver-
+ * private half -- rxe: the ring mmap vm_pgoff, the producer/consumer
+ * cursors and the unreaped-CQE image -- is opaque here; the owning
+ * plugin reshapes its per-CQ plugin_blob into UHW_IN (and declares the
+ * UHW_OUT size the kernel's udata requires, optionally with a verify
+ * template) via CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK, dispatched
+ * by @criu_driver.
+ *
+ * This is the "ring lives in kernel pages, exposed via vm_pgoff" camp
+ * (rxe): the verb MUST run here, before the pie's user-VMA pass mmaps
+ * the cdev at that vm_pgoff (rxe_restore_cq registers the pending mmap
+ * slot; mmapping it before the slot exists -EINVALs). rxe pins no user
+ * pages, so master's mm is fine. Drivers that pin the ring from
+ * current->mm (mlx5) will instead defer to the pie in a later milestone.
+ *
+ * user_handle is 0 in v0: the source cq_context cookie is not captured
+ * (QUERY_CQ/NLDEV don't expose it) and matters only for comp_channel /
+ * async-event delivery, neither of which v0 restores. ibv_poll_cq does
+ * not consult it.
+ *
+ * Returns 0 on success, -errno on ioctl failure (a too-old kernel
+ * returns -EOPNOTSUPP for the unknown UVERBS_OBJECT_RESTORE), or the
+ * negative errno the UHW_PACK dispatch / verify reported.
+ */
+static int rdma_send_restore_cq(int cmd_fd, uint32_t criu_driver, uint32_t kernel_driver_id, const RdmaUobjEntry *e)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[7];
+	} cmd = {};
+	struct rdma_uhw_spec uhw = {};
+	const RdmaCqAttrs *attrs = e->cq;
+	uint32_t cqe = 0, comp_vector = 0, flags = 0, resp_cqe = 0;
+	uint64_t user_handle = 0;
+	void *uhw_out_actual = NULL;
+	unsigned int n = 0;
+	int rc;
+
+	if (attrs) {
+		if (attrs->has_cqe_count)
+			cqe = attrs->cqe_count;
+		if (attrs->has_comp_vector)
+			comp_vector = attrs->comp_vector;
+		if (attrs->has_flags)
+			flags = attrs->flags;
+	}
+
+	rc = rdma_dispatch_restore_cq_uhw_pack(criu_driver, e, &uhw);
+	if (rc)
+		return rc; /* dispatch already logged */
+
+	if (uhw.out_len) {
+		uhw_out_actual = malloc(uhw.out_len);
+		if (!uhw_out_actual) {
+			rc = -ENOMEM;
+			goto out_free_uhw;
+		}
+		memset(uhw_out_actual, 0, uhw.out_len);
+	}
+
+	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_CQ;
+	cmd.hdr.driver_id = kernel_driver_id;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_HANDLE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = e->ufile_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_CQE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = cqe;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_USER_HANDLE;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = user_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = comp_vector;
+	n++;
+
+	if (flags) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_FLAGS;
+		cmd.attrs[n].len = sizeof(uint32_t);
+		cmd.attrs[n].flags = 0;
+		cmd.attrs[n].data = flags;
+		n++;
+	}
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_CQ_RESP_CQE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp_cqe;
+	n++;
+
+	if (uhw.out_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_OUT;
+		cmd.attrs[n].len = (uint16_t)uhw.out_len;
+		cmd.attrs[n].flags = 0;
+		cmd.attrs[n].data = (uintptr_t)uhw_out_actual;
+		n++;
+	}
+	if (uhw.in_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
+		cmd.attrs[n].len = (uint16_t)uhw.in_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)uhw.in_buf;
+		n++;
+	}
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0) {
+		rc = -errno;
+		goto out_free_uhw;
+	}
+
+	if (uhw.verify_len > 0 && uhw.verify_len <= uhw.out_len &&
+	    memcmp(uhw_out_actual, uhw.out_buf, uhw.verify_len) != 0) {
+		pr_err("uobj DAG: RESTORE_CQ handle=%u UHW_OUT byte-template mismatch (verify_len=%zu); kernel did not "
+		       "echo the requested ring offset\n",
+		       e->ufile_handle, uhw.verify_len);
+		rc = -EPROTO;
+		goto out_free_uhw;
+	}
+	rc = 0;
+
+out_free_uhw:
+	free(uhw_out_actual);
+	free(uhw.in_buf);
+	free(uhw.out_buf);
+	return rc;
+}
+
+/*
+ * Restore one CQ: reinstall an ib_uobject at the ufile_handle the dump
+ * captured, synchronously on the cmd_fd (master side, before the pie's
+ * VMA pass -- see rdma_send_restore_cq). The CQ is a DAG root in v0 (no
+ * incoming xrefs), so unlike the MR path it needs no parent resolution
+ * and touches no handle map; QPs will resolve their send/recv-CQ edges
+ * once that milestone records CQ handles here.
+ */
+static int uobj_restore_cq(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobjEntry *e)
+{
+	int rc;
+
+	if (!e->has_ufile_handle) {
+		pr_err("uobj DAG: CQ entry (restrack_id=%u) has no ufile_handle; cannot restore (dump ran on a "
+		       "pre-K8a kernel)\n",
+		       e->has_restrack_id ? e->restrack_id : 0);
+		return -1;
+	}
+
+	rc = rdma_send_restore_cq(cmd_fd, e->hw_driver_id, kernel_driver_id, e);
+	if (rc) {
+		pr_err("uobj DAG: RESTORE_CQ handle=%u on cmd_fd=%d driver=%u failed: %d (%s)\n", e->ufile_handle,
+		       cmd_fd, kernel_driver_id, rc, strerror(rc < 0 ? -rc : rc));
+		return -1;
+	}
+	pr_debug("uobj DAG: RESTORE_CQ handle=%u ok (cmd_fd=%d driver=%u)\n", e->ufile_handle, cmd_fd, kernel_driver_id);
+	return 0;
+}
+
+/*
  * MRs resolved in Phase A (the per-ufile dispatch) but issued in the
  * pie restorer. The RESTORE_MR ioctl must run in the target's restored
  * address space -- rxe pins the MR's user_addr pages via
@@ -492,6 +708,16 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 		switch (c->e->type) {
 		case R3_UOBJ_TYPE__R3UT_PD:
 			break; /* restored in the first pass */
+		case R3_UOBJ_TYPE__R3UT_CQ:
+			/*
+			 * CQ is a root like PD (no incoming xrefs in v0) and
+			 * is restored synchronously here on cmd_fd -- it must
+			 * precede the pie's VMA mmap of the ring (see
+			 * rdma_send_restore_cq). Order vs the MR queueing below
+			 * is immaterial: MR only depends on PD.
+			 */
+			ret = uobj_restore_cq(cmd_fd, kernel_driver_id, c->e);
+			break;
 		case R3_UOBJ_TYPE__R3UT_MR:
 			ret = uobj_prepare_mr(cmd_fd, ufile_id, kernel_driver_id, c->e, &map);
 			break;

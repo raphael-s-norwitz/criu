@@ -50,7 +50,7 @@ int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
  * For each dumped context, asks NLDEV to enumerate its uobjects and
  * writes one rdma_uobj_entry per uobject to rdma_uobj.img.
  *
- * v0 scope (rxe PD + MR + CQ): emits R3UT_PD / R3UT_MR / R3UT_CQ
+ssh  * v0 scope (rxe PD + MR + CQ): emits R3UT_PD / R3UT_MR / R3UT_CQ
  * records. No-op (and writes no image) for trees that hold no RDMA
  * contexts. Returns 0 on success or a no-op skip, -1 on any netlink /
  * image-write failure (fails the dump closed, consistent with the
@@ -167,6 +167,27 @@ int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe);
 #include "images/rdma_uobj.pb-c.h"
 int rdma_dispatch_dump_uobj_cq(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id, int lfd,
 			       uint32_t ufile_handle, pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob);
+
+/*
+ * Restore-side per-CQ UHW-pack dispatch (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_restore_cq_uhw_pack()
+ *       Invokes CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK on the
+ *       single loaded plugin whose exported cr_rdma_provided_driver
+ *       matches @criu_driver (the R3UT_CQ entry's, same by-driver
+ *       keying as the dump-side dispatch). The plugin reshapes the
+ *       entry's opaque plugin_blob into @uhw (UHW_IN payload + required
+ *       UHW_OUT size + optional verify template); core's
+ *       rdma_send_restore_cq() then issues UVERBS_METHOD_RESTORE_CQ and
+ *       frees @uhw's buffers. Returns 0 on success (including the no-op
+ *       case where the plugin exposes no hook), negative errno on
+ *       no/ambiguous match or hook failure.
+ *
+ * struct rdma_uhw_spec is defined in criu-plugin.h (the plugin ABI);
+ * a bare forward declaration suffices for this pointer parameter.
+ */
+struct rdma_uhw_spec;
+int rdma_dispatch_restore_cq_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
 
 /*
  * RDMA driver-name resolution (criu/rdma/driver.c):
