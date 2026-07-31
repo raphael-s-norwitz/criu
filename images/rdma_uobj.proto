@@ -14,8 +14,9 @@
  * never parses these bytes).
  *
  * v0 scope: rxe PD (R3UT_PD), rxe MR (R3UT_MR, with a single
- * R3XR_PARENT_PD edge), and rxe CQ (R3UT_CQ). Follow-on milestones
- * append their types (R3UT_QP, ...), xref roles, and per-class
+ * R3XR_PARENT_PD edge), rxe CQ (R3UT_CQ), and rxe QP (R3UT_QP, with
+ * R3XR_PARENT_PD / R3XR_SEND_CQ / R3XR_RECV_CQ edges). Follow-on
+ * milestones append further types, xref roles, and per-class
  * attribute messages at fresh integers as they start emitting them.
  * proto2 enums/fields are append-only and nothing decodes an
  * rdma_uobj.img yet (v0 is unreleased), so only exercised values are
@@ -72,18 +73,22 @@ enum r3_uobj_type {
 	R3UT_PD				= 1;
 	R3UT_MR				= 2;
 	R3UT_CQ				= 3;
+	R3UT_QP				= 4;
 };
 
 /*
  * Edge label in the per-ucontext DAG: a typed reference from one
  * uobject to another. The set grows per milestone -- only edges an
- * emitted type actually uses are defined. v0 (rxe PD + MR) needs a
- * single edge: an MR's parent PD. Unknown roles are tolerable on
+ * emitted type actually uses are defined. The rxe MR path needs a
+ * single edge (an MR's parent PD); the rxe QP path adds its parent
+ * PD plus its two completion queues. Unknown roles are tolerable on
  * decode (skip the edge with a warning) for forward compatibility.
  */
 enum r3_xref_role {
 	R3XR_UNKNOWN			= 0;
 	R3XR_PARENT_PD			= 1;
+	R3XR_SEND_CQ			= 2;
+	R3XR_RECV_CQ			= 3;
 };
 
 /*
@@ -164,6 +169,46 @@ message rdma_cq_attrs {
 	optional uint32		flags			= 3;
 };
 
+/*
+ * QP hw-agnostic state. This milestone (dump-side NLDEV discovery)
+ * emits only the subset fill_res_qp_entry surfaces: the transport
+ * type, the transition state, the local/remote QP numbers, the two
+ * PSN bases, and the port. The parent PD and the two completion
+ * queues are not fields here -- they are typed xref edges
+ * (R3XR_PARENT_PD / R3XR_SEND_CQ / R3XR_RECV_CQ) resolved by
+ * restrack id, mirroring how the MR path carries its parent PD.
+ *
+ * The driver-private QP wire state the destination cannot re-derive
+ * (AV, live req/comp/resp cursors, ssn, transport knobs, the SQ/RQ
+ * ring mmap offsets, and the async-event user_handle) is NOT here:
+ * it lives in the entry-level @plugin_blob, packed by the owning
+ * plugin's QUERY_QP hook, exactly like the CQ ring vm_pgoff. That
+ * hook and the hw-agnostic cap (max_send_wr, ...) sourced from the
+ * standard QUERY_QP verb land with the QP-query milestone; the
+ * matching fields (cap = 2, av = 16, user_handle = 40, ...) are
+ * appended then at the numbers the design reserves, so nothing here
+ * needs pre-declaring.
+ *
+ * Field provenance (rxe, this milestone):
+ *   qp_type       NLDEV fill_res_qp_entry (RES_TYPE).
+ *   state         NLDEV (RES_STATE).
+ *   qp_num        NLDEV (RES_LQPN, the local QP number).
+ *   dest_qp_num   NLDEV (RES_RQPN, the remote QP number; only set
+ *                 once the QP has been connected, so optional).
+ *   sq_psn        NLDEV (RES_SQ_PSN); optional.
+ *   rq_psn        NLDEV (RES_RQ_PSN); optional.
+ *   port_num      NLDEV (PORT_INDEX); optional.
+ */
+message rdma_qp_attrs {
+	optional uint32		qp_type			= 1;	/* RC/UC/UD/...   */
+	optional uint32		state			= 10;
+	optional uint32		qp_num			= 11;	/* identity hint  */
+	optional uint32		dest_qp_num		= 12;
+	optional uint32		sq_psn			= 13;
+	optional uint32		rq_psn			= 14;
+	optional uint32		port_num		= 27;
+};
+
 /* ---------------- top-level per-uobject record ---------------- */
 
 /*
@@ -186,8 +231,8 @@ message rdma_cq_attrs {
  *
  * Payload:
  *   EXACTLY ONE of the per-class sub-messages matches `type`. v0 emits
- *   `pd`, `mr`, and `cq`. The remaining per-class fields
- *   (qp/srq/ah/cc/aef) and further xref roles are added in their
+ *   `pd`, `mr`, `cq`, and `qp`. The remaining per-class fields
+ *   (srq/ah/cc/aef) and further xref roles are added in their
  *   milestones at pre-assigned field numbers.
  *
  *   plugin_blob is the per-plugin opaque hw-specific state (FW pdn, FW
@@ -206,8 +251,9 @@ message rdma_uobj_entry {
 	/* HW-agnostic per-class attrs. EXACTLY ONE matches `type`. */
 	optional rdma_pd_attrs		pd		= 10;
 	optional rdma_cq_attrs		cq		= 11;
+	optional rdma_qp_attrs		qp		= 12;
 	optional rdma_mr_attrs		mr		= 13;
-	/* 12,14..17 reserved: qp/srq/ah/cc/aef (follow-on milestones). */
+	/* 14..17 reserved: srq/ah/cc/aef (follow-on milestones). */
 
 	/* Typed edges into other uobjects in the same ufile. v0: MR's PD. */
 	repeated rdma_uobj_xref		xref		= 30;
