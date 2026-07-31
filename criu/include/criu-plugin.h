@@ -195,6 +195,32 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP = 20,
 
+	/*
+	 * RDMA per-QP restore-side UHW shaping. The QP twin of
+	 * RDMA_RESTORE_UOBJ_CQ_UHW_PACK: dispatched by core's
+	 * rdma_send_restore_qp() (criu/rdma/uobj_restore.c), once per
+	 * R3UT_QP image entry, to the plugin whose cr_rdma_provided_driver
+	 * matches the entry's criu_driver (same by-driver keying as the
+	 * dump-side hooks).
+	 *
+	 * The UVERBS_METHOD_RESTORE_QP verb's driver-agnostic half (target
+	 * handle, parent-PD / send-CQ / recv-CQ IDR refs, type, state,
+	 * user_handle, cap, resp_qpn) is built by core; this hook
+	 * translates the plugin-private RdmaUobjEntry.plugin_blob it
+	 * emitted at dump time into the driver's UHW_IN (rxe: the
+	 * rxe_restore_qp_req wire state -- AV, PSNs, cursors, transport
+	 * knobs, SQ/RQ ring mmap offsets) and declares the UHW_OUT size the
+	 * kernel's udata->outbuf requires (rxe: sizeof(rxe_create_qp_resp)).
+	 * The plugin owns @uhw's malloc'd in_buf/out_buf; core frees both
+	 * after the ioctl. A plugin may also pre-fill out_buf with an
+	 * expected byte template and set verify_len > 0 to have core memcmp
+	 * the kernel's UHW_OUT echo against it post-ioctl.
+	 *
+	 * Return: 0 on success, negative errno on failure (aborts the
+	 * restore of this ufile).
+	 */
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK = 21,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -271,6 +297,8 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK, const Rd
 			 struct rdma_uhw_spec *uhw);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP, const char *ibdev, uint32_t kernel_driver_id, int lfd,
 			 uint32_t ufile_handle, pid_t pid, RdmaQpAttrs *qp_attrs, ProtobufCBinaryData *plugin_blob);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK, const RdmaUobjEntry *e,
+			 struct rdma_uhw_spec *uhw);
 
 /*
  * RDMA sharing policy.

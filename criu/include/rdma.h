@@ -207,6 +207,23 @@ struct rdma_uhw_spec;
 int rdma_dispatch_restore_cq_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
 
 /*
+ * Restore-side per-QP UHW-pack dispatch (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_restore_qp_uhw_pack()
+ *       The QP twin of rdma_dispatch_restore_cq_uhw_pack(): invokes
+ *       CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK on the single
+ *       loaded plugin whose exported cr_rdma_provided_driver matches
+ *       @criu_driver (the R3UT_QP entry's). The plugin reshapes the
+ *       entry's opaque plugin_blob into @uhw (UHW_IN payload + required
+ *       UHW_OUT size + optional verify template); core's
+ *       rdma_send_restore_qp() then issues UVERBS_METHOD_RESTORE_QP and
+ *       frees @uhw's buffers. Returns 0 on success (including the no-op
+ *       case where the plugin exposes no hook), negative errno on
+ *       no/ambiguous match or hook failure.
+ */
+int rdma_dispatch_restore_qp_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
+
+/*
  * RDMA driver-name resolution (criu/rdma/driver.c):
  *
  *   rdma_driver_name_from_ibdev()
