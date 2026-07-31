@@ -19,11 +19,12 @@
  * image emission. PD carries no per-driver state (empty plugin_blob);
  * MR is queried in core (QUERY_MR is a generic core uverb); CQ is the
  * first type with driver-private per-uobject state, so it dispatches to
- * the owning plugin (RDMA_DUMP_UOBJ_CQ) for its QUERY_CQ. QP is
- * NLDEV-only at this milestone (identity + parent-PD/send-CQ/recv-CQ
- * xrefs); its per-driver QUERY_QP dispatch and standard-verb cap land
- * with the QP-query milestone. The SRQ arm and the early-capture split
- * land with their milestones.
+ * the owning plugin (RDMA_DUMP_UOBJ_CQ) for its QUERY_CQ. QP gets its
+ * identity + parent-PD/send-CQ/recv-CQ xrefs from NLDEV and its
+ * hw-agnostic create-time cap from the standard QUERY_QP verb issued in
+ * core; its per-driver QUERY_QP dispatch (driver-private wire state +
+ * user_handle) lands with the QP-query milestone. The SRQ arm and the
+ * early-capture split land with their milestones.
  *
  * Field provenance is documented inline in images/rdma_uobj.proto.
  * Briefly:
@@ -72,6 +73,7 @@
 
 #include <rdma/rdma_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_cmds.h>
+#include <rdma/ib_user_verbs.h>
 
 #include "common/compiler.h"
 #include "common/list.h"
@@ -241,6 +243,58 @@ static int rdma_send_query_mr(int cmd_fd, uint32_t driver_id, uint32_t handle, s
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
 
 	return ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0 ? -errno : 0;
+}
+
+/*
+ * Issue the standard QUERY_QP verb on @cmd_fd (the holder's dup'd uverbs
+ * cdev) for QP ufile-handle @handle, harvesting the create-time cap
+ * (init_attr->cap) RESTORE_QP needs to size the recreated QP's rings.
+ *
+ * Unlike QUERY_MR, there is no ioctl QUERY_QP method upstream (the
+ * UVERBS_OBJECT_QP ioctl namespace has only CREATE/DESTROY), so this
+ * goes through the legacy write() ABI's IB_USER_VERBS_CMD_QUERY_QP --
+ * the same path rdma-core's ibv_query_qp uses, and the path the rxe
+ * QUERY_QP UAPI explicitly defers cap/qp_type/qp_state to. The verb is
+ * hw-agnostic: the driver fills init_attr->cap unconditionally, so
+ * attr_mask is 0 (we want no qp_attr fields, only the always-populated
+ * init_attr). @cmd_fd MUST share the holder's ucontext IDR so @handle
+ * resolves; the per-IDR ownership check is the security boundary.
+ *
+ * The write ABI (drivers/infiniband/core/uverbs_main.c): the request is
+ * a struct ib_uverbs_cmd_hdr followed by the command body, in_words
+ * counts the whole request in 4-byte units (in_len = in_words*4 -
+ * sizeof(hdr)), out_words sizes the reply, and the reply is written to
+ * the userspace pointer in the command's leading @response field.
+ *
+ * Returns 0 on success (with @resp populated); -errno on failure. A
+ * short write (kernel wrote fewer bytes than asked) is mapped to -EIO.
+ */
+static int rdma_send_query_qp(int cmd_fd, uint32_t handle, struct ib_uverbs_query_qp_resp *resp)
+{
+	struct {
+		struct ib_uverbs_cmd_hdr hdr;
+		struct ib_uverbs_query_qp cmd;
+	} req = {};
+	ssize_t rc;
+
+	_Static_assert(sizeof(req) % 4 == 0, "QUERY_QP request must be a whole number of 4-byte words");
+	_Static_assert(sizeof(*resp) % 4 == 0, "QUERY_QP response must be a whole number of 4-byte words");
+
+	memset(resp, 0, sizeof(*resp));
+
+	req.hdr.command = IB_USER_VERBS_CMD_QUERY_QP;
+	req.hdr.in_words = sizeof(req) / 4;
+	req.hdr.out_words = sizeof(*resp) / 4;
+	req.cmd.response = (uintptr_t)resp;
+	req.cmd.qp_handle = handle;
+	req.cmd.attr_mask = 0;
+
+	rc = write(cmd_fd, &req, sizeof(req));
+	if (rc < 0)
+		return -errno;
+	if (rc != sizeof(req))
+		return -EIO;
+	return 0;
 }
 
 /* pdn -> owning in-tree ufile, built by the PD walk for the MR join. */
@@ -585,15 +639,15 @@ static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
 /*
  * QP callback: join to the owning ufile through the parent pdn (QPs,
  * like MRs, carry no ctxn in NLDEV), and emit one R3UT_QP entry from
- * the hw-agnostic identity NLDEV surfaces (type/state/qpn/psns/port)
- * plus three typed xrefs: R3XR_PARENT_PD (RES_PDN), R3XR_SEND_CQ
- * (RES_SEND_CQN) and R3XR_RECV_CQ (RES_RECV_CQN).
+ * the hw-agnostic identity NLDEV surfaces (type/state/qpn/psns/port),
+ * the create-time cap from the standard QUERY_QP verb (init_attr->cap,
+ * sourced in core), plus three typed xrefs: R3XR_PARENT_PD (RES_PDN),
+ * R3XR_SEND_CQ (RES_SEND_CQN) and R3XR_RECV_CQ (RES_RECV_CQN).
  *
- * This milestone is NLDEV-only: no per-driver QUERY_QP dispatch and no
- * standard-verb cap yet, so the entry carries no plugin_blob and no
- * ib_qp_cap. The driver-private wire state (AV, cursors, ring
- * vm_pgoffs, user_handle) and the cap land with the QP-query milestone,
- * appended onto rdma_qp_attrs / plugin_blob at their reserved numbers.
+ * The per-driver QUERY_QP dispatch (driver-private wire state -- AV,
+ * cursors, ring vm_pgoffs -- and the async-event user_handle, packed
+ * into plugin_blob) lands with the QP-query milestone; until then the
+ * entry carries no plugin_blob and no user_handle.
  *
  * A QP with a parent PD not in-tree is dropped (kernel/other-ucontext
  * QP). A QP whose owning ufile is in-tree but which is missing a
@@ -606,10 +660,13 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 {
 	struct uobj_walk_ctx *w = arg;
 	struct rdma_dumped_ufile *uf;
+	struct ib_uverbs_query_qp_resp qp_resp;
 	RdmaUobjEntry pe;
 	RdmaQpAttrs attrs;
+	RdmaQpCap cap;
 	RdmaUobjXref xr_pd, xr_scq, xr_rcq;
 	RdmaUobjXref *xrefs[3];
+	int rc;
 
 	if (!e->qp.has_pdn) {
 		w->n_dropped++;
@@ -633,6 +690,12 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 		       "(kernel lacks the QP CQ-binding NLDEV attrs); cannot resolve "
 		       "the SEND_CQ/RECV_CQ handles RESTORE_QP requires\n",
 		       e->qp.lqpn, w->ib->ibdev, e->qp.pdn, e->qp.has_send_cqn ? "RECV" : "SEND");
+		return (w->err = -1);
+	}
+	if (uf->holder_uctx_fd < 0) {
+		pr_err("uobj DAG: QP lqpn=%u on ibdev=%s has no holder cdev fd (dup failed at dump); "
+		       "cannot QUERY_QP\n",
+		       e->qp.lqpn, w->ib->ibdev);
 		return (w->err = -1);
 	}
 
@@ -668,6 +731,32 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 		attrs.port_num = e->qp.port;
 	}
 	pe.qp = &attrs;
+
+	/*
+	 * Create-time cap (hw-agnostic, core-issued): the standard
+	 * QUERY_QP verb on the holder's dup'd cdev fills init_attr->cap,
+	 * which RESTORE_QP needs to size the recreated QP's rings. NLDEV
+	 * does not surface it and the rxe QUERY_QP blob deliberately omits
+	 * it, so it is sourced here in core rather than in the plugin.
+	 */
+	rc = rdma_send_query_qp(uf->holder_uctx_fd, e->ufile_handle, &qp_resp);
+	if (rc) {
+		pr_err("uobj DAG: QUERY_QP(handle=%u) on ibdev=%s failed: %d (%s)\n", e->ufile_handle, w->ib->ibdev,
+		       rc, strerror(rc < 0 ? -rc : rc));
+		return (w->err = -1);
+	}
+	rdma_qp_cap__init(&cap);
+	cap.has_max_send_wr = true;
+	cap.max_send_wr = qp_resp.max_send_wr;
+	cap.has_max_recv_wr = true;
+	cap.max_recv_wr = qp_resp.max_recv_wr;
+	cap.has_max_send_sge = true;
+	cap.max_send_sge = qp_resp.max_send_sge;
+	cap.has_max_recv_sge = true;
+	cap.max_recv_sge = qp_resp.max_recv_sge;
+	cap.has_max_inline_data = true;
+	cap.max_inline_data = qp_resp.max_inline_data;
+	attrs.cap = &cap;
 
 	rdma_uobj_xref__init(&xr_pd);
 	xr_pd.role = R3_XREF_ROLE__R3XR_PARENT_PD;
