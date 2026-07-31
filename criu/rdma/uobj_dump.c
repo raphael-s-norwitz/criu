@@ -15,10 +15,12 @@
  * follow-on milestone for in-flight datapath state; PD carries no such
  * state, so a plain NLDEV walk after the freeze suffices here.
  *
- * v0 scope (rxe PD + MR): PD and MR discovery + image emission. No
- * per-driver QUERY_PD dispatch (rxe PD carries no FW state; the
- * plugin_blob stays empty). CQ/QP/SRQ arms, the plugin dump dispatch,
- * and the early-capture split land with their milestones.
+ * v0 scope (rxe PD + MR + CQ): PD, MR and CQ discovery + image
+ * emission. PD carries no per-driver state (empty plugin_blob); MR is
+ * queried in core (QUERY_MR is a generic core uverb); CQ is the first
+ * type with driver-private per-uobject state, so it dispatches to the
+ * owning plugin (RDMA_DUMP_UOBJ_CQ) for its QUERY_CQ. QP/SRQ arms and
+ * the early-capture split land with their milestones.
  *
  * Field provenance is documented inline in images/rdma_uobj.proto.
  * Briefly:
@@ -32,15 +34,20 @@
  *     (lkey/rkey), shape (length/iova), and registration provenance
  *     (user_addr/access_flags) come from a QUERY_MR ioctl issued on the
  *     holder's dup'd cdev fd -- NLDEV exposes only len/lkey/rkey.
+ *   * CQ has a direct CTXN (like PD) and a restrack id (RES_CQN);
+ *     cqe_count comes from NLDEV (RES_CQE). Its driver-private ring
+ *     state (rxe: the source ring mmap vm_pgoff) is not in NLDEV, so
+ *     the owning plugin QUERY_CQ's the holder's dup'd cdev fd and packs
+ *     it into the entry's plugin_blob.
  *
  * Failure policy:
- *   * Netlink failure on a PD or MR walk -> hard fail. We've already
+ *   * Netlink failure on a PD/MR/CQ walk -> hard fail. We've already
  *     accepted the cost of the pre-suspend coverage netlink dump;
  *     failing closed here is consistent.
- *   * QUERY_MR failure on an in-tree MR -> hard fail (we cannot emit a
- *     restorable MR without user_addr/access_flags/iova).
+ *   * QUERY_MR / per-CQ plugin dispatch failure on an in-tree uobject
+ *     -> hard fail (we cannot emit a restorable entry without it).
  *   * Image open / write failure -> hard fail.
- *   * An NLDEV PD/MR that doesn't map to any in-tree ufile ->
+ *   * An NLDEV PD/MR/CQ that doesn't map to any in-tree ufile ->
  *     silently dropped (kernel resource, or a userspace resource
  *     belonging to a non-snapshot-tree ucontext sharing the ibdev;
  *     the coverage check has already proven any in-tree ucontext is
@@ -51,6 +58,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -478,6 +486,96 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	return 0;
 }
 
+/*
+ * CQ callback: direct CTXN join (like PD), then hand off to the owning
+ * plugin for the driver-private per-CQ state NLDEV can't express (rxe:
+ * the ring mmap vm_pgoff, via QUERY_CQ). Emits one R3UT_CQ entry with
+ * the hw-agnostic cqe_count (RES_CQE) plus whatever comp_vector/flags
+ * the plugin fills, and the plugin's opaque byte blob.
+ */
+static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct uobj_walk_ctx *w = arg;
+	struct rdma_dumped_ufile *uf;
+	ProtobufCBinaryData plugin_blob = {};
+	RdmaUobjEntry pe;
+	RdmaCqAttrs attrs;
+	int rc;
+
+	if (!e->has_ctxn || !e->has_restrack_id) {
+		w->n_dropped++;
+		return 0;
+	}
+	uf = uobj_ibdev_ufile_by_ctxn(w->ib, e->ctxn);
+	if (!uf) {
+		w->n_dropped++;
+		return 0;
+	}
+
+	/*
+	 * ufile_handle is both the QUERY_CQ target and the value restore
+	 * reinstalls the CQ at; without it (pre-K8a kernel) the CQ is
+	 * unrestorable, so fail the dump rather than emit a dead entry.
+	 */
+	if (!e->has_ufile_handle) {
+		pr_err("uobj DAG: CQ cqn=%u on ibdev=%s ctxn=%u has no RES_HANDLE "
+		       "(kernel pre-K8a); cannot restore\n",
+		       e->restrack_id, w->ib->ibdev, e->ctxn);
+		return (w->err = -1);
+	}
+	if (uf->holder_uctx_fd < 0) {
+		pr_err("uobj DAG: CQ cqn=%u on ibdev=%s has no holder cdev fd (dup failed at dump); "
+		       "cannot QUERY_CQ\n",
+		       e->restrack_id, w->ib->ibdev);
+		return (w->err = -1);
+	}
+
+	rdma_uobj_entry__init(&pe);
+	pe.ufile_id = uf->uvfe_id;
+	pe.hw_driver_id = uf->criu_driver;
+	pe.type = R3_UOBJ_TYPE__R3UT_CQ;
+	pe.has_restrack_id = true;
+	pe.restrack_id = e->restrack_id;
+	pe.has_ufile_handle = true;
+	pe.ufile_handle = e->ufile_handle;
+
+	rdma_cq_attrs__init(&attrs);
+	attrs.has_cqe_count = true;
+	attrs.cqe_count = e->cq.cqe;
+	pe.cq = &attrs;
+
+	/*
+	 * Per-driver CQ payload: the plugin issues its QUERY_CQ on the
+	 * holder's dup'd cdev fd, fills comp_vector/flags in @attrs, and
+	 * mallocs its ring-vm_pgoff schema into @plugin_blob. We attach
+	 * those bytes onto the entry and free them after the write.
+	 */
+	rc = rdma_dispatch_dump_uobj_cq(uf->criu_driver, uf->ibdev, uf->kernel_driver_id, uf->holder_uctx_fd,
+					e->ufile_handle, uf->pid, &attrs, &plugin_blob);
+	if (rc) {
+		pr_err("uobj DAG: per-CQ dispatch failed for cqn=%u on ibdev=%s handle=%u: %d (%s)\n", e->restrack_id,
+		       w->ib->ibdev, e->ufile_handle, rc, strerror(rc < 0 ? -rc : rc));
+		free(plugin_blob.data);
+		return (w->err = -1);
+	}
+
+	if (plugin_blob.data && plugin_blob.len > 0) {
+		pe.has_plugin_blob = true;
+		pe.plugin_blob = plugin_blob;
+	}
+
+	if (pb_write_one(w->img, &pe, PB_RDMA_UOBJ) < 0) {
+		pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed for ufile_id=%#x cqn=%u\n", pe.ufile_id,
+		       e->restrack_id);
+		free(plugin_blob.data);
+		return (w->err = -1);
+	}
+
+	free(plugin_blob.data);
+	w->n_emitted++;
+	return 0;
+}
+
 struct devidx_resolver {
 	struct list_head *ibdevs;
 };
@@ -547,6 +645,7 @@ int rdma_dump_uobj_dag(void)
 	list_for_each_entry(ib, &ibdevs, link) {
 		struct uobj_walk_ctx w = { .ib = ib, .img = img };
 		int pd_emitted, pd_dropped;
+		int mr_emitted, mr_dropped;
 		int r;
 
 		if (!ib->has_dev_index) {
@@ -572,9 +671,26 @@ int rdma_dump_uobj_dag(void)
 			       ib->dev_index, r, w.err);
 			goto out;
 		}
+		mr_emitted = w.n_emitted;
+		mr_dropped = w.n_dropped;
+		w.n_emitted = w.n_dropped = 0;
 
-		pr_info("uobj DAG: ibdev=%s pd(emitted=%d dropped=%d) mr(emitted=%d dropped=%d) (in-tree-ufiles=%zu)\n",
-			ib->ibdev, pd_emitted, pd_dropped, w.n_emitted, w.n_dropped, ib->n_ufiles);
+		/*
+		 * CQs join by ctxn like PDs (no pdn dependency), so ordering
+		 * against the MR walk is immaterial; kept after MR to keep the
+		 * emit order PD -> MR -> CQ.
+		 */
+		r = rdma_nl_for_each_resource(ib->dev_index, ib->ibdev, RDMA_NL_RES_CQ, uobj_cq_cb, &w);
+		if (r < 0 || w.err) {
+			pr_err("uobj DAG: cq walk failed on ibdev '%s' (idx=%u): r=%d err=%d\n", ib->ibdev,
+			       ib->dev_index, r, w.err);
+			goto out;
+		}
+
+		pr_info("uobj DAG: ibdev=%s pd(emitted=%d dropped=%d) mr(emitted=%d dropped=%d) "
+			"cq(emitted=%d dropped=%d) (in-tree-ufiles=%zu)\n",
+			ib->ibdev, pd_emitted, pd_dropped, mr_emitted, mr_dropped, w.n_emitted, w.n_dropped,
+			ib->n_ufiles);
 	}
 
 	ret = 0;

@@ -50,10 +50,11 @@ int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
  * For each dumped context, asks NLDEV to enumerate its uobjects and
  * writes one rdma_uobj_entry per uobject to rdma_uobj.img.
  *
- * v0 scope (rxe PD): emits R3UT_PD records only. No-op (and writes no
- * image) for trees that hold no RDMA contexts. Returns 0 on success or
- * a no-op skip, -1 on any netlink / image-write failure (fails the
- * dump closed, consistent with the pre-suspend coverage gate).
+ * v0 scope (rxe PD + MR + CQ): emits R3UT_PD / R3UT_MR / R3UT_CQ
+ * records. No-op (and writes no image) for trees that hold no RDMA
+ * contexts. Returns 0 on success or a no-op skip, -1 on any netlink /
+ * image-write failure (fails the dump closed, consistent with the
+ * pre-suspend coverage gate).
  */
 int rdma_dump_uobj_dag(void);
 
@@ -144,6 +145,28 @@ int rdma_plugin_sharing_policy_by_name(const char *plugin_name);
  */
 #include "images/uverbsfd.pb-c.h"
 int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe);
+
+/*
+ * Dump-side per-CQ dispatch (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_dump_uobj_cq()
+ *       Invokes CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ on the single loaded
+ *       plugin whose exported cr_rdma_provided_driver matches
+ *       @criu_driver (the owning ucontext's, from the dump-side ufile
+ *       record) -- the same by-driver keying as the open dispatcher,
+ *       since the hook chain alone can't tell an rxe CQ from an mlx5
+ *       one. The plugin QUERY_CQ's @lfd (criu's dup of the dumpee's
+ *       uverbs cdev fd) for @ufile_handle, fills the fields it owns in
+ *       @cq_attrs, and mallocs its per-CQ byte schema into
+ *       @plugin_blob (caller frees). Returns 0 on success, negative on
+ *       no/ambiguous match or hook failure.
+ *
+ * The rdma_uobj pb-c header is pulled in directly (not forward-
+ * declared) for the same protobuf-c tag-stability reason as above.
+ */
+#include "images/rdma_uobj.pb-c.h"
+int rdma_dispatch_dump_uobj_cq(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id, int lfd,
+			       uint32_t ufile_handle, pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob);
 
 /*
  * RDMA driver-name resolution (criu/rdma/driver.c):

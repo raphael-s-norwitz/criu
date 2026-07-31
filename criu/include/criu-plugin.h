@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 
 #define CRIU_PLUGIN_GEN_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + (c))
 #define CRIU_PLUGIN_VERSION_MAJOR	 0
@@ -119,6 +120,34 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV = 17,
 
+	/*
+	 * RDMA per-CQ dump-side capture. Dispatched by the R3 uobject
+	 * walker (criu/rdma/uobj_dump.c::uobj_cq_cb) once per NLDEV-
+	 * enumerated CQ, to the single plugin whose exported
+	 * cr_rdma_provided_driver matches the owning ucontext's
+	 * criu_driver (same keying as RDMA_OPEN_UVERBS_CDEV).
+	 *
+	 * Distinct from the per-context claim/open hooks because it runs
+	 * per-uobject: the CQ's driver-private state (rxe: the source ring
+	 * mmap vm_pgoff, read via RXE_IB_METHOD_QUERY_CQ) is not something
+	 * NLDEV exposes, so the plugin queries it on @lfd -- criu's dup of
+	 * the dumpee's uverbs cdev fd, which shares the ucontext IDR that
+	 * resolves @ufile_handle.
+	 *
+	 * The plugin fills the hw-agnostic per-class fields it owns
+	 * (comp_vector, flags) into @cq_attrs -- the caller has already
+	 * stamped cqe_count from NLDEV RES_CQE and the plugin must not
+	 * touch it -- and mallocs its driver-private byte schema into
+	 * @plugin_blob. The caller attaches those bytes onto
+	 * RdmaUobjEntry.plugin_blob, pb_write_one's them into the image,
+	 * then frees them; a plugin with no per-CQ state leaves
+	 * @plugin_blob as {NULL, 0}.
+	 *
+	 * Return: 0 on success, negative errno on failure (aborts the
+	 * dump -- a partially captured ufile would not restore).
+	 */
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ = 18,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -154,6 +183,16 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *
  */
 #include "images/uverbsfd.pb-c.h"
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const UverbsFileEntry *uvfe);
+/*
+ * The RdmaCqAttrs typedef and the ProtobufCBinaryData plugin-blob
+ * byteslice resolve through images/rdma_uobj.pb-c.h -- same forward-
+ * include style (and the same protoc-c naming-stability concern: only
+ * the typedef name is portable across generator versions) as the
+ * UverbsFileEntry include above.
+ */
+#include "images/rdma_uobj.pb-c.h"
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ, const char *ibdev, uint32_t kernel_driver_id, int lfd,
+			 uint32_t ufile_handle, pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob);
 
 /*
  * RDMA sharing policy.
