@@ -75,6 +75,24 @@
 #endif
 
 /*
+ * Compat shim for the QP CQ-binding attrs the R3 QP dump joins on.
+ * fill_res_qp_entry emits RDMA_NLDEV_ATTR_RES_SEND_CQN / RES_RECV_CQN
+ * (qp->send_cq / qp->recv_cq restrack ids) as of the kernel commits
+ * that pair with T1.4; slot ids 106 / 107 are the first two free
+ * positions after RES_HANDLE (105). The kernel patch lands the
+ * symbolic names; the runtime emission is u32, so this build picks
+ * them up by numeric value on an updated kernel and leaves the fields
+ * unset on an older one. Drop once the build's minimum rdma-core ships
+ * the symbols.
+ */
+#ifndef RDMA_NLDEV_ATTR_RES_SEND_CQN
+#define RDMA_NLDEV_ATTR_RES_SEND_CQN 106
+#endif
+#ifndef RDMA_NLDEV_ATTR_RES_RECV_CQN
+#define RDMA_NLDEV_ATTR_RES_RECV_CQN 107
+#endif
+
+/*
  * libnl3's nla_parse stores attribute pointers in a caller-supplied
  * table indexed by nla_type, bounded by the @maxtype argument. We size
  * that argument off RDMA_NLDEV_ATTR_MAX, which on older host headers
@@ -82,12 +100,12 @@
  * RDMA_NLDEV_ATTR_MAX cap silently drops the new attr and stack-
  * overruns reads past tb[]. Take the max of the host enum tail and
  * (compat constant + 1) to keep both the table and the parse range
- * large enough on either kernel. RES_HANDLE is the highest CRIU-
- * extended slot the PD walker reads, so we anchor the cap there;
+ * large enough on either kernel. RES_RECV_CQN (107) is the highest
+ * CRIU-extended slot any walker reads, so we anchor the cap there;
  * follow-on walkers that read higher slots re-anchor this macro.
  */
 #define CRIU_RDMA_NLDEV_ATTR_TBSZ \
-	(RDMA_NLDEV_ATTR_MAX > (RDMA_NLDEV_ATTR_RES_HANDLE + 1) ? RDMA_NLDEV_ATTR_MAX : (RDMA_NLDEV_ATTR_RES_HANDLE + 1))
+	(RDMA_NLDEV_ATTR_MAX > (RDMA_NLDEV_ATTR_RES_RECV_CQN + 1) ? RDMA_NLDEV_ATTR_MAX : (RDMA_NLDEV_ATTR_RES_RECV_CQN + 1))
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "rdma_netlink: "
@@ -436,8 +454,9 @@ int rdma_nl_for_each_ibdev(rdma_nl_ibdev_cb_t cb, void *arg)
  * inside which sit zero or more RES_<TYPE>_ENTRY nested children, each
  * carrying that resource's per-attr leaves.
  *
- * v0 wires PD (T1.1), MR (T1.2), and CQ (T1.3); QP/SRQ arms are added
- * in their milestones as the res_types table and the parse switch grow.
+ * v0 wires PD (T1.1), MR (T1.2), CQ (T1.3), and QP (T1.4 dump-side
+ * discovery); the SRQ arm is added in its milestone as the res_types
+ * table and the parse switch grow.
  */
 struct res_walk_ctx {
 	rdma_nl_res_cb_t user_cb;
@@ -469,6 +488,9 @@ static const struct res_type_info {
 			     RDMA_NLDEV_ATTR_RES_MRN, "mr" },
 	[RDMA_NL_RES_CQ] = { RDMA_NLDEV_CMD_RES_CQ_GET, RDMA_NLDEV_ATTR_RES_CQ, RDMA_NLDEV_ATTR_RES_CQ_ENTRY,
 			     RDMA_NLDEV_ATTR_RES_CQN, "cq" },
+	/* QP carries no restrack id of its own in NLDEV (restrack_attr = 0). */
+	[RDMA_NL_RES_QP] = { RDMA_NLDEV_CMD_RES_QP_GET, RDMA_NLDEV_ATTR_RES_QP, RDMA_NLDEV_ATTR_RES_QP_ENTRY, 0,
+			     "qp" },
 };
 
 /*
@@ -544,6 +566,55 @@ static int parse_res_entry(struct nlattr *entry, const struct res_type_info *inf
 		/* user-visible CQ entry count; the ring vm_pgoff comes from QUERY_CQ. */
 		if (tb[RDMA_NLDEV_ATTR_RES_CQE])
 			e->cq.cqe = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_CQE]);
+		break;
+	case RDMA_NL_RES_QP:
+		/* Local QP number: identity hint, always present for user QPs. */
+		if (tb[RDMA_NLDEV_ATTR_RES_LQPN])
+			e->qp.lqpn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_LQPN]);
+		if (tb[RDMA_NLDEV_ATTR_RES_RQPN]) {
+			e->qp.has_rqpn = true;
+			e->qp.rqpn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_RQPN]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_SQ_PSN]) {
+			e->qp.has_sq_psn = true;
+			e->qp.sq_psn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_SQ_PSN]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_RQ_PSN]) {
+			e->qp.has_rq_psn = true;
+			e->qp.rq_psn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_RQ_PSN]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_TYPE])
+			e->qp.qp_type = nla_get_u8(tb[RDMA_NLDEV_ATTR_RES_TYPE]);
+		if (tb[RDMA_NLDEV_ATTR_RES_STATE])
+			e->qp.qp_state = nla_get_u8(tb[RDMA_NLDEV_ATTR_RES_STATE]);
+		if (tb[RDMA_NLDEV_ATTR_PORT_INDEX]) {
+			e->qp.has_port = true;
+			e->qp.port = nla_get_u32(tb[RDMA_NLDEV_ATTR_PORT_INDEX]);
+		}
+		/*
+		 * fill_res_qp_entry emits no ctxn: the QP joins to its owning
+		 * ufile through the parent PD's restrack id (RES_PDN), the
+		 * same PDN-join the MR walk uses. It's also the R3XR_PARENT_PD
+		 * xref target.
+		 */
+		if (tb[RDMA_NLDEV_ATTR_RES_PDN]) {
+			e->qp.has_pdn = true;
+			e->qp.pdn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_PDN]);
+		}
+		/*
+		 * Parent CQ restrack ids -- the R3XR_SEND_CQ / R3XR_RECV_CQ
+		 * xref targets. Presence-gated: a pre-patch host header leaves
+		 * them unset and the R3 QP walker fails the dump with a clear
+		 * kernel-version diagnostic (RESTORE_QP needs both CQ handles).
+		 */
+		if (tb[RDMA_NLDEV_ATTR_RES_SEND_CQN]) {
+			e->qp.has_send_cqn = true;
+			e->qp.send_cqn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_SEND_CQN]);
+		}
+		if (tb[RDMA_NLDEV_ATTR_RES_RECV_CQN]) {
+			e->qp.has_recv_cqn = true;
+			e->qp.recv_cqn = nla_get_u32(tb[RDMA_NLDEV_ATTR_RES_RECV_CQN]);
+		}
 		break;
 	}
 	return 0;
