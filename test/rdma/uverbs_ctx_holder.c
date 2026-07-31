@@ -24,6 +24,14 @@
  * the source vm_pgoff) and the plugin's UPDATE_VMA_MAP hook (remap the
  * ring VMA onto the restored, ucontext-bearing cdev fd).
  *
+ * If HOLDER_ALLOC_QP is set (implies a PD and a CQ), also create an RC
+ * QP sharing that CQ for send + recv completions -- the dump-side QP
+ * discovery gate. NLDEV surfaces the QP with its parent-PD and both
+ * CQ-binding restrack ids, which the R3 dump walker turns into an
+ * R3UT_QP entry with R3XR_PARENT_PD / R3XR_SEND_CQ / R3XR_RECV_CQ
+ * xrefs. (Restore of the QP is a later milestone; this holder mode
+ * exercises the dump/discovery path only.)
+ *
  * Then blocks until SIGTERM. SIGUSR1 re-queries the device and, per
  * mode, functionally exercises the post-restore state:
  *   - PD mode: register + deregister a small MR against the PD (reg_mr
@@ -57,6 +65,7 @@ static struct ibv_context *g_ctx;
 static struct ibv_pd *g_pd;
 static struct ibv_mr *g_mr;
 static struct ibv_cq *g_cq;
+static struct ibv_qp *g_qp;
 static uint32_t g_mr_lkey, g_mr_rkey;
 static const char *g_status_path;
 static volatile sig_atomic_t g_terminate;
@@ -225,8 +234,8 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	/* MR mode implies a PD (the MR's parent). */
-	if (getenv("HOLDER_ALLOC_PD") || getenv("HOLDER_ALLOC_MR")) {
+	/* MR and QP modes both imply a PD (their parent). */
+	if (getenv("HOLDER_ALLOC_PD") || getenv("HOLDER_ALLOC_MR") || getenv("HOLDER_ALLOC_QP")) {
 		g_pd = ibv_alloc_pd(g_ctx);
 		if (!g_pd) {
 			fprintf(stderr, "ibv_alloc_pd: %s\n", strerror(errno));
@@ -246,10 +255,26 @@ int main(int argc, char **argv)
 		g_mr_rkey = g_mr->rkey;
 	}
 
-	if (getenv("HOLDER_ALLOC_CQ")) {
+	/* A QP needs a CQ for its send + recv completions. */
+	if (getenv("HOLDER_ALLOC_CQ") || getenv("HOLDER_ALLOC_QP")) {
 		g_cq = ibv_create_cq(g_ctx, 16, NULL, NULL, 0);
 		if (!g_cq) {
 			fprintf(stderr, "ibv_create_cq: %s\n", strerror(errno));
+			return 2;
+		}
+	}
+
+	if (getenv("HOLDER_ALLOC_QP")) {
+		struct ibv_qp_init_attr qia = {
+			.send_cq = g_cq,
+			.recv_cq = g_cq,
+			.cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 1 },
+			.qp_type = IBV_QPT_RC,
+		};
+
+		g_qp = ibv_create_qp(g_pd, &qia);
+		if (!g_qp) {
+			fprintf(stderr, "ibv_create_qp: %s\n", strerror(errno));
 			return 2;
 		}
 	}
@@ -258,8 +283,9 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_sigterm);
 	signal(SIGUSR1, on_sigusr1);
 
-	printf("READY pid=%d ctx=%s async_fd=%d pd=%d mr_lkey=0x%x mr_rkey=0x%x cq=%d\n", getpid(), devname,
-	       g_ctx->async_fd, g_pd ? (int)g_pd->handle : -1, g_mr_lkey, g_mr_rkey, g_cq ? (int)g_cq->handle : -1);
+	printf("READY pid=%d ctx=%s async_fd=%d pd=%d mr_lkey=0x%x mr_rkey=0x%x cq=%d qp=%d qpn=%d\n", getpid(),
+	       devname, g_ctx->async_fd, g_pd ? (int)g_pd->handle : -1, g_mr_lkey, g_mr_rkey,
+	       g_cq ? (int)g_cq->handle : -1, g_qp ? (int)g_qp->handle : -1, g_qp ? (int)g_qp->qp_num : -1);
 	fflush(stdout);
 	write_status("READY");
 
@@ -283,6 +309,8 @@ int main(int argc, char **argv)
 		pause();
 	}
 
+	if (g_qp)
+		ibv_destroy_qp(g_qp);
 	if (g_mr)
 		ibv_dereg_mr(g_mr);
 	if (g_cq)
