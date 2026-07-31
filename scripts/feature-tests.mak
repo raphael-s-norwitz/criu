@@ -221,3 +221,13 @@ int main(void)
 	return (int)RDMA_NLDEV_ATTR_RES_RECV_CQN;
 }
 endef
+
+define FEATURE_TEST_RXE_ALLOC_UCTX_RESTORE_MODE
+
+#include <rdma/rdma_user_rxe.h>
+
+int main(void)
+{
+	return (int)RXE_ALLOC_UCTX_RESTORE_MODE;
+}
+endef
