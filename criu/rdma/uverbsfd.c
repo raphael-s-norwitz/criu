@@ -200,6 +200,90 @@ struct collect_image_info uverbsasyncevfd_cinfo = {
 	.collect = collect_one_uverbsasyncevfd,
 };
 
+/*
+ * Dump-time comp_channel pre-check. v0 RDMA-class plugins do not
+ * support comp_channel (completion channel) save/restore: the kernel
+ * UVERBS_METHOD_RESTORE_CQ declares COMP_CHANNEL UA_OPTIONAL but
+ * hard-rejects with -EOPNOTSUPP if a caller actually supplies one
+ * (drivers/infiniband/core/uverbs_std_types_restore.c), and
+ * RESTORE_COMP_CHANNEL itself is future kernel work. A source CQ bound
+ * to a comp_channel would otherwise dump cleanly and only surface as a
+ * failure mid-restore, after the image has been moved off-host. Bail at
+ * dump time so the operator sees a crisp diagnostic next to the dumpee.
+ *
+ * Fires UVERBS_METHOD_INFO_HANDLES on UVERBS_OBJECT_DEVICE asking for
+ * UVERBS_OBJECT_COMP_CHANNEL handles. Best-effort: any ioctl failure
+ * (older kernel, missing INFO_HANDLES support, transient EBUSY, ...)
+ * downgrades to a warn-and-continue rather than a hard fail -- the
+ * kernel RESTORE_CQ gate is the real backstop. The INFO_HANDLES handler
+ * needs a non-empty HANDLES_LIST out buffer, so we pass a tiny one even
+ * though only TOTAL_HANDLES is inspected.
+ *
+ * @lfd is the parasite-drained cdev fd (shares the dumpee's ucontext
+ * IDR); @driver_id is validated by the ioctl dispatcher against the
+ * per-ucontext rdma_driver_id, so it must be the kernel driver id from
+ * CLAIM arbitration. Returns 0 if clear (or on a best-effort skip), -1
+ * if the context has live comp_channel uobjects.
+ */
+#define RDMA_CC_PRECHECK_HANDLES_BUF 16
+static int dump_uverbsfile_cc_precheck(int lfd, uint32_t driver_id, const char *ibdev, uint32_t ctxn)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[3];
+	} cmd = {};
+	uint32_t total = 0;
+	uint32_t handles[RDMA_CC_PRECHECK_HANDLES_BUF];
+
+	cmd.hdr.object_id = UVERBS_OBJECT_DEVICE;
+	cmd.hdr.method_id = UVERBS_METHOD_INFO_HANDLES;
+	cmd.hdr.driver_id = driver_id;
+
+	/*
+	 * INFO_OBJECT_ID is a UVERBS_ATTR_CONST_IN (sizeof(u64) min/max);
+	 * the parser takes the inline-attr path (len <= 8) and reads the
+	 * value -- UVERBS_OBJECT_COMP_CHANNEL from enum
+	 * uverbs_default_objects -- verbatim from attr.data.
+	 */
+	cmd.attrs[0].attr_id = UVERBS_ATTR_INFO_OBJECT_ID;
+	cmd.attrs[0].len = sizeof(uint64_t);
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = UVERBS_OBJECT_COMP_CHANNEL;
+
+	cmd.attrs[1].attr_id = UVERBS_ATTR_INFO_TOTAL_HANDLES;
+	cmd.attrs[1].len = sizeof(total);
+	cmd.attrs[1].flags = 0;
+	cmd.attrs[1].data = (uintptr_t)&total;
+
+	cmd.attrs[2].attr_id = UVERBS_ATTR_INFO_HANDLES_LIST;
+	cmd.attrs[2].len = sizeof(handles);
+	cmd.attrs[2].flags = 0;
+	cmd.attrs[2].data = (uintptr_t)handles;
+
+	cmd.hdr.num_attrs = 3;
+	cmd.hdr.length = sizeof(cmd.hdr) + 3 * sizeof(cmd.attrs[0]);
+
+	if (ioctl(lfd, RDMA_VERBS_IOCTL, &cmd) < 0) {
+		pr_warn("dump_uverbsfile: INFO_HANDLES(COMP_CHANNEL) on ibdev=%s ctxn=%u failed: %m. Skipping "
+			"comp_channel pre-check; a CC-bound CQ (if any) would surface as -EOPNOTSUPP at restore.\n",
+			ibdev, ctxn);
+		return 0;
+	}
+
+	if (total > 0) {
+		pr_err("dump_uverbsfile: ibdev=%s ctxn=%u has %u live UVERBS_OBJECT_COMP_CHANNEL uobject(s); v0 "
+		       "RDMA-class plugins do not support comp_channel save/restore. The dump would record per-CQ "
+		       "state without the CC binding, and UVERBS_METHOD_RESTORE_CQ on the destination rejects any "
+		       "CC-attached CQ with -EOPNOTSUPP. Aborting now to surface the limitation explicitly.\n",
+		       ibdev, ctxn, total);
+		return -1;
+	}
+
+	pr_debug("dump_uverbsfile: comp_channel pre-check ok for ibdev=%s ctxn=%u (no live comp_channel uobjects)\n",
+		 ibdev, ctxn);
+	return 0;
+}
+
 static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 {
 	UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
@@ -281,6 +365,17 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	if (uve.has_ctxn)
 		pr_info(" ctxn %u", uve.ctxn);
 	pr_info("\n");
+
+	/*
+	 * v0 does not model comp_channel save/restore. Reject up front (on
+	 * the drained cdev fd, which shares the ucontext IDR) rather than
+	 * dumping a CQ whose CC binding the destination RESTORE_CQ would
+	 * reject with -EOPNOTSUPP mid-restore.
+	 */
+	if (dump_uverbsfile_cc_precheck(lfd, uve.driver_id, ibdev, uve.ctxn)) {
+		ret = -1;
+		goto out;
+	}
 
 	fe.type = FD_TYPES__UVERBSFD;
 	fe.id = uve.id;
