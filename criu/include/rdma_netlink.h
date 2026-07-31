@@ -68,10 +68,10 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
  * on a given ibdev and surface the hw-agnostic attrs the kernel emits
  * via NLDEV today.
  *
- * v0 wires PD (T1.1), MR (T1.2), and CQ (T1.3); QP/SRQ arms land in
- * their own milestones as the enum and the per-type leaf union grow
- * (append-only, so the e->pd.* / e->mr.* / e->cq.* access pattern
- * below stays stable).
+ * v0 wires PD (T1.1), MR (T1.2), CQ (T1.3), and QP (T1.4 dump-side
+ * discovery); the SRQ arm lands in its own milestone as the enum and
+ * the per-type leaf union grow (append-only, so the e->pd.* / e->mr.*
+ * / e->cq.* / e->qp.* access pattern below stays stable).
  *
  * Each per-resource walker takes a single ibdev (named by dev_index,
  * the same kernel-side index returned by rdma_nl_for_each_context).
@@ -99,6 +99,23 @@ int rdma_nl_for_each_context(rdma_nl_ctx_cb_t cb, void *arg);
  *   driver-private CQ ring vm_pgoff is NOT in NLDEV -- the R3 CQ dump
  *   reads it per-handle via the plugin's QUERY_CQ.
  *
+ * Field availability for QP tracks the kernel's fill_res_qp_entry:
+ *   qp.lqpn (RES_LQPN), qp.qp_type (RES_TYPE) and qp.qp_state
+ *   (RES_STATE) always set for user QPs; qp.rqpn (RES_RQPN),
+ *   qp.sq_psn / qp.rq_psn (RES_SQ_PSN / RES_RQ_PSN) and qp.port
+ *   (PORT_INDEX) conditional (has_* gated). qp.pdn (RES_PDN, the
+ *   parent PD's restrack id -- the R3XR_PARENT_PD xref target and the
+ *   ufile join key, since fill_res_qp_entry emits no ctxn) and
+ *   ufile_handle (RES_HANDLE) set for user QPs. qp.send_cqn /
+ *   qp.recv_cqn (RES_SEND_CQN / RES_RECV_CQN -- the R3XR_SEND_CQ /
+ *   R3XR_RECV_CQ xref targets) require the kernel patch that adds
+ *   those attrs; has_send_cqn / has_recv_cqn gate them. QP carries no
+ *   NLDEV restrack id of its own (has_restrack_id stays false), so a
+ *   QP entry is an xref source but never a target. The driver-private
+ *   QP wire state (AV, cursors, ring vm_pgoffs, user_handle) is NOT in
+ *   NLDEV -- the R3 QP dump reads it per-handle via the plugin's
+ *   QUERY_QP (a follow-on milestone).
+ *
  * Per-uobject ufile_handle (the per-ufile obj->id user code holds in
  * its restored memory) is emitted by the kernel for every
  * user-created resource as of upstream commit 0601c496b413 (K8a,
@@ -120,6 +137,7 @@ enum rdma_nl_res_type {
 	RDMA_NL_RES_PD,
 	RDMA_NL_RES_MR,
 	RDMA_NL_RES_CQ,
+	RDMA_NL_RES_QP,
 };
 
 struct rdma_nl_res_entry {
@@ -160,6 +178,35 @@ struct rdma_nl_res_entry {
 		struct {
 			uint32_t cqe; /* RES_CQE: user-visible CQ entry count */
 		} cq;
+		struct {
+			uint32_t lqpn; /* RES_LQPN: local QP number (identity) */
+			bool has_rqpn;
+			uint32_t rqpn; /* RES_RQPN: remote (dest) QP number */
+			bool has_sq_psn;
+			uint32_t sq_psn; /* RES_SQ_PSN */
+			bool has_rq_psn;
+			uint32_t rq_psn;  /* RES_RQ_PSN */
+			uint8_t qp_type;  /* RES_TYPE: RC/UC/UD/... */
+			uint8_t qp_state; /* RES_STATE */
+			bool has_port;
+			uint32_t port; /* PORT_INDEX */
+			bool has_pdn;
+			uint32_t pdn; /* parent PD restrack id (R3XR_PARENT_PD target) */
+			/*
+			 * SEND_CQN / RECV_CQN are the parent CQs' restrack ids
+			 * -- the join keys R3 turns into R3XR_SEND_CQ /
+			 * R3XR_RECV_CQ xref edges. fill_res_qp_entry emits them
+			 * only for user QPs (kernel commits emitting
+			 * RDMA_NLDEV_ATTR_RES_SEND_CQN / RES_RECV_CQN); on a
+			 * pre-patch host header they stay unset and the QP walk
+			 * fails the dump with a clear kernel-version diagnostic,
+			 * since UVERBS_METHOD_RESTORE_QP needs both CQ handles.
+			 */
+			bool has_send_cqn;
+			uint32_t send_cqn;
+			bool has_recv_cqn;
+			uint32_t recv_cqn;
+		} qp;
 	};
 };
 
