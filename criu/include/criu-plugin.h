@@ -172,6 +172,29 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK = 19,
 
+	/*
+	 * RDMA per-QP dump-side capture. The QP twin of
+	 * RDMA_DUMP_UOBJ_CQ: dispatched by the R3 uobject walker
+	 * (criu/rdma/uobj_dump.c::uobj_qp_cb) once per NLDEV-enumerated
+	 * QP, to the single plugin whose exported cr_rdma_provided_driver
+	 * matches the owning ucontext's criu_driver.
+	 *
+	 * The QP's driver-private wire state the destination cannot
+	 * re-derive from NLDEV or the standard QUERY_QP verb (rxe: the AV,
+	 * PSN bases, live req/comp/resp cursors, ssn, transport knobs and
+	 * the SQ/RQ ring mmap offsets -- read via RXE_IB_METHOD_QUERY_QP)
+	 * is packed into @plugin_blob (malloc'd; caller attaches it to the
+	 * entry, writes it, then frees). The plugin also fills the one
+	 * hw-agnostic field whose provenance is that same query rather
+	 * than NLDEV: @qp_attrs->user_handle (the async-event cookie). The
+	 * caller has already stamped the NLDEV-derived qp_attrs
+	 * (type/state/qpn/psns/port) and the plugin must not touch them.
+	 *
+	 * Return: 0 on success, negative errno on failure (aborts the
+	 * dump -- a partially captured ufile would not restore).
+	 */
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP = 20,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -246,6 +269,8 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ, const char *ibdev, u
 			 uint32_t ufile_handle, pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK, const RdmaUobjEntry *e,
 			 struct rdma_uhw_spec *uhw);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP, const char *ibdev, uint32_t kernel_driver_id, int lfd,
+			 uint32_t ufile_handle, pid_t pid, RdmaQpAttrs *qp_attrs, ProtobufCBinaryData *plugin_blob);
 
 /*
  * RDMA sharing policy.

@@ -281,6 +281,66 @@ int rdma_dispatch_dump_uobj_cq(uint32_t criu_driver, const char *ibdev, uint32_t
 }
 
 /*
+ * Dump-side per-QP dispatch.
+ *
+ * The QP twin of rdma_dispatch_dump_uobj_cq(): the R3 QP walker
+ * resolves the QP's driver-private wire state (rxe: AV / PSNs /
+ * cursors / ring mmap offsets, via RXE_IB_METHOD_QUERY_QP) through the
+ * owning plugin, keyed by @criu_driver against each plugin's
+ * cr_rdma_provided_driver -- same reasoning as the CQ dump dispatch
+ * (the hook chain alone can't tell an rxe QP from an mlx5 one).
+ *
+ * Failure modes (all hard, aborting the dump):
+ *   - two plugins declare the same provided-driver (-EEXIST).
+ *   - no plugin matches (-ENOENT; coverage/claim should have caught
+ *     this at pre-suspend, defence in depth).
+ * The matching plugin's hook owns its own pr_err on QUERY_QP failure.
+ */
+int rdma_dispatch_dump_uobj_qp(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id, int lfd,
+			       uint32_t ufile_handle, pid_t pid, RdmaQpAttrs *qp_attrs, ProtobufCBinaryData *plugin_blob)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+	const char *winner_name = NULL;
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP_t *fn;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		if (!this->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP])
+			continue;
+		p = (const int *)dlsym(this->dlhandle, CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != criu_driver)
+			continue;
+
+		if (winner) {
+			pr_err("QP dump (ibdev=%s handle=%u): multiple plugins declare cr_rdma_provided_driver=%u "
+			       "('%s' and '%s'); operator's plugin set is inconsistent.\n",
+			       ibdev ?: "?", ufile_handle, criu_driver, winner_name, this->d->name);
+			return -EEXIST;
+		}
+		winner = this;
+		winner_name = this->d->name;
+	}
+
+	if (!winner) {
+		pr_err("QP dump (ibdev=%s handle=%u): no loaded RDMA plugin exports cr_rdma_provided_driver=%u; "
+		       "cannot capture per-QP driver state.\n",
+		       ibdev ?: "?", ufile_handle, criu_driver);
+		return -ENOENT;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP];
+	pr_debug("QP dump: dispatching DUMP_UOBJ_QP to plugin '%s' (criu_driver=%u ibdev=%s handle=%u)\n", winner_name,
+		 criu_driver, ibdev ?: "?", ufile_handle);
+	return fn(ibdev, kernel_driver_id, lfd, ufile_handle, pid, qp_attrs, plugin_blob);
+}
+
+/*
  * Restore-side per-CQ UHW-pack dispatch.
  *
  * The restore-time twin of rdma_dispatch_dump_uobj_cq(): core builds the
