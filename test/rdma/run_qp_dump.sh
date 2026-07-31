@@ -7,8 +7,15 @@
 # process; the R3 dump-side uobject walker enumerates the QP over NLDEV
 # and emits an R3UT_QP entry into rdma-uobj.img with three typed xrefs:
 # R3XR_PARENT_PD (RES_PDN), R3XR_SEND_CQ (RES_SEND_CQN) and R3XR_RECV_CQ
-# (RES_RECV_CQN). This gate asserts that entry is present and correctly
-# shaped by decoding the image with crit.
+# (RES_RECV_CQN). The walker also dispatches the rxe plugin's QUERY_QP,
+# which fills the hw-agnostic user_handle and mallocs the driver-private
+# wire-state blob (rxe_restore_qp_req) attached as plugin_blob. This gate
+# asserts that entry is present and correctly shaped by decoding the
+# image with crit.
+#
+# The rxe plugin loaded by criu is the one in criu's plugin dir; if you
+# rebuilt it, reinstall (cp plugins/rdma/rxe/rdma_rxe_plugin.so to the
+# criu libdir) before running, or the QUERY_QP dispatch will not fire.
 #
 # This is dump-only: QP restore is a later milestone, so the process is
 # not restored. The holder is killed by the dump (default criu
@@ -151,6 +158,8 @@ cat "$JSON"
 #   * qp_type / qp_num are populated
 #   * cap is present with depths >= the requested 16/16/1/1 (filled by
 #     the core standard QUERY_QP verb)
+#   * user_handle is present (filled by the rxe QUERY_QP hook)
+#   * a non-empty plugin_blob is attached (rxe wire state)
 #
 python3 - "$JSON" <<'PY'
 import json, sys
@@ -167,6 +176,8 @@ qp = qps[0]
 attrs = qp.get("qp", {})
 if "qp_type" not in attrs or "qp_num" not in attrs:
     sys.exit("FAIL: QP entry missing qp_type/qp_num: %r" % attrs)
+if "user_handle" not in attrs:
+    sys.exit("FAIL: QP entry missing user_handle (rxe QUERY_QP hook did not fire): %r" % attrs)
 
 cap = attrs.get("cap")
 if not isinstance(cap, dict):
@@ -189,8 +200,13 @@ for role, tt in want.items():
     if got[role] != tt:
         sys.exit("FAIL: xref %s target_type=%s, want %s" % (role, got[role], tt))
 
-print("QP entry OK: qp_num=%s qp_type=%s state=%s cap=%r xrefs=%r" %
-      (attrs.get("qp_num"), attrs.get("qp_type"), attrs.get("state"), cap, got))
+blob = qp.get("plugin_blob")
+if not blob:
+    sys.exit("FAIL: QP entry missing plugin_blob (rxe wire state not attached)")
+
+print("QP entry OK: qp_num=%s qp_type=%s state=%s cap=%r user_handle=%s xrefs=%r plugin_blob_present=%s" %
+      (attrs.get("qp_num"), attrs.get("qp_type"), attrs.get("state"),
+       cap, attrs.get("user_handle"), got, bool(blob)))
 PY
 
 echo "PASS"
