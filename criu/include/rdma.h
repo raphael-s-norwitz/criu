@@ -169,6 +169,23 @@ int rdma_dispatch_dump_uobj_cq(uint32_t criu_driver, const char *ibdev, uint32_t
 			       uint32_t ufile_handle, pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob);
 
 /*
+ * Dump-side per-QP dispatch (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_dump_uobj_qp()
+ *       The QP twin of rdma_dispatch_dump_uobj_cq(): invokes
+ *       CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP on the single loaded plugin
+ *       whose exported cr_rdma_provided_driver matches @criu_driver.
+ *       The plugin reads the QP's driver-private wire state on @lfd
+ *       (criu's dup of the dumpee's cdev, holder of the QP IDR that
+ *       resolves @ufile_handle), fills the one hw-agnostic field it
+ *       owns (@qp_attrs->user_handle), and mallocs its per-QP byte
+ *       schema into @plugin_blob (caller frees). Returns 0 on success,
+ *       negative on no/ambiguous match or hook failure.
+ */
+int rdma_dispatch_dump_uobj_qp(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id, int lfd,
+			       uint32_t ufile_handle, pid_t pid, RdmaQpAttrs *qp_attrs, ProtobufCBinaryData *plugin_blob);
+
+/*
  * Restore-side per-CQ UHW-pack dispatch (criu/rdma/plugin_api.c):
  *
  *   rdma_dispatch_restore_cq_uhw_pack()
