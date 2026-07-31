@@ -17,6 +17,13 @@
  * MR outlives the dump so restore must drive UVERBS_METHOD_RESTORE_MR
  * (from the pie) to reinstall it at its ufile handle.
  *
+ * If HOLDER_ALLOC_CQ is set, also create a CQ -- the rxe RESTORE_CQ dev
+ * gate. ibv_create_cq mmaps the completion ring off the cdev, so the CQ
+ * outliving the dump forces restore to drive UVERBS_METHOD_RESTORE_CQ
+ * (reinstall the uobject + re-register the ring's pending mmap slot at
+ * the source vm_pgoff) and the plugin's UPDATE_VMA_MAP hook (remap the
+ * ring VMA onto the restored, ucontext-bearing cdev fd).
+ *
  * Then blocks until SIGTERM. SIGUSR1 re-queries the device and, per
  * mode, functionally exercises the post-restore state:
  *   - PD mode: register + deregister a small MR against the PD (reg_mr
@@ -27,6 +34,11 @@
  *     ufile handle, so success proves RESTORE_MR reinstalled the
  *     uobject. Byte-identical lkey/rkey are guaranteed kernel-side by
  *     the pie's RESP==hint assertion.
+ *   - CQ mode: ibv_poll_cq the restored CQ (rxe polls the mmap'd ring
+ *     in userspace, so a mis-remapped VMA faults or reads garbage; a
+ *     drained CQ returns 0 cleanly), then ibv_destroy_cq -- which
+ *     resolves the CQ by its ufile handle, proving RESTORE_CQ
+ *     reinstalled the uobject.
  * Writes "OK" or "FAIL: ..." to the status file. The runner uses
  * SIGUSR1 after restore to confirm the context is still functional.
  */
@@ -44,6 +56,7 @@
 static struct ibv_context *g_ctx;
 static struct ibv_pd *g_pd;
 static struct ibv_mr *g_mr;
+static struct ibv_cq *g_cq;
 static uint32_t g_mr_lkey, g_mr_rkey;
 static const char *g_status_path;
 static volatile sig_atomic_t g_terminate;
@@ -129,6 +142,33 @@ static int verify_mr(char *msg, size_t msglen)
 	return 0;
 }
 
+/*
+ * Prove the restored CQ is a live kernel object with a working ring
+ * mapping. ibv_poll_cq reads the completion ring directly out of the
+ * mmap'd VMA (rxe does the producer/consumer walk in userspace), so if
+ * the plugin's UPDATE_VMA_MAP failed to remap the ring onto the restored
+ * cdev the poll would fault or read garbage; a drained CQ returns 0.
+ * ibv_destroy_cq then resolves the CQ by its ufile handle, so success
+ * proves RESTORE_CQ reinstalled the uobject at that handle.
+ */
+static int verify_cq(char *msg, size_t msglen)
+{
+	struct ibv_wc wc[4];
+	int n;
+
+	n = ibv_poll_cq(g_cq, 4, wc);
+	if (n < 0) {
+		snprintf(msg, msglen, "FAIL: ibv_poll_cq on restored CQ: %s", strerror(errno));
+		return -1;
+	}
+	if (ibv_destroy_cq(g_cq)) {
+		snprintf(msg, msglen, "FAIL: ibv_destroy_cq on restored CQ: %s", strerror(errno));
+		return -1;
+	}
+	g_cq = NULL;
+	return 0;
+}
+
 static void write_status(const char *line)
 {
 	FILE *f;
@@ -206,12 +246,20 @@ int main(int argc, char **argv)
 		g_mr_rkey = g_mr->rkey;
 	}
 
+	if (getenv("HOLDER_ALLOC_CQ")) {
+		g_cq = ibv_create_cq(g_ctx, 16, NULL, NULL, 0);
+		if (!g_cq) {
+			fprintf(stderr, "ibv_create_cq: %s\n", strerror(errno));
+			return 2;
+		}
+	}
+
 	signal(SIGTERM, on_sigterm);
 	signal(SIGINT, on_sigterm);
 	signal(SIGUSR1, on_sigusr1);
 
-	printf("READY pid=%d ctx=%s async_fd=%d pd=%d mr_lkey=0x%x mr_rkey=0x%x\n", getpid(), devname, g_ctx->async_fd,
-	       g_pd ? (int)g_pd->handle : -1, g_mr_lkey, g_mr_rkey);
+	printf("READY pid=%d ctx=%s async_fd=%d pd=%d mr_lkey=0x%x mr_rkey=0x%x cq=%d\n", getpid(), devname,
+	       g_ctx->async_fd, g_pd ? (int)g_pd->handle : -1, g_mr_lkey, g_mr_rkey, g_cq ? (int)g_cq->handle : -1);
 	fflush(stdout);
 	write_status("READY");
 
@@ -225,6 +273,8 @@ int main(int argc, char **argv)
 				write_status("FAIL: ibv_query_device after signal");
 			else if (g_mr && verify_mr(msg, sizeof(msg)))
 				write_status(msg);
+			else if (g_cq && verify_cq(msg, sizeof(msg)))
+				write_status(msg);
 			else if (!g_mr && g_pd && verify_pd(msg, sizeof(msg)))
 				write_status(msg);
 			else
@@ -235,6 +285,8 @@ int main(int argc, char **argv)
 
 	if (g_mr)
 		ibv_dereg_mr(g_mr);
+	if (g_cq)
+		ibv_destroy_cq(g_cq);
 	if (g_pd)
 		ibv_dealloc_pd(g_pd);
 	ibv_close_device(g_ctx);
