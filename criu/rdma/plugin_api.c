@@ -215,3 +215,67 @@ int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 		 winner_name, (int)uvfe->criu_driver, uvfe->ib_dev ?: "?");
 	return fn(uvfe);
 }
+
+/*
+ * Dump-side per-CQ dispatch.
+ *
+ * The per-uobject twin of rdma_dispatch_open_uverbs_cdev(): the R3 CQ
+ * walker resolves the CQ's driver-private state (rxe: the ring mmap
+ * vm_pgoff, via RXE_IB_METHOD_QUERY_CQ) through the owning plugin, not
+ * in core, since the query verb is driver-specific. We key by
+ * @criu_driver -- the value the dump-time claim recorded on this
+ * ucontext -- against each plugin's cr_rdma_provided_driver, for the
+ * same reason the open dispatcher does: the DUMP_UOBJ_CQ hook chain
+ * holds every RDMA plugin that registered it, so blind first-wins would
+ * hand an rxe CQ to an mlx5 plugin when both .so are loaded.
+ *
+ * Failure modes (all hard, aborting the dump):
+ *   - two plugins declare the same provided-driver: inconsistent
+ *     operator plugin set (-EEXIST).
+ *   - no plugin matches: -ENOENT (the coverage/claim gate should have
+ *     caught this at pre-suspend; defence in depth).
+ * The matching plugin's hook owns its own pr_err on QUERY_CQ failure.
+ */
+int rdma_dispatch_dump_uobj_cq(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id, int lfd,
+			       uint32_t ufile_handle, pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+	const char *winner_name = NULL;
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ_t *fn;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		if (!this->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ])
+			continue;
+		p = (const int *)dlsym(this->dlhandle, CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != criu_driver)
+			continue;
+
+		if (winner) {
+			pr_err("CQ dump (ibdev=%s handle=%u): multiple plugins declare cr_rdma_provided_driver=%u "
+			       "('%s' and '%s'); operator's plugin set is inconsistent.\n",
+			       ibdev ?: "?", ufile_handle, criu_driver, winner_name, this->d->name);
+			return -EEXIST;
+		}
+		winner = this;
+		winner_name = this->d->name;
+	}
+
+	if (!winner) {
+		pr_err("CQ dump (ibdev=%s handle=%u): no loaded RDMA plugin exports cr_rdma_provided_driver=%u; "
+		       "cannot capture per-CQ driver state.\n",
+		       ibdev ?: "?", ufile_handle, criu_driver);
+		return -ENOENT;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ];
+	pr_debug("CQ dump: dispatching DUMP_UOBJ_CQ to plugin '%s' (criu_driver=%u ibdev=%s handle=%u)\n", winner_name,
+		 criu_driver, ibdev ?: "?", ufile_handle);
+	return fn(ibdev, kernel_driver_id, lfd, ufile_handle, pid, cq_attrs, plugin_blob);
+}
