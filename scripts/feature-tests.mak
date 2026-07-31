@@ -201,3 +201,23 @@ int main(void)
 	return (int)UVERBS_OBJECT_RESTORE;
 }
 endef
+
+define FEATURE_TEST_RDMA_NLDEV_ATTR_RES_SEND_CQN
+
+#include <rdma/rdma_netlink.h>
+
+int main(void)
+{
+	return (int)RDMA_NLDEV_ATTR_RES_SEND_CQN;
+}
+endef
+
+define FEATURE_TEST_RDMA_NLDEV_ATTR_RES_RECV_CQN
+
+#include <rdma/rdma_netlink.h>
+
+int main(void)
+{
+	return (int)RDMA_NLDEV_ATTR_RES_RECV_CQN;
+}
+endef
