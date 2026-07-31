@@ -170,6 +170,24 @@ message rdma_cq_attrs {
 };
 
 /*
+ * QP create-time capacities (ib_qp_cap): the send/recv queue depths and
+ * SGE fan-out RESTORE_QP must recreate the QP with, since ibv_create_qp
+ * sizes the rings from them. Mirrors struct ib_uverbs_qp_cap. Sourced
+ * from the standard IB_USER_VERBS_CMD_QUERY_QP verb (init_attr->cap),
+ * which every provider fills regardless of attr_mask -- so this is a
+ * hw-agnostic, core-issued query, no plugin involved. All optional:
+ * absent (pre-query image, or a kernel that clamps a field to 0) means
+ * "use the provider default", exactly as ibv_create_qp treats a 0.
+ */
+message rdma_qp_cap {
+	optional uint32		max_send_wr		= 1;
+	optional uint32		max_recv_wr		= 2;
+	optional uint32		max_send_sge		= 3;
+	optional uint32		max_recv_sge		= 4;
+	optional uint32		max_inline_data		= 5;
+};
+
+/*
  * QP hw-agnostic state. This milestone (dump-side NLDEV discovery)
  * emits only the subset fill_res_qp_entry surfaces: the transport
  * type, the transition state, the local/remote QP numbers, the two
@@ -183,11 +201,9 @@ message rdma_cq_attrs {
  * ring mmap offsets, and the async-event user_handle) is NOT here:
  * it lives in the entry-level @plugin_blob, packed by the owning
  * plugin's QUERY_QP hook, exactly like the CQ ring vm_pgoff. That
- * hook and the hw-agnostic cap (max_send_wr, ...) sourced from the
- * standard QUERY_QP verb land with the QP-query milestone; the
- * matching fields (cap = 2, av = 16, user_handle = 40, ...) are
- * appended then at the numbers the design reserves, so nothing here
- * needs pre-declaring.
+ * hook and the matching fields (av = 16, user_handle = 40, ...) are
+ * appended with the QP-query milestone at the numbers the design
+ * reserves, so nothing else here needs pre-declaring.
  *
  * Field provenance (rxe, this milestone):
  *   qp_type       NLDEV fill_res_qp_entry (RES_TYPE).
@@ -198,9 +214,13 @@ message rdma_cq_attrs {
  *   sq_psn        NLDEV (RES_SQ_PSN); optional.
  *   rq_psn        NLDEV (RES_RQ_PSN); optional.
  *   port_num      NLDEV (PORT_INDEX); optional.
+ *   cap           standard IB_USER_VERBS_CMD_QUERY_QP verb
+ *                 (init_attr->cap); not NLDEV-visible, but hw-agnostic
+ *                 and core-issued (no plugin). Optional.
  */
 message rdma_qp_attrs {
 	optional uint32		qp_type			= 1;	/* RC/UC/UD/...   */
+	optional rdma_qp_cap	cap			= 2;
 	optional uint32		state			= 10;
 	optional uint32		qp_num			= 11;	/* identity hint  */
 	optional uint32		dest_qp_num		= 12;
