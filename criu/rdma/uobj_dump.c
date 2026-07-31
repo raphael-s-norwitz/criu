@@ -19,11 +19,12 @@
  * image emission. PD carries no per-driver state (empty plugin_blob);
  * MR is queried in core (QUERY_MR is a generic core uverb); CQ is the
  * first type with driver-private per-uobject state, so it dispatches to
- * the owning plugin (RDMA_DUMP_UOBJ_CQ) for its QUERY_CQ. QP gets its
- * identity + parent-PD/send-CQ/recv-CQ xrefs from NLDEV and its
- * hw-agnostic create-time cap from the standard QUERY_QP verb issued in
- * core; its per-driver QUERY_QP dispatch (driver-private wire state +
- * user_handle) lands with the QP-query milestone. The SRQ arm and the
+ * the owning plugin (RDMA_DUMP_UOBJ_CQ) for its QUERY_CQ. QP mirrors
+ * CQ: NLDEV supplies identity + the parent-PD/send-CQ/recv-CQ xrefs,
+ * and the owning plugin (RDMA_DUMP_UOBJ_QP) supplies the driver-private
+ * wire state + user_handle via QUERY_QP, and the hw-agnostic create-time
+ * cap comes from the standard QUERY_QP verb issued in core. The SRQ arm
+ * and the
  * early-capture split land with their milestones.
  *
  * Field provenance is documented inline in images/rdma_uobj.proto.
@@ -642,25 +643,25 @@ static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
  * the hw-agnostic identity NLDEV surfaces (type/state/qpn/psns/port),
  * the create-time cap from the standard QUERY_QP verb (init_attr->cap,
  * sourced in core), plus three typed xrefs: R3XR_PARENT_PD (RES_PDN),
- * R3XR_SEND_CQ (RES_SEND_CQN) and R3XR_RECV_CQ (RES_RECV_CQN).
- *
- * The per-driver QUERY_QP dispatch (driver-private wire state -- AV,
- * cursors, ring vm_pgoffs -- and the async-event user_handle, packed
- * into plugin_blob) lands with the QP-query milestone; until then the
- * entry carries no plugin_blob and no user_handle.
+ * R3XR_SEND_CQ (RES_SEND_CQN) and R3XR_RECV_CQ (RES_RECV_CQN). The
+ * owning plugin then supplies the driver-private per-QP wire state NLDEV
+ * can't express (rxe: AV, PSN bases, live cursors, ssn, transport knobs
+ * and the SQ/RQ ring mmap offsets) plus the async-event user_handle, via
+ * QUERY_QP, packed into the entry's opaque plugin_blob.
  *
  * A QP with a parent PD not in-tree is dropped (kernel/other-ucontext
  * QP). A QP whose owning ufile is in-tree but which is missing a
- * restore prerequisite -- the ufile handle, or either CQ-binding
- * restrack id (needs the kernel patch that emits RES_SEND_CQN /
- * RES_RECV_CQN) -- fails the dump, surfacing the requirement here
- * rather than as a mid-restore -ENOENT from RESTORE_QP's IDR check.
+ * restore prerequisite -- the ufile handle, either CQ-binding restrack
+ * id (needs the kernel patch that emits RES_SEND_CQN / RES_RECV_CQN),
+ * or the holder cdev fd QUERY_QP needs -- fails the dump, surfacing the
+ * requirement here rather than as a mid-restore -ENOENT.
  */
 static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 {
 	struct uobj_walk_ctx *w = arg;
 	struct rdma_dumped_ufile *uf;
 	struct ib_uverbs_query_qp_resp qp_resp;
+	ProtobufCBinaryData plugin_blob = {};
 	RdmaUobjEntry pe;
 	RdmaQpAttrs attrs;
 	RdmaQpCap cap;
@@ -758,6 +759,26 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 	cap.max_inline_data = qp_resp.max_inline_data;
 	attrs.cap = &cap;
 
+	/*
+	 * Per-driver QP payload: the plugin issues its QUERY_QP on the
+	 * holder's dup'd cdev fd, fills the hw-agnostic user_handle in
+	 * @attrs, and mallocs its wire-state schema into @plugin_blob. We
+	 * attach those bytes onto the entry and free them after the write.
+	 */
+	rc = rdma_dispatch_dump_uobj_qp(uf->criu_driver, uf->ibdev, uf->kernel_driver_id, uf->holder_uctx_fd,
+					e->ufile_handle, uf->pid, &attrs, &plugin_blob);
+	if (rc) {
+		pr_err("uobj DAG: per-QP dispatch failed for lqpn=%u on ibdev=%s handle=%u: %d (%s)\n", e->qp.lqpn,
+		       w->ib->ibdev, e->ufile_handle, rc, strerror(rc < 0 ? -rc : rc));
+		free(plugin_blob.data);
+		return (w->err = -1);
+	}
+
+	if (plugin_blob.data && plugin_blob.len > 0) {
+		pe.has_plugin_blob = true;
+		pe.plugin_blob = plugin_blob;
+	}
+
 	rdma_uobj_xref__init(&xr_pd);
 	xr_pd.role = R3_XREF_ROLE__R3XR_PARENT_PD;
 	xr_pd.target_type = R3_UOBJ_TYPE__R3UT_PD;
@@ -782,9 +803,11 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 	if (pb_write_one(w->img, &pe, PB_RDMA_UOBJ) < 0) {
 		pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed for ufile_id=%#x lqpn=%u\n", pe.ufile_id,
 		       e->qp.lqpn);
+		free(plugin_blob.data);
 		return (w->err = -1);
 	}
 
+	free(plugin_blob.data);
 	w->n_emitted++;
 	return 0;
 }
