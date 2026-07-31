@@ -149,6 +149,8 @@ cat "$JSON"
 #   * it carries all three xref roles PARENT_PD / SEND_CQ / RECV_CQ
 #   * each xref target_type is the expected class (PD, CQ, CQ)
 #   * qp_type / qp_num are populated
+#   * cap is present with depths >= the requested 16/16/1/1 (filled by
+#     the core standard QUERY_QP verb)
 #
 python3 - "$JSON" <<'PY'
 import json, sys
@@ -166,6 +168,19 @@ attrs = qp.get("qp", {})
 if "qp_type" not in attrs or "qp_num" not in attrs:
     sys.exit("FAIL: QP entry missing qp_type/qp_num: %r" % attrs)
 
+cap = attrs.get("cap")
+if not isinstance(cap, dict):
+    sys.exit("FAIL: QP entry missing cap (standard QUERY_QP verb did not fire): %r" % attrs)
+# Holder requests 16/16/1/1; the provider may round the depths up, so
+# assert presence and that the depths meet at least what was requested.
+for k in ("max_send_wr", "max_recv_wr", "max_send_sge", "max_recv_sge"):
+    if k not in cap:
+        sys.exit("FAIL: QP cap missing %s: %r" % (k, cap))
+if cap["max_send_wr"] < 16 or cap["max_recv_wr"] < 16:
+    sys.exit("FAIL: QP cap depths below requested 16/16: %r" % cap)
+if cap["max_send_sge"] < 1 or cap["max_recv_sge"] < 1:
+    sys.exit("FAIL: QP cap sge below requested 1/1: %r" % cap)
+
 want = {"R3XR_PARENT_PD": "R3UT_PD", "R3XR_SEND_CQ": "R3UT_CQ", "R3XR_RECV_CQ": "R3UT_CQ"}
 got = {x["role"]: x.get("target_type") for x in qp.get("xref", [])}
 for role, tt in want.items():
@@ -174,8 +189,8 @@ for role, tt in want.items():
     if got[role] != tt:
         sys.exit("FAIL: xref %s target_type=%s, want %s" % (role, got[role], tt))
 
-print("QP entry OK: qp_num=%s qp_type=%s state=%s xrefs=%r" %
-      (attrs.get("qp_num"), attrs.get("qp_type"), attrs.get("state"), got))
+print("QP entry OK: qp_num=%s qp_type=%s state=%s cap=%r xrefs=%r" %
+      (attrs.get("qp_num"), attrs.get("qp_type"), attrs.get("state"), cap, got))
 PY
 
 echo "PASS"
