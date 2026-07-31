@@ -932,6 +932,27 @@ _Static_assert(sizeof(struct rxe_restore_qp_req_local) == 232,
 	       "rxe_restore_qp_req_local must be 232 bytes (field-identical to kernel rxe_restore_qp_req)");
 
 /*
+ * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
+ * rxe_create_qp_resp (two mminfo, 32 bytes): the RESTORE_QP UHW_OUT the
+ * kernel's rxe_restore_qp publishes (udata->outbuf must be at least this
+ * size). rq_mi comes first, then sq_mi -- each carries the destination
+ * ring's mmap byte offset, which rxe replays from the UHW_IN
+ * rq_vm_pgoff / sq_vm_pgoff. The restore hook seeds the offsets as an
+ * echo-verify template so core can confirm the kernel honoured the
+ * forced ring offsets rather than falling back to its monotonic
+ * counter. Remove once host rdma-core ships it.
+ */
+struct rxe_create_qp_resp_local {
+	uint64_t rq_mi_offset;
+	uint32_t rq_mi_size;
+	uint32_t rq_mi_pad;
+	uint64_t sq_mi_offset;
+	uint32_t sq_mi_size;
+	uint32_t sq_mi_pad;
+};
+_Static_assert(sizeof(struct rxe_create_qp_resp_local) == 32, "rxe_create_qp_resp_local must be 32 bytes (kernel UAPI)");
+
+/*
  * Issue RXE_IB_METHOD_QUERY_QP on @fd (criu's dup of the dumpee's
  * uverbs cdev fd, holder of the QP IDR) against @qp_handle, the
  * dump-side counterpart of UVERBS_METHOD_RESTORE_QP. HANDLE is an
@@ -1109,6 +1130,98 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, stru
 }
 
 /*
+ * RDMA_RESTORE_UOBJ_QP_UHW_PACK hook (rxe). The restore-time twin of
+ * rdma_rxe_plugin_dump_uobj_qp(): reshapes the per-QP plugin_blob it
+ * emitted into the UVERBS_METHOD_RESTORE_QP udata that core issues.
+ *
+ * UHW_IN is the plugin_blob verbatim -- the kernel deliberately makes
+ * the QUERY_QP RESP_BLOB byte-identical to the RESTORE_QP UHW_IN (both
+ * struct rxe_restore_qp_req), so unlike the CQ path there is no
+ * re-shaping: the drained wire state (AV / PSNs / cursors / transport
+ * knobs / ring vm_pgoffs) replays as captured. UHW_OUT is a 32-byte
+ * rxe_create_qp_resp receive area (the kernel's udata->outbuf minimum)
+ * pre-seeded with the requested rq/sq ring offsets so core memcmp-
+ * verifies the kernel echoed the same rq offset back. Core owns and
+ * frees both buffers after the ioctl.
+ *
+ * v0 restores a drained QP only: the blob must be exactly the
+ * fixed-size header with no in-flight ring image appended, and its
+ * *_image_bytes counts must be zero. A non-drained blob is rejected
+ * here (the kernel would -EOPNOTSUPP it anyway) so the requirement
+ * surfaces with a clear per-QP message rather than a mid-restore errno.
+ */
+static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
+{
+	const struct rxe_restore_qp_req_local *pb;
+	struct rxe_create_qp_resp_local *out;
+	void *inbuf;
+
+	if (!e || !uhw)
+		return -EINVAL;
+
+	if (!e->has_plugin_blob || e->plugin_blob.len != sizeof(*pb)) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected exactly %zu "
+		       "(drained rxe_restore_qp_req)\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, e->has_plugin_blob ? e->plugin_blob.len : (size_t)0,
+		       sizeof(*pb));
+		return -EINVAL;
+	}
+	pb = (const struct rxe_restore_qp_req_local *)e->plugin_blob.data;
+
+	if (pb->sq_image_bytes || pb->rq_image_bytes || pb->res_image_bytes) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: in-flight image unsupported at v0 (sq=%u rq=%u "
+		       "res=%u); only a drained QP restores\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, pb->sq_image_bytes, pb->rq_image_bytes,
+		       pb->res_image_bytes);
+		return -EOPNOTSUPP;
+	}
+	if (pb->qpn == 0) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: captured qpn is 0 (the kernel installs at the "
+		       "source qpn and rejects 0)\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+
+	out = malloc(sizeof(*out));
+	if (!out) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK out of memory (out_buf %zu bytes)\n", sizeof(*out));
+		return -ENOMEM;
+	}
+	memset(out, 0, sizeof(*out));
+	out->rq_mi_offset = pb->rq_vm_pgoff;
+	out->sq_mi_offset = pb->sq_vm_pgoff;
+	uhw->out_buf = out;
+	uhw->out_len = sizeof(*out);
+	/*
+	 * The verify mechanism is a single contiguous prefix memcmp, so it
+	 * can only cover rq_mi.offset (bytes 0..7); rq_mi.size/pad follow
+	 * and are kernel-assigned. rxe forces both ring offsets from the
+	 * same restore path, so a honoured rq offset is a sufficient proxy
+	 * that sq was honoured too.
+	 */
+	uhw->verify_len = pb->rq_vm_pgoff ? sizeof(out->rq_mi_offset) : 0;
+
+	inbuf = malloc(e->plugin_blob.len);
+	if (!inbuf) {
+		free(out);
+		uhw->out_buf = NULL;
+		uhw->out_len = 0;
+		uhw->verify_len = 0;
+		pr_err("rxe: RESTORE_QP_UHW_PACK out of memory (in_buf %zu bytes)\n", e->plugin_blob.len);
+		return -ENOMEM;
+	}
+	memcpy(inbuf, e->plugin_blob.data, e->plugin_blob.len);
+	uhw->in_buf = inbuf;
+	uhw->in_len = e->plugin_blob.len;
+
+	pr_debug("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u qpn=%u sq_vm_pgoff=%#" PRIx64 " rq_vm_pgoff=%#" PRIx64
+		 " (uhw_in=%zu uhw_out=%zu)\n",
+		 e->has_ufile_handle ? e->ufile_handle : 0, pb->qpn, (uint64_t)pb->sq_vm_pgoff,
+		 (uint64_t)pb->rq_vm_pgoff, uhw->in_len, uhw->out_len);
+	return 0;
+}
+
+/*
  * UPDATE_VMA_MAP hook for the /dev/infiniband/uverbs* ring VMAs the rxe
  * plugin claimed at dump time (HANDLE_DEVICE_VMA). Runs from
  * open_filemap() during open_vmas() -- after prepare_fds() (where
@@ -1188,6 +1301,8 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP,
 			rdma_rxe_plugin_dump_uobj_qp)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
 			rdma_rxe_plugin_restore_uobj_cq_uhw_pack)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK,
+			rdma_rxe_plugin_restore_uobj_qp_uhw_pack)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP,
 			rdma_rxe_plugin_update_vma_map)
 
