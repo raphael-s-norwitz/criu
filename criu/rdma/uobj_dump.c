@@ -15,12 +15,15 @@
  * follow-on milestone for in-flight datapath state; PD carries no such
  * state, so a plain NLDEV walk after the freeze suffices here.
  *
- * v0 scope (rxe PD + MR + CQ): PD, MR and CQ discovery + image
- * emission. PD carries no per-driver state (empty plugin_blob); MR is
- * queried in core (QUERY_MR is a generic core uverb); CQ is the first
- * type with driver-private per-uobject state, so it dispatches to the
- * owning plugin (RDMA_DUMP_UOBJ_CQ) for its QUERY_CQ. QP/SRQ arms and
- * the early-capture split land with their milestones.
+ * v0 scope (rxe PD + MR + CQ + QP): PD, MR, CQ and QP discovery +
+ * image emission. PD carries no per-driver state (empty plugin_blob);
+ * MR is queried in core (QUERY_MR is a generic core uverb); CQ is the
+ * first type with driver-private per-uobject state, so it dispatches to
+ * the owning plugin (RDMA_DUMP_UOBJ_CQ) for its QUERY_CQ. QP is
+ * NLDEV-only at this milestone (identity + parent-PD/send-CQ/recv-CQ
+ * xrefs); its per-driver QUERY_QP dispatch and standard-verb cap land
+ * with the QP-query milestone. The SRQ arm and the early-capture split
+ * land with their milestones.
  *
  * Field provenance is documented inline in images/rdma_uobj.proto.
  * Briefly:
@@ -41,13 +44,16 @@
  *     it into the entry's plugin_blob.
  *
  * Failure policy:
- *   * Netlink failure on a PD/MR/CQ walk -> hard fail. We've already
+ *   * Netlink failure on a PD/MR/CQ/QP walk -> hard fail. We've already
  *     accepted the cost of the pre-suspend coverage netlink dump;
  *     failing closed here is consistent.
  *   * QUERY_MR / per-CQ plugin dispatch failure on an in-tree uobject
  *     -> hard fail (we cannot emit a restorable entry without it).
+ *   * An in-tree QP missing a restore prerequisite (RES_HANDLE, or
+ *     either RES_SEND_CQN/RES_RECV_CQN) -> hard fail, surfacing the
+ *     kernel-version requirement at dump time.
  *   * Image open / write failure -> hard fail.
- *   * An NLDEV PD/MR/CQ that doesn't map to any in-tree ufile ->
+ *   * An NLDEV PD/MR/CQ/QP that doesn't map to any in-tree ufile ->
  *     silently dropped (kernel resource, or a userspace resource
  *     belonging to a non-snapshot-tree ucontext sharing the ibdev;
  *     the coverage check has already proven any in-tree ucontext is
@@ -576,6 +582,124 @@ static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
 	return 0;
 }
 
+/*
+ * QP callback: join to the owning ufile through the parent pdn (QPs,
+ * like MRs, carry no ctxn in NLDEV), and emit one R3UT_QP entry from
+ * the hw-agnostic identity NLDEV surfaces (type/state/qpn/psns/port)
+ * plus three typed xrefs: R3XR_PARENT_PD (RES_PDN), R3XR_SEND_CQ
+ * (RES_SEND_CQN) and R3XR_RECV_CQ (RES_RECV_CQN).
+ *
+ * This milestone is NLDEV-only: no per-driver QUERY_QP dispatch and no
+ * standard-verb cap yet, so the entry carries no plugin_blob and no
+ * ib_qp_cap. The driver-private wire state (AV, cursors, ring
+ * vm_pgoffs, user_handle) and the cap land with the QP-query milestone,
+ * appended onto rdma_qp_attrs / plugin_blob at their reserved numbers.
+ *
+ * A QP with a parent PD not in-tree is dropped (kernel/other-ucontext
+ * QP). A QP whose owning ufile is in-tree but which is missing a
+ * restore prerequisite -- the ufile handle, or either CQ-binding
+ * restrack id (needs the kernel patch that emits RES_SEND_CQN /
+ * RES_RECV_CQN) -- fails the dump, surfacing the requirement here
+ * rather than as a mid-restore -ENOENT from RESTORE_QP's IDR check.
+ */
+static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
+{
+	struct uobj_walk_ctx *w = arg;
+	struct rdma_dumped_ufile *uf;
+	RdmaUobjEntry pe;
+	RdmaQpAttrs attrs;
+	RdmaUobjXref xr_pd, xr_scq, xr_rcq;
+	RdmaUobjXref *xrefs[3];
+
+	if (!e->qp.has_pdn) {
+		w->n_dropped++;
+		return 0;
+	}
+	uf = uobj_ibdev_ufile_by_pdn(w->ib, e->qp.pdn);
+	if (!uf) {
+		/* Parent PD not in-tree (kernel/other-ucontext QP): drop. */
+		w->n_dropped++;
+		return 0;
+	}
+
+	if (!e->has_ufile_handle) {
+		pr_err("uobj DAG: QP lqpn=%u on ibdev=%s (pdn=%u) has no RES_HANDLE "
+		       "(kernel pre-K8a); cannot restore\n",
+		       e->qp.lqpn, w->ib->ibdev, e->qp.pdn);
+		return (w->err = -1);
+	}
+	if (!e->qp.has_send_cqn || !e->qp.has_recv_cqn) {
+		pr_err("uobj DAG: QP lqpn=%u on ibdev=%s (pdn=%u) missing RES_%s_CQN "
+		       "(kernel lacks the QP CQ-binding NLDEV attrs); cannot resolve "
+		       "the SEND_CQ/RECV_CQ handles RESTORE_QP requires\n",
+		       e->qp.lqpn, w->ib->ibdev, e->qp.pdn, e->qp.has_send_cqn ? "RECV" : "SEND");
+		return (w->err = -1);
+	}
+
+	rdma_uobj_entry__init(&pe);
+	pe.ufile_id = uf->uvfe_id;
+	pe.hw_driver_id = uf->criu_driver;
+	pe.type = R3_UOBJ_TYPE__R3UT_QP;
+	pe.has_ufile_handle = true;
+	pe.ufile_handle = e->ufile_handle;
+	/* QP has no NLDEV restrack id of its own: an xref source, never a target. */
+
+	rdma_qp_attrs__init(&attrs);
+	attrs.has_qp_type = true;
+	attrs.qp_type = e->qp.qp_type;
+	attrs.has_state = true;
+	attrs.state = e->qp.qp_state;
+	attrs.has_qp_num = true;
+	attrs.qp_num = e->qp.lqpn;
+	if (e->qp.has_rqpn) {
+		attrs.has_dest_qp_num = true;
+		attrs.dest_qp_num = e->qp.rqpn;
+	}
+	if (e->qp.has_sq_psn) {
+		attrs.has_sq_psn = true;
+		attrs.sq_psn = e->qp.sq_psn;
+	}
+	if (e->qp.has_rq_psn) {
+		attrs.has_rq_psn = true;
+		attrs.rq_psn = e->qp.rq_psn;
+	}
+	if (e->qp.has_port) {
+		attrs.has_port_num = true;
+		attrs.port_num = e->qp.port;
+	}
+	pe.qp = &attrs;
+
+	rdma_uobj_xref__init(&xr_pd);
+	xr_pd.role = R3_XREF_ROLE__R3XR_PARENT_PD;
+	xr_pd.target_type = R3_UOBJ_TYPE__R3UT_PD;
+	xr_pd.target_restrack_id = e->qp.pdn;
+
+	rdma_uobj_xref__init(&xr_scq);
+	xr_scq.role = R3_XREF_ROLE__R3XR_SEND_CQ;
+	xr_scq.target_type = R3_UOBJ_TYPE__R3UT_CQ;
+	xr_scq.target_restrack_id = e->qp.send_cqn;
+
+	rdma_uobj_xref__init(&xr_rcq);
+	xr_rcq.role = R3_XREF_ROLE__R3XR_RECV_CQ;
+	xr_rcq.target_type = R3_UOBJ_TYPE__R3UT_CQ;
+	xr_rcq.target_restrack_id = e->qp.recv_cqn;
+
+	xrefs[0] = &xr_pd;
+	xrefs[1] = &xr_scq;
+	xrefs[2] = &xr_rcq;
+	pe.n_xref = 3;
+	pe.xref = xrefs;
+
+	if (pb_write_one(w->img, &pe, PB_RDMA_UOBJ) < 0) {
+		pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed for ufile_id=%#x lqpn=%u\n", pe.ufile_id,
+		       e->qp.lqpn);
+		return (w->err = -1);
+	}
+
+	w->n_emitted++;
+	return 0;
+}
+
 struct devidx_resolver {
 	struct list_head *ibdevs;
 };
@@ -646,6 +770,7 @@ int rdma_dump_uobj_dag(void)
 		struct uobj_walk_ctx w = { .ib = ib, .img = img };
 		int pd_emitted, pd_dropped;
 		int mr_emitted, mr_dropped;
+		int cq_emitted, cq_dropped;
 		int r;
 
 		if (!ib->has_dev_index) {
@@ -686,11 +811,28 @@ int rdma_dump_uobj_dag(void)
 			       ib->dev_index, r, w.err);
 			goto out;
 		}
+		cq_emitted = w.n_emitted;
+		cq_dropped = w.n_dropped;
+		w.n_emitted = w.n_dropped = 0;
+
+		/*
+		 * QPs join by pdn like MRs, so the PD walk must precede them;
+		 * their SEND_CQ/RECV_CQ xref targets are CQ entries, but image
+		 * order is immaterial (restore topo-sorts via the xref graph),
+		 * so the QP walk lands last to keep the emit order
+		 * PD -> MR -> CQ -> QP.
+		 */
+		r = rdma_nl_for_each_resource(ib->dev_index, ib->ibdev, RDMA_NL_RES_QP, uobj_qp_cb, &w);
+		if (r < 0 || w.err) {
+			pr_err("uobj DAG: qp walk failed on ibdev '%s' (idx=%u): r=%d err=%d\n", ib->ibdev,
+			       ib->dev_index, r, w.err);
+			goto out;
+		}
 
 		pr_info("uobj DAG: ibdev=%s pd(emitted=%d dropped=%d) mr(emitted=%d dropped=%d) "
-			"cq(emitted=%d dropped=%d) (in-tree-ufiles=%zu)\n",
-			ib->ibdev, pd_emitted, pd_dropped, mr_emitted, mr_dropped, w.n_emitted, w.n_dropped,
-			ib->n_ufiles);
+			"cq(emitted=%d dropped=%d) qp(emitted=%d dropped=%d) (in-tree-ufiles=%zu)\n",
+			ib->ibdev, pd_emitted, pd_dropped, mr_emitted, mr_dropped, cq_emitted, cq_dropped,
+			w.n_emitted, w.n_dropped, ib->n_ufiles);
 	}
 
 	ret = 0;
