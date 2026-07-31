@@ -99,6 +99,76 @@ static bool rxe_active = false;
 static int rxe_dev_count = 0;
 
 /*
+ * Restore-side cache of cdev fds that already carry a kernel ucontext
+ * (attached by rxe_send_get_context_restore in open_uverbs_cdev). Keyed
+ * by ibdev name so the UPDATE_VMA_MAP path can hand back a dup() of the
+ * *same struct file* the per-uobject RESTORE_* ioctls ran on -- the only
+ * file whose ufile->ucontext is non-NULL, which is exactly what
+ * ib_uverbs_mmap requires (it -EINVALs via ib_uverbs_get_ucontext_file
+ * otherwise). Without it, open_filemap() would re-open the cdev through
+ * the generic path, mint a fresh ucontext-less ib_uverbs_file, and the
+ * pie restorer's mmap of the CQ-ring VMA would die at -EINVAL.
+ *
+ * Lifetime: appended in open_uverbs_cdev, freed in fini(RESTORE).
+ * Process-local; CRIU restore is single-threaded across these phases,
+ * so no locking.
+ *
+ * The cached dup is parked at >= RXE_CACHED_FD_FLOOR: CRIU installs
+ * workload fds with fcntl(F_DUPFD, want) and treats an occupied target
+ * slot as a hard error, so a low-numbered cache fd could collide with a
+ * dumpee fd. 1024 is comfortably above any plausible small workload fd.
+ */
+#define RXE_CACHED_FD_FLOOR 1024
+struct rxe_cdev_cache_entry {
+	char ibdev[64];
+	int fd; /* high-numbered dup of the GET_CONTEXT'd cdev fd */
+	struct rxe_cdev_cache_entry *next;
+};
+static struct rxe_cdev_cache_entry *rxe_cdev_cache;
+
+static void rxe_cdev_cache_remember(const char *ibdev, int fd)
+{
+	struct rxe_cdev_cache_entry *e;
+
+	if (!ibdev || ibdev[0] == '\0' || fd < 0)
+		return;
+
+	e = calloc(1, sizeof(*e));
+	if (!e) {
+		pr_perror("rxe_cdev_cache_remember(%s)", ibdev);
+		return;
+	}
+	snprintf(e->ibdev, sizeof(e->ibdev), "%s", ibdev);
+	e->fd = fd;
+	e->next = rxe_cdev_cache;
+	rxe_cdev_cache = e;
+	pr_debug("rxe_cdev_cache: remembered ibdev=%s fd=%d\n", ibdev, fd);
+}
+
+static int rxe_cdev_cache_lookup(const char *ibdev)
+{
+	struct rxe_cdev_cache_entry *e;
+
+	for (e = rxe_cdev_cache; e; e = e->next)
+		if (!strcmp(e->ibdev, ibdev))
+			return e->fd;
+	return -1;
+}
+
+static void rxe_cdev_cache_drop_all(void)
+{
+	struct rxe_cdev_cache_entry *e, *next;
+
+	for (e = rxe_cdev_cache; e; e = next) {
+		next = e->next;
+		if (e->fd >= 0)
+			close(e->fd);
+		free(e);
+	}
+	rxe_cdev_cache = NULL;
+}
+
+/*
  * Resolve the kernel driver backing /sys/class/infiniband/<ibdev>.
  *
  * For PCI-backed ibdevs the canonical answer comes from readlink() on
@@ -210,6 +280,15 @@ static void rdma_rxe_plugin_fini(int stage, int ret)
 {
 	pr_info("fini (stage %d ret %d): was %s, %d rxe ibdev(s)\n", stage,
 		ret, rxe_active ? "active" : "inactive", rxe_dev_count);
+
+	/*
+	 * Close the restore-side cdev-fd cache (populated by
+	 * open_uverbs_cdev, dup'd from by UPDATE_VMA_MAP). Only meaningful
+	 * on the RESTORE stage; a no-op otherwise since the cache stays
+	 * empty on dump.
+	 */
+	if (stage == CR_PLUGIN_STAGE__RESTORE)
+		rxe_cdev_cache_drop_all();
 }
 
 /*
@@ -386,6 +465,28 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 		       uvfe->ib_dev, rc, strerror(-rc));
 		close(fd);
 		return -1;
+	}
+
+	/*
+	 * Stash a high-numbered dup of the GET_CONTEXT'd fd so the later
+	 * UPDATE_VMA_MAP hook can return a sibling fd on the *same struct
+	 * file* -- dup() shares it, so the ucontext just attached is visible
+	 * through the dup and ib_uverbs_mmap can resolve it when the pie
+	 * restorer mmaps the CQ-ring VMA. The caller-returned fd stays the
+	 * original; CRIU plumbs it into the dumpee fd table and may move or
+	 * close it without disturbing the cached copy. See the cache header
+	 * for the FD_FLOOR parking rationale.
+	 */
+	{
+		int hi = fcntl(fd, F_DUPFD_CLOEXEC, RXE_CACHED_FD_FLOOR);
+
+		if (hi < 0) {
+			pr_perror("open_uverbs_cdev: F_DUPFD_CLOEXEC(fd=%d, >=%d) for cache (ibdev=%s)", fd,
+				  RXE_CACHED_FD_FLOOR, uvfe->ib_dev);
+			close(fd);
+			return -1;
+		}
+		rxe_cdev_cache_remember(uvfe->ib_dev, hi);
 	}
 
 	return fd;
@@ -828,6 +929,72 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, stru
 	return 0;
 }
 
+/*
+ * UPDATE_VMA_MAP hook for the /dev/infiniband/uverbs* ring VMAs the rxe
+ * plugin claimed at dump time (HANDLE_DEVICE_VMA). Runs from
+ * open_filemap() during open_vmas() -- after prepare_fds() (where
+ * uverbsfd_open -> open_uverbs_cdev populated rxe_cdev_cache and, for a
+ * CQ, RESTORE_CQ registered the ring's pending mmap slot) and before the
+ * pie restorer's mmap blob.
+ *
+ * We must intercept here rather than let CRIU's generic open_path()
+ * reopen the cdev: each fresh open() of the cdev mints an ib_uverbs_file
+ * with ucontext == NULL, and ib_uverbs_mmap -EINVALs on that before ever
+ * reaching rxe_mmap. Returning a dup() of the cached GET_CONTEXT'd fd
+ * hands the pie a sibling on the same struct file, whose ucontext (and
+ * thus the RESTORE_CQ-registered ring offset) is visible.
+ *
+ * The ring offset is unchanged across restore: RESTORE_CQ replays the
+ * source vm_pgoff and the kernel echoes it back (verified in
+ * rdma_send_restore_cq), so new_pgoff == old_pgoff and this hook only
+ * substitutes the backing fd.
+ *
+ * Return 1 = claimed (*plugin_fd is a fresh dup for the pie, *new_pgoff
+ * set); -ENOTSUP = not ours / fall through to CRIU's generic path; <0 =
+ * hard error. @path is the source-side dumped cdev path; we resolve the
+ * destination cdev's maj:min -> ibdev (which may differ cross-host) for
+ * the cache join key, mirroring the dump-side claim.
+ */
+static int rdma_rxe_plugin_update_vma_map(const char *path, const uint64_t addr, const uint64_t old_pgoff,
+					  uint64_t *new_pgoff, int *plugin_fd)
+{
+	struct stat st;
+	char ibdev[64];
+	int cached_fd, dup_fd;
+
+	(void)addr;
+
+	if (!rxe_active)
+		return -ENOTSUP;
+	if (!path || strncmp(path, "/dev/infiniband/uverbs", 22) != 0)
+		return -ENOTSUP;
+
+	if (stat(path, &st) < 0 || !S_ISCHR(st.st_mode))
+		return -ENOTSUP;
+	if (rxe_chrdev_to_ibdev(st.st_rdev, ibdev, sizeof(ibdev)) < 0)
+		return -ENOTSUP;
+
+	cached_fd = rxe_cdev_cache_lookup(ibdev);
+	if (cached_fd < 0) {
+		pr_warn("update_vma_map: ibdev=%s not in cache (path=%s); open_uverbs_cdev did not run for this VMA's "
+			"cdev. Falling through.\n",
+			ibdev, path);
+		return -ENOTSUP;
+	}
+
+	dup_fd = dup(cached_fd);
+	if (dup_fd < 0) {
+		pr_perror("update_vma_map: dup(cached_fd=%d) for ibdev=%s", cached_fd, ibdev);
+		return -1;
+	}
+
+	*new_pgoff = old_pgoff;
+	*plugin_fd = dup_fd;
+	pr_info("update_vma_map: path=%s ibdev=%s pgoff=%#" PRIx64 " -> dest_fd=%d (dup of cached cdev w/ ucontext)\n",
+		path, ibdev, old_pgoff, dup_fd);
+	return 1;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
@@ -840,6 +1007,8 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
 			rdma_rxe_plugin_dump_uobj_cq)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_UHW_PACK,
 			rdma_rxe_plugin_restore_uobj_cq_uhw_pack)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP,
+			rdma_rxe_plugin_update_vma_map)
 
 /*
  * RDMA provided driver: RCD_RXE.
