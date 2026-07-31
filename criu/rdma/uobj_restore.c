@@ -530,11 +530,13 @@ out_free_uhw:
  * Restore one CQ: reinstall an ib_uobject at the ufile_handle the dump
  * captured, synchronously on the cmd_fd (master side, before the pie's
  * VMA pass -- see rdma_send_restore_cq). The CQ is a DAG root in v0 (no
- * incoming xrefs), so unlike the MR path it needs no parent resolution
- * and touches no handle map; QPs will resolve their send/recv-CQ edges
- * once that milestone records CQ handles here.
+ * incoming xrefs), so unlike the MR path it needs no parent resolution.
+ * It is, however, an xref *target*: a QP binds its send/recv completion
+ * queues by the source CQ restrack id (RES_SEND_CQN / RES_RECV_CQN), so
+ * record (CQ, restrack_id) -> handle here for the QP pass to resolve
+ * those edges against, exactly as the PD pass does for MR parents.
  */
-static int uobj_restore_cq(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobjEntry *e)
+static int uobj_restore_cq(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobjEntry *e, struct uobj_handle_map *m)
 {
 	int rc;
 
@@ -542,6 +544,12 @@ static int uobj_restore_cq(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 		pr_err("uobj DAG: CQ entry (restrack_id=%u) has no ufile_handle; cannot restore (dump ran on a "
 		       "pre-K8a kernel)\n",
 		       e->has_restrack_id ? e->restrack_id : 0);
+		return -1;
+	}
+	if (!e->has_restrack_id) {
+		pr_err("uobj DAG: CQ entry (handle=%u) has no restrack_id; QP send/recv-CQ xrefs could not resolve "
+		       "it\n",
+		       e->ufile_handle);
 		return -1;
 	}
 
@@ -552,7 +560,8 @@ static int uobj_restore_cq(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 		return -1;
 	}
 	pr_debug("uobj DAG: RESTORE_CQ handle=%u ok (cmd_fd=%d driver=%u)\n", e->ufile_handle, cmd_fd, kernel_driver_id);
-	return 0;
+
+	return handle_map_add(m, R3_UOBJ_TYPE__R3UT_CQ, e->restrack_id, e->ufile_handle);
 }
 
 /*
@@ -715,7 +724,7 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 			 * rdma_send_restore_cq). Order vs the MR queueing below
 			 * is immaterial: MR only depends on PD.
 			 */
-			ret = uobj_restore_cq(cmd_fd, kernel_driver_id, c->e);
+			ret = uobj_restore_cq(cmd_fd, kernel_driver_id, c->e, &map);
 			break;
 		case R3_UOBJ_TYPE__R3UT_MR:
 			ret = uobj_prepare_mr(cmd_fd, ufile_id, kernel_driver_id, c->e, &map);
