@@ -860,13 +860,24 @@ out:
  * method (FREEZE_DATAPATH=+0, QUERY_QP=+1, QUERY_CQ=+2), so its id is
  * (1<<SHIFT)+1. Attr namespace: HANDLE (IDR) at +0, RESP_BLOB (the
  * rxe_restore_qp_req PTR_OUT) at +1, RESP_USER_HANDLE (u64 PTR_OUT) at
- * +2. Keep in sync with the kernel UAPI; remove once host rdma-core
- * ships rxe_user_ioctl_cmds.h.
+ * +2, and the optional in-flight SQ ring image PTR_OUT at +3. Keep in
+ * sync with the kernel UAPI; remove once host rdma-core ships
+ * rxe_user_ioctl_cmds.h.
  */
 #define RXE_IB_METHOD_QUERY_QP_LOCAL		    ((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define RXE_IB_ATTR_QUERY_QP_HANDLE_LOCAL	    (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_ATTR_QUERY_QP_RESP_BLOB_LOCAL	    ((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE_LOCAL ((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE_LOCAL    ((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 3)
+
+/*
+ * Per-image capture cap. Each in-flight image ships as one uverbs attr
+ * whose len is u16, so a single image's [consumer, producer) subspan
+ * must fit in 65535 bytes; the kernel fails QUERY_QP with -ENOSPC
+ * otherwise. Deep-ring chunking is a kernel-side follow-up, matching the
+ * CQ image cap.
+ */
+#define RXE_QP_IMAGE_CAP_LOCAL 65535u
 
 /*
  * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
@@ -879,12 +890,15 @@ out:
  * rdma-core (rdma_user_rxe.h), so only this outer struct needs mirroring
  * until host rdma-core ships it.
  *
- * QUERY_QP emits only the drained subset: identity, AV, PSN bases, the
- * live req/comp/resp cursors, ssn, transport knobs and the SQ/RQ ring
- * mmap offsets. The in-flight datapath group (sq_producer .. and the
- * *_image_bytes counts) is left zero by the kernel until the in-flight
- * QP slice lands; the field group is declared here so the plugin ABI
- * stays byte-stable.
+ * The fixed header carries identity, AV, PSN bases, the live
+ * req/comp/resp cursors, ssn, transport knobs, the SQ/RQ ring mmap
+ * offsets, and the in-flight datapath group: the ring producer/consumer
+ * indices, responder continuity scalars/cursors, and the
+ * {sq,rq,res}_image_bytes counts. The variable-length images those
+ * counts describe travel out-of-band as separate QUERY_QP PTR_OUT attrs
+ * and are appended to the plugin_blob after this header (see
+ * rdma_rxe_plugin_dump_uobj_qp). All the in-flight fields are zero for a
+ * drained QP.
  */
 struct rxe_restore_qp_req_local {
 	struct rxe_av av;
@@ -961,13 +975,20 @@ _Static_assert(sizeof(struct rxe_create_qp_resp_local) == 32, "rxe_create_qp_res
  * user_handle into @user_handle_out (both MANDATORY PTR_OUTs, so the
  * kernel writes them all or rejects the ioctl -- no partial outcome).
  *
+ * When @sq_img (@img_cap bytes) is provided the kernel also emits the
+ * in-flight SQ ring image into it, reporting the subspan's byte count in
+ * @req_out->sq_image_bytes. This is an optional PTR_OUT (a drained QP
+ * writes 0 bytes); a buffer smaller than a live subspan fails the whole
+ * QUERY_QP with -ENOSPC, so advertise the full @img_cap.
+ *
  * Returns 0 on success, -errno on failure.
  */
-static int rxe_query_qp(int fd, uint32_t qp_handle, struct rxe_restore_qp_req_local *req_out, uint64_t *user_handle_out)
+static int rxe_query_qp(int fd, uint32_t qp_handle, struct rxe_restore_qp_req_local *req_out, uint64_t *user_handle_out,
+			void *sq_img, uint32_t img_cap)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;
-		struct ib_uverbs_attr attrs[3];
+		struct ib_uverbs_attr attrs[6];
 	} cmd = {};
 	unsigned int n = 0;
 
@@ -993,6 +1014,14 @@ static int rxe_query_qp(int fd, uint32_t qp_handle, struct rxe_restore_qp_req_lo
 	cmd.attrs[n].data = (uintptr_t)user_handle_out;
 	n++;
 
+	if (sq_img && img_cap) {
+		cmd.attrs[n].attr_id = RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE_LOCAL;
+		cmd.attrs[n].len = img_cap;
+		cmd.attrs[n].flags = 0;
+		cmd.attrs[n].data = (uintptr_t)sq_img;
+		n++;
+	}
+
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
 
@@ -1004,11 +1033,14 @@ static int rxe_query_qp(int fd, uint32_t qp_handle, struct rxe_restore_qp_req_lo
 /*
  * RDMA_DUMP_UOBJ_QP hook (rxe). The QP twin of
  * rdma_rxe_plugin_dump_uobj_cq(): issues QUERY_QP on @lfd for
- * @ufile_handle and captures the returned rxe_restore_qp_req verbatim
- * as the entry-level plugin_blob (malloc'd; uobj_qp_cb frees it after
- * pb_write_one). The blob is byte-identical to the RESTORE_QP UHW_IN,
- * so restore replays it without re-shaping. Also fills the one
- * hw-agnostic field whose provenance is QUERY_QP rather than NLDEV:
+ * @ufile_handle and packs the returned rxe_restore_qp_req header plus,
+ * for a non-drained QP, the in-flight ring image(s) as the header +
+ * image tail into the entry-level plugin_blob (malloc'd; uobj_qp_cb
+ * frees it after pb_write_one). The tail layout -- header followed by
+ * each image sized by the header's {sq,..}_image_bytes -- is exactly the
+ * RESTORE_QP UHW_IN the kernel's tail slicer expects, so restore replays
+ * the whole blob without re-shaping. Also fills the one hw-agnostic
+ * field whose provenance is QUERY_QP rather than NLDEV:
  * qp_attrs->user_handle. The caller has already stamped the
  * NLDEV-derived qp_attrs (type/state/qpn/psns/port).
  *
@@ -1020,37 +1052,69 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_drive
 {
 	struct rxe_restore_qp_req_local req = {};
 	uint64_t user_handle = 0;
-	void *buf;
+	uint8_t *sq_img = NULL;
+	uint8_t *buf;
+	size_t total, off;
 	int rc;
 
 	(void)kernel_driver_id;
 	(void)pid;
 
-	rc = rxe_query_qp(lfd, ufile_handle, &req, &user_handle);
+	sq_img = malloc(RXE_QP_IMAGE_CAP_LOCAL);
+	if (!sq_img) {
+		pr_err("rxe: dump_uobj_qp: out of memory for image buffers (handle=%u)\n", ufile_handle);
+		return -ENOMEM;
+	}
+
+	rc = rxe_query_qp(lfd, ufile_handle, &req, &user_handle, sq_img, RXE_QP_IMAGE_CAP_LOCAL);
 	if (rc) {
 		pr_err("rxe: dump_uobj_qp: QUERY_QP(handle=%u) on ibdev=%s failed: %d (%s)\n", ufile_handle, ibdev, rc,
 		       strerror(-rc));
-		return rc;
+		goto out;
 	}
 
-	buf = malloc(sizeof(req));
+	/*
+	 * Defence in depth: the kernel already -ENOSPCs an image that
+	 * overflows the advertised cap, but reject a reported length larger
+	 * than the buffer we passed (a report inconsistent with the ioctl).
+	 */
+	if (req.sq_image_bytes > RXE_QP_IMAGE_CAP_LOCAL) {
+		pr_err("rxe: QP handle=%u on ibdev=%s: in-flight image exceeds the %u-byte cap (sq=%u); "
+		       "deep-ring chunking is a kernel-side follow-up\n",
+		       ufile_handle, ibdev, RXE_QP_IMAGE_CAP_LOCAL, req.sq_image_bytes);
+		rc = -E2BIG;
+		goto out;
+	}
+
+	total = sizeof(req) + req.sq_image_bytes;
+	buf = malloc(total);
 	if (!buf) {
 		pr_err("rxe: dump_uobj_qp: out of memory packing plugin_blob (handle=%u, %zu bytes)\n", ufile_handle,
-		       sizeof(req));
-		return -ENOMEM;
+		       total);
+		rc = -ENOMEM;
+		goto out;
 	}
 	memcpy(buf, &req, sizeof(req));
+	off = sizeof(req);
+	if (req.sq_image_bytes) {
+		memcpy(buf + off, sq_img, req.sq_image_bytes);
+		off += req.sq_image_bytes;
+	}
+
 	plugin_blob->data = buf;
-	plugin_blob->len = sizeof(req);
+	plugin_blob->len = total;
 
 	qp_attrs->has_user_handle = true;
 	qp_attrs->user_handle = user_handle;
 
 	pr_info("rxe: dump_uobj_qp: ibdev=%s handle=%u qpn=%u sq_vm_pgoff=%#" PRIx64 " rq_vm_pgoff=%#" PRIx64
-		" psn(sq=%u rq=%u req=%u comp=%u resp=%u) user_handle=%#" PRIx64 " blob=%zu\n",
+		" psn(sq=%u rq=%u req=%u comp=%u resp=%u) img(sq=%u) user_handle=%#" PRIx64 " blob=%zu\n",
 		ibdev, ufile_handle, req.qpn, (uint64_t)req.sq_vm_pgoff, (uint64_t)req.rq_vm_pgoff, req.sq_psn,
-		req.rq_psn, req.req_psn, req.comp_psn, req.resp_psn, (uint64_t)user_handle, sizeof(req));
-	return 0;
+		req.rq_psn, req.req_psn, req.comp_psn, req.resp_psn, req.sq_image_bytes, (uint64_t)user_handle, total);
+	rc = 0;
+out:
+	free(sq_img);
+	return rc;
 }
 
 /*
