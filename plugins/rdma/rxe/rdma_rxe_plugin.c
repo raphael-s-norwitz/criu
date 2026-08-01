@@ -1242,11 +1242,11 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, stru
  * verifies the kernel echoed the same rq offset back. Core owns and
  * frees both buffers after the ioctl.
  *
- * The blob is the fixed-size header plus its declared sq_image_bytes of
- * SQ image tail (zero for a drained QP). An RQ or responder image is
- * rejected here for now -- those tails wire up in the next commits --
- * so the requirement surfaces with a clear per-QP message rather than a
- * mid-restore -EINVAL from the kernel's tail slicer.
+ * The blob is the fixed-size header plus its declared sq_image_bytes /
+ * rq_image_bytes of SQ and RQ image tail (zero for a drained QP). A
+ * responder image is rejected here for now -- that tail wires up in the
+ * next commit -- so the requirement surfaces with a clear per-QP message
+ * rather than a mid-restore -EINVAL from the kernel's tail slicer.
  */
 static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
 {
@@ -1265,21 +1265,21 @@ static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, stru
 	}
 	pb = (const struct rxe_restore_qp_req_local *)e->plugin_blob.data;
 
-	if (pb->rq_image_bytes || pb->res_image_bytes) {
-		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: RQ/responder image unsupported yet (rq=%u "
-		       "res=%u); only the SQ image restores\n",
-		       e->has_ufile_handle ? e->ufile_handle : 0, pb->rq_image_bytes, pb->res_image_bytes);
+	if (pb->res_image_bytes) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: responder image unsupported yet (res=%u); "
+		       "only the SQ and RQ images restore\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, pb->res_image_bytes);
 		return -EOPNOTSUPP;
 	}
 
 	{
-		size_t want = sizeof(*pb) + (size_t)pb->sq_image_bytes;
+		size_t want = sizeof(*pb) + (size_t)pb->sq_image_bytes + pb->rq_image_bytes;
 
 		if (e->plugin_blob.len != want) {
 			pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected %zu (%zuB "
-			       "header + img sq=%u tail)\n",
+			       "header + img sq=%u rq=%u tail)\n",
 			       e->has_ufile_handle ? e->ufile_handle : 0, e->plugin_blob.len, want, sizeof(*pb),
-			       pb->sq_image_bytes);
+			       pb->sq_image_bytes, pb->rq_image_bytes);
 			return -EINVAL;
 		}
 	}
