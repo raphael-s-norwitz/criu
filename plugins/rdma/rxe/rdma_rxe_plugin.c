@@ -1234,20 +1234,21 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, stru
  * emitted into the UVERBS_METHOD_RESTORE_QP udata that core issues.
  *
  * UHW_IN is the plugin_blob verbatim -- the kernel deliberately makes
- * the QUERY_QP RESP_BLOB byte-identical to the RESTORE_QP UHW_IN (both
- * struct rxe_restore_qp_req), so unlike the CQ path there is no
- * re-shaping: the drained wire state (AV / PSNs / cursors / transport
- * knobs / ring vm_pgoffs) replays as captured. UHW_OUT is a 32-byte
+ * the QUERY_QP output byte-identical to the RESTORE_QP UHW_IN (the
+ * struct rxe_restore_qp_req header followed by the in-flight image
+ * tail), so unlike the CQ path there is no re-shaping: the wire state
+ * (AV / PSNs / cursors / transport knobs / ring vm_pgoffs) and any
+ * in-flight images replay as captured. UHW_OUT is a 32-byte
  * rxe_create_qp_resp receive area (the kernel's udata->outbuf minimum)
  * pre-seeded with the requested rq/sq ring offsets so core memcmp-
  * verifies the kernel echoed the same rq offset back. Core owns and
  * frees both buffers after the ioctl.
  *
- * v0 restores a drained QP only: the blob must be exactly the
- * fixed-size header with no in-flight ring image appended, and its
- * *_image_bytes counts must be zero. A non-drained blob is rejected
- * here (the kernel would -EOPNOTSUPP it anyway) so the requirement
- * surfaces with a clear per-QP message rather than a mid-restore errno.
+ * The blob is the fixed-size header plus its declared sq_image_bytes of
+ * SQ image tail (zero for a drained QP). An RQ or responder image is
+ * rejected here for now -- those tails wire up in the next commits --
+ * so the requirement surfaces with a clear per-QP message rather than a
+ * mid-restore -EINVAL from the kernel's tail slicer.
  */
 static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
 {
@@ -1258,22 +1259,33 @@ static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, stru
 	if (!e || !uhw)
 		return -EINVAL;
 
-	if (!e->has_plugin_blob || e->plugin_blob.len != sizeof(*pb)) {
-		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected exactly %zu "
-		       "(drained rxe_restore_qp_req)\n",
+	if (!e->has_plugin_blob || e->plugin_blob.len < sizeof(*pb)) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: plugin_blob len=%zu below the %zu-byte header\n",
 		       e->has_ufile_handle ? e->ufile_handle : 0, e->has_plugin_blob ? e->plugin_blob.len : (size_t)0,
 		       sizeof(*pb));
 		return -EINVAL;
 	}
 	pb = (const struct rxe_restore_qp_req_local *)e->plugin_blob.data;
 
-	if (pb->sq_image_bytes || pb->rq_image_bytes || pb->res_image_bytes) {
-		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: in-flight image unsupported at v0 (sq=%u rq=%u "
-		       "res=%u); only a drained QP restores\n",
-		       e->has_ufile_handle ? e->ufile_handle : 0, pb->sq_image_bytes, pb->rq_image_bytes,
-		       pb->res_image_bytes);
+	if (pb->rq_image_bytes || pb->res_image_bytes) {
+		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: RQ/responder image unsupported yet (rq=%u "
+		       "res=%u); only the SQ image restores\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, pb->rq_image_bytes, pb->res_image_bytes);
 		return -EOPNOTSUPP;
 	}
+
+	{
+		size_t want = sizeof(*pb) + (size_t)pb->sq_image_bytes;
+
+		if (e->plugin_blob.len != want) {
+			pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected %zu (%zuB "
+			       "header + img sq=%u tail)\n",
+			       e->has_ufile_handle ? e->ufile_handle : 0, e->plugin_blob.len, want, sizeof(*pb),
+			       pb->sq_image_bytes);
+			return -EINVAL;
+		}
+	}
+
 	if (pb->qpn == 0) {
 		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: captured qpn is 0 (the kernel installs at the "
 		       "source qpn and rejects 0)\n",
