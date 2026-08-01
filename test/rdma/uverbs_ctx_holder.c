@@ -219,6 +219,73 @@ static int verify_qp(char *msg, size_t msglen)
 	return 0;
 }
 
+/*
+ * Drive g_qp through RESET -> INIT -> RTR -> RTS as a self-loop RC
+ * connection (dest_qp_num == own qpn, dgid == own port GID). No work is
+ * posted, so the SQ/RQ rings stay empty (sq/rq_image_bytes == 0), but an
+ * RC QP that reaches RTR with max_dest_rd_atomic > 0 allocates a
+ * responder-resources table -- exactly the res_image_bytes != 0 case a
+ * connected (but quiesced) ping-pong QP carries, which drained-only
+ * restore cannot round-trip. Used to exercise the in-flight RES image
+ * path under checkpoint/restore. Returns 0 on success, -1 on failure.
+ */
+static int qp_to_rts(struct ibv_qp *qp, uint8_t port)
+{
+	union ibv_gid gid;
+	struct ibv_qp_attr attr;
+
+	if (ibv_query_gid(qp->context, port, 0, &gid)) {
+		fprintf(stderr, "ibv_query_gid: %s\n", strerror(errno));
+		return -1;
+	}
+
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_INIT;
+	attr.pkey_index = 0;
+	attr.port_num = port;
+	attr.qp_access_flags =
+		IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC;
+	if (ibv_modify_qp(qp, &attr,
+			  IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+		fprintf(stderr, "modify_qp(INIT): %s\n", strerror(errno));
+		return -1;
+	}
+
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_RTR;
+	attr.path_mtu = IBV_MTU_1024;
+	attr.dest_qp_num = qp->qp_num;
+	attr.rq_psn = 0;
+	attr.max_dest_rd_atomic = 1;
+	attr.min_rnr_timer = 12;
+	attr.ah_attr.is_global = 1;
+	attr.ah_attr.grh.dgid = gid;
+	attr.ah_attr.grh.sgid_index = 0;
+	attr.ah_attr.grh.hop_limit = 1;
+	attr.ah_attr.port_num = port;
+	if (ibv_modify_qp(qp, &attr,
+			  IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+				  IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
+		fprintf(stderr, "modify_qp(RTR): %s\n", strerror(errno));
+		return -1;
+	}
+
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_RTS;
+	attr.timeout = 14;
+	attr.retry_cnt = 7;
+	attr.rnr_retry = 7;
+	attr.sq_psn = 0;
+	attr.max_rd_atomic = 1;
+	if (ibv_modify_qp(qp, &attr,
+			  IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+				  IBV_QP_MAX_QP_RD_ATOMIC)) {
+		fprintf(stderr, "modify_qp(RTS): %s\n", strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 static void write_status(const char *line)
 {
 	FILE *f;
@@ -318,6 +385,16 @@ int main(int argc, char **argv)
 			fprintf(stderr, "ibv_create_qp: %s\n", strerror(errno));
 			return 2;
 		}
+
+		/*
+		 * HOLDER_QP_CONNECT drives the QP to RTS as a self-loop RC
+		 * connection so it carries a responder-resources table
+		 * (res_image_bytes != 0) -- the connected-but-quiesced case a
+		 * drained-only restore cannot round-trip. Left unset, the QP
+		 * stays in RESET (the drained lone-QP gate).
+		 */
+		if (getenv("HOLDER_QP_CONNECT") && qp_to_rts(g_qp, 1))
+			return 2;
 	}
 
 	signal(SIGTERM, on_sigterm);
