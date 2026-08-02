@@ -605,8 +605,8 @@ static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
  *
  * UVERBS_ID_NS_SHIFT is 12 across the uverbs UAPI; pinned locally so a
  * header drift can't silently shift these ids. RXE_IB_OBJECT_MIGRATE is
- * the first (and only) rxe driver object at (1<<SHIFT)+0; QUERY_CQ is
- * the third method (FREEZE_DATAPATH=+0, QUERY_QP=+1, QUERY_CQ=+2). Keep
+ * the first (and only) rxe driver object at (1<<SHIFT)+0; its methods are
+ * FREEZE_DATAPATH=+0, QUERY_QP=+1, QUERY_CQ=+2, FREEZE_CONTEXT=+3. Keep
  * in sync with the kernel UAPI; remove once host rdma-core ships them.
  */
 #define RXE_UVERBS_ID_NS_SHIFT_LOCAL	     12
@@ -744,6 +744,51 @@ static int rxe_query_cq(int fd, uint32_t cq_handle, struct rxe_query_cq_resp_loc
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * RXE_IB_METHOD_FREEZE_CONTEXT (+3): the ucontext-scoped freeze-all arm
+ * of RXE_IB_OBJECT_MIGRATE. A single handle-less ioctl parks (freeze=1)
+ * or unparks (freeze=0) every user QP owned by the calling uverbs fd,
+ * driving the same per-QP rxe_qp_pause/resume as the per-QP
+ * FREEZE_DATAPATH. Keep in sync with the kernel UAPI; remove once host
+ * rdma-core ships rxe_user_ioctl_cmds.h.
+ */
+#define RXE_IB_METHOD_FREEZE_CONTEXT_LOCAL	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 3)
+#define RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+
+/*
+ * Issue RXE_IB_METHOD_FREEZE_CONTEXT on @fd (a uverbs cdev fd carrying
+ * the ucontext whose QPs to act on): park (@freeze=true) or unpark
+ * (@freeze=false) every user QP that ucontext owns. The lone FREEZE attr
+ * is a PTR_IN u8; at len 1 it is inline (len <= sizeof(ib_uverbs_attr.
+ * data)), so its value rides in the data field rather than behind a
+ * pointer. Idempotent and order-independent (both arms drive the per-QP
+ * pause/resume).
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+static int rxe_freeze_context(int fd, bool freeze)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[1];
+	} cmd = {};
+
+	cmd.hdr.object_id = RXE_IB_OBJECT_MIGRATE_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_FREEZE_CONTEXT_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd.hdr) + sizeof(cmd.attrs[0]);
+
+	cmd.attrs[0].attr_id = RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE_LOCAL;
+	cmd.attrs[0].len = sizeof(uint8_t);
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = freeze ? 1 : 0;
 
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;
@@ -1390,6 +1435,123 @@ static int rdma_rxe_plugin_update_vma_map(const char *path, const uint64_t addr,
 	return 1;
 }
 
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_getfd
+#define __NR_pidfd_getfd 438
+#endif
+
+static int rxe_pidfd_open(pid_t pid)
+{
+	return syscall(__NR_pidfd_open, pid, 0);
+}
+
+static int rxe_pidfd_getfd(int pidfd, int targetfd)
+{
+	return syscall(__NR_pidfd_getfd, pidfd, targetfd, 0);
+}
+
+/*
+ * RESUME_DEVICES_LATE hook (rxe). RESTORE_QP installs every restored QP
+ * datapath-frozen (the kernel rxe_qp_pause on the restore path), so no
+ * traffic flows until CRIU thaws. We issue FREEZE_CONTEXT(freeze=0) once
+ * per restored ucontext; the kernel's rxe_qp_resume() re-arms the worker
+ * tasks (and, for an RTS QP with a non-empty SQ, replays the rewound
+ * in-flight window).
+ *
+ * This runs in the criu master, but the born-frozen ucontexts live in
+ * the forked restored task: open_uverbs_cdev (which mints the
+ * GET_CONTEXT(restore) ucontext) runs post-fork during the task's
+ * prepare_fds, so the master's rxe_cdev_cache is empty here and a
+ * cache-walk thaws nothing. Instead reach the task's real ucontext fds
+ * the way the dump side does -- pidfd_open(@pid) + pidfd_getfd() steals a
+ * dup of the SAME struct file (ucontext intact), whereas a fresh cdev
+ * open would mint a ucontext-less ib_uverbs_file that FREEZE_CONTEXT
+ * -EINVALs. Walk /proc/<pid>/fd, filter to rxe uverbs cdevs, and thaw
+ * each. RESUME_DEVICES_LATE fires after the pie placed the VMAs and
+ * registered the MRs but before the tasks are released, the correct
+ * post-everything / pre-resume barrier.
+ *
+ * Best-effort: a thaw failure is logged (the workload stalls on that
+ * ucontext) but the hook still returns 0 -- the QP is otherwise fully
+ * restored, and core treats the return as advisory anyway.
+ */
+static int rdma_rxe_plugin_resume_devices_late(int pid)
+{
+	char fdpath[64];
+	DIR *d;
+	int dfd, pidfd;
+	struct dirent *de;
+	int thawed = 0, failed = 0;
+
+	if (!rxe_active)
+		return -ENOTSUP;
+
+	snprintf(fdpath, sizeof(fdpath), "/proc/%d/fd", pid);
+	d = opendir(fdpath);
+	if (!d) {
+		pr_perror("rxe: resume_late: opendir(%s)", fdpath);
+		return -ENOTSUP;
+	}
+	dfd = dirfd(d);
+
+	pidfd = rxe_pidfd_open(pid);
+	if (pidfd < 0) {
+		pr_perror("rxe: resume_late: pidfd_open(%d)", pid);
+		closedir(d);
+		return -ENOTSUP;
+	}
+
+	while ((de = readdir(d)) != NULL) {
+		char ibdev[64];
+		struct stat st;
+		int target_fd, local_fd, rc;
+
+		if (de->d_name[0] == '.')
+			continue;
+		target_fd = atoi(de->d_name);
+		if (target_fd <= 0)
+			continue;
+
+		/*
+		 * fstatat() follows the /proc/<pid>/fd/N symlink (no
+		 * AT_SYMLINK_NOFOLLOW) so st_rdev names the device node the
+		 * fd resolves to; rxe_match_cdev_vma() keeps only S_ISCHR
+		 * uverbs cdevs whose ibdev resolves to rxe.
+		 */
+		if (fstatat(dfd, de->d_name, &st, 0) < 0)
+			continue;
+		if (rxe_match_cdev_vma(&st, ibdev, sizeof(ibdev)) != 0)
+			continue;
+
+		local_fd = rxe_pidfd_getfd(pidfd, target_fd);
+		if (local_fd < 0) {
+			pr_perror("rxe: resume_late: pidfd_getfd(pid=%d fd=%d ibdev=%s)", pid, target_fd, ibdev);
+			failed++;
+			continue;
+		}
+
+		rc = rxe_freeze_context(local_fd, false);
+		close(local_fd);
+		if (rc) {
+			pr_err("rxe: resume_late: FREEZE_CONTEXT(freeze=0) pid=%d fd=%d ibdev=%s failed: %d (%s); "
+			       "restored QP datapath left frozen -- the workload will stall on this ucontext\n",
+			       pid, target_fd, ibdev, rc, strerror(-rc));
+			failed++;
+			continue;
+		}
+		pr_info("rxe: resume_late: thawed restored ucontext (pid=%d fd=%d ibdev=%s)\n", pid, target_fd, ibdev);
+		thawed++;
+	}
+
+	close(pidfd);
+	closedir(d);
+
+	pr_debug("rxe: resume_late: pid=%d thawed=%d failed=%d\n", pid, thawed, failed);
+	return 0;
+}
+
 CR_PLUGIN_REGISTER("rdma_rxe_plugin", rdma_rxe_plugin_init,
 		   rdma_rxe_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
@@ -1408,6 +1570,8 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK,
 			rdma_rxe_plugin_restore_uobj_qp_uhw_pack)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP,
 			rdma_rxe_plugin_update_vma_map)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE,
+			rdma_rxe_plugin_resume_devices_late)
 
 /*
  * RDMA provided driver: RCD_RXE.
