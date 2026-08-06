@@ -39,12 +39,19 @@ syntax = "proto2";
  * keep generated identifiers from double-prefixing into illegibility.
  */
 enum rdma_criu_driver {
-	RCD_UNKNOWN	= 0;
-	RCD_RXE		= 1;
+	RCD_UNKNOWN		= 0;
+	RCD_RXE			= 1;
 	/*
-	 * mlx5 SR-IOV VF-migration enumerants (RCD_MLX5_SRIOV_VFMIG et al.)
-	 * are added with the mlx5 plugin in a later round; the enum is
-	 * append-only, so they slot in at the next free integer without
-	 * disturbing RCD_RXE.
+	 * Host-driven mlx5 SR-IOV VF migration: the plugin at
+	 * plugins/rdma/mlx5_sriov_vfmig/ save/restores a VF's firmware
+	 * state via the per-PF /dev/mlx5_vfmig cdev and shapes its RDMA
+	 * uverbs objects with mlx5-specific UHW.
+	 */
+	RCD_MLX5_SRIOV_VFMIG	= 2;
+	/*
+	 * Reserved for the future fw-assisted IB-resource replay strategy
+	 * (a distinct plugin over the same mlx5_core ibdev). The enum is
+	 * append-only, so it slots in at the next free integer when it
+	 * lands, without disturbing the values above.
 	 */
 };
