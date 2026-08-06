@@ -175,7 +175,7 @@ HOSTCFLAGS		+= $(WARNINGS) $(DEFINES) -iquote include/
 export AFLAGS CFLAGS USERCLFAGS HOSTCFLAGS
 
 # Default target
-all: criu lib crit cuda_plugin rdma_rxe_plugin
+all: criu lib crit cuda_plugin rdma_rxe_plugin rdma_mlx5_vfmig_plugin
 .PHONY: all
 
 #
@@ -317,6 +317,10 @@ clean-rdma_rxe_plugin:
 	$(Q) $(MAKE) -C plugins/rdma/rxe clean
 .PHONY: clean-rdma_rxe_plugin
 
+clean-rdma_mlx5_vfmig_plugin:
+	$(Q) $(MAKE) -C plugins/rdma/mlx5_sriov_vfmig clean
+.PHONY: clean-rdma_mlx5_vfmig_plugin
+
 clean-top:
 	$(Q) $(MAKE) -C Documentation clean
 	$(Q) $(MAKE) -C soccr/test clean
@@ -324,9 +328,9 @@ clean-top:
 	$(Q) $(RM) .gitid
 .PHONY: clean-top
 
-clean: clean-top clean-amdgpu_plugin clean-cuda_plugin clean-rdma_rxe_plugin
+clean: clean-top clean-amdgpu_plugin clean-cuda_plugin clean-rdma_rxe_plugin clean-rdma_mlx5_vfmig_plugin
 
-mrproper-top: clean-top clean-amdgpu_plugin clean-cuda_plugin clean-rdma_rxe_plugin
+mrproper-top: clean-top clean-amdgpu_plugin clean-cuda_plugin clean-rdma_rxe_plugin clean-rdma_mlx5_vfmig_plugin
 	$(Q) $(RM) $(CONFIG_HEADER)
 	$(Q) $(RM) $(VERSION_HEADER)
 	$(Q) $(RM) $(COMPEL_VERSION_HEADER)
@@ -365,6 +369,10 @@ cuda_plugin: criu
 rdma_rxe_plugin: criu
 	$(Q) $(MAKE) -C plugins/rdma/rxe all
 .PHONY: rdma_rxe_plugin
+
+rdma_mlx5_vfmig_plugin: criu
+	$(Q) $(MAKE) -C plugins/rdma/mlx5_sriov_vfmig all
+.PHONY: rdma_mlx5_vfmig_plugin
 
 crit: lib
 	$(Q) $(MAKE) -C crit
