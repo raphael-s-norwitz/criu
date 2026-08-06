@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+#
+# pre-commit hook (kernel + criu rebase worktrees).
+#
+# Repo-aware C/header style gate on the staged diff:
+#
+#   - kernel repo -> checkpatch --strict; blocks unless FULLY clean
+#     (0 errors, 0 warnings, 0 checks).
+#   - criu repo   -> git clang-format against .clang-format; blocks if
+#     the staged changes are not already clang-format clean. criu's own
+#     policy is clang-format (see CONTRIBUTING.md / `make indent`), NOT
+#     checkpatch -- criu is userspace and "less strict than the kernel",
+#     so checkpatch produces false positives (uint32_t vs u32, SPDX
+#     style, BIT() in vendored UAPI headers, ...).
+#
+# The repo is identified by the presence of scripts/checkpatch.pl: the
+# kernel tree ships one, criu does not.
+#
+# Bypass with:  git commit --no-verify
+#
+set -u
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+# ---------------------------------------------------------------------------
+# criu repo: clang-format gate.
+# ---------------------------------------------------------------------------
+if [ ! -x "$ROOT/scripts/checkpatch.pl" ]; then
+	if ! command -v git-clang-format >/dev/null 2>&1; then
+		echo "pre-commit: git-clang-format not found; skipping clang-format gate." >&2
+		exit 0
+	fi
+
+	# Staged code files only (skip docs/plans/etc.).
+	mapfile -t FILES < <(git diff --cached --name-only --diff-filter=ACMR -- '*.c' '*.h')
+	[ "${#FILES[@]}" -eq 0 ] && exit 0
+
+	# Drop vendored kernel UAPI mirrors (any */uapi/* path): those are
+	# kept byte-identical to the kernel source, so criu's .clang-format
+	# must not rewrite them (the plugin Makefiles warn on drift instead).
+	CF_FILES=()
+	for f in "${FILES[@]}"; do
+		case "$f" in
+		*/uapi/*) continue ;;
+		esac
+		CF_FILES+=("$f")
+	done
+	[ "${#CF_FILES[@]}" -eq 0 ] && exit 0
+
+	# --diff shows what clang-format would change on the *staged* content
+	# (changed lines only, per .clang-format) without applying it.
+	out="$(git clang-format --style file --extensions c,h --staged --diff -- "${CF_FILES[@]}" 2>/dev/null)"
+
+	case "$out" in
+	"" | *"no modified files to format"* | *"clang-format did not modify any files"*)
+		exit 0
+		;;
+	esac
+
+	printf '%s\n' "$out" >&2
+	echo >&2
+	echo "pre-commit: staged C changes are not clang-format clean." >&2
+	echo "Run 'make indent' (or 'git clang-format --staged'), re-stage, and retry." >&2
+	echo "Bypass with: git commit --no-verify" >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# kernel repo: checkpatch --strict gate.
+# ---------------------------------------------------------------------------
+CHECKPATCH="$ROOT/scripts/checkpatch.pl"
+TREE_ARGS=(--root="$ROOT")
+
+# Staged code files only (skip docs/plans/etc.).
+mapfile -t FILES < <(git diff --cached --name-only --diff-filter=ACMR -- '*.c' '*.h' '*.S')
+[ "${#FILES[@]}" -eq 0 ] && exit 0
+
+diff_tmp="$(mktemp)"
+trap 'rm -f "$diff_tmp"' EXIT
+git diff --cached -- "${FILES[@]}" > "$diff_tmp"
+[ -s "$diff_tmp" ] || exit 0
+
+report="$("$CHECKPATCH" --strict --no-signoff --ignore=FILE_PATH_CHANGES "${TREE_ARGS[@]}" - < "$diff_tmp" 2>&1)"
+rc=$?
+
+total_line="$(printf '%s\n' "$report" | grep -E '^total: [0-9]' | tail -1)"
+if [ -n "$total_line" ]; then
+	e="$(printf '%s' "$total_line" | sed -n 's/^total: \([0-9]\{1,\}\) errors.*/\1/p')"
+	w="$(printf '%s' "$total_line" | sed -n 's/^total: [0-9]\{1,\} errors, \([0-9]\{1,\}\) warnings.*/\1/p')"
+	c="$(printf '%s' "$total_line" | sed -n 's/.*, \([0-9]\{1,\}\) checks,.*/\1/p')"
+	e=${e:-0}; w=${w:-0}; c=${c:-0}
+	if [ "$e" -gt 0 ] || [ "$w" -gt 0 ] || [ "$c" -gt 0 ]; then
+		printf '%s\n' "$report" >&2
+		echo >&2
+		echo "pre-commit: checkpatch not clean ($e errors, $w warnings, $c checks)." >&2
+		echo "Fix the issues, or bypass with: git commit --no-verify" >&2
+		exit 1
+	fi
+	exit 0
+fi
+
+# No parseable summary: defer to checkpatch's own exit status.
+if [ "$rc" -ne 0 ]; then
+	printf '%s\n' "$report" >&2
+	echo "pre-commit: checkpatch failed (rc=$rc). Bypass with: git commit --no-verify" >&2
+	exit 1
+fi
+exit 0
