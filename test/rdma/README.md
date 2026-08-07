@@ -27,6 +27,28 @@ enough for a proper zdtm test.
   and the pie restorer reinstalls it at its ufile handle after the
   buffer VMA is laid out, which the post-restore content + `dereg_mr`
   check proves is live (byte-identical lkey/rkey asserted by the pie).
+- `run_vfmig_presence.sh` -- smoke gate for the `rdma_mlx5_vfmig`
+  plugin at its early bring-up stage, where it can only detect
+  migration-capable VFs and claim their uverbs contexts -- it does not
+  yet snapshot or restore any device state. This is NOT a
+  checkpoint/restore round-trip (the full C/R harness needs tracked VFs
+  + the kernel deterministic-IOVA path); it validates the two live
+  behaviours:
+    - Tier 1 (presence, always): dumps a trivial victim with only the
+      mlx5 plugin loaded and asserts the plugin loaded, probed each
+      `/dev/mlx5_vfmig/<bdf>` cdev via `QUERY_VF`, and reached an
+      active/inactive verdict consistent with the host (PF count ==
+      #cdevs, summed per-cdev `tracked` == the verdict's count). On a
+      host with no tracked VFs the expected verdict is INACTIVE.
+    - Tier 2 (claim decline, auto when `rxe` is available; force with
+      `VFMIG_GATE_CLAIM=1`, skip with `=0`): dumps an rxe context with
+      BOTH plugins loaded and asserts the core exactly-one-claim
+      arbitration invoked the mlx5 plugin's claim hook for the rxe
+      ibdev and it DECLINED (rxe wins, no conflict). Exercises the
+      claim path's negative branch without a tracked mlx5 VF.
+  Victims are launched via `systemd-run --scope` so they don't inherit
+  the caller's fds (a bare child inherits a unix control socket criu
+  can't dump).
 
 ## Run
 
@@ -38,6 +60,8 @@ sudo CRIU=/usr/local/sbin/criu test/rdma/run_uverbs_cr.sh [<netdev>]
 sudo CRIU=/usr/local/sbin/criu test/rdma/run_pd_cr.sh [<netdev>]
 # same, plus an MR round-trip (RESTORE_MR dev gate):
 sudo CRIU=/usr/local/sbin/criu test/rdma/run_mr_cr.sh [<netdev>]
+# mlx5_vfmig plugin bring-up gate (presence detection + claim decline):
+sudo CRIU=/usr/local/sbin/criu test/rdma/run_vfmig_presence.sh [<netdev>]
 ```
 
 `<netdev>` defaults to the first up IPv4 netdev.
