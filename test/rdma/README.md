@@ -49,6 +49,17 @@ enough for a proper zdtm test.
   Victims are launched via `systemd-run --scope` so they don't inherit
   the caller's fds (a bare child inherits a unix control socket criu
   can't dump).
+- `vfmig_image_test.c` + `run_vfmig_image_test.sh` -- no-hardware unit
+  test for the `rdma_mlx5_vfmig` plugin's on-disk image helpers
+  (`vf_image.c`). Needs no tracked VF, no running criu, and no plugin
+  `.so`: it compiles `vf_image.c` and the generated image pb-c straight
+  into a test binary, points the plugin's image-dir override at a temp
+  directory, and round-trips length-prefixed state records + a firmware
+  blob through the real code (missing-image, two-entry field-by-field
+  round-trip, all-zero-`vf_uuid` refusal, and `SAVE`-fd drain size +
+  byte-identity). This is the earliest functional validation of the
+  VF-firmware-state build-up -- the image format is exercisable before
+  any tracked VF exists.
 
 ## Run
 
@@ -62,6 +73,8 @@ sudo CRIU=/usr/local/sbin/criu test/rdma/run_pd_cr.sh [<netdev>]
 sudo CRIU=/usr/local/sbin/criu test/rdma/run_mr_cr.sh [<netdev>]
 # mlx5_vfmig plugin bring-up gate (presence detection + claim decline):
 sudo CRIU=/usr/local/sbin/criu test/rdma/run_vfmig_presence.sh [<netdev>]
+# mlx5_vfmig image-format unit test (no hardware, no sudo):
+test/rdma/run_vfmig_image_test.sh
 ```
 
 `<netdev>` defaults to the first up IPv4 netdev.
