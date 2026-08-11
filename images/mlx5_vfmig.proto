@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: MIT
+
+/*
+ * Plugin-private image schema for the mlx5_sriov_vfmig CRIU plugin.
+ *
+ * Lives under criu/images/ rather than under plugins/rdma/mlx5_sriov_vfmig/
+ * for two reasons:
+ *   1. The pb-c headers go through the same protoc + dependency-tracking
+ *      pipeline as the rest of the criu image schema, so the plugin can
+ *      just `#include "images/mlx5_vfmig.pb-c.h"` like any other image
+ *      record.
+ *   2. `crit decode` learns the schema for free, so an operator
+ *      debugging an mlx5_vfmig dump can inspect the per-VF records
+ *      without running the plugin's restore-side reader.
+ *
+ * Image layout written by the plugin's dump path:
+ *
+ *   <img-dir>/mlx5_vfmig.img
+ *       Sequence of length-prefixed mlx5_vfmig_state_entry records
+ *       (one per dumped VF-backed uverbs context). The plugin writes
+ *       records in dump order; the restore side reads them all up front.
+ *
+ *   <img-dir>/mlx5_vfmig-pf<bdf>-vf<id>.blob
+ *       Raw firmware-state blob produced by
+ *       MLX5_VFMIG_IOC_SAVE_VHCA_STATE { vf_id, KEEP_SUSPENDED }.
+ *       One blob per (pf_bdf, vf_id) tuple. Multiple contexts on the
+ *       same VF reference the same blob -- the SAVE is at VF
+ *       granularity, not per-context.
+ *
+ * This is the VF-firmware-state (device-level) schema. The uverbs
+ * context / ib_uobject restore layer is a separate, later step; the
+ * fields that layer needs (the ucontext UAR snapshot) are intentionally
+ * NOT part of this schema yet and will be added append-only when that
+ * layer lands, without breaking images written today.
+ */
+
+syntax = "proto2";
+
+message mlx5_vfmig_state_entry {
+	/*
+	 * uverbs context number, from /proc/<pid>/fdinfo of the
+	 * source uverbs cdev. Recorded so a future context-restore
+	 * layer can use it as the join key against the generic
+	 * uverbs_file_entry; the VF-firmware layer treats it as
+	 * diagnostic.
+	 */
+	required uint32		ctxn		= 1;
+
+	/*
+	 * ibdev name as resolved on the source (e.g. "mlx5_2").
+	 * Diagnostic + integrity cross-check only; the destination's
+	 * ibdev for the same VF may differ and is re-resolved from
+	 * the (pf_bdf, vf_id) tuple at restore time.
+	 */
+	required string		ibdev		= 2;
+
+	/*
+	 * Source PF BDF (e.g. "0000:08:00.0"). Diagnostic only on
+	 * restore (the destination's PF BDF will differ on another
+	 * host); indispensable when triaging which source VF a
+	 * snapshot came from.
+	 */
+	required string		pf_bdf		= 3;
+
+	/*
+	 * Source vf_id within its PF, in the same numbering the
+	 * MLX5_VFMIG_IOC_* ioctls use. Diagnostic only on restore
+	 * (the destination vf_id is whatever the orchestrator
+	 * allocates).
+	 */
+	required uint32		vf_id		= 4;
+
+	/*
+	 * Source vhca_id captured at SAVE time (from
+	 * MLX5_VFMIG_IOC_GET_VHCA_ID). The destination's vhca_id
+	 * after LOAD_VHCA_STATE is allocated by the destination's
+	 * firmware and will differ; recorded for a before/after
+	 * diagnostic pair.
+	 */
+	required uint32		vhca_id		= 5;
+
+	/*
+	 * Basename (relative to the CRIU image dir) of the firmware
+	 * blob file holding the SAVE_VHCA_STATE byte stream for
+	 * (pf_bdf, vf_id). Multiple entries may share a blob_path --
+	 * one VF, multiple contexts.
+	 */
+	required string		blob_path	= 6;
+
+	/*
+	 * Byte length of the blob file. Restore uses this to size
+	 * the LOAD_VHCA_STATE write up front.
+	 */
+	required uint64		blob_size	= 7;
+
+	/*
+	 * Source-side cdev path (e.g. "/dev/infiniband/uverbs2") of
+	 * the uverbs cdev this context was opened against on the
+	 * source. Diagnostic for the VF-firmware layer; becomes a
+	 * join key for the later device-VMA remap layer.
+	 */
+	required string		source_cdev_path	= 8;
+
+	/*
+	 * Orchestrator-stamped per-VF UUID. 16 raw bytes, captured at
+	 * dump time via MLX5_VFMIG_IOC_QUERY_VF on the source PF
+	 * cdev. Must be present and non-zero in every record: the
+	 * dump path refuses to write an entry whose source VF's
+	 * vf_uuid reads back all-zeros, on the assumption the
+	 * orchestrator stamped a stable identity onto the VF before
+	 * workload bind.
+	 *
+	 * The orchestrator owns the UUID; CRIU never calls
+	 * MLX5_VFMIG_IOC_SET_VF_UUID. The restore path iterates
+	 * eligible destination PFs/VFs and binds this record to
+	 * whichever VF QUERY_VF reports a matching vf_uuid. Required
+	 * because there is no fallback identity (vhca_id is not
+	 * stable across SAVE/LOAD; vf_id and pf_bdf are
+	 * orchestrator-assignable on the destination).
+	 */
+	required bytes		vf_uuid		= 9;
+}
