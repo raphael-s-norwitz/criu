@@ -14,14 +14,17 @@
  *     bit that gates the per-VF unmanaged IOMMU domain + deterministic
  *     IOVA allocator on the destination, so an untracked VF cannot
  *     round-trip a SAVE/LOAD blob even with its migratable bit set.
- *   - this commit: the per-context claim hook. Given a uverbs
- *     context's ibdev, resolve ibdev -> VF BDF -> PF BDF -> vf_id and
- *     re-check QUERY_VF tracked=1; on success claim the context as
- *     RCD_MLX5_SRIOV_VFMIG. The matching provided-driver + sharing
- *     declarations let dump-time arbitration route this driver's
- *     contexts to this plugin. Still no dump/restore hooks -- a claim
- *     only asserts ownership; the actual capture lands next.
- *   - next: the dump/restore hooks.
+ *   - the per-context claim hook. Given a uverbs context's ibdev,
+ *     resolve ibdev -> VF BDF -> PF BDF -> vf_id and re-check QUERY_VF
+ *     tracked=1; on success claim the context as RCD_MLX5_SRIOV_VFMIG.
+ *     The matching provided-driver + sharing declarations let dump-time
+ *     arbitration route this driver's contexts to this plugin.
+ *   - this commit: the claimed-VF cache (vfmig_dump.c). A successful
+ *     claim records (ibdev, pf_bdf, vf_id) into a dedup'd set so the
+ *     dump-side hooks added next can act on exactly the VFs backing the
+ *     snapshot tree without re-walking sysfs. A claim still only
+ *     asserts ownership; the actual capture lands next.
+ *   - next: the dump/restore hooks (SAVE on dump, LOAD on restore).
  *
  * Vendored UAPI header:
  *   The plugin compiles against plugins/rdma/mlx5_sriov_vfmig/uapi/
@@ -75,6 +78,7 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 	vfmig_active = false;
 	vfmig_tracked_vf_count = 0;
 	vfmig_pf_count = 0;
+	vfmig_claimed_clear();
 
 	d = opendir(MLX5_VFMIG_DEV_DIR);
 	if (!d) {
@@ -123,6 +127,7 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 {
 	pr_info("fini (stage %d ret %d): was %s, %d tracked VF(s) across %d PF(s)\n", stage, ret,
 		vfmig_active ? "active" : "inactive", vfmig_tracked_vf_count, vfmig_pf_count);
+	vfmig_claimed_clear();
 }
 
 /*
@@ -219,6 +224,14 @@ static int rdma_mlx5_vfmig_plugin_claim_uverbs_context(const char *ibdev, uint32
 
 	pr_info("claim(%s, vf_bdf=%s, pf=%s, vf_id=%d): claiming as RCD_MLX5_SRIOV_VFMIG\n", ibdev, vf_bdf, pf_bdf,
 		vf_id);
+
+	/*
+	 * Record the VF we just won the claim for. The dump-side hooks
+	 * added in later commits (CHECKPOINT_DEVICES suspend, fini(DUMP)
+	 * SAVE drain) consume this set; the cache dedups by (pf_bdf,
+	 * vf_id) so multiple contexts on the same VF record once.
+	 */
+	vfmig_claimed_add(ibdev, pf_bdf, (uint32_t)vf_id);
 	return RDMA_CRIU_DRIVER__RCD_MLX5_SRIOV_VFMIG;
 }
 
