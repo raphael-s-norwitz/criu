@@ -19,12 +19,15 @@
  *     tracked=1; on success claim the context as RCD_MLX5_SRIOV_VFMIG.
  *     The matching provided-driver + sharing declarations let dump-time
  *     arbitration route this driver's contexts to this plugin.
- *   - this commit: the claimed-VF cache (vfmig_dump.c). A successful
- *     claim records (ibdev, pf_bdf, vf_id) into a dedup'd set so the
- *     dump-side hooks added next can act on exactly the VFs backing the
- *     snapshot tree without re-walking sysfs. A claim still only
- *     asserts ownership; the actual capture lands next.
- *   - next: the dump/restore hooks (SAVE on dump, LOAD on restore).
+ *   - the claimed-VF cache (vfmig_dump.c). A successful claim records
+ *     (ibdev, pf_bdf, vf_id) into a dedup'd set so the dump-side drain
+ *     can act on exactly the VFs backing the snapshot tree without
+ *     re-walking sysfs.
+ *   - this commit: SAVE on dump. fini(DUMP) drains the claimed set,
+ *     runs SAVE_VHCA_STATE per VF, writes one firmware blob per VF plus
+ *     one Mlx5VfmigStateEntry per VF into the image dir. Still no
+ *     restore-side hooks -- LOAD lands next.
+ *   - next: the restore path (LOAD + MARK_RESTORED + bind).
  *
  * Vendored UAPI header:
  *   The plugin compiles against plugins/rdma/mlx5_sriov_vfmig/uapi/
@@ -125,6 +128,18 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 
 static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 {
+	/*
+	 * Drain the SAVE queue at the very end of dump, and only when the
+	 * rest of CRIU's dump pipeline succeeded (ret == 0). SAVE_VHCA_STATE
+	 * is the most invasive thing this plugin does to the host; firing it
+	 * for a dump that has already been declared lost would suspend VFs
+	 * and produce blobs that can never be paired with a restorable
+	 * image. On the RESTORE stage the claimed set is empty, so the drain
+	 * is a no-op there too.
+	 */
+	if (stage == CR_PLUGIN_STAGE__DUMP && ret == 0)
+		vfmig_drain_claimed_in_fini();
+
 	pr_info("fini (stage %d ret %d): was %s, %d tracked VF(s) across %d PF(s)\n", stage, ret,
 		vfmig_active ? "active" : "inactive", vfmig_tracked_vf_count, vfmig_pf_count);
 	vfmig_claimed_clear();

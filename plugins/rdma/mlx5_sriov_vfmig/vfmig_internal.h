@@ -28,6 +28,7 @@
 int probe_pf_cdev(const char *path);
 int resolve_pci_bdf_via_symlink(const char *sysfs_link_path, char *out, size_t outsz);
 int find_vf_id_under_pf(const char *pf_bdf, const char *vf_bdf);
+int find_uverbs_cdev_for_ibdev(const char *ibdev, char *out, size_t outsz);
 
 /*
  * Process-global activation flag. Set true by init() iff at least one
@@ -59,6 +60,15 @@ extern bool vfmig_active;
  */
 void vfmig_claimed_add(const char *ibdev, const char *pf_bdf, uint32_t vf_id);
 void vfmig_claimed_clear(void);
+
+/*
+ * Dump-side SAVE drain. Called from fini(DUMP) on a successful dump:
+ * walks the claimed-VF set, runs SAVE_VHCA_STATE per VF, drains each
+ * blob to the image dir, and appends one Mlx5VfmigStateEntry per VF to
+ * mlx5_vfmig.img. Deferred to fini so the invasive SAVE runs only after
+ * the rest of the dump has succeeded.
+ */
+void vfmig_drain_claimed_in_fini(void);
 
 /*
  * vf_image.c -- on-disk image format helpers. Take primitives + raw

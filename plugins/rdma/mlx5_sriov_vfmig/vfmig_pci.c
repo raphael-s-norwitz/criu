@@ -161,3 +161,35 @@ int find_vf_id_under_pf(const char *pf_bdf, const char *vf_bdf)
 	closedir(d);
 	return vf_id;
 }
+
+/*
+ * Resolve an ibdev name (e.g. "mlx5_2") to its uverbs character-device
+ * path (e.g. "/dev/infiniband/uverbs2"). The uverbsN node lives under
+ * /sys/class/infiniband/<ibdev>/device/infiniband_verbs/uverbsN.
+ * Returns 0 on success with @out populated, -1 if no uverbs node is
+ * found (diagnostic-only for the VF-firmware image, so callers treat a
+ * miss as non-fatal rather than failing the dump).
+ */
+int find_uverbs_cdev_for_ibdev(const char *ibdev, char *out, size_t outsz)
+{
+	char path[PATH_MAX];
+	struct dirent *de;
+	DIR *d;
+	int rc = -1;
+
+	snprintf(path, sizeof(path), "/sys/class/infiniband/%s/device/infiniband_verbs", ibdev);
+	d = opendir(path);
+	if (!d)
+		return -1;
+
+	while ((de = readdir(d)) != NULL) {
+		if (strncmp(de->d_name, "uverbs", 6) != 0)
+			continue;
+		snprintf(out, outsz, "/dev/infiniband/%s", de->d_name);
+		rc = 0;
+		break;
+	}
+
+	closedir(d);
+	return rc;
+}
