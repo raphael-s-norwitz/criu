@@ -57,7 +57,21 @@ case "$subject" in
 	'Merge '*|'Revert "'*|'fixup! '*|'squash! '*|'amend! '*) exit 0 ;;
 esac
 
-is_trailer() { [[ "$1" =~ ^[A-Za-z][A-Za-z0-9-]*:[[:space:]] ]]; }
+# Recognised git commit trailer keys -- "Key: value" lines that belong in
+# the trailer block rather than the prose body. Matched case-insensitively
+# against the token before the first colon. This is deliberately an
+# allowlist and NOT a generic "^Word: " match: ordinary sentences that
+# happen to start with a capitalised word and a colon (e.g. a wrapped body
+# line beginning "VFs: no successful claim ...") must NOT be mistaken for
+# trailers, or the blank line separating the body from the trailer block
+# gets dropped and long body lines wrongly skip the wrap check.
+TRAILER_KEYS_RE='^(signed-off-by|assisted-by|co-authored-by|co-developed-by|reviewed-by|acked-by|tested-by|reported-by|suggested-by|requested-by|reviewed-on|cc|link|links|closes|fixes|references|reference|depends-on|change-id|message-id|buglink|resolves|see-also):[[:space:]]'
+
+is_trailer() {
+	local lower
+	lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+	[[ "$lower" =~ $TRAILER_KEYS_RE ]]
+}
 
 longest_word() {
 	local w max=0
