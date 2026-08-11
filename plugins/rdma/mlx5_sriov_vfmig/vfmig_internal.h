@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * vfmig_pci.c -- PCI / sysfs / per-PF cdev probe + resolution helpers.
@@ -40,5 +41,21 @@ extern bool vfmig_active;
  * cdev paths under it. Defined here so all .c files agree.
  */
 #define MLX5_VFMIG_DEV_DIR "/dev/mlx5_vfmig"
+
+/*
+ * vfmig_dump.c -- dump-side plugin state.
+ *
+ * The claimed-VF cache. The claim hook (which core RDMA dump-time
+ * arbitration runs over every snapshot-tree context) already resolves
+ * each context's (pf_bdf, vf_id) and confirms QUERY_VF.tracked=1;
+ * vfmig_claimed_add() records each VF we win the claim for so the
+ * dump-side hooks added in later commits (CHECKPOINT_DEVICES suspend,
+ * fini(DUMP) SAVE drain) can act on exactly that set without re-walking
+ * /proc/<pid>/fd or re-querying sysfs. Deduplicated by (pf_bdf, vf_id)
+ * since a VF can back several contexts. Reset by init()/fini() via
+ * vfmig_claimed_clear().
+ */
+void vfmig_claimed_add(const char *ibdev, const char *pf_bdf, uint32_t vf_id);
+void vfmig_claimed_clear(void);
 
 #endif /* __CR_VFMIG_INTERNAL_H__ */
