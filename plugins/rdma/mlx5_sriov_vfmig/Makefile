@@ -49,6 +49,7 @@ PLUGIN_CFLAGS := -g -Wall -Werror -shared -nostartfiles -fPIC
 #
 PLUGIN_SRCS := rdma_mlx5_vfmig_plugin.c
 PLUGIN_SRCS += vfmig_pci.c
+PLUGIN_SRCS += vfmig_dump.c
 
 __nmk_dir ?= ../../../scripts/nmk/scripts/
 include $(__nmk_dir)msg.mk
