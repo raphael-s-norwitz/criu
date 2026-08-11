@@ -12,6 +12,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "images/mlx5_vfmig.pb-c.h"
+
 /*
  * vfmig_pci.c -- PCI / sysfs / per-PF cdev probe + resolution helpers.
  * Pure name resolution, no plugin state.
@@ -57,5 +59,37 @@ extern bool vfmig_active;
  */
 void vfmig_claimed_add(const char *ibdev, const char *pf_bdf, uint32_t vf_id);
 void vfmig_claimed_clear(void);
+
+/*
+ * vf_image.c -- on-disk image format helpers. Take primitives + raw
+ * buffers, no dependency on dump/restore aggregate types, so this file
+ * is the canonical description of the on-disk shape.
+ *
+ *   vfmig_drain_save_fd_to_blob() streams the SAVE_VHCA_STATE fd into a
+ *   per-VF blob file under the image dir.
+ *
+ *   vfmig_append_state_entry() appends one length-prefixed
+ *   Mlx5VfmigStateEntry record to mlx5_vfmig.img.
+ *
+ *   vfmig_read_image() walks mlx5_vfmig.img and returns an in-memory
+ *   array of unpacked entries (caller frees each via
+ *   mlx5_vfmig_state_entry__free_unpacked + free() the array).
+ */
+int vfmig_drain_save_fd_to_blob(int save_fd, const char *blob_path, uint64_t *out_size);
+int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *source_cdev_path, const char *pf_bdf,
+			     uint32_t vf_id, uint32_t vhca_id, const uint8_t vf_uuid[16], const char *blob_path,
+			     uint64_t blob_size);
+int vfmig_read_image(Mlx5VfmigStateEntry ***out_arr, size_t *out_n);
+
+/*
+ * Image-directory fd indirection. vfmig_get_image_dir() returns the
+ * override fd if one is set (vfmig_set_image_dir_override()), else
+ * criu_get_image_dir(). The override lets the standalone restore binary
+ * drive the plugin's read/LOAD path against a plain directory fd,
+ * outside criu; unset (fd = -1) it falls back to criu's service fd.
+ */
+int vfmig_get_image_dir(void);
+void vfmig_set_image_dir_override(int fd);
+void vfmig_clear_image_dir_override(void);
 
 #endif /* __CR_VFMIG_INTERNAL_H__ */
