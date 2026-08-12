@@ -41,13 +41,19 @@
  *     MARK_RESTORED and bind it to mlx5_core, then resolve the dest
  *     ibdev + uverbs cdev. This completes the VF firmware layer's
  *     round-trip; uverbs contexts and RDMA objects remain a later layer.
- *   - this commit: the device-VMA dump hook. An mlx5 uverbs context
- *     maps a write-only shared device page (the VF's UAR); core VMA
- *     collection aborts the dump on such a non-regular mapping unless a
- *     plugin claims it. The HANDLE_DEVICE_VMA hook claims exactly the
+ *   - the device-VMA dump hook. An mlx5 uverbs context maps a
+ *     write-only shared device page (the VF's UAR); core VMA collection
+ *     aborts the dump on such a non-regular mapping unless a plugin
+ *     claims it. The HANDLE_DEVICE_VMA hook claims exactly the
  *     uverbs-cdev mappings of our tracked VFs (metadata only), which is
  *     what lets a plain criu dump of a process holding a VF context run
  *     far enough for the claim + fini(DUMP) SAVE drain to fire.
+ *   - this commit: snapshot-ordering datapath suspend. The
+ *     CHECKPOINT_DEVICES hook parks every claimed VF to STOP
+ *     (SUSPEND_VHCA) at CRIU's freeze point, before task memory is
+ *     copied, so no peer RDMA or VF self-DMA lands in a pinned MR page
+ *     mid-snapshot; fini(DUMP) resumes the set (RESUME_VHCA) once the
+ *     capture is done.
  *
  * Vendored UAPI header:
  *   The plugin compiles against plugins/rdma/mlx5_sriov_vfmig/uapi/
@@ -103,6 +109,7 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 	vfmig_tracked_vf_count = 0;
 	vfmig_pf_count = 0;
 	vfmig_claimed_clear();
+	vfmig_suspended_clear();
 
 	d = opendir(MLX5_VFMIG_DEV_DIR);
 	if (!d) {
@@ -157,9 +164,18 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 	 * and produce blobs that can never be paired with a restorable
 	 * image. On the RESTORE stage the claimed set is empty, so the drain
 	 * is a no-op there too.
+	 *
+	 * Then resume anything CHECKPOINT_DEVICES parked -- on both the
+	 * success and failure paths, so a failed dump never strands a VF in
+	 * STOP. The resume must follow the drain: SAVE captures the parked
+	 * VF as-is, so quiescing it until after the blob is read keeps the
+	 * capture consistent.
 	 */
-	if (stage == CR_PLUGIN_STAGE__DUMP && ret == 0)
-		vfmig_drain_claimed_in_fini();
+	if (stage == CR_PLUGIN_STAGE__DUMP) {
+		if (ret == 0)
+			vfmig_drain_claimed_in_fini();
+		vfmig_resume_suspended_vfs();
+	}
 
 	pr_info("fini (stage %d ret %d): was %s, %d tracked VF(s) across %d PF(s)\n", stage, ret,
 		vfmig_active ? "active" : "inactive", vfmig_tracked_vf_count, vfmig_pf_count);
@@ -345,6 +361,7 @@ static int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd, const struct stat *s
 CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init, rdma_mlx5_vfmig_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, rdma_mlx5_vfmig_plugin_claim_uverbs_context)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA, rdma_mlx5_vfmig_plugin_handle_device_vma)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES, rdma_mlx5_vfmig_plugin_checkpoint_devices)
 
 /*
  * RDMA sharing policy: EXCLUSIVE.
