@@ -36,12 +36,18 @@
  *     vf_uuid to a (pf_bdf, vf_id) on this host by scanning QUERY_VF,
  *     enforce that the destination vf_id matches the source, and record
  *     the tuple.
- *   - this commit: the firmware LOAD. For each matched VF, unless it is
- *     already bound, drive ENABLE_MIGRATABLE + SET_TRACKED +
- *     LOAD_VHCA_STATE + MARK_RESTORED and bind it to mlx5_core, then
- *     resolve the dest ibdev + uverbs cdev. This completes the VF
- *     firmware layer's round-trip; uverbs contexts and RDMA objects
- *     remain a later layer.
+ *   - the firmware LOAD. For each matched VF, unless it is already
+ *     bound, drive ENABLE_MIGRATABLE + SET_TRACKED + LOAD_VHCA_STATE +
+ *     MARK_RESTORED and bind it to mlx5_core, then resolve the dest
+ *     ibdev + uverbs cdev. This completes the VF firmware layer's
+ *     round-trip; uverbs contexts and RDMA objects remain a later layer.
+ *   - this commit: the device-VMA dump hook. An mlx5 uverbs context
+ *     maps a write-only shared device page (the VF's UAR); core VMA
+ *     collection aborts the dump on such a non-regular mapping unless a
+ *     plugin claims it. The HANDLE_DEVICE_VMA hook claims exactly the
+ *     uverbs-cdev mappings of our tracked VFs (metadata only), which is
+ *     what lets a plain criu dump of a process holding a VF context run
+ *     far enough for the claim + fini(DUMP) SAVE drain to fire.
  *
  * Vendored UAPI header:
  *   The plugin compiles against plugins/rdma/mlx5_sriov_vfmig/uapi/
@@ -71,6 +77,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef LOG_PREFIX
@@ -264,8 +271,80 @@ static int rdma_mlx5_vfmig_plugin_claim_uverbs_context(const char *ibdev, uint32
 	return RDMA_CRIU_DRIVER__RCD_MLX5_SRIOV_VFMIG;
 }
 
+/*
+ * Device-VMA hook (dump). An mlx5 uverbs context maps a write-only
+ * shared device page -- the VF's UAR / doorbell BAR -- backed by
+ * /dev/infiniband/uverbsN. Core VMA collection cannot checkpoint a
+ * non-regular device mapping on its own and aborts the dump unless a
+ * plugin claims it. Claim exactly the uverbs-cdev mappings that belong
+ * to one of our tracked VFs: criu then records the mapping as metadata
+ * only (it never reads the write-only page), and the VF's real device
+ * state is captured separately by the fini(DUMP) SAVE drain. Decline
+ * everything else with -ENOTSUP so the mapping falls through to any
+ * other plugin or to the core's default handling.
+ */
+static int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd, const struct stat *st)
+{
+	struct mlx5_vfmig_query_vf q;
+	char ibdev[64], vf_bdf[64], pf_bdf[64];
+	char sysfs_path[PATH_MAX];
+	char cdev_path[PATH_MAX];
+	int vf_id, cdev_fd, rc;
+
+	(void)fd;
+
+	if (!vfmig_active)
+		return -ENOTSUP;
+	if (!S_ISCHR(st->st_mode))
+		return -ENOTSUP;
+
+	if (vfmig_uverbs_rdev_to_ibdev(st->st_rdev, ibdev, sizeof(ibdev)))
+		return -ENOTSUP;
+
+	snprintf(sysfs_path, sizeof(sysfs_path), "/sys/class/infiniband/%s/device", ibdev);
+	if (resolve_pci_bdf_via_symlink(sysfs_path, vf_bdf, sizeof(vf_bdf)))
+		return -ENOTSUP;
+
+	snprintf(sysfs_path, sizeof(sysfs_path), "/sys/bus/pci/devices/%s/physfn", vf_bdf);
+	if (resolve_pci_bdf_via_symlink(sysfs_path, pf_bdf, sizeof(pf_bdf)))
+		return -ENOTSUP;
+
+	vf_id = find_vf_id_under_pf(pf_bdf, vf_bdf);
+	if (vf_id < 0)
+		return -ENOTSUP;
+
+	snprintf(cdev_path, sizeof(cdev_path), "%s/%s", MLX5_VFMIG_DEV_DIR, pf_bdf);
+	cdev_fd = open(cdev_path, O_RDWR | O_CLOEXEC);
+	if (cdev_fd < 0) {
+		pr_debug("handle_device_vma(%s, pf=%s): open(%s) failed: %s; declining\n", ibdev, pf_bdf, cdev_path,
+			 strerror(errno));
+		return -ENOTSUP;
+	}
+
+	memset(&q, 0, sizeof(q));
+	q.vf_id = vf_id;
+	rc = ioctl(cdev_fd, MLX5_VFMIG_IOC_QUERY_VF, &q);
+	close(cdev_fd);
+	if (rc != 0) {
+		pr_warn("handle_device_vma(%s, pf=%s, vf_id=%d): QUERY_VF failed: %s; declining\n", ibdev, pf_bdf,
+			vf_id, strerror(errno));
+		return -ENOTSUP;
+	}
+	if (!q.tracked) {
+		pr_err("handle_device_vma(%s, pf=%s, vf_id=%d): VF not tracked; its uverbs UAR mapping cannot be "
+		       "checkpointed. Enable tracking on this VF before dump.\n",
+		       ibdev, pf_bdf, vf_id);
+		return -ENOTSUP;
+	}
+
+	pr_info("handle_device_vma(%s, pf=%s, vf_id=%d): claiming uverbs-cdev UAR mapping (tracked VF)\n", ibdev,
+		pf_bdf, vf_id);
+	return 0;
+}
+
 CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init, rdma_mlx5_vfmig_plugin_fini)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, rdma_mlx5_vfmig_plugin_claim_uverbs_context)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA, rdma_mlx5_vfmig_plugin_handle_device_vma)
 
 /*
  * RDMA sharing policy: EXCLUSIVE.
