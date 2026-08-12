@@ -16,11 +16,11 @@
  * restore a process. Driving it from the tool lets the VF firmware
  * round-trip be validated on its own.
  *
- * This commit adds the destination-VF discovery step onto the entry
- * point's image read: for each entry, match a destination VF by vf_uuid
- * and record the resolved tuple. The invasive part -- LOAD_VHCA_STATE +
- * MARK_RESTORED + bind -- lands in the next commit, wired into the same
- * per-entry loop.
+ * With the destination VF matched by vf_uuid, this commit completes the
+ * flow: unless the VF is already bound, drive ENABLE_MIGRATABLE +
+ * SET_TRACKED + LOAD_VHCA_STATE (streaming the firmware blob off the
+ * image dir) + MARK_RESTORED and bind it to mlx5_core, then wait for
+ * and resolve the destination ibdev and uverbs cdev.
  *
  * Identity model: the destination VF is found by matching the image
  * entry's 16-byte vf_uuid against MLX5_VFMIG_IOC_QUERY_VF on every VF
@@ -44,6 +44,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <linux/mlx5_vfmig.h>
@@ -59,8 +61,9 @@
 
 /*
  * One entry per unique vf_uuid the image references. Carries the
- * destination-side tuple the UUID resolved to on this host. The list is
- * process-global and freed by vfmig_restore_fini_close_all().
+ * destination-side tuple the UUID resolved to on this host plus the
+ * post-bind ibdev and cdev path. The list is process-global and freed
+ * by vfmig_restore_fini_close_all().
  */
 struct vfmig_restored_vf {
 	struct vfmig_restored_vf *next;
@@ -68,6 +71,8 @@ struct vfmig_restored_vf {
 	char pf_bdf[64];
 	uint32_t vf_id;
 	char vf_bdf[64];
+	char dest_ibdev[64];
+	char dest_cdev_path[PATH_MAX];
 };
 static struct vfmig_restored_vf *vfmig_restored_vfs;
 
@@ -212,14 +217,304 @@ static int vfmig_resolve_vf_bdf(const char *pf_bdf, uint32_t vf_id, char *out, s
 }
 
 /*
- * Read mlx5_vfmig.img and, for each unique vf_uuid, resolve the
- * matching destination VF on this host and record it.
+ * Is @vf_bdf bound to any kernel driver?
+ *
+ * Returns 1 if /sys/bus/pci/devices/<vf_bdf>/driver exists (the VF is
+ * already bound -- e.g. a prior restore-vf run already drove LOAD +
+ * bind on it), 0 if it does not (the orchestrator-provisioned-but-
+ * unbound state this path expects), or -1 on a sysfs error the caller
+ * should treat as fatal.
+ *
+ * We use the sysfs driver symlink rather than QUERY_VF.restored on
+ * purpose: the kernel consumes the `restored` bit at VF-probe time (it
+ * is cleared as soon as the bind triggers the VF's driver load), so any
+ * post-bind QUERY_VF reads it back as 0 regardless of whether a LOAD +
+ * MARK_RESTORED cycle ran moments earlier. Under the orchestrator
+ * contract -- the destination VF is created unbound and only this path
+ * binds it -- "bound to a driver" is a clean "already restored" signal.
+ */
+static int vfmig_is_vf_bound(const char *vf_bdf)
+{
+	char path[PATH_MAX];
+	struct stat st;
+
+	if (snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/driver", vf_bdf) >= (int)sizeof(path)) {
+		pr_err("vfmig: vf_bdf=%s too long for sysfs path\n", vf_bdf);
+		return -1;
+	}
+	if (lstat(path, &st) == 0)
+		return 1;
+	if (errno == ENOENT)
+		return 0;
+	pr_perror("vfmig: lstat(%s) for bind check", path);
+	return -1;
+}
+
+/*
+ * Drive ENABLE_MIGRATABLE + SET_TRACKED + LOAD_VHCA_STATE +
+ * MARK_RESTORED on a single (pf_bdf, vf_id), streaming the firmware
+ * blob at @blob_path (relative to the image dir) into the load fd.
+ *
+ * ENABLE_MIGRATABLE and SET_TRACKED are idempotent per the kernel UAPI:
+ * the orchestrator may already have run them on the destination VF, in
+ * which case the kernel returns 0 with no firmware traffic. Re-issuing
+ * them lets the plugin tolerate a minimal orchestrator that only does
+ * sriov_numvfs + SET_VF_UUID.
+ */
+static int vfmig_load_one_vf(const char *pf_bdf, uint32_t vf_id, const char *blob_path, uint64_t blob_size)
+{
+	char cdev_path[PATH_MAX];
+	char buf[65536];
+	int cdev_fd, blob_fd, img_dir, load_fd;
+	struct mlx5_vfmig_enable_migratable em;
+	struct mlx5_vfmig_set_tracked sttr;
+	struct mlx5_vfmig_load_state ls;
+	struct mlx5_vfmig_mark_restored mr;
+	uint64_t total_written = 0;
+
+	memset(&em, 0, sizeof(em));
+	memset(&sttr, 0, sizeof(sttr));
+	memset(&ls, 0, sizeof(ls));
+	memset(&mr, 0, sizeof(mr));
+
+	snprintf(cdev_path, sizeof(cdev_path), "%s/%s", MLX5_VFMIG_DEV_DIR, pf_bdf);
+	cdev_fd = open(cdev_path, O_RDWR | O_CLOEXEC);
+	if (cdev_fd < 0) {
+		pr_perror("vfmig: open(%s)", cdev_path);
+		return -1;
+	}
+
+	em.vf_id = vf_id;
+	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_ENABLE_MIGRATABLE, &em)) {
+		pr_perror("vfmig: ENABLE_MIGRATABLE pf=%s vf_id=%u", pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+
+	sttr.vf_id = vf_id;
+	sttr.enable = 1;
+	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_SET_TRACKED, &sttr)) {
+		pr_perror("vfmig: SET_TRACKED pf=%s vf_id=%u", pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+
+	ls.vf_id = vf_id;
+	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_LOAD_VHCA_STATE, &ls)) {
+		pr_perror("vfmig: LOAD_VHCA_STATE pf=%s vf_id=%u", pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+	load_fd = ls.load_fd;
+
+	img_dir = vfmig_get_image_dir();
+	if (img_dir < 0) {
+		pr_err("vfmig: vfmig_get_image_dir() returned %d loading blob for pf=%s vf_id=%u\n", img_dir, pf_bdf,
+		       vf_id);
+		close(load_fd);
+		close(cdev_fd);
+		return -1;
+	}
+	blob_fd = openat(img_dir, blob_path, O_RDONLY | O_CLOEXEC);
+	if (blob_fd < 0) {
+		pr_perror("vfmig: openat(image_dir/%s) for blob", blob_path);
+		close(load_fd);
+		close(cdev_fd);
+		return -1;
+	}
+
+	while (total_written < blob_size) {
+		ssize_t r = read(blob_fd, buf, sizeof(buf));
+		ssize_t w;
+
+		if (r < 0) {
+			pr_perror("vfmig: read(%s)", blob_path);
+			close(blob_fd);
+			close(load_fd);
+			close(cdev_fd);
+			return -1;
+		}
+		if (r == 0)
+			break;
+		for (w = 0; w < r;) {
+			ssize_t k = write(load_fd, buf + w, r - w);
+
+			if (k <= 0) {
+				pr_perror("vfmig: write(load_fd) pf=%s vf_id=%u", pf_bdf, vf_id);
+				close(blob_fd);
+				close(load_fd);
+				close(cdev_fd);
+				return -1;
+			}
+			w += k;
+		}
+		total_written += r;
+	}
+	close(blob_fd);
+
+	/*
+	 * Closing load_fd commits the staged blob: per the UAPI the driver
+	 * issues no firmware command against the destination VHCA until
+	 * close(), so a failure here is meaningful and surfaces errors in
+	 * the blob's DMA pipeline.
+	 */
+	if (close(load_fd)) {
+		pr_perror("vfmig: close(load_fd) pf=%s vf_id=%u", pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+
+	/*
+	 * MARK_RESTORED latches the "skip re-init on next probe" bit. On
+	 * current firmware, staging a LOAD_VHCA_STATE blob already sets that
+	 * bit (QUERY_VF.restored reads 1 after the load fd is committed), so
+	 * an explicit MARK_RESTORED here returns -EALREADY. That is the
+	 * desired end state -- the bit is set -- so tolerate it; still issue
+	 * the ioctl so the path also works on a kernel where LOAD does not
+	 * implicitly latch the bit.
+	 */
+	mr.vf_id = vf_id;
+	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_MARK_RESTORED, &mr) && errno != EALREADY) {
+		pr_perror("vfmig: MARK_RESTORED pf=%s vf_id=%u", pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+
+	close(cdev_fd);
+	pr_info("vfmig: loaded pf=%s vf_id=%u (%llu bytes)\n", pf_bdf, vf_id, (unsigned long long)total_written);
+	return 0;
+}
+
+/*
+ * Set the VF's driver_override to mlx5_core and bind it. The
+ * orchestrator left autoprobe disabled and the VF unbound; this is the
+ * step that makes the kernel mlx5_core probe run against the loaded
+ * VHCA blob.
+ */
+static int vfmig_driver_override_and_bind(const char *vf_bdf)
+{
+	char path[PATH_MAX];
+	int fd;
+	size_t bdf_len;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/driver_override", vf_bdf);
+	fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		pr_perror("vfmig: open(%s)", path);
+		return -1;
+	}
+	if (write(fd, "mlx5_core\n", 10) != 10) {
+		pr_perror("vfmig: write(%s)", path);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/drivers/mlx5_core/bind");
+	fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		pr_perror("vfmig: open(%s)", path);
+		return -1;
+	}
+	bdf_len = strlen(vf_bdf);
+	if (write(fd, vf_bdf, bdf_len) != (ssize_t)bdf_len) {
+		pr_perror("vfmig: write(bind, %s)", vf_bdf);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	pr_info("vfmig: bound %s to mlx5_core\n", vf_bdf);
+	return 0;
+}
+
+/*
+ * Wait up to ~10s for /sys/bus/pci/devices/<vf_bdf>/infiniband/ to
+ * appear and hold at least one entry, then resolve the dest ibdev
+ * (basename of the first directory entry) into @out. mlx5_core probe is
+ * asynchronous: the bind write returns as soon as the probe is
+ * scheduled and the ibdev shows up some milliseconds later.
+ */
+static int vfmig_wait_for_dest_ibdev(const char *vf_bdf, char *out, size_t outsz)
+{
+	char path[PATH_MAX];
+	int tries = 100;
+	DIR *d;
+	struct dirent *de;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/infiniband", vf_bdf);
+
+	while (tries-- > 0) {
+		d = opendir(path);
+		if (d) {
+			while ((de = readdir(d)) != NULL) {
+				if (de->d_name[0] == '.')
+					continue;
+				snprintf(out, outsz, "%s", de->d_name);
+				closedir(d);
+				pr_info("vfmig: dest ibdev for %s -> %s\n", vf_bdf, out);
+				return 0;
+			}
+			closedir(d);
+		}
+		usleep(100 * 1000);
+	}
+	pr_err("vfmig: timed out waiting for ibdev under %s\n", path);
+	return -1;
+}
+
+/*
+ * Resolve the dest uverbs cdev path for @ibdev by walking
+ * /sys/class/infiniband_verbs/uverbs* /ibdev.
+ */
+static int vfmig_resolve_dest_cdev_path(const char *ibdev, char *out, size_t outsz)
+{
+	DIR *d;
+	struct dirent *de;
+	char path[PATH_MAX], buf[64];
+	int fd;
+	ssize_t n;
+
+	d = opendir("/sys/class/infiniband_verbs");
+	if (!d) {
+		pr_perror("vfmig: opendir(/sys/class/infiniband_verbs)");
+		return -1;
+	}
+	while ((de = readdir(d)) != NULL) {
+		if (strncmp(de->d_name, "uverbs", 6) != 0)
+			continue;
+		snprintf(path, sizeof(path), "/sys/class/infiniband_verbs/%s/ibdev", de->d_name);
+		fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		buf[n] = '\0';
+		if (buf[n - 1] == '\n')
+			buf[--n] = '\0';
+		if (strcmp(buf, ibdev) != 0)
+			continue;
+		snprintf(out, outsz, "/dev/infiniband/%s", de->d_name);
+		closedir(d);
+		return 0;
+	}
+	closedir(d);
+	pr_err("vfmig: no uverbsN matches ibdev=%s\n", ibdev);
+	return -1;
+}
+
+/*
+ * Read mlx5_vfmig.img and, for each unique vf_uuid, restore the
+ * matching destination VF up to "firmware loaded, bound, ibdev up".
  *
  * Per entry: validate the vf_uuid, resolve it to a destination
  * (pf_bdf, vf_id), enforce that the destination vf_id equals the source
- * vf_id, resolve the destination VF's PCI BDF, and record the tuple.
- * The actual LOAD_VHCA_STATE + MARK_RESTORED + bind is added to this
- * loop in the next commit.
+ * vf_id, resolve the destination VF's PCI BDF, then -- unless the VF is
+ * already bound -- drive LOAD_VHCA_STATE + MARK_RESTORED and bind it to
+ * mlx5_core; finally resolve the dest ibdev and cdev path and record
+ * the tuple.
  *
  * Any per-entry failure aborts the whole restore (goto err): a VF-level
  * restore is all-or-nothing from the operator's point of view.
@@ -269,7 +564,9 @@ static int vfmig_restore_all_vfs(void)
 		struct vfmig_restored_vf *v;
 		char dest_pf_bdf[64];
 		uint32_t dest_vf_id;
-		char vf_bdf[64];
+		int dest_bound;
+		char vf_bdf[64], dest_ibdev[64];
+		char dest_cdev_path[PATH_MAX];
 		char uuid_str[VFMIG_UUID_STR_LEN];
 		int rc;
 
@@ -309,6 +606,30 @@ static int vfmig_restore_all_vfs(void)
 		if (vfmig_resolve_vf_bdf(dest_pf_bdf, dest_vf_id, vf_bdf, sizeof(vf_bdf)))
 			goto err;
 
+		pr_info("vfmig: matched ctxn=%u source(pf=%s vf_id=%u) -> dest(pf=%s vf_id=%u vf_bdf=%s) by "
+			"vf_uuid=%s\n",
+			e->ctxn, e->pf_bdf, e->vf_id, dest_pf_bdf, dest_vf_id, vf_bdf, uuid_str);
+
+		dest_bound = vfmig_is_vf_bound(vf_bdf);
+		if (dest_bound < 0)
+			goto err;
+
+		if (dest_bound) {
+			pr_info("vfmig: dest vf_id=%u (vf_bdf=%s) already bound to mlx5_core; skipping "
+				"LOAD_VHCA_STATE\n",
+				dest_vf_id, vf_bdf);
+		} else {
+			if (vfmig_load_one_vf(dest_pf_bdf, dest_vf_id, e->blob_path, e->blob_size))
+				goto err;
+			if (vfmig_driver_override_and_bind(vf_bdf))
+				goto err;
+		}
+
+		if (vfmig_wait_for_dest_ibdev(vf_bdf, dest_ibdev, sizeof(dest_ibdev)))
+			goto err;
+		if (vfmig_resolve_dest_cdev_path(dest_ibdev, dest_cdev_path, sizeof(dest_cdev_path)))
+			goto err;
+
 		v = calloc(1, sizeof(*v));
 		if (!v)
 			goto err;
@@ -316,12 +637,15 @@ static int vfmig_restore_all_vfs(void)
 		snprintf(v->pf_bdf, sizeof(v->pf_bdf), "%s", dest_pf_bdf);
 		v->vf_id = dest_vf_id;
 		snprintf(v->vf_bdf, sizeof(v->vf_bdf), "%s", vf_bdf);
+		snprintf(v->dest_ibdev, sizeof(v->dest_ibdev), "%s", dest_ibdev);
+		snprintf(v->dest_cdev_path, sizeof(v->dest_cdev_path), "%s", dest_cdev_path);
 		v->next = vfmig_restored_vfs;
 		vfmig_restored_vfs = v;
 
-		pr_info("vfmig: matched ctxn=%u source(pf=%s vf_id=%u) -> dest(pf=%s vf_id=%u vf_bdf=%s) by "
-			"vf_uuid=%s\n",
-			e->ctxn, e->pf_bdf, e->vf_id, v->pf_bdf, v->vf_id, v->vf_bdf, uuid_str);
+		pr_info("vfmig: restored VF: vf_uuid=%s source(pf=%s vf_id=%u) -> dest(pf=%s vf_id=%u vf_bdf=%s) "
+			"dest_ibdev=%s dest_cdev=%s\n",
+			uuid_str, e->pf_bdf, e->vf_id, v->pf_bdf, v->vf_id, v->vf_bdf, v->dest_ibdev,
+			v->dest_cdev_path);
 	}
 
 	for (i = 0; i < n_entries; i++)
