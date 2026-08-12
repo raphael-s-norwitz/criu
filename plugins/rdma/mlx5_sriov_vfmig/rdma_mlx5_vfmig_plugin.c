@@ -26,14 +26,17 @@
  *   - SAVE on dump. fini(DUMP) drains the claimed set, runs
  *     SAVE_VHCA_STATE per VF, writes one firmware blob per VF plus one
  *     Mlx5VfmigStateEntry per VF into the image dir.
- *   - this commit: the restore-side entry point (vfmig_restore.c). The
- *     exported mlx5_vfmig_plugin_restore_vf_only() symbol, driven by
- *     the standalone mlx5_vfmig_restore_vf tool (not by criu restore),
- *     reads mlx5_vfmig.img and validates each entry. Matching entries
- *     to destination VFs and the firmware LOAD land next. Only the VF
+ *   - the restore-side entry point (vfmig_restore.c). The exported
+ *     mlx5_vfmig_plugin_restore_vf_only() symbol, driven by the
+ *     standalone mlx5_vfmig_restore_vf tool (not by criu restore),
+ *     reads mlx5_vfmig.img and validates each entry. Only the VF
  *     firmware layer is in scope; uverbs contexts and RDMA objects are
  *     a later layer.
- *   - next: destination-VF discovery, then LOAD + MARK_RESTORED + bind.
+ *   - this commit: destination-VF discovery. For each image entry,
+ *     resolve the vf_uuid to a (pf_bdf, vf_id) on this host by scanning
+ *     QUERY_VF, enforce that the destination vf_id matches the source,
+ *     and record the tuple.
+ *   - next: LOAD_VHCA_STATE + MARK_RESTORED + bind on each matched VF.
  *
  * Vendored UAPI header:
  *   The plugin compiles against plugins/rdma/mlx5_sriov_vfmig/uapi/
