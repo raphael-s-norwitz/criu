@@ -16,10 +16,12 @@
  * restore a process. Driving it from the tool lets the VF firmware
  * round-trip be validated on its own.
  *
- * This commit lands the entry point and the image read: it decodes
- * mlx5_vfmig.img and validates each entry's vf_uuid. Matching each
- * entry to a destination VF, and the LOAD_VHCA_STATE + bind that
- * follows, are added to the per-entry loop in the following commits.
+ * This commit adds the process-global restored-VF cache and a dedup
+ * pass over the image entries: the image can reference the same vf_uuid
+ * from more than one context, and each destination VF must be resolved
+ * and restored only once. Resolving each unique vf_uuid to a
+ * destination VF, and the LOAD_VHCA_STATE + bind that follows, are
+ * added to the same per-entry loop in the following commits.
  */
 
 #include <stddef.h>
@@ -37,10 +39,34 @@
 #define LOG_PREFIX "rdma_mlx5_vfmig_plugin: "
 
 /*
- * Read mlx5_vfmig.img and walk its entries. Per entry this validates
- * the vf_uuid (the sole restore-side identity key); resolving the entry
- * to a destination VF and driving the firmware LOAD are added to this
- * loop in the following commits.
+ * One entry per unique vf_uuid the image references. Carries the
+ * destination-side tuple the UUID resolved to on this host. The list is
+ * process-global and freed by vfmig_restore_fini_close_all().
+ */
+struct vfmig_restored_vf {
+	struct vfmig_restored_vf *next;
+	uint8_t vf_uuid[16];
+	char pf_bdf[64];
+	uint32_t vf_id;
+	char vf_bdf[64];
+};
+static struct vfmig_restored_vf *vfmig_restored_vfs;
+
+static struct vfmig_restored_vf *vfmig_restored_vf_lookup_by_uuid(const uint8_t uuid[16])
+{
+	struct vfmig_restored_vf *p;
+
+	for (p = vfmig_restored_vfs; p; p = p->next)
+		if (!memcmp(p->vf_uuid, uuid, 16))
+			return p;
+	return NULL;
+}
+
+/*
+ * Read mlx5_vfmig.img, validate each entry's vf_uuid, and dedup the
+ * entries by vf_uuid through the restored-VF cache. Resolving each
+ * unique vf_uuid to a destination VF and driving the firmware LOAD are
+ * added to this loop in the following commits.
  *
  * Any per-entry failure aborts the whole restore (goto err): a VF-level
  * restore is all-or-nothing from the operator's point of view.
@@ -60,17 +86,17 @@ static int vfmig_restore_all_vfs(void)
 
 	pr_info("vfmig: restore: %zu state entries in image\n", n_entries);
 
+	/*
+	 * Pre-flight: every entry must carry a well-formed, non-zero
+	 * vf_uuid. The proto field is required so unpack already rejects an
+	 * omitted field; what we still guard against is a malformed length
+	 * (wire bug) or all-zeros bytes (an orchestrator bug that bypassed
+	 * the dump-side capture refusal). The UUID-only identity model has
+	 * no fallback for either.
+	 */
 	for (i = 0; i < n_entries; i++) {
 		const Mlx5VfmigStateEntry *e = entries[i];
 
-		/*
-		 * The vf_uuid proto field is required, so unpack already
-		 * rejects an omitted field; what we still guard against here
-		 * is a malformed length (wire bug) or all-zeros bytes (an
-		 * orchestrator bug that bypassed the dump-side capture
-		 * refusal). The UUID-only identity model has no fallback for
-		 * either.
-		 */
 		if (e->vf_uuid.len != 16) {
 			pr_err("vfmig: image entry ctxn=%u has malformed vf_uuid (len=%zu, want 16)\n", e->ctxn,
 			       e->vf_uuid.len);
@@ -83,9 +109,19 @@ static int vfmig_restore_all_vfs(void)
 			       e->ctxn);
 			goto err;
 		}
+	}
 
-		pr_info("vfmig: image entry %zu: ctxn=%u source(pf=%s vf_id=%u vhca_id=%u) blob='%s' size=%llu\n", i,
-			e->ctxn, e->pf_bdf, e->vf_id, e->vhca_id, e->blob_path, (unsigned long long)e->blob_size);
+	for (i = 0; i < n_entries; i++) {
+		Mlx5VfmigStateEntry *e = entries[i];
+
+		if (vfmig_restored_vf_lookup_by_uuid(e->vf_uuid.data))
+			continue;
+
+		/*
+		 * A cache miss is a vf_uuid we have not seen yet: the next
+		 * commits resolve it to a destination VF, record it here, and
+		 * drive the firmware LOAD. Until then the loop only dedups.
+		 */
 	}
 
 	for (i = 0; i < n_entries; i++)
@@ -97,7 +133,19 @@ err:
 	for (i = 0; i < n_entries; i++)
 		mlx5_vfmig_state_entry__free_unpacked(entries[i], NULL);
 	free(entries);
+	vfmig_restore_fini_close_all();
 	return -1;
+}
+
+void vfmig_restore_fini_close_all(void)
+{
+	struct vfmig_restored_vf *v, *vn;
+
+	for (v = vfmig_restored_vfs; v; v = vn) {
+		vn = v->next;
+		free(v);
+	}
+	vfmig_restored_vfs = NULL;
 }
 
 /*
@@ -125,5 +173,11 @@ int mlx5_vfmig_plugin_restore_vf_only(int image_dir_fd)
 	vfmig_set_image_dir_override(image_dir_fd);
 	rc = vfmig_restore_all_vfs();
 	vfmig_clear_image_dir_override();
+
+	/*
+	 * Free the in-memory cache so a subsequent caller starts clean; the
+	 * tool typically exits right after we return regardless.
+	 */
+	vfmig_restore_fini_close_all();
 	return rc;
 }
