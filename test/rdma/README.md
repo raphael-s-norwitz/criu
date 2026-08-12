@@ -60,6 +60,27 @@ enough for a proper zdtm test.
   byte-identity). This is the earliest functional validation of the
   VF-firmware-state build-up -- the image format is exercisable before
   any tracked VF exists.
+- `run_vfmig_roundtrip.sh` -- VF firmware-state round-trip gate for the
+  `rdma_mlx5_vfmig` plugin's SAVE-on-dump path and the standalone
+  `mlx5_vfmig_restore_vf` tool. Two tiers:
+    - Tier 1 (always, no hardware): runs `mlx5_vfmig_restore_vf` against
+      an empty image dir and asserts it dlopens the plugin, reads the
+      (missing) image, finds nothing to restore, and exits 0 -- a
+      regression gate for the tool + plugin restore plumbing on any host.
+    - Tier 2 (hardware, self-skips): the real SAVE -> LOAD round-trip.
+      `criu dump` of a `uverbs_ctx_holder` on a tracked, migration-capable
+      VF triggers the plugin's claim + `fini(DUMP)` `SAVE_VHCA_STATE`
+      drain (asserts `mlx5_vfmig.img` + a non-empty firmware blob land in
+      the image dir), then the source VF is torn down and a destination
+      VF is reprovisioned (same `vf_uuid`, left unbound) and
+      `mlx5_vfmig_restore_vf` drives `LOAD_VHCA_STATE` + `MARK_RESTORED` +
+      bind (asserts the tool logs a completed VF restore and the VF ends
+      up bound with its ibdev up). It does NOT run `criu restore`:
+      restoring the process and its RDMA verbs objects is a separate
+      layer not built here. Needs root, a spare mlx5 PF (`PF=...`), and
+      the out-of-band `mlx5_vfmig` orchestrator CLI (`VFMIG_TOOL=...`,
+      used to stamp the per-VF UUID criu never sets); skips gracefully
+      when any precondition is missing.
 
 ## Run
 
@@ -75,6 +96,10 @@ sudo CRIU=/usr/local/sbin/criu test/rdma/run_mr_cr.sh [<netdev>]
 sudo CRIU=/usr/local/sbin/criu test/rdma/run_vfmig_presence.sh [<netdev>]
 # mlx5_vfmig image-format unit test (no hardware, no sudo):
 test/rdma/run_vfmig_image_test.sh
+# mlx5_vfmig VF firmware round-trip (tier 1 no hardware; tier 2 needs a VF):
+test/rdma/run_vfmig_roundtrip.sh
+sudo PF=0000:08:00.0 VFMIG_TOOL=/path/to/mlx5_vfmig \
+    test/rdma/run_vfmig_roundtrip.sh
 ```
 
 `<netdev>` defaults to the first up IPv4 netdev.
