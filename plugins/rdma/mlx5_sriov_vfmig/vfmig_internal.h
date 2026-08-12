@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "images/mlx5_vfmig.pb-c.h"
 
@@ -24,11 +25,14 @@
  *                                 basename.
  *   find_vf_id_under_pf()         map a VF BDF to its virtfnN index
  *                                 under the owning PF.
+ *   vfmig_uverbs_rdev_to_ibdev()  map a uverbs cdev device number back
+ *                                 to its ibdev (reverse cdev lookup).
  */
 int probe_pf_cdev(const char *path);
 int resolve_pci_bdf_via_symlink(const char *sysfs_link_path, char *out, size_t outsz);
 int find_vf_id_under_pf(const char *pf_bdf, const char *vf_bdf);
 int find_uverbs_cdev_for_ibdev(const char *ibdev, char *out, size_t outsz);
+int vfmig_uverbs_rdev_to_ibdev(dev_t rdev, char *out, size_t outsz);
 
 /*
  * Process-global activation flag. Set true by init() iff at least one

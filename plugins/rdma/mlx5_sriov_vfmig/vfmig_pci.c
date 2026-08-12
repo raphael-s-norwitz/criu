@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -186,6 +187,70 @@ int find_uverbs_cdev_for_ibdev(const char *ibdev, char *out, size_t outsz)
 		if (strncmp(de->d_name, "uverbs", 6) != 0)
 			continue;
 		snprintf(out, outsz, "/dev/infiniband/%s", de->d_name);
+		rc = 0;
+		break;
+	}
+
+	closedir(d);
+	return rc;
+}
+
+/*
+ * Reverse of find_uverbs_cdev_for_ibdev(): given the device number of a
+ * mapped /dev/infiniband/uverbsN char device (as reported for a device
+ * VMA), find the ibdev that node belongs to. Walks
+ * /sys/class/infiniband_verbs/uverbsN, matches @rdev against each node's
+ * "dev" (major:minor) attribute, and reads its sibling "ibdev". Returns
+ * 0 with @out populated on match, -1 otherwise. Used by the device-VMA
+ * hook to decide whether a char-device mapping is one of our VFs' uverbs
+ * UAR pages before resolving it through the PF cdev.
+ */
+int vfmig_uverbs_rdev_to_ibdev(dev_t rdev, char *out, size_t outsz)
+{
+	struct dirent *de;
+	DIR *d;
+	int rc = -1;
+
+	d = opendir("/sys/class/infiniband_verbs");
+	if (!d)
+		return -1;
+
+	while ((de = readdir(d)) != NULL) {
+		char path[PATH_MAX], name[64];
+		unsigned int maj, min;
+		FILE *f;
+
+		if (strncmp(de->d_name, "uverbs", 6) != 0)
+			continue;
+
+		snprintf(path, sizeof(path), "/sys/class/infiniband_verbs/%s/dev", de->d_name);
+		f = fopen(path, "re");
+		if (!f)
+			continue;
+		rc = fscanf(f, "%u:%u", &maj, &min);
+		fclose(f);
+		if (rc != 2) {
+			rc = -1;
+			continue;
+		}
+		if (makedev(maj, min) != rdev) {
+			rc = -1;
+			continue;
+		}
+
+		snprintf(path, sizeof(path), "/sys/class/infiniband_verbs/%s/ibdev", de->d_name);
+		f = fopen(path, "re");
+		if (!f) {
+			rc = -1;
+			continue;
+		}
+		rc = fscanf(f, "%63s", name);
+		fclose(f);
+		if (rc != 1) {
+			rc = -1;
+			continue;
+		}
+		snprintf(out, outsz, "%s", name);
 		rc = 0;
 		break;
 	}
