@@ -31,12 +31,20 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+/* Mirror criu/include/log.h's level constants so the shims agree. */
+#define LOG_MSG	  0
+#define LOG_ERROR 1
+#define LOG_WARN  2
+#define LOG_INFO  3
+#define LOG_DEBUG 4
 
 /*
  * Default plugin install path: matches PLUGINDIR in the criu Makefile
@@ -53,6 +61,57 @@
  */
 typedef int (*mlx5_vfmig_plugin_restore_vf_only_fn)(int image_dir_fd);
 
+static unsigned int g_loglevel = LOG_INFO;
+
+/* -------- shims for plugin .so symbol resolution -------- */
+
+/*
+ * The plugin .so references a handful of symbols the criu binary
+ * normally provides. When the tool dlopens the .so out of criu, we must
+ * supply them ourselves. They are linked with default visibility and
+ * the tool is built -rdynamic so the dynamic linker resolves the .so's
+ * references against these definitions.
+ */
+
+/*
+ * print_on_level -- the plugin's pr_err / pr_info / pr_perror macros
+ * expand to print_on_level(LOG_*, fmt, ...). Route to stderr, gated on
+ * our own loglevel (LOG_MSG is always emitted).
+ */
+__attribute__((visibility("default"))) void print_on_level(unsigned int level, const char *fmt, ...)
+{
+	va_list ap;
+
+	if (level > g_loglevel && level != LOG_MSG)
+		return;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+}
+
+/*
+ * log_get_loglevel -- the plugin's debug-gating helpers consult this.
+ * Returning our own level keeps debug-vs-info gating consistent across
+ * the tool and the plugin.
+ */
+__attribute__((visibility("default"))) unsigned int log_get_loglevel(void)
+{
+	return g_loglevel;
+}
+
+/*
+ * criu_get_image_dir -- in the criu binary this returns the image
+ * service fd. The tool always sets the plugin's image-dir override
+ * before calling the entry point, so this is never actually reached;
+ * the shim exists only to satisfy the dynamic linker.
+ */
+__attribute__((visibility("default"))) int criu_get_image_dir(void)
+{
+	fprintf(stderr, "mlx5_vfmig_restore_vf: BUG: criu_get_image_dir() reached on the standalone path -- the "
+			"image-dir override should have intercepted it.\n");
+	return -1;
+}
+
 /* -------- CLI -------- */
 
 static void usage(FILE *out, const char *argv0)
@@ -68,6 +127,8 @@ static void usage(FILE *out, const char *argv0)
 		"                     %s\n"
 		"      --dry-run      Resolve the plugin .so + entry symbol and open\n"
 		"                     the image dir but do NOT drive any restore work.\n"
+		"  -v, --verbose      Increase log verbosity (repeat for debug).\n"
+		"  -q, --quiet        Decrease log verbosity (errors only).\n"
 		"  -h, --help         Show this help text and exit.\n"
 		"\n"
 		"Exit status: 0 on success, non-zero on any error.\n",
@@ -87,6 +148,8 @@ static int parse_args(int argc, char **argv, struct opts *o)
 		{ "dir", required_argument, NULL, 'D' },
 		{ "plugin", required_argument, NULL, 'p' },
 		{ "dry-run", no_argument, NULL, 1 },
+		{ "verbose", no_argument, NULL, 'v' },
+		{ "quiet", no_argument, NULL, 'q' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -95,7 +158,7 @@ static int parse_args(int argc, char **argv, struct opts *o)
 	memset(o, 0, sizeof(*o));
 	o->plugin_path = DEFAULT_PLUGIN_PATH;
 
-	while ((c = getopt_long(argc, argv, "D:p:h", long_opts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "D:p:vqh", long_opts, NULL)) != -1) {
 		switch (c) {
 		case 'D':
 			o->image_dir = optarg;
@@ -105,6 +168,14 @@ static int parse_args(int argc, char **argv, struct opts *o)
 			break;
 		case 1:
 			o->dry_run = true;
+			break;
+		case 'v':
+			if (g_loglevel < LOG_DEBUG)
+				g_loglevel++;
+			break;
+		case 'q':
+			if (g_loglevel > LOG_ERROR)
+				g_loglevel--;
 			break;
 		case 'h':
 			o->show_help = true;
