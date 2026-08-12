@@ -32,11 +32,16 @@
  *     reads mlx5_vfmig.img and validates each entry. Only the VF
  *     firmware layer is in scope; uverbs contexts and RDMA objects are
  *     a later layer.
- *   - this commit: destination-VF discovery. For each image entry,
- *     resolve the vf_uuid to a (pf_bdf, vf_id) on this host by scanning
- *     QUERY_VF, enforce that the destination vf_id matches the source,
- *     and record the tuple.
- *   - next: LOAD_VHCA_STATE + MARK_RESTORED + bind on each matched VF.
+ *   - destination-VF discovery. For each image entry, resolve the
+ *     vf_uuid to a (pf_bdf, vf_id) on this host by scanning QUERY_VF,
+ *     enforce that the destination vf_id matches the source, and record
+ *     the tuple.
+ *   - this commit: the firmware LOAD. For each matched VF, unless it is
+ *     already bound, drive ENABLE_MIGRATABLE + SET_TRACKED +
+ *     LOAD_VHCA_STATE + MARK_RESTORED and bind it to mlx5_core, then
+ *     resolve the dest ibdev + uverbs cdev. This completes the VF
+ *     firmware layer's round-trip; uverbs contexts and RDMA objects
+ *     remain a later layer.
  *
  * Vendored UAPI header:
  *   The plugin compiles against plugins/rdma/mlx5_sriov_vfmig/uapi/
