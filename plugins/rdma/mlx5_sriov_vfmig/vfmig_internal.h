@@ -66,6 +66,17 @@ void vfmig_claimed_add(const char *ibdev, const char *pf_bdf, uint32_t vf_id);
 void vfmig_claimed_clear(void);
 
 /*
+ * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()
+ * is the CHECKPOINT_DEVICES hook: it parks every claimed VF to STOP
+ * (SUSPEND_VHCA) at CRIU's freeze point, before task memory is copied.
+ * vfmig_resume_suspended_vfs() resumes that set (RESUME_VHCA) from
+ * fini(DUMP); vfmig_suspended_clear() drops it at init()/fini() reset.
+ */
+int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid);
+void vfmig_resume_suspended_vfs(void);
+void vfmig_suspended_clear(void);
+
+/*
  * Dump-side SAVE drain. Called from fini(DUMP) on a successful dump:
  * walks the claimed-VF set, runs SAVE_VHCA_STATE per VF, drains each
  * blob to the image dir, and appends one Mlx5VfmigStateEntry per VF to

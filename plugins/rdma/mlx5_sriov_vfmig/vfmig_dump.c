@@ -1,20 +1,30 @@
 /*
  * mlx5_sriov_vfmig dump-side state.
  *
- * This commit introduces only the claimed-VF cache. The claim hook
- * (CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT) already resolves every
- * snapshot-tree uverbs context's (ibdev, pf_bdf, vf_id) and confirms
- * QUERY_VF.tracked=1 before it returns RCD_MLX5_SRIOV_VFMIG. Recording
- * each VF we win the claim for lets the dump-side hooks added in later
- * commits -- CHECKPOINT_DEVICES (suspend) and the fini(DUMP) SAVE drain
- * -- act on exactly that set without re-walking /proc/<pid>/fd or
- * re-querying sysfs.
+ * Two per-VF sets and the hooks that drive them:
  *
- * The set is deduplicated by (pf_bdf, vf_id): a single VF can back
+ *   - the claimed-VF cache. The claim hook
+ *     (CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT) already resolves every
+ *     snapshot-tree uverbs context's (ibdev, pf_bdf, vf_id) and confirms
+ *     QUERY_VF.tracked=1 before it returns RCD_MLX5_SRIOV_VFMIG.
+ *     Recording each VF we win the claim for lets the dump-side hooks
+ *     act on exactly that set without re-walking /proc/<pid>/fd or
+ *     re-querying sysfs.
+ *
+ *   - the suspended-VF set. The CHECKPOINT_DEVICES hook parks every
+ *     claimed VF's datapath to STOP (SUSPEND_VHCA) at CRIU's freeze
+ *     point, before any task memory is copied, so no peer RDMA or VF
+ *     self-DMA lands in a pinned MR page mid-snapshot. fini(DUMP)
+ *     resumes the set (RESUME_VHCA) once the snapshot is done.
+ *
+ *   - the fini(DUMP) SAVE drain. Runs SAVE_VHCA_STATE per claimed VF and
+ *     writes one blob + one Mlx5VfmigStateEntry per VF into the image.
+ *
+ * Both sets are deduplicated by (pf_bdf, vf_id): a single VF can back
  * several uverbs contexts (e.g. one per worker thread, or across
- * several pids in the snapshot tree), and the firmware SAVE_VHCA_STATE
- * is per-VF, not per-context. Reset at init()/fini() via
- * vfmig_claimed_clear().
+ * several pids in the snapshot tree), and the firmware SAVE_VHCA_STATE /
+ * SUSPEND_VHCA are per-VF, not per-context. Reset at init()/fini() via
+ * vfmig_claimed_clear() / vfmig_suspended_clear().
  */
 
 #include "criu-log.h"
@@ -26,6 +36,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,6 +93,174 @@ void vfmig_claimed_clear(void)
 }
 
 /*
+ * The suspended-VF set: the (pf_bdf, vf_id) pairs CHECKPOINT_DEVICES
+ * parked to STOP, so we suspend each VF exactly once (a VF backs several
+ * contexts across several pids) and fini(DUMP) resumes exactly what we
+ * parked.
+ */
+struct vfmig_suspended_vf {
+	struct vfmig_suspended_vf *next;
+	char pf_bdf[64];
+	uint32_t vf_id;
+};
+
+static struct vfmig_suspended_vf *vfmig_suspended_head;
+
+static struct vfmig_suspended_vf *vfmig_suspended_lookup(const char *pf_bdf, uint32_t vf_id)
+{
+	struct vfmig_suspended_vf *p;
+
+	for (p = vfmig_suspended_head; p; p = p->next)
+		if (p->vf_id == vf_id && !strcmp(p->pf_bdf, pf_bdf))
+			return p;
+	return NULL;
+}
+
+static int vfmig_suspended_add(const char *pf_bdf, uint32_t vf_id)
+{
+	struct vfmig_suspended_vf *p = calloc(1, sizeof(*p));
+
+	if (!p)
+		return -1;
+	snprintf(p->pf_bdf, sizeof(p->pf_bdf), "%s", pf_bdf);
+	p->vf_id = vf_id;
+	p->next = vfmig_suspended_head;
+	vfmig_suspended_head = p;
+	return 0;
+}
+
+void vfmig_suspended_clear(void)
+{
+	struct vfmig_suspended_vf *p, *n;
+
+	for (p = vfmig_suspended_head; p; p = n) {
+		n = p->next;
+		free(p);
+	}
+	vfmig_suspended_head = NULL;
+}
+
+/*
+ * Drive one VF's datapath run-state via the per-PF cdev: SUSPEND_VHCA
+ * (RUNNING -> STOP) or RESUME_VHCA (STOP -> RUNNING), both with flags=0
+ * (the fused ladder walking both direction steps in one call). Both are
+ * idempotent in the kernel, so re-issuing against a VF already at the
+ * requested depth is a no-op. Returns 0 on success, -1 otherwise.
+ */
+static int vfmig_vf_set_datapath(const char *pf_bdf, uint32_t vf_id, bool suspend)
+{
+	char cdev_path[PATH_MAX];
+	int cdev_fd, rc;
+
+	snprintf(cdev_path, sizeof(cdev_path), "%s/%s", MLX5_VFMIG_DEV_DIR, pf_bdf);
+	cdev_fd = open(cdev_path, O_RDWR | O_CLOEXEC);
+	if (cdev_fd < 0) {
+		pr_perror("vfmig: open(%s)", cdev_path);
+		return -1;
+	}
+
+	if (suspend) {
+		struct mlx5_vfmig_suspend_vhca s;
+
+		memset(&s, 0, sizeof(s));
+		s.vf_id = vf_id;
+		s.flags = 0;
+		rc = ioctl(cdev_fd, MLX5_VFMIG_IOC_SUSPEND_VHCA, &s);
+	} else {
+		struct mlx5_vfmig_resume_vhca r;
+
+		memset(&r, 0, sizeof(r));
+		r.vf_id = vf_id;
+		r.flags = 0;
+		rc = ioctl(cdev_fd, MLX5_VFMIG_IOC_RESUME_VHCA, &r);
+	}
+
+	if (rc)
+		pr_perror("vfmig: %s_VHCA(pf=%s vf_id=%u)", suspend ? "SUSPEND" : "RESUME", pf_bdf, vf_id);
+
+	close(cdev_fd);
+	return rc ? -1 : 0;
+}
+
+/*
+ * CHECKPOINT_DEVICES hook. Fires at CRIU's freeze point (seize.c), once
+ * per alive task, before any task memory is copied into the image. Park
+ * every claimed VF's datapath to STOP via SUSPEND_VHCA so no peer RDMA
+ * WRITE/SEND and no VF self-DMA can land in a pinned MR page mid-
+ * snapshot. The claimed set is tree-wide (the pre-suspend coverage check
+ * already ran the claim hook over every context), so the whole set is
+ * parked on the first call and later calls dedup via the suspended set;
+ * @pid is unused.
+ *
+ * Returns -ENOTSUP when the plugin is inactive (so CRIU's hook chain
+ * treats it as absent), 0 on success ("nothing to do" included), or -1
+ * if a VF that must be parked fails to suspend -- a dump that cannot
+ * quiesce the datapath must fail rather than snapshot a live one.
+ */
+int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid)
+{
+	struct vfmig_claimed_vf *c;
+	int parked = 0;
+
+	(void)pid;
+
+	if (!vfmig_active)
+		return -ENOTSUP;
+
+	for (c = vfmig_claimed_head; c; c = c->next) {
+		if (vfmig_suspended_lookup(c->pf_bdf, c->vf_id))
+			continue;
+		if (vfmig_vf_set_datapath(c->pf_bdf, c->vf_id, true))
+			return -1;
+		if (vfmig_suspended_add(c->pf_bdf, c->vf_id)) {
+			/*
+			 * Parked but out of memory to remember it -> fini
+			 * would not resume it. Roll the suspend back and fail
+			 * the dump rather than strand the source (the kernel's
+			 * SR-IOV-teardown force-resume is only a last resort).
+			 */
+			pr_err("vfmig: checkpoint: OOM tracking suspended pf=%s vf_id=%u; rolling back suspend\n",
+			       c->pf_bdf, c->vf_id);
+			(void)vfmig_vf_set_datapath(c->pf_bdf, c->vf_id, false);
+			return -1;
+		}
+		parked++;
+	}
+
+	if (parked)
+		pr_info("vfmig: checkpoint: parked %d VF datapath(s) before memory dump\n", parked);
+	return 0;
+}
+
+/*
+ * Resume every VF this dump parked at CHECKPOINT_DEVICES. Called from
+ * fini(DUMP) after the SAVE drain, on both the success and failure
+ * paths: the snapshot is complete (or lost) either way, and a VF left in
+ * STOP would make the orchestrator's sriov_numvfs=0 teardown walk a dead
+ * command ring. RESUME_VHCA is idempotent, so a VF the kernel already
+ * force-resumed is harmless. Best-effort: a failed resume is logged but
+ * we still drop the entry and free the set.
+ */
+void vfmig_resume_suspended_vfs(void)
+{
+	struct vfmig_suspended_vf *p, *n;
+	int resumed = 0, failed = 0;
+
+	for (p = vfmig_suspended_head; p; p = n) {
+		n = p->next;
+		if (vfmig_vf_set_datapath(p->pf_bdf, p->vf_id, false))
+			failed++;
+		else
+			resumed++;
+		free(p);
+	}
+	vfmig_suspended_head = NULL;
+
+	if (resumed || failed)
+		pr_info("fini-DUMP resume: resumed=%d resume_failed=%d\n", resumed, failed);
+}
+
+/*
  * Per-VF capture result, produced by vfmig_capture_one_vf() and consumed
  * by vfmig_drain_claimed_in_fini() to build one image record.
  */
@@ -104,12 +283,14 @@ struct vfmig_saved_vf {
  *   4. SAVE_VHCA_STATE { vf_id, flags = 0 } -> read-only save_fd
  *   5. drain save_fd into a per-VF blob under the image dir
  *
- * flags=0 means the kernel self-suspends the VF for the duration of the
- * save and resumes it when save_fd is closed, so the source is left
- * runnable. Pre-suspending at CHECKPOINT_DEVICES (with KEEP_SUSPENDED
- * here) is a separate snapshot-ordering step that matters once pinned
- * MR pages are copied into the image; it is not needed for the
- * VF-firmware-state capture on its own.
+ * flags=0 is correct in both cases the plugin produces. When the VF was
+ * already parked to STOP by CHECKPOINT_DEVICES (the normal path -- that
+ * hook runs at freeze, before this drain), SAVE captures it as-is and
+ * leaves the resume to our fini RESUME_VHCA; KEEP_SUSPENDED would be a
+ * no-op for a caller-parked VF. When the VF was not pre-parked, SAVE
+ * transiently self-suspends and resumes it on close, leaving the source
+ * runnable. Either way SAVE never changes the persistent SUSPEND_VHCA
+ * datapath state this plugin owns.
  */
 static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id, struct vfmig_saved_vf *out)
 {
