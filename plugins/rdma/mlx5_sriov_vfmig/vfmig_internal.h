@@ -110,7 +110,11 @@ void vfmig_clear_image_dir_override(void);
  * fd it reads mlx5_vfmig.img and drives the destination VF restore. It
  * handles only the VF firmware layer -- uverbs contexts and RDMA
  * objects are a separate layer, not restored here.
+ *
+ * vfmig_restore_fini_close_all() frees the process-global restored-VF
+ * cache; safe to call regardless of restore success/failure.
  */
 int mlx5_vfmig_plugin_restore_vf_only(int image_dir_fd);
+void vfmig_restore_fini_close_all(void);
 
 #endif /* __CR_VFMIG_INTERNAL_H__ */
