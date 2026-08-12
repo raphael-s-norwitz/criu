@@ -102,4 +102,15 @@ int vfmig_get_image_dir(void);
 void vfmig_set_image_dir_override(int fd);
 void vfmig_clear_image_dir_override(void);
 
+/*
+ * vfmig_restore.c -- restore-side VF firmware-state path.
+ *
+ * mlx5_vfmig_plugin_restore_vf_only() is the exported entry point the
+ * standalone mlx5_vfmig_restore_vf tool dlopen()s: given an image-dir
+ * fd it reads mlx5_vfmig.img and drives the destination VF restore. It
+ * handles only the VF firmware layer -- uverbs contexts and RDMA
+ * objects are a separate layer, not restored here.
+ */
+int mlx5_vfmig_plugin_restore_vf_only(int image_dir_fd);
+
 #endif /* __CR_VFMIG_INTERNAL_H__ */
