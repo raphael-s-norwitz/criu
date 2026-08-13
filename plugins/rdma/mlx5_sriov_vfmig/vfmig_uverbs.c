@@ -7,6 +7,10 @@
  *   vfmig_query_uctx / vfmig_snapshot_uctx       (static-UAR mode)
  *   vfmig_query_dyn_uars / vfmig_snapshot_dyn_uars (dyn-UAR mode)
  *
+ * Restore-side surface:
+ *   vfmig_send_get_context_v2  (legacy GET_CONTEXT alloc, VFMIG_RESTORE)
+ *   vfmig_restore_uctx         (RESTORE_UCONTEXT, static-UAR replay)
+ *
  * The snapshot helpers wrap the raw QUERY verbs in the two-pass
  * (size, then fetch) idiom the kernel UAPI uses for variable-length
  * arrays. All routines are pure marshaling -- no plugin state, no
@@ -229,5 +233,117 @@ int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **
 
 	*records_out = recs;
 	*n_out = count;
+	return 0;
+}
+
+/*
+ * Allocate a fresh ucontext on @fd via the legacy write()-based
+ * IB_USER_VERBS_CMD_GET_CONTEXT command, with the mlx5 driver payload
+ * appended. @flags carries the MLX5_IB_ALLOC_UCTX_* bits (the restore
+ * path sets MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE so the kernel leaves the
+ * UAR table empty and arms vfmig_restore_pending for the follow-up
+ * RESTORE_UCONTEXT verb).
+ *
+ * The static path passes the source ucontext's resolved (lib_caps,
+ * total_bfregs, ll_bfregs, max_cqe_version) verbatim so the
+ * destination's alloc_ucontext computes a meta that bitwise-matches
+ * the source; RESTORE_UCONTEXT then enforces that equality.
+ *
+ * @adopt_devx_uid must be 0 in the v0 (non-DEVX source) contract.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+int vfmig_send_get_context_v2(int fd, uint32_t flags, uint64_t lib_caps, uint32_t total_bfregs, uint32_t ll_bfregs,
+			      uint8_t max_cqe_version, uint32_t adopt_devx_uid)
+{
+	struct {
+		struct ib_uverbs_cmd_hdr hdr;
+		struct ib_uverbs_get_context get_ctx;
+		struct mlx5_ib_alloc_ucontext_req_v2_local req;
+	} cmd = {};
+	struct {
+		struct ib_uverbs_get_context_resp resp;
+		struct mlx5_ib_alloc_ucontext_resp_local drv;
+	} resp = {};
+	ssize_t n;
+
+	cmd.hdr.command = IB_USER_VERBS_CMD_GET_CONTEXT;
+	cmd.hdr.in_words = sizeof(cmd) / 4;
+	cmd.hdr.out_words = sizeof(resp) / 4;
+	cmd.get_ctx.response = (uintptr_t)&resp;
+	cmd.req.total_num_bfregs = total_bfregs;
+	cmd.req.num_low_latency_bfregs = ll_bfregs;
+	cmd.req.flags = flags;
+	cmd.req.max_cqe_version = max_cqe_version;
+	cmd.req.lib_caps = lib_caps;
+	cmd.req.adopt_devx_uid = adopt_devx_uid;
+
+	n = write(fd, &cmd, sizeof(cmd));
+	if (n < 0)
+		return -errno;
+	if ((size_t)n != sizeof(cmd))
+		return -EIO;
+	/*
+	 * The legacy GET_CONTEXT path always installs a fresh
+	 * async-event fd in our fdtable and returns its number via
+	 * resp.async_fd. We don't use it -- criu reconstructs the
+	 * workload's async-event fd separately -- and leaving it around
+	 * occupies a low fd slot the later fd-install pass would collide
+	 * with. Drop it as soon as the response is parsed.
+	 */
+	close((int)resp.resp.async_fd);
+	return 0;
+}
+
+/*
+ * Replay a static-UAR ucontext snapshot into a VFMIG_RESTORE ucontext
+ * via MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT. @uar_table / @bfreg_count
+ * are the arrays captured by vfmig_snapshot_uctx(); @meta is the
+ * matching meta struct. @bfreg_count may be NULL (attr omitted).
+ *
+ * The kernel enforces bitwise equality between @meta and the meta it
+ * computed at GET_CONTEXT time, so a mismatch surfaces here as -EINVAL
+ * rather than silently corrupting the restored context.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+int vfmig_restore_uctx(int fd, const uint32_t *uar_table, size_t uar_n, const uint32_t *bfreg_count, size_t bfreg_n,
+		       const struct mlx5_ib_vfmig_ucontext_meta_local *meta)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[3];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_UAR_TABLE_LOCAL;
+	cmd.attrs[n].len = (uint16_t)(uar_n * sizeof(*uar_table));
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)uar_table;
+	n++;
+
+	if (bfreg_count) {
+		cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_BFREG_COUNT_LOCAL;
+		cmd.attrs[n].len = (uint16_t)(bfreg_n * sizeof(*bfreg_count));
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)bfreg_count;
+		n++;
+	}
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META_LOCAL;
+	cmd.attrs[n].len = sizeof(*meta);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)meta;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
 	return 0;
 }
