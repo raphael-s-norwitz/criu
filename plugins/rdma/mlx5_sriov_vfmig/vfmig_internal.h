@@ -70,10 +70,10 @@ void vfmig_claimed_clear(void);
  * Per-ucontext dump capture. rdma_mlx5_vfmig_plugin_dump_uverbs_context()
  * is the RDMA_DUMP_UVERBS_CONTEXT hook: core RDMA dump hands it a
  * drained cdev fd sharing the source ucontext's IDR, and it snapshots
- * that ucontext (QUERY_UCONTEXT) onto the matching claimed-VF entry so
- * the fini(DUMP) SAVE drain can write it into mlx5_vfmig.img. See the
- * claimed-set note above for why the snapshot rides on the claimed
- * entry rather than a separate queue.
+ * that ucontext (QUERY_UCONTEXT, falling back to QUERY_DYN_UARS) onto
+ * the matching claimed-VF entry so the fini(DUMP) SAVE drain can write
+ * it into mlx5_vfmig.img. See the claimed-set note above for why the
+ * snapshot rides on the claimed entry rather than a separate queue.
  */
 int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kernel_driver_id, uint32_t ctxn, int lfd,
 					       pid_t pid);
@@ -85,13 +85,17 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
  *   vfmig_snapshot_uctx()      two-pass QUERY_UCONTEXT: fills @meta and
  *                              allocates the UAR-index / bfreg-count
  *                              arrays (static-UAR mode). Returns
- *                              -EOPNOTSUPP for a dyn-UAR ucontext (whose
- *                              QUERY surface lands in a later commit).
+ *                              -EOPNOTSUPP for a dyn-UAR ucontext.
+ *   vfmig_snapshot_dyn_uars()  two-pass QUERY_DYN_UARS: allocates the
+ *                              dyn-UAR record array (dyn-UAR mode).
  *
- * Arrays are caller-owned (free()).
+ * Exactly one of the two applies to any given ucontext; the dump hook
+ * tries the static path first and falls back on -EOPNOTSUPP. Arrays
+ * are caller-owned (free()).
  */
 int vfmig_snapshot_uctx(int fd, struct mlx5_ib_vfmig_ucontext_meta_local *meta_out, uint32_t **uar_out,
 			size_t *uar_n_out, uint32_t **cnt_out, size_t *cnt_n_out);
+int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **records_out, size_t *n_out);
 
 /*
  * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()
@@ -132,10 +136,10 @@ void vfmig_drain_claimed_in_fini(void);
  * file: it copies the raw bytes into the matching optional proto
  * fields when the pointer is non-NULL and the length is non-zero, and
  * leaves the field unset otherwise. A firmware-only record (no seed
- * context) passes NULL for all of them. The static-UAR snapshot
- * {uctx_meta, uctx_uar_table [+ uctx_bfreg_count]} is populated for a
- * context-bearing VF; the shaping/validation is the dump hook's job,
- * not this writer's. The dyn-UAR variant is added in a later commit.
+ * context) passes NULL for all of them. Exactly one of the static
+ * pair {uctx_meta, uctx_uar_table [+ uctx_bfreg_count]} or the dyn
+ * buffer uctx_dyn_uar_records is populated for a context-bearing VF;
+ * the shaping/validation is the dump hook's job, not this writer's.
  */
 struct vfmig_uctx_image_blob {
 	const void *meta;
@@ -144,6 +148,8 @@ struct vfmig_uctx_image_blob {
 	size_t uar_table_len;
 	const void *bfreg_count;
 	size_t bfreg_count_len;
+	const void *dyn_uar_records;
+	size_t dyn_uar_records_len;
 	uint32_t source_devx_uid;
 	bool has_source_devx_uid;
 };

@@ -21,10 +21,9 @@
  *   include/uapi/rdma/mlx5_user_ioctl_cmds.h  (VFMIG object/methods)
  *
  * This header grows one section at a time as the plugin's context
- * dump/restore layers land: today it carries only the static-UAR
- * dump-side QUERY surface (QUERY_UCONTEXT); the dyn-UAR QUERY verb, the
- * RESTORE verbs, and the GET_CONTEXT alloc structs arrive with later
- * commits.
+ * dump/restore layers land: today it carries only the dump-side QUERY
+ * surface (QUERY_UCONTEXT / QUERY_DYN_UARS); the RESTORE verbs and the
+ * GET_CONTEXT alloc structs arrive with the restore-side commits.
  */
 
 #include <stdint.h>
@@ -49,6 +48,14 @@
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_META_LOCAL \
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+
+/* Dynamic-UAR (lib_uar_dyn=true) QUERY_DYN_UARS method + attrs. */
+#define MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 
 /*
  * Local mirror of include/uapi/rdma/mlx5_user_ioctl_cmds.h's struct
@@ -75,6 +82,19 @@ struct mlx5_ib_vfmig_ucontext_meta_local {
 	uint8_t cqe_version;
 	uint8_t reserved1[3];
 	uint16_t devx_uid;
+} __attribute__((aligned(8)));
+
+/*
+ * Per-dynamic-UAR record (see include/uapi/rdma/mlx5_user_ioctl_cmds.h
+ * for the full doc). Wire layout MUST match the kernel struct exactly
+ * -- both QUERY and RESTORE consume/produce raw arrays of these.
+ */
+struct mlx5_ib_vfmig_dyn_uar_record_local {
+	uint32_t handle;
+	uint32_t uar_index;
+	uint64_t mmap_offset;
+	uint8_t alloc_type;
+	uint8_t reserved0[7];
 } __attribute__((aligned(8)));
 
 #endif /* __CR_MLX5_VFMIG_UAPI_H__ */

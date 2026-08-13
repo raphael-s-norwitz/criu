@@ -162,15 +162,36 @@ message mlx5_vfmig_state_entry {
 	 * RESTORE with a clear "image predates ucontext restore support"
 	 * message rather than silently producing a broken ucontext.
 	 *
-	 * These carry the static-UAR (lib_uar_dyn=false) snapshot. A
-	 * dynamic-UAR source ucontext is captured into a separate field
-	 * (uctx_dyn_uar_records) added in a later change; field number 13
-	 * is reserved for it. Exactly one of the two shapes is populated
-	 * per entry, depending on which mode the source ucontext ran in.
+	 * EXACTLY ONE of {uctx_meta + uctx_uar_table (+ uctx_bfreg_count)}
+	 * vs uctx_dyn_uar_records is populated per entry, depending on
+	 * which mode the source ucontext ran in.
 	 */
 	optional bytes		uctx_meta		= 10;
 	optional bytes		uctx_uar_table		= 11;
 	optional bytes		uctx_bfreg_count	= 12;
+
+	/*
+	 * VFMIG dynamic-UAR ucontext snapshot. Populated when the source
+	 * ucontext was opened by libmlx5 in dynamic-UAR mode (the default
+	 * for modern libmlx5). In that mode sys_pages[] is bypassed
+	 * entirely; UARs are per-object handles allocated lazily and
+	 * exposed to userspace as (handle, mmap_offset) pairs.
+	 *
+	 * Captured at dump time via MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS
+	 * (which the kernel rejects for static ucontexts, and the static
+	 * QUERY_UCONTEXT verb rejects for dyn ucontexts -- exactly-one-of
+	 * by construction). Replayed at restore time after a destination
+	 * ucontext is opened with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE plus
+	 * the dyn-UAR lib cap, via MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS,
+	 * which pins each UAR object at its source-side handle and
+	 * re-inserts the mmap entry at the same offset so the captured
+	 * (handle, mmap_offset) pairs round-trip byte-for-byte.
+	 *
+	 * Wire shape: contiguous array of `struct
+	 * mlx5_ib_vfmig_dyn_uar_record`. Opaque bytes for the same
+	 * wire-shape-locked rationale as uctx_meta / uctx_uar_table.
+	 */
+	optional bytes		uctx_dyn_uar_records	= 13;
 
 	/*
 	 * Source-side DEVX uid that owned the ucontext at dump time
