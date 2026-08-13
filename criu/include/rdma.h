@@ -147,6 +147,25 @@ int rdma_plugin_sharing_policy_by_name(const char *plugin_name);
 int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe);
 
 /*
+ * Dump-side per-ucontext dispatch (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_dump_uverbs_context()
+ *       Invokes CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT on the single
+ *       loaded plugin whose exported cr_rdma_provided_driver matches
+ *       @criu_driver (the context's claimed driver) -- the same
+ *       by-driver keying as the open / per-uobject dispatchers. The
+ *       plugin captures per-ucontext driver-private state on @lfd
+ *       (criu's dup of the dumpee's uverbs cdev fd, sharing the
+ *       ucontext IDR) keyed by @ibdev / @ctxn. The hook is OPTIONAL:
+ *       returns 0 when no loaded plugin registers it for @criu_driver
+ *       (nothing to capture beyond the generic UverbsFileEntry), and
+ *       negative on a duplicate provided-driver declaration or hook
+ *       failure.
+ */
+int rdma_dispatch_dump_uverbs_context(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id,
+				      uint32_t ctxn, int lfd, pid_t pid);
+
+/*
  * Dump-side per-CQ dispatch (criu/rdma/plugin_api.c):
  *
  *   rdma_dispatch_dump_uobj_cq()
