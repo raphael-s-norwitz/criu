@@ -21,9 +21,10 @@
  *     vfmig_restore_init_all_vfs(). It runs the same Phase A and then a
  *     Phase B that parses + validates each image entry's ucontext
  *     snapshot and builds a per-context cache keyed by the source ctxn.
- *     The restore-side uverbs-cdev open path (added in a following
- *     commit) consumes that cache to open the destination cdev and
- *     replay the ucontext.
+ *     The RDMA_OPEN_UVERBS_CDEV hook consumes that cache to open the
+ *     destination cdev (and, in a following commit, replay the ucontext
+ *     snapshot onto it), returning a dup'd fd for core RDMA restore to
+ *     install.
  *
  * The prerestore contract for `criu restore`: the standalone tool (or
  * the orchestrator) has already loaded the VF firmware and bound the
@@ -560,6 +561,106 @@ static int vfmig_resolve_dest_cdev_path(const char *ibdev, char *out, size_t out
 	closedir(d);
 	pr_err("vfmig: no uverbsN matches ibdev=%s\n", ibdev);
 	return -1;
+}
+
+/*
+ * Move a cached destination-cdev fd up into a high range so the
+ * workload's fd-install pass (criu/util.c) does not trip over us
+ * occupying the low slot it wants for this same uverbs fd. Returns the
+ * new (high) fd on success and closes the original; -1 on failure.
+ */
+#define VFMIG_CACHED_FD_FLOOR 1024
+static int vfmig_park_fd_high(int fd)
+{
+	int hi = fcntl(fd, F_DUPFD_CLOEXEC, VFMIG_CACHED_FD_FLOOR);
+
+	if (hi < 0) {
+		pr_perror("vfmig: F_DUPFD_CLOEXEC(%d, >=%d)", fd, VFMIG_CACHED_FD_FLOOR);
+		return -1;
+	}
+	close(fd);
+	return hi;
+}
+
+/*
+ * Lazily open the destination cdev for a cached context, park the fd
+ * high, and cache it. A no-op once the fd is cached (dest_cdev_fd >= 0).
+ *
+ * The ucontext replay onto the freshly opened cdev
+ * (GET_CONTEXT(VFMIG_RESTORE) + RESTORE_UCONTEXT) is added in a
+ * following commit; this commit wires the open + fd bookkeeping the
+ * OPEN_UVERBS_CDEV hook needs. Returns 0 on success, -1 on failure.
+ */
+static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
+{
+	int fd;
+
+	if (c->dest_cdev_fd >= 0)
+		return 0;
+
+	fd = open(c->dest_cdev_path, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		pr_perror("vfmig: open(%s) for ctxn=%u", c->dest_cdev_path, c->source_ctxn);
+		return -1;
+	}
+
+	fd = vfmig_park_fd_high(fd);
+	if (fd < 0)
+		return -1;
+
+	c->dest_cdev_fd = fd;
+	pr_info("vfmig: lazy-opened ctxn=%u dest_cdev=%s -> dest_fd=%d (parked above %d)\n", c->source_ctxn,
+		c->dest_cdev_path, fd, VFMIG_CACHED_FD_FLOOR - 1);
+	return 0;
+}
+
+/*
+ * RDMA_OPEN_UVERBS_CDEV hook. Core RDMA restore dispatches each source
+ * uverbs-file image entry to the plugin that claimed its driver; we map
+ * the entry to a cached destination context by its source ctxn, open
+ * the destination cdev (vfmig_ensure_cdev_open) on first use, and
+ * return a dup'd fd for core to install as the workload's uverbs fd.
+ *
+ * Returns the (non-negative) fd on success, -1 on any failure.
+ */
+int rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
+{
+	struct vfmig_restored_ctx *p, *c = NULL;
+	int dup_fd;
+
+	if (!vfmig_active) {
+		pr_err("vfmig: open_uverbs_cdev called but plugin inactive (no tracked VFs at restore-side init?)\n");
+		return -1;
+	}
+	if (!uvfe->has_ctxn) {
+		pr_err("vfmig: open_uverbs_cdev: uvfe has no ctxn -- image too old\n");
+		return -1;
+	}
+
+	for (p = vfmig_restored_ctxs; p; p = p->next) {
+		if (p->source_ctxn == uvfe->ctxn) {
+			c = p;
+			break;
+		}
+	}
+	if (!c) {
+		pr_err("vfmig: open_uverbs_cdev: no cached ctx for uvfe.ctxn=%u ibdev=%s\n", uvfe->ctxn,
+		       uvfe->ib_dev ?: "?");
+		return -1;
+	}
+
+	if (vfmig_ensure_cdev_open(c))
+		return -1;
+
+	dup_fd = dup(c->dest_cdev_fd);
+	if (dup_fd < 0) {
+		pr_perror("vfmig: dup(dest_cdev_fd=%d) for ctxn=%u", c->dest_cdev_fd, uvfe->ctxn);
+		return -1;
+	}
+
+	pr_info("vfmig: open_uverbs_cdev: ctxn=%u -> dest_fd=%d (dup of cached fd=%d)\n", uvfe->ctxn, dup_fd,
+		c->dest_cdev_fd);
+	return dup_fd;
 }
 
 /*
