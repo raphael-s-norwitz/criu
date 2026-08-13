@@ -109,13 +109,17 @@ int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **
  *   vfmig_restore_uctx()         MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT:
  *                                replays the captured uar_table +
  *                                bfreg_count + meta into the ucontext.
+ *   vfmig_restore_dyn_uars()     MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS:
+ *                                replays the captured dyn-UAR record
+ *                                array into the ucontext.
  *
- * Both are pure marshaling; the caller owns the fd and the arrays.
+ * All are pure marshaling; the caller owns the fd and the arrays.
  */
 int vfmig_send_get_context_v2(int fd, uint32_t flags, uint64_t lib_caps, uint32_t total_bfregs, uint32_t ll_bfregs,
 			      uint8_t max_cqe_version, uint32_t adopt_devx_uid);
 int vfmig_restore_uctx(int fd, const uint32_t *uar_table, size_t uar_n, const uint32_t *bfreg_count, size_t bfreg_n,
 		       const struct mlx5_ib_vfmig_ucontext_meta_local *meta);
+int vfmig_restore_dyn_uars(int fd, const struct mlx5_ib_vfmig_dyn_uar_record_local *records, size_t n_records);
 
 /*
  * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()

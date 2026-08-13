@@ -10,6 +10,7 @@
  * Restore-side surface:
  *   vfmig_send_get_context_v2  (legacy GET_CONTEXT alloc, VFMIG_RESTORE)
  *   vfmig_restore_uctx         (RESTORE_UCONTEXT, static-UAR replay)
+ *   vfmig_restore_dyn_uars     (RESTORE_DYN_UARS, dyn-UAR replay)
  *
  * The snapshot helpers wrap the raw QUERY verbs in the two-pass
  * (size, then fetch) idiom the kernel UAPI uses for variable-length
@@ -346,6 +347,39 @@ int vfmig_restore_uctx(int fd, const uint32_t *uar_table, size_t uar_n, const ui
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Replay a dyn-UAR ucontext snapshot into a VFMIG_RESTORE ucontext via
+ * MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS. @records is the array captured
+ * by vfmig_snapshot_dyn_uars(); the kernel infers the count from the
+ * attr length, so a zero-length array clears vfmig_restore_pending with
+ * no UARs seeded.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+int vfmig_restore_dyn_uars(int fd, const struct mlx5_ib_vfmig_dyn_uar_record_local *records, size_t n_records)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[1];
+	} cmd = {};
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[0].attr_id = MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS_LOCAL;
+	cmd.attrs[0].len = (uint16_t)(n_records * sizeof(*records));
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = (uintptr_t)records;
+
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd.hdr) + sizeof(cmd.attrs[0]);
 
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;
