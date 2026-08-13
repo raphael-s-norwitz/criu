@@ -1,26 +1,36 @@
 /*
- * mlx5_sriov_vfmig restore-side VF firmware-state path.
+ * mlx5_sriov_vfmig restore-side path.
  *
- * This is the LOAD counterpart to the fini(DUMP) SAVE drain in
- * vfmig_dump.c, and it covers only the VF firmware layer. It does NOT
- * restore any uverbs context, PD/CQ/QP/MR, or process memory -- that is
- * a separate uverbs-object layer, which needs core CRIU hooks and is
- * not wired here.
+ * The VF firmware layer here is the LOAD counterpart to the fini(DUMP)
+ * SAVE drain in vfmig_dump.c: it matches each image entry's vf_uuid to
+ * a destination VF, and -- unless the VF is already bound -- drives
+ * ENABLE_MIGRATABLE + SET_TRACKED + LOAD_VHCA_STATE (streaming the
+ * firmware blob off the image dir) + MARK_RESTORED and binds it to
+ * mlx5_core, then waits for and resolves the destination ibdev and
+ * uverbs cdev.
  *
- * The single entry point is the exported symbol
- * mlx5_vfmig_plugin_restore_vf_only(), which the standalone
- * mlx5_vfmig_restore_vf tool dlopen()s and calls with an image-dir fd.
- * There is deliberately no hook into the plugin's own init(RESTORE): a
- * full `criu restore` also needs the uverbs-object layer, so wiring the
- * VF restore into init() before that layer exists would only ever half
- * restore a process. Driving it from the tool lets the VF firmware
- * round-trip be validated on its own.
+ * Two callers drive that firmware layer (both via
+ * vfmig_restore_init_all_vfs_internal):
  *
- * With the destination VF matched by vf_uuid, this commit completes the
- * flow: unless the VF is already bound, drive ENABLE_MIGRATABLE +
- * SET_TRACKED + LOAD_VHCA_STATE (streaming the firmware blob off the
- * image dir) + MARK_RESTORED and bind it to mlx5_core, then wait for
- * and resolve the destination ibdev and uverbs cdev.
+ *   - the standalone mlx5_vfmig_restore_vf tool, through the exported
+ *     mlx5_vfmig_plugin_restore_vf_only() symbol. Firmware layer only
+ *     (Phase A): it stops once the destination VFs are bound and their
+ *     ibdev/cdev are up.
+ *
+ *   - the plugin's own init(RESTORE), through
+ *     vfmig_restore_init_all_vfs(). It runs the same Phase A and then a
+ *     Phase B that parses + validates each image entry's ucontext
+ *     snapshot and builds a per-context cache keyed by the source ctxn.
+ *     The restore-side uverbs-cdev open path (added in a following
+ *     commit) consumes that cache to open the destination cdev and
+ *     replay the ucontext.
+ *
+ * The prerestore contract for `criu restore`: the standalone tool (or
+ * the orchestrator) has already loaded the VF firmware and bound the
+ * VF, so init(RESTORE)'s Phase A finds every VF already bound and skips
+ * LOAD -- it only re-discovers + caches. Dynamic-UAR ucontext restore
+ * (RESTORE_DYN_UARS) is not wired here yet; a dyn-mode image entry is
+ * refused in Phase B.
  *
  * Identity model: the destination VF is found by matching the image
  * entry's 16-byte vf_uuid against MLX5_VFMIG_IOC_QUERY_VF on every VF
@@ -82,6 +92,53 @@ static struct vfmig_restored_vf *vfmig_restored_vf_lookup_by_uuid(const uint8_t 
 
 	for (p = vfmig_restored_vfs; p; p = p->next)
 		if (!memcmp(p->vf_uuid, uuid, 16))
+			return p;
+	return NULL;
+}
+
+/*
+ * One entry per source ucontext the image carries. Built by Phase B of
+ * vfmig_restore_init_all_vfs() from the image's ucontext snapshot and
+ * the destination cdev resolved for the entry's vf_uuid. Holds the
+ * parsed snapshot plus the resolved destination cdev path; the cdev
+ * open + ucontext replay are deferred to the restore-side open path
+ * added in a following commit. Process-global, keyed by the source
+ * ctxn; freed by vfmig_restore_fini_close_all().
+ *
+ * This commit carries the static-UAR (lib_uar_dyn=false) snapshot only;
+ * the dyn-UAR record array arrives with the RESTORE_DYN_UARS commit.
+ */
+struct vfmig_restored_ctx {
+	struct vfmig_restored_ctx *next;
+	uint32_t source_ctxn;
+	char source_ibdev[64];
+	char source_cdev_path[PATH_MAX];
+	char dest_cdev_path[PATH_MAX];
+	int dest_cdev_fd;
+
+	struct mlx5_ib_vfmig_ucontext_meta_local meta;
+	uint32_t *uar_table;
+	size_t uar_n;
+	uint32_t *bfreg_count;
+	size_t bfreg_n;
+
+	/*
+	 * Source-side mlx5_ib_ucontext.devx_uid (see
+	 * mlx5_vfmig.proto::source_devx_uid). 0 means non-DEVX
+	 * ucontext, which is the v0 contract. Carried as image-only
+	 * diagnostic metadata; the static restore path opens the
+	 * destination without DEVX and does not consume it.
+	 */
+	uint32_t source_devx_uid;
+};
+static struct vfmig_restored_ctx *vfmig_restored_ctxs;
+
+static struct vfmig_restored_ctx *vfmig_ctx_lookup_by_source_path(const char *source_cdev_path)
+{
+	struct vfmig_restored_ctx *p;
+
+	for (p = vfmig_restored_ctxs; p; p = p->next)
+		if (!strcmp(p->source_cdev_path, source_cdev_path))
 			return p;
 	return NULL;
 }
@@ -518,8 +575,14 @@ static int vfmig_resolve_dest_cdev_path(const char *ibdev, char *out, size_t out
  *
  * Any per-entry failure aborts the whole restore (goto err): a VF-level
  * restore is all-or-nothing from the operator's point of view.
+ *
+ * @run_phase_b: false for the standalone tool (firmware layer only --
+ * stops once the VFs are bound and ibdev/cdev are up); true for the
+ * plugin's init(RESTORE), which then runs Phase B to parse each image
+ * entry's ucontext snapshot into the per-context cache the
+ * OPEN_UVERBS_CDEV hook consumes.
  */
-static int vfmig_restore_all_vfs(void)
+static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 {
 	static const uint8_t zero_uuid[16] = { 0 };
 	Mlx5VfmigStateEntry **entries = NULL;
@@ -648,6 +711,123 @@ static int vfmig_restore_all_vfs(void)
 			v->dest_cdev_path);
 	}
 
+	if (!run_phase_b)
+		goto done;
+
+	/*
+	 * Phase B: build the per-context restore cache from each entry's
+	 * ucontext snapshot. The cdev open + ucontext replay are deferred
+	 * to the OPEN_UVERBS_CDEV hook (vfmig_ensure_cdev_open); doing the
+	 * fd work here, in criu main, would lose the fd to the fd-table
+	 * teardown in every restored task.
+	 */
+	for (i = 0; i < n_entries; i++) {
+		Mlx5VfmigStateEntry *e = entries[i];
+		struct vfmig_restored_vf *v;
+		struct vfmig_restored_ctx *c;
+		const struct mlx5_ib_vfmig_ucontext_meta_local *m;
+		size_t uar_n, cnt_n;
+
+		v = vfmig_restored_vf_lookup_by_uuid(e->vf_uuid.data);
+		if (!v) {
+			pr_err("vfmig: restored_vf lookup miss for ctxn=%u (vf_uuid not found in cache; Phase A "
+			       "logic bug)\n",
+			       e->ctxn);
+			goto err;
+		}
+
+		if (vfmig_ctx_lookup_by_source_path(e->source_cdev_path)) {
+			pr_err("vfmig: multiple state entries reference source cdev path %s -- "
+			       "multi-ctxn-per-VF restore is not supported in v0\n",
+			       e->source_cdev_path);
+			goto err;
+		}
+
+		/*
+		 * The image must carry exactly one of the static pair
+		 * {uctx_meta + uctx_uar_table (+ uctx_bfreg_count)} or the
+		 * dyn buffer uctx_dyn_uar_records. An entry with neither
+		 * predates VFMIG_RESTORE support; one with both is a
+		 * malformed image. A dyn-mode entry is well-formed but not
+		 * restorable by this commit -- RESTORE_DYN_UARS lands later.
+		 */
+		if (e->has_uctx_dyn_uar_records && !e->has_uctx_meta) {
+			pr_err("vfmig: image entry ctxn=%u carries a dynamic-UAR ucontext snapshot; dyn-UAR "
+			       "restore is not supported yet (arrives with the RESTORE_DYN_UARS commit)\n",
+			       e->ctxn);
+			goto err;
+		}
+		if (!e->has_uctx_meta || !e->has_uctx_uar_table) {
+			pr_err("vfmig: image entry ctxn=%u missing static uctx snapshot (meta=%d uar_table=%d) -- "
+			       "image predates VFMIG_RESTORE support and is not restorable; re-dump with a current "
+			       "criu build\n",
+			       e->ctxn, e->has_uctx_meta, e->has_uctx_uar_table);
+			goto err;
+		}
+		if (e->has_uctx_dyn_uar_records) {
+			pr_err("vfmig: image entry ctxn=%u carries BOTH static and dyn uctx snapshots -- malformed "
+			       "image\n",
+			       e->ctxn);
+			goto err;
+		}
+		if (e->uctx_meta.len != sizeof(struct mlx5_ib_vfmig_ucontext_meta_local)) {
+			pr_err("vfmig: image entry ctxn=%u static uctx_meta length=%zu != %zu\n", e->ctxn,
+			       e->uctx_meta.len, sizeof(struct mlx5_ib_vfmig_ucontext_meta_local));
+			goto err;
+		}
+
+		m = (const void *)e->uctx_meta.data;
+		uar_n = e->uctx_uar_table.len / sizeof(uint32_t);
+		cnt_n = e->has_uctx_bfreg_count ? (e->uctx_bfreg_count.len / sizeof(uint32_t)) : 0;
+
+		if (uar_n != m->num_sys_pages) {
+			pr_err("vfmig: image entry ctxn=%u uar_table len mismatch: %zu != meta.num_sys_pages=%u\n",
+			       e->ctxn, uar_n, m->num_sys_pages);
+			goto err;
+		}
+		if (cnt_n && cnt_n != m->total_num_bfregs) {
+			pr_err("vfmig: image entry ctxn=%u bfreg_count len mismatch: %zu != "
+			       "meta.total_num_bfregs=%u\n",
+			       e->ctxn, cnt_n, m->total_num_bfregs);
+			goto err;
+		}
+
+		c = calloc(1, sizeof(*c));
+		if (!c)
+			goto err;
+		c->source_ctxn = e->ctxn;
+		snprintf(c->source_ibdev, sizeof(c->source_ibdev), "%s", e->ibdev);
+		snprintf(c->source_cdev_path, sizeof(c->source_cdev_path), "%s", e->source_cdev_path);
+		snprintf(c->dest_cdev_path, sizeof(c->dest_cdev_path), "%s", v->dest_cdev_path);
+		c->dest_cdev_fd = -1;
+		c->source_devx_uid = e->has_source_devx_uid ? e->source_devx_uid : 0;
+		c->meta = *m;
+		c->uar_n = uar_n;
+		c->uar_table = malloc(e->uctx_uar_table.len);
+		if (!c->uar_table) {
+			free(c);
+			goto err;
+		}
+		memcpy(c->uar_table, e->uctx_uar_table.data, e->uctx_uar_table.len);
+		if (cnt_n) {
+			c->bfreg_n = cnt_n;
+			c->bfreg_count = malloc(e->uctx_bfreg_count.len);
+			if (!c->bfreg_count) {
+				free(c->uar_table);
+				free(c);
+				goto err;
+			}
+			memcpy(c->bfreg_count, e->uctx_bfreg_count.data, e->uctx_bfreg_count.len);
+		}
+
+		c->next = vfmig_restored_ctxs;
+		vfmig_restored_ctxs = c;
+		pr_info("vfmig: cached ctxn=%u source_ibdev=%s source_cdev=%s dest_cdev=%s mode=static "
+			"source_devx_uid=%u (snapshot deferred-open)\n",
+			c->source_ctxn, c->source_ibdev, c->source_cdev_path, c->dest_cdev_path, c->source_devx_uid);
+	}
+
+done:
 	for (i = 0; i < n_entries; i++)
 		mlx5_vfmig_state_entry__free_unpacked(entries[i], NULL);
 	free(entries);
@@ -664,12 +844,35 @@ err:
 void vfmig_restore_fini_close_all(void)
 {
 	struct vfmig_restored_vf *v, *vn;
+	struct vfmig_restored_ctx *c, *cn;
+
+	for (c = vfmig_restored_ctxs; c; c = cn) {
+		cn = c->next;
+		if (c->dest_cdev_fd >= 0)
+			close(c->dest_cdev_fd);
+		free(c->uar_table);
+		free(c->bfreg_count);
+		free(c);
+	}
+	vfmig_restored_ctxs = NULL;
 
 	for (v = vfmig_restored_vfs; v; v = vn) {
 		vn = v->next;
 		free(v);
 	}
 	vfmig_restored_vfs = NULL;
+}
+
+/*
+ * criu-restore-side entry point, driven from the plugin's
+ * init(RESTORE). Runs the full firmware discovery (Phase A) plus the
+ * per-context cache build (Phase B) so the OPEN_UVERBS_CDEV hook can
+ * lazily open + replay each context. Uses criu's own image dir (no
+ * override). Returns 0 on success, -1 on any error.
+ */
+int vfmig_restore_init_all_vfs(void)
+{
+	return vfmig_restore_init_all_vfs_internal(true);
 }
 
 /*
@@ -695,7 +898,7 @@ int mlx5_vfmig_plugin_restore_vf_only(int image_dir_fd)
 	}
 
 	vfmig_set_image_dir_override(image_dir_fd);
-	rc = vfmig_restore_all_vfs();
+	rc = vfmig_restore_init_all_vfs_internal(false);
 	vfmig_clear_image_dir_override();
 
 	/*

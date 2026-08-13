@@ -182,8 +182,16 @@ void vfmig_clear_image_dir_override(void);
  *
  * vfmig_restore_fini_close_all() frees the process-global restored-VF
  * cache; safe to call regardless of restore success/failure.
+ *
+ * vfmig_restore_init_all_vfs() is the criu-restore-side entry point,
+ * driven from the plugin's init(RESTORE). It runs the same VF firmware
+ * discovery as the standalone tool (Phase A -- resolve dest VF by
+ * vf_uuid, LOAD-unless-already-bound, resolve dest ibdev/cdev) and then
+ * builds the per-context restore cache from the image's uctx snapshots
+ * (Phase B) that the restore-side uverbs-cdev open path consumes.
  */
 int mlx5_vfmig_plugin_restore_vf_only(int image_dir_fd);
 void vfmig_restore_fini_close_all(void);
+int vfmig_restore_init_all_vfs(void);
 
 #endif /* __CR_VFMIG_INTERNAL_H__ */
