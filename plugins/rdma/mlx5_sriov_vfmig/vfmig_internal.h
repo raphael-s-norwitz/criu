@@ -14,6 +14,7 @@
 #include <sys/types.h>
 
 #include "images/mlx5_vfmig.pb-c.h"
+#include "images/uverbsfd.pb-c.h"
 #include "mlx5_uapi.h"
 
 /*
@@ -189,9 +190,16 @@ void vfmig_clear_image_dir_override(void);
  * vf_uuid, LOAD-unless-already-bound, resolve dest ibdev/cdev) and then
  * builds the per-context restore cache from the image's uctx snapshots
  * (Phase B) that the restore-side uverbs-cdev open path consumes.
+ *
+ * rdma_mlx5_vfmig_plugin_open_uverbs_cdev() is the RDMA_OPEN_UVERBS_CDEV
+ * hook: given a source uverbs-file image entry it looks up the cached
+ * destination context by source ctxn, opens the destination cdev on
+ * first use, and returns a dup'd fd for core RDMA restore to install as
+ * the workload's uverbs fd.
  */
 int mlx5_vfmig_plugin_restore_vf_only(int image_dir_fd);
 void vfmig_restore_fini_close_all(void);
 int vfmig_restore_init_all_vfs(void);
+int rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe);
 
 #endif /* __CR_VFMIG_INTERNAL_H__ */
