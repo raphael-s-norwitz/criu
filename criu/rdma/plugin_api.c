@@ -217,6 +217,68 @@ int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 }
 
 /*
+ * Dump-side per-ucontext dispatch.
+ *
+ * The per-context twin of rdma_dispatch_dump_uobj_cq(): dispatch
+ * CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT to the single plugin whose
+ * exported cr_rdma_provided_driver matches @criu_driver -- the value
+ * the dump-time claim recorded on this ucontext. Same by-driver keying
+ * as the open / per-uobject dispatchers, since the hook chain alone
+ * can't tell an rxe context from an mlx5 one.
+ *
+ * Unlike the CQ/QP dispatchers this hook is OPTIONAL: a plugin with no
+ * per-ucontext driver state (rxe) simply doesn't register it. When no
+ * loaded plugin registers the hook for @criu_driver we return 0 (the
+ * generic UverbsFileEntry already captured everything). A duplicate
+ * provided-driver declaration is still a hard error (-EEXIST): the
+ * operator's plugin set is inconsistent.
+ */
+int rdma_dispatch_dump_uverbs_context(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id,
+				      uint32_t ctxn, int lfd, pid_t pid)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+	const char *winner_name = NULL;
+	CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT_t *fn;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		if (!this->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT])
+			continue;
+		p = (const int *)dlsym(this->dlhandle, CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != criu_driver)
+			continue;
+
+		if (winner) {
+			pr_err("uverbs context dump (ibdev=%s ctxn=%u): multiple plugins declare "
+			       "cr_rdma_provided_driver=%u ('%s' and '%s'); operator's plugin set is inconsistent.\n",
+			       ibdev ?: "?", ctxn, criu_driver, winner_name, this->d->name);
+			return -EEXIST;
+		}
+		winner = this;
+		winner_name = this->d->name;
+	}
+
+	if (!winner) {
+		pr_debug("uverbs context dump (ibdev=%s ctxn=%u): no loaded RDMA plugin registers "
+			 "RDMA_DUMP_UVERBS_CONTEXT for cr_rdma_provided_driver=%u; nothing to capture.\n",
+			 ibdev ?: "?", ctxn, criu_driver);
+		return 0;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT];
+	pr_debug("uverbs context dump: dispatching DUMP_UVERBS_CONTEXT to plugin '%s' (criu_driver=%u ibdev=%s "
+		 "ctxn=%u)\n",
+		 winner_name, criu_driver, ibdev ?: "?", ctxn);
+	return fn(ibdev, kernel_driver_id, ctxn, lfd, pid);
+}
+
+/*
  * Dump-side per-CQ dispatch.
  *
  * The per-uobject twin of rdma_dispatch_open_uverbs_cdev(): the R3 CQ

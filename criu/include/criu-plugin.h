@@ -221,6 +221,32 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK = 21,
 
+	/*
+	 * RDMA per-ucontext dump-side capture. Dispatched by core's
+	 * dump_uverbsfile() (criu/rdma/uverbsfd.c) once per uverbs cdev
+	 * being checkpointed, to the single plugin whose exported
+	 * cr_rdma_provided_driver matches the context's claimed
+	 * criu_driver (same by-driver keying as RDMA_OPEN_UVERBS_CDEV /
+	 * RDMA_DUMP_UOBJ_CQ).
+	 *
+	 * Distinct from the per-uobject dump hooks: this captures
+	 * per-ucontext aggregate driver state that NLDEV does not expose
+	 * and the destination cannot re-derive (mlx5: the UAR / bfreg
+	 * snapshot the destination's restore-mode GET_CONTEXT needs to
+	 * reproduce the source ucontext's sys_pages[] layout). The plugin
+	 * queries it on @lfd -- criu's dup of the dumpee's uverbs cdev fd,
+	 * which shares the ucontext IDR -- and stashes it keyed by @ibdev
+	 * / @ctxn for its own image writer to persist at fini(DUMP).
+	 *
+	 * Optional: a no-op for plugins (e.g. rxe) with no per-ucontext
+	 * driver state beyond the generic UverbsFileEntry. The core
+	 * dispatcher returns 0 when no loaded plugin registers the hook.
+	 *
+	 * Return: 0 on success, negative errno on failure (aborts the
+	 * dump -- a partially captured context would not restore).
+	 */
+	CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT = 22,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -283,6 +309,8 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *
  */
 #include "images/uverbsfd.pb-c.h"
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const UverbsFileEntry *uvfe);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT, const char *ibdev, uint32_t kernel_driver_id,
+			 uint32_t ctxn, int lfd, pid_t pid);
 /*
  * The RdmaCqAttrs typedef and the ProtobufCBinaryData plugin-blob
  * byteslice resolve through images/rdma_uobj.pb-c.h -- same forward-
