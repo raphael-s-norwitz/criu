@@ -22,9 +22,9 @@
  *     Phase B that parses + validates each image entry's ucontext
  *     snapshot and builds a per-context cache keyed by the source ctxn.
  *     The RDMA_OPEN_UVERBS_CDEV hook consumes that cache to open the
- *     destination cdev (and, in a following commit, replay the ucontext
- *     snapshot onto it), returning a dup'd fd for core RDMA restore to
- *     install.
+ *     destination cdev and replay the static-UAR ucontext
+ *     (GET_CONTEXT(VFMIG_RESTORE) + RESTORE_UCONTEXT) on first use,
+ *     returning a dup'd fd for core RDMA restore to install.
  *
  * The prerestore contract for `criu restore`: the standalone tool (or
  * the orchestrator) has already loaded the VF firmware and bound the
@@ -102,9 +102,10 @@ static struct vfmig_restored_vf *vfmig_restored_vf_lookup_by_uuid(const uint8_t 
  * vfmig_restore_init_all_vfs() from the image's ucontext snapshot and
  * the destination cdev resolved for the entry's vf_uuid. Holds the
  * parsed snapshot plus the resolved destination cdev path; the cdev
- * open + ucontext replay are deferred to the restore-side open path
- * added in a following commit. Process-global, keyed by the source
- * ctxn; freed by vfmig_restore_fini_close_all().
+ * open + ucontext replay are deferred to first use
+ * (vfmig_ensure_cdev_open), fired by the OPEN_UVERBS_CDEV hook.
+ * Process-global, keyed by the source ctxn; freed by
+ * vfmig_restore_fini_close_all().
  *
  * This commit carries the static-UAR (lib_uar_dyn=false) snapshot only;
  * the dyn-UAR record array arrives with the RESTORE_DYN_UARS commit.
@@ -585,17 +586,29 @@ static int vfmig_park_fd_high(int fd)
 }
 
 /*
- * Lazily open the destination cdev for a cached context, park the fd
- * high, and cache it. A no-op once the fd is cached (dest_cdev_fd >= 0).
+ * Lazily open the destination cdev for a cached context and replay its
+ * static-UAR ucontext snapshot: GET_CONTEXT(VFMIG_RESTORE) allocates a
+ * fresh restore-pending ucontext whose meta bitwise-matches the source
+ * (the source's resolved lib_caps / bfreg counts / cqe_version are
+ * passed verbatim), then RESTORE_UCONTEXT seeds the UAR table +
+ * bfreg counts from the image. A post-restore re-QUERY confirms the
+ * kernel actually reproduced the snapshot bitwise before the fd is
+ * cached (parked high) for the OPEN_UVERBS_CDEV consumer.
  *
- * The ucontext replay onto the freshly opened cdev
- * (GET_CONTEXT(VFMIG_RESTORE) + RESTORE_UCONTEXT) is added in a
- * following commit; this commit wires the open + fd bookkeeping the
- * OPEN_UVERBS_CDEV hook needs. Returns 0 on success, -1 on failure.
+ * v0 contract: the destination is always opened without DEVX, so
+ * c->source_devx_uid (commonly non-zero -- default libmlx5 auto-DEVX)
+ * is not consumed, only logged for diagnostics. RESTORE_UCONTEXT
+ * tolerates the source/dest devx_uid mismatch, so no devx_uid is
+ * enforced. A no-op once the fd is cached (dest_cdev_fd >= 0). Returns
+ * 0 on success, -1 on any failure.
  */
 static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 {
-	int fd;
+	const struct mlx5_ib_vfmig_ucontext_meta_local *m = &c->meta;
+	struct mlx5_ib_vfmig_ucontext_meta_local meta_b = {};
+	uint32_t *uar_b = NULL, *cnt_b = NULL;
+	size_t uar_bn = 0, cnt_bn = 0;
+	int fd, rc;
 
 	if (c->dest_cdev_fd >= 0)
 		return 0;
@@ -605,6 +618,45 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 		pr_perror("vfmig: open(%s) for ctxn=%u", c->dest_cdev_path, c->source_ctxn);
 		return -1;
 	}
+
+	rc = vfmig_send_get_context_v2(fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE, m->lib_caps, m->total_num_bfregs,
+				       m->num_low_latency_bfregs, m->cqe_version, /* adopt_devx_uid */ 0);
+	if (rc) {
+		pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE, static) on %s ctxn=%u failed: %d (%s) "
+		       "[source_devx_uid=%u (image-only, not consumed at restore)]\n",
+		       c->dest_cdev_path, c->source_ctxn, rc, strerror(-rc), c->source_devx_uid);
+		close(fd);
+		return -1;
+	}
+
+	rc = vfmig_restore_uctx(fd, c->uar_table, c->uar_n, c->bfreg_count, c->bfreg_n, m);
+	if (rc) {
+		pr_err("vfmig: RESTORE_UCONTEXT on %s ctxn=%u failed: %d (%s)\n", c->dest_cdev_path, c->source_ctxn,
+		       rc, strerror(-rc));
+		close(fd);
+		return -1;
+	}
+
+	rc = vfmig_snapshot_uctx(fd, &meta_b, &uar_b, &uar_bn, &cnt_b, &cnt_bn);
+	if (rc) {
+		pr_err("vfmig: post-restore re-QUERY on %s ctxn=%u failed: %d (%s)\n", c->dest_cdev_path,
+		       c->source_ctxn, rc, strerror(-rc));
+		close(fd);
+		return -1;
+	}
+	if (memcmp(&meta_b, m, sizeof(*m)) != 0 || uar_bn != c->uar_n ||
+	    memcmp(uar_b, c->uar_table, c->uar_n * sizeof(*uar_b)) != 0) {
+		pr_err("vfmig: post-restore re-QUERY on %s ctxn=%u diverged from snapshot\n", c->dest_cdev_path,
+		       c->source_ctxn);
+		free(uar_b);
+		free(cnt_b);
+		close(fd);
+		return -1;
+	}
+	free(uar_b);
+	free(cnt_b);
+	pr_info("vfmig: post-restore re-QUERY ctxn=%u (static): bitwise match (num_sys_pages=%zu)\n", c->source_ctxn,
+		c->uar_n);
 
 	fd = vfmig_park_fd_high(fd);
 	if (fd < 0)
@@ -619,8 +671,8 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 /*
  * RDMA_OPEN_UVERBS_CDEV hook. Core RDMA restore dispatches each source
  * uverbs-file image entry to the plugin that claimed its driver; we map
- * the entry to a cached destination context by its source ctxn, open
- * the destination cdev (vfmig_ensure_cdev_open) on first use, and
+ * the entry to a cached destination context by its source ctxn, lazily
+ * open + replay the ucontext (vfmig_ensure_cdev_open) on first use, and
  * return a dup'd fd for core to install as the workload's uverbs fd.
  *
  * Returns the (non-negative) fd on success, -1 on any failure.

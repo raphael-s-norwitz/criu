@@ -99,6 +99,25 @@ int vfmig_snapshot_uctx(int fd, struct mlx5_ib_vfmig_ucontext_meta_local *meta_o
 int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **records_out, size_t *n_out);
 
 /*
+ * Restore-side ucontext replay (static-UAR mode). Mirror of the QUERY
+ * surface above, consumed by the restore-side cdev-open path:
+ *
+ *   vfmig_send_get_context_v2()  legacy IB_USER_VERBS_CMD_GET_CONTEXT
+ *                                alloc with the mlx5 driver payload;
+ *                                @flags carries VFMIG_RESTORE so the
+ *                                kernel arms the restore-pending gate.
+ *   vfmig_restore_uctx()         MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT:
+ *                                replays the captured uar_table +
+ *                                bfreg_count + meta into the ucontext.
+ *
+ * Both are pure marshaling; the caller owns the fd and the arrays.
+ */
+int vfmig_send_get_context_v2(int fd, uint32_t flags, uint64_t lib_caps, uint32_t total_bfregs, uint32_t ll_bfregs,
+			      uint8_t max_cqe_version, uint32_t adopt_devx_uid);
+int vfmig_restore_uctx(int fd, const uint32_t *uar_table, size_t uar_n, const uint32_t *bfreg_count, size_t bfreg_n,
+		       const struct mlx5_ib_vfmig_ucontext_meta_local *meta);
+
+/*
  * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()
  * is the CHECKPOINT_DEVICES hook: it parks every claimed VF to STOP
  * (SUSPEND_VHCA) at CRIU's freeze point, before task memory is copied.
@@ -193,9 +212,9 @@ void vfmig_clear_image_dir_override(void);
  *
  * rdma_mlx5_vfmig_plugin_open_uverbs_cdev() is the RDMA_OPEN_UVERBS_CDEV
  * hook: given a source uverbs-file image entry it looks up the cached
- * destination context by source ctxn, opens the destination cdev on
- * first use, and returns a dup'd fd for core RDMA restore to install as
- * the workload's uverbs fd.
+ * destination context by source ctxn, lazily opens the destination cdev
+ * + replays the ucontext snapshot on first use, and returns a dup'd fd
+ * for core RDMA restore to install as the workload's uverbs fd.
  */
 int mlx5_vfmig_plugin_restore_vf_only(int image_dir_fd);
 void vfmig_restore_fini_close_all(void);
