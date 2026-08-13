@@ -219,10 +219,17 @@ void vfmig_clear_image_dir_override(void);
  * destination context by source ctxn, lazily opens the destination cdev
  * + replays the ucontext snapshot on first use, and returns a dup'd fd
  * for core RDMA restore to install as the workload's uverbs fd.
+ *
+ * rdma_mlx5_vfmig_plugin_update_vma_map() is the UPDATE_VMA_MAP hook:
+ * for a device VMA whose backing file is one of our source cdev paths,
+ * it ensures the destination context is open + replayed and hands core
+ * a dup'd cdev fd (and unchanged page offset) to mmap the UAR from.
  */
 int mlx5_vfmig_plugin_restore_vf_only(int image_dir_fd);
 void vfmig_restore_fini_close_all(void);
 int vfmig_restore_init_all_vfs(void);
 int rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe);
+int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path, const uint64_t addr, const uint64_t old_pgoff,
+					  uint64_t *new_pgoff, int *plugin_fd);
 
 #endif /* __CR_VFMIG_INTERNAL_H__ */

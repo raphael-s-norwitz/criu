@@ -800,6 +800,53 @@ int rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 }
 
 /*
+ * UPDATE_VMA_MAP hook. Core restore calls this for every device VMA
+ * backed by a plugin-claimed file (VMA_EXT_PLUGIN); we recognize the
+ * seed context's UAR mapping by its source cdev @path, ensure the
+ * destination context is open + replayed (vfmig_ensure_cdev_open), and
+ * hand back a dup'd fd plus the page offset so core mmaps the UAR off
+ * the restored cdev.
+ *
+ * The UAR page offset is stable across the migration: RESTORE_UCONTEXT
+ * / RESTORE_DYN_UARS reproduce the same UAR indices on the destination,
+ * so the source mmap offset addresses the same UAR -- @new_pgoff is
+ * @old_pgoff unchanged.
+ *
+ * Returns 1 (handled, *new_pgoff + *plugin_fd set) for a path we own,
+ * -ENOTSUP to decline a mapping that is not ours, or -1 on failure.
+ */
+int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path, const uint64_t addr, const uint64_t old_pgoff,
+					  uint64_t *new_pgoff, int *plugin_fd)
+{
+	struct vfmig_restored_ctx *c;
+	int dup_fd;
+
+	(void)addr;
+
+	if (!vfmig_active)
+		return -ENOTSUP;
+
+	c = vfmig_ctx_lookup_by_source_path(path);
+	if (!c)
+		return -ENOTSUP;
+
+	if (vfmig_ensure_cdev_open(c))
+		return -1;
+
+	dup_fd = dup(c->dest_cdev_fd);
+	if (dup_fd < 0) {
+		pr_perror("vfmig: dup(dest_cdev_fd=%d) for path=%s", c->dest_cdev_fd, path);
+		return -1;
+	}
+
+	*new_pgoff = old_pgoff;
+	*plugin_fd = dup_fd;
+	pr_info("vfmig: update_vma_map path=%s pgoff=%#llx -> dest_fd=%d (dup of cached)\n", path,
+		(unsigned long long)old_pgoff, dup_fd);
+	return 1;
+}
+
+/*
  * Read mlx5_vfmig.img and, for each unique vf_uuid, restore the
  * matching destination VF up to "firmware loaded, bound, ibdev up".
  *
