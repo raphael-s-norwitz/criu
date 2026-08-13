@@ -199,11 +199,12 @@ int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *sourc
 	e.vf_uuid.len = 16;
 
 	/*
-	 * Optional static-UAR ucontext snapshot. A firmware-only record
-	 * (no seed context on the VF) passes uctx == NULL and leaves
-	 * every optional field unset. Each buffer is set independently;
-	 * the dump hook has already enforced the shaping. The dyn-UAR
-	 * variant field is written by a later commit.
+	 * Optional ucontext snapshot. A firmware-only record (no seed
+	 * context on the VF) passes uctx == NULL and leaves every
+	 * optional field unset. Each buffer is set independently so the
+	 * static path {meta, uar_table, bfreg_count} and the dyn path
+	 * {dyn_uar_records} share this one writer; the dump hook has
+	 * already enforced the exactly-one-of shaping.
 	 */
 	if (uctx) {
 		if (uctx->meta && uctx->meta_len) {
@@ -220,6 +221,11 @@ int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *sourc
 			e.has_uctx_bfreg_count = 1;
 			e.uctx_bfreg_count.data = (uint8_t *)uctx->bfreg_count;
 			e.uctx_bfreg_count.len = uctx->bfreg_count_len;
+		}
+		if (uctx->dyn_uar_records && uctx->dyn_uar_records_len) {
+			e.has_uctx_dyn_uar_records = 1;
+			e.uctx_dyn_uar_records.data = (uint8_t *)uctx->dyn_uar_records;
+			e.uctx_dyn_uar_records.len = uctx->dyn_uar_records_len;
 		}
 		if (uctx->has_source_devx_uid) {
 			e.has_source_devx_uid = 1;
