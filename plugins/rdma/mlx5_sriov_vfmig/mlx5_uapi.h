@@ -21,10 +21,10 @@
  *   include/uapi/rdma/mlx5_user_ioctl_cmds.h  (VFMIG object/methods)
  *
  * This header grows one section at a time as the plugin's context
- * dump/restore layers land: today it carries the dump-side QUERY
- * surface (QUERY_UCONTEXT / QUERY_DYN_UARS) plus the static-UAR
- * restore surface (RESTORE_UCONTEXT verb + GET_CONTEXT alloc structs);
- * the dynamic-UAR RESTORE_DYN_UARS verb arrives with a later commit.
+ * dump/restore layers land: it carries the dump-side QUERY surface
+ * (QUERY_UCONTEXT / QUERY_DYN_UARS) and the restore surface for both
+ * modes (RESTORE_UCONTEXT / RESTORE_DYN_UARS verbs + GET_CONTEXT alloc
+ * structs).
  */
 
 #include <stdint.h>
@@ -66,13 +66,22 @@
 #define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META_LOCAL \
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
 
-/* Dynamic-UAR (lib_uar_dyn=true) QUERY_DYN_UARS method + attrs. */
+/*
+ * Dynamic-UAR (lib_uar_dyn=true) QUERY_DYN_UARS / RESTORE_DYN_UARS
+ * method + attrs. The dyn methods are the next two slots in the VFMIG
+ * enum after the static ones. RESTORE_DYN_UARS takes only the records
+ * array (the kernel infers the count from the attr length).
+ */
 #define MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS_LOCAL \
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 3)
 #define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS_LOCAL \
 	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
 #define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT_LOCAL \
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
 
 /*
  * Local mirror of include/uapi/rdma/mlx5_user_ioctl_cmds.h's struct
@@ -113,6 +122,18 @@ struct mlx5_ib_vfmig_dyn_uar_record_local {
 	uint8_t alloc_type;
 	uint8_t reserved0[7];
 } __attribute__((aligned(8)));
+
+/*
+ * Library-capability bits carried in mlx5_ib_alloc_ucontext_req_v2's
+ * lib_caps (mirror of the mlx5-abi MLX5_LIB_CAP_* bits). The dyn-UAR
+ * restore path opens the destination ucontext with 4K_UAR | DYN_UAR so
+ * the kernel takes the dynamic-UAR alloc branch (empty UAR uobject
+ * list) that RESTORE_DYN_UARS then seeds.
+ */
+enum {
+	MLX5_LIB_CAP_4K_UAR = (uint64_t)1 << 0,
+	MLX5_LIB_CAP_DYN_UAR = (uint64_t)1 << 1,
+};
 
 /*
  * Restore-side alloc-ucontext flags (mirror of the mlx5-abi
