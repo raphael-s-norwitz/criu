@@ -21,9 +21,10 @@
  *   include/uapi/rdma/mlx5_user_ioctl_cmds.h  (VFMIG object/methods)
  *
  * This header grows one section at a time as the plugin's context
- * dump/restore layers land: today it carries only the dump-side QUERY
- * surface (QUERY_UCONTEXT / QUERY_DYN_UARS); the RESTORE verbs and the
- * GET_CONTEXT alloc structs arrive with the restore-side commits.
+ * dump/restore layers land: today it carries the dump-side QUERY
+ * surface (QUERY_UCONTEXT / QUERY_DYN_UARS) plus the static-UAR
+ * restore surface (RESTORE_UCONTEXT verb + GET_CONTEXT alloc structs);
+ * the dynamic-UAR RESTORE_DYN_UARS verb arrives with a later commit.
  */
 
 #include <stdint.h>
@@ -47,6 +48,22 @@
 #define MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_BFREG_COUNT_LOCAL \
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_META_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+
+/*
+ * Static-UAR RESTORE_UCONTEXT method + attrs. The restore side replays
+ * the QUERY_UCONTEXT snapshot back into a freshly allocated
+ * VFMIG_RESTORE ucontext; the attr ids mirror the QUERY_UCONTEXT ones
+ * (uar_table, bfreg_count, meta) so the kernel's uverbs_copy_from lines
+ * up byte-for-byte with what QUERY_UCONTEXT copied out.
+ */
+#define MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_UAR_TABLE_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_BFREG_COUNT_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META_LOCAL \
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
 
 /* Dynamic-UAR (lib_uar_dyn=true) QUERY_DYN_UARS method + attrs. */
@@ -96,6 +113,72 @@ struct mlx5_ib_vfmig_dyn_uar_record_local {
 	uint64_t mmap_offset;
 	uint8_t alloc_type;
 	uint8_t reserved0[7];
+} __attribute__((aligned(8)));
+
+/*
+ * Restore-side alloc-ucontext flags (mirror of the mlx5-abi
+ * MLX5_IB_ALLOC_UCTX_* bits). The legacy IB_USER_VERBS_CMD_GET_CONTEXT
+ * write command carries these in mlx5_ib_alloc_ucontext_req_v2::flags.
+ *
+ * VFMIG_RESTORE tells mlx5_ib_alloc_ucontext to leave the fresh
+ * ucontext's UAR table / sys_pages[] empty and arm vfmig_restore_pending
+ * so the follow-up RESTORE_UCONTEXT verb can seed them from the image
+ * snapshot. DEVX is defined only to document that bit 0 is taken; the
+ * restore path always opens the destination without DEVX (the source's
+ * devx_uid, commonly non-zero, is diagnostic-only and never adopted).
+ */
+enum {
+	MLX5_IB_ALLOC_UCTX_DEVX = 1 << 0,
+	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE = 1 << 1,
+};
+
+/*
+ * Local mirror of the mlx5-abi GET_CONTEXT request/response payloads
+ * (include/uapi/rdma/mlx5-abi.h: struct mlx5_ib_alloc_ucontext_req_v2 /
+ * struct mlx5_ib_alloc_ucontext_resp). The restore side issues the
+ * legacy write()-based IB_USER_VERBS_CMD_GET_CONTEXT with the driver
+ * payload appended, so these must match the kernel wire layout exactly.
+ * Only the request fields the restore path sets (total_num_bfregs,
+ * num_low_latency_bfregs, flags, max_cqe_version, lib_caps) are
+ * meaningful here; the rest are zeroed.
+ */
+struct mlx5_ib_alloc_ucontext_req_v2_local {
+	uint32_t total_num_bfregs;
+	uint32_t num_low_latency_bfregs;
+	uint32_t flags;
+	uint32_t comp_mask;
+	uint8_t max_cqe_version;
+	uint8_t reserved0;
+	uint16_t reserved1;
+	uint32_t reserved2;
+	uint64_t lib_caps;
+	uint32_t adopt_devx_uid;
+	uint32_t reserved3;
+} __attribute__((aligned(8)));
+
+struct mlx5_ib_alloc_ucontext_resp_local {
+	uint32_t qp_tab_size;
+	uint32_t bf_reg_size;
+	uint32_t tot_bfregs;
+	uint32_t cache_line_size;
+	uint16_t max_sq_desc_sz;
+	uint16_t max_rq_desc_sz;
+	uint32_t max_send_wqebb;
+	uint32_t max_recv_wr;
+	uint32_t max_srq_recv_wr;
+	uint16_t num_ports;
+	uint16_t flow_action_flags;
+	uint32_t comp_mask;
+	uint32_t response_length;
+	uint8_t cqe_version;
+	uint8_t cmds_supp_uhw;
+	uint8_t eth_min_inline;
+	uint8_t clock_info_versions;
+	uint64_t hca_core_clock_offset;
+	uint32_t log_uar_size;
+	uint32_t num_uars_per_page;
+	uint32_t num_dyn_bfregs;
+	uint32_t dump_fill_mkey;
 } __attribute__((aligned(8)));
 
 #endif /* __CR_MLX5_VFMIG_UAPI_H__ */
