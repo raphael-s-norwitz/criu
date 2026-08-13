@@ -5,12 +5,12 @@
  *
  * Dump-side QUERY surface on the MLX5_IB_OBJECT_VFMIG object:
  *   vfmig_query_uctx / vfmig_snapshot_uctx       (static-UAR mode)
+ *   vfmig_query_dyn_uars / vfmig_snapshot_dyn_uars (dyn-UAR mode)
  *
- * The snapshot helper wraps the raw QUERY verb in the two-pass
+ * The snapshot helpers wrap the raw QUERY verbs in the two-pass
  * (size, then fetch) idiom the kernel UAPI uses for variable-length
  * arrays. All routines are pure marshaling -- no plugin state, no
- * /sys walks, no logging. Callers own the orchestration. The dyn-UAR
- * QUERY_DYN_UARS surface is added in a later commit.
+ * /sys walks, no logging. Callers own the orchestration.
  */
 
 #include <errno.h>
@@ -28,12 +28,14 @@
 #include "vfmig_internal.h"
 
 /*
- * The QUERY/RESTORE handlers exchange this struct verbatim, so a
+ * The QUERY/RESTORE handlers exchange these structs verbatim, so a
  * wire-layout drift between this build and the kernel would corrupt
- * the snapshot silently. Lock the size at compile time.
+ * the snapshot silently. Lock the sizes at compile time.
  */
 _Static_assert(sizeof(struct mlx5_ib_vfmig_ucontext_meta_local) == 40,
 	       "mlx5_ib_vfmig_ucontext_meta_local must be 40 bytes (kernel UAPI)");
+_Static_assert(sizeof(struct mlx5_ib_vfmig_dyn_uar_record_local) == 24,
+	       "mlx5_ib_vfmig_dyn_uar_record_local must be 24 bytes (kernel UAPI)");
 
 /*
  * Issue MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT via RDMA_VERBS_IOCTL.
@@ -134,5 +136,98 @@ int vfmig_snapshot_uctx(int fd, struct mlx5_ib_vfmig_ucontext_meta_local *meta_o
 	*uar_n_out = meta.num_sys_pages;
 	*cnt_out = cnt;
 	*cnt_n_out = meta.total_num_bfregs;
+	return 0;
+}
+
+/*
+ * Issue MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS via RDMA_VERBS_IOCTL.
+ * Two-pass aware: records=NULL/n_records=0 fills @count_out only.
+ * The kernel rejects this verb with -EINVAL on a static-mode ucontext.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+static int vfmig_query_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local *records, size_t n_records,
+				uint32_t *count_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[2];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	if (records) {
+		cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS_LOCAL;
+		cmd.attrs[n].len = (uint16_t)(n_records * sizeof(*records));
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)records;
+		n++;
+	}
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT_LOCAL;
+	cmd.attrs[n].len = sizeof(*count_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)count_out;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Two-pass dyn-UAR snapshot for a source ucontext. On success
+ * *@records_out / *@n_out point at a caller-owned array (free()).
+ *
+ * A dyn-UAR ucontext with no live UARs (sizing pass returns count==0)
+ * is preserved as records=NULL, n=0 and reported as success: the
+ * proto entry carries a zero-length uctx_dyn_uar_records and
+ * RESTORE_DYN_UARS is effectively a no-op on the destination.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **records_out, size_t *n_out)
+{
+	struct mlx5_ib_vfmig_dyn_uar_record_local *recs = NULL;
+	uint32_t count = 0, count2 = 0;
+	int rc;
+
+	*records_out = NULL;
+	*n_out = 0;
+
+	rc = vfmig_query_dyn_uars(fd, NULL, 0, &count);
+	if (rc)
+		return rc;
+
+	if (count == 0)
+		return 0;
+
+	recs = calloc(count, sizeof(*recs));
+	if (!recs)
+		return -ENOMEM;
+
+	rc = vfmig_query_dyn_uars(fd, recs, count, &count2);
+	if (rc) {
+		free(recs);
+		return rc;
+	}
+	if (count2 != count) {
+		/*
+		 * A concurrent UAR alloc/destroy between the two passes.
+		 * The workload is CRIU-suspended here, so this is a
+		 * structural surprise rather than a benign race; surface
+		 * it rather than snapshot a torn array.
+		 */
+		free(recs);
+		return -EAGAIN;
+	}
+
+	*records_out = recs;
+	*n_out = count;
 	return 0;
 }

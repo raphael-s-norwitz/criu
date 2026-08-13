@@ -60,19 +60,24 @@ struct vfmig_claimed_vf {
 	 * hook (rdma_mlx5_vfmig_plugin_dump_uverbs_context) and consumed
 	 * by the fini(DUMP) drain. v0 carries a single snapshot per VF:
 	 * a VF backs one seed context on the bare-context critical path.
-	 * Static-UAR shape only; the dyn-UAR shape lands in a later
-	 * commit.
+	 * uctx_is_dyn selects which of the two shapes below is live.
 	 */
 	bool uctx_captured;
+	bool uctx_is_dyn;
 	uint32_t ctxn;
 	uint32_t source_devx_uid;
 	char source_cdev_path[PATH_MAX];
 
+	/* static-UAR shape (uctx_is_dyn == false) */
 	struct mlx5_ib_vfmig_ucontext_meta_local uctx_meta;
 	uint32_t *uctx_uar_table;
 	size_t uctx_uar_n;
 	uint32_t *uctx_bfreg_count;
 	size_t uctx_bfreg_n;
+
+	/* dyn-UAR shape (uctx_is_dyn == true) */
+	struct mlx5_ib_vfmig_dyn_uar_record_local *uctx_dyn_records;
+	size_t uctx_dyn_n;
 };
 
 static struct vfmig_claimed_vf *vfmig_claimed_head;
@@ -108,6 +113,7 @@ void vfmig_claimed_clear(void)
 		n = p->next;
 		free(p->uctx_uar_table);
 		free(p->uctx_bfreg_count);
+		free(p->uctx_dyn_records);
 		free(p);
 	}
 	vfmig_claimed_head = NULL;
@@ -127,10 +133,6 @@ void vfmig_claimed_clear(void)
  * runtime condition, and fails the dump (an image record without its
  * ucontext snapshot is unrestorable).
  *
- * v0 handles static-UAR ucontexts only. A dyn-UAR ucontext makes
- * QUERY_UCONTEXT return -EOPNOTSUPP; that is failed here with a clear
- * message until the dyn-UAR QUERY/RESTORE path lands in a later commit.
- *
  * Returns 0 on success (including "not our device" / inactive), -1 on a
  * capture failure that must fail the dump. @kernel_driver_id and @pid
  * are unused -- the fd already targets the right context.
@@ -139,8 +141,9 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
 					       pid_t pid)
 {
 	struct mlx5_ib_vfmig_ucontext_meta_local meta;
+	struct mlx5_ib_vfmig_dyn_uar_record_local *dyn = NULL;
 	uint32_t *uar = NULL, *cnt = NULL;
-	size_t uar_n = 0, cnt_n = 0;
+	size_t uar_n = 0, cnt_n = 0, dyn_n = 0;
 	char link[64], cdev_path[PATH_MAX];
 	struct vfmig_claimed_vf *c;
 	ssize_t ll;
@@ -180,30 +183,42 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
 	}
 	cdev_path[ll] = '\0';
 
+	/*
+	 * Static-UAR first; -EOPNOTSUPP means a dyn-UAR ucontext, which
+	 * QUERY_UCONTEXT rejects and QUERY_DYN_UARS handles instead.
+	 * Exactly one of the two applies by construction.
+	 */
 	rc = vfmig_snapshot_uctx(lfd, &meta, &uar, &uar_n, &cnt, &cnt_n);
 	if (rc == -EOPNOTSUPP) {
-		pr_err("vfmig: dump-uctx: ibdev=%s ctxn=%u is a dyn-UAR ucontext; only static-UAR ucontexts are "
-		       "supported so far (dyn-UAR dump/restore lands in a later commit)\n",
-		       ibdev, ctxn);
-		return -1;
-	}
-	if (rc) {
+		rc = vfmig_snapshot_dyn_uars(lfd, &dyn, &dyn_n);
+		if (rc) {
+			pr_err("vfmig: dump-uctx: QUERY_DYN_UARS(ibdev=%s ctxn=%u) failed: %s\n", ibdev, ctxn,
+			       strerror(-rc));
+			return -1;
+		}
+		c->uctx_is_dyn = true;
+		c->uctx_dyn_records = dyn;
+		c->uctx_dyn_n = dyn_n;
+		c->source_devx_uid = 0; /* dyn QUERY carries no meta.devx_uid */
+	} else if (rc) {
 		pr_err("vfmig: dump-uctx: QUERY_UCONTEXT(ibdev=%s ctxn=%u) failed: %s\n", ibdev, ctxn, strerror(-rc));
 		return -1;
+	} else {
+		c->uctx_is_dyn = false;
+		c->uctx_meta = meta;
+		c->uctx_uar_table = uar;
+		c->uctx_uar_n = uar_n;
+		c->uctx_bfreg_count = cnt;
+		c->uctx_bfreg_n = cnt_n;
+		c->source_devx_uid = meta.devx_uid;
 	}
-	c->uctx_meta = meta;
-	c->uctx_uar_table = uar;
-	c->uctx_uar_n = uar_n;
-	c->uctx_bfreg_count = cnt;
-	c->uctx_bfreg_n = cnt_n;
-	c->source_devx_uid = meta.devx_uid;
 
 	snprintf(c->source_cdev_path, sizeof(c->source_cdev_path), "%s", cdev_path);
 	c->ctxn = ctxn;
 	c->uctx_captured = true;
 
-	pr_info("vfmig: dump-uctx: captured static-UAR ucontext for ibdev=%s ctxn=%u devx_uid=%u\n", ibdev, ctxn,
-		c->source_devx_uid);
+	pr_info("vfmig: dump-uctx: captured %s ucontext for ibdev=%s ctxn=%u devx_uid=%u\n",
+		c->uctx_is_dyn ? "dyn-UAR" : "static-UAR", ibdev, ctxn, c->source_devx_uid);
 	return 0;
 }
 
@@ -528,12 +543,17 @@ void vfmig_drain_claimed_in_fini(void)
 
 		if (c->uctx_captured) {
 			memset(&uctx_blob, 0, sizeof(uctx_blob));
-			uctx_blob.meta = &c->uctx_meta;
-			uctx_blob.meta_len = sizeof(c->uctx_meta);
-			uctx_blob.uar_table = c->uctx_uar_table;
-			uctx_blob.uar_table_len = c->uctx_uar_n * sizeof(*c->uctx_uar_table);
-			uctx_blob.bfreg_count = c->uctx_bfreg_count;
-			uctx_blob.bfreg_count_len = c->uctx_bfreg_n * sizeof(*c->uctx_bfreg_count);
+			if (c->uctx_is_dyn) {
+				uctx_blob.dyn_uar_records = c->uctx_dyn_records;
+				uctx_blob.dyn_uar_records_len = c->uctx_dyn_n * sizeof(*c->uctx_dyn_records);
+			} else {
+				uctx_blob.meta = &c->uctx_meta;
+				uctx_blob.meta_len = sizeof(c->uctx_meta);
+				uctx_blob.uar_table = c->uctx_uar_table;
+				uctx_blob.uar_table_len = c->uctx_uar_n * sizeof(*c->uctx_uar_table);
+				uctx_blob.bfreg_count = c->uctx_bfreg_count;
+				uctx_blob.bfreg_count_len = c->uctx_bfreg_n * sizeof(*c->uctx_bfreg_count);
+			}
 			uctx_blob.source_devx_uid = c->source_devx_uid;
 			uctx_blob.has_source_devx_uid = true;
 			uctx = &uctx_blob;
