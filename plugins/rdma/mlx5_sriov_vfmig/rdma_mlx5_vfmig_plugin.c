@@ -151,6 +151,21 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 		pr_info("inactive (stage %d): %d PF cdev(s) probed, no tracked VFs\n", stage, vfmig_pf_count);
 	}
 
+	/*
+	 * Restore-side firmware discovery + per-context cache build. The
+	 * prerestore contract has the standalone tool (or orchestrator)
+	 * already load + bind the destination VFs, so this re-discovers
+	 * them (Phase A finds them bound and skips LOAD) and parses the
+	 * image's ucontext snapshots into the cache the OPEN_UVERBS_CDEV
+	 * hook consumes (Phase B). An empty image is a no-op; a mismatch
+	 * (image entries but no matching tracked VF) fails init, which
+	 * aborts the restore with a clear diagnostic.
+	 */
+	if (stage == CR_PLUGIN_STAGE__RESTORE) {
+		if (vfmig_restore_init_all_vfs())
+			return -1;
+	}
+
 	return 0;
 }
 
@@ -176,6 +191,15 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 			vfmig_drain_claimed_in_fini();
 		vfmig_resume_suspended_vfs();
 	}
+
+	/*
+	 * Restore-side cleanup: init(RESTORE) built the restored-VF and
+	 * per-context caches in the criu process (and the OPEN hook may
+	 * have cached destination cdev fds), so drop them here. Safe
+	 * regardless of restore success/failure, and a no-op on DUMP.
+	 */
+	if (stage == CR_PLUGIN_STAGE__RESTORE)
+		vfmig_restore_fini_close_all();
 
 	pr_info("fini (stage %d ret %d): was %s, %d tracked VF(s) across %d PF(s)\n", stage, ret,
 		vfmig_active ? "active" : "inactive", vfmig_tracked_vf_count, vfmig_pf_count);
