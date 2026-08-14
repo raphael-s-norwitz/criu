@@ -14,6 +14,7 @@
 #include <sys/types.h>
 
 #include "images/mlx5_vfmig.pb-c.h"
+#include "mlx5_uapi.h"
 
 /*
  * vfmig_pci.c -- PCI / sysfs / per-PF cdev probe + resolution helpers.
@@ -68,13 +69,29 @@ void vfmig_claimed_clear(void);
 /*
  * Per-ucontext dump capture. rdma_mlx5_vfmig_plugin_dump_uverbs_context()
  * is the RDMA_DUMP_UVERBS_CONTEXT hook: core RDMA dump hands it a
- * drained cdev fd sharing the source ucontext's IDR, and it records the
- * cdev path + context number on the matching claimed-VF entry so the
- * fini(DUMP) SAVE drain can key off it. The ucontext UAR-state snapshot
- * this hook takes is added in a later commit.
+ * drained cdev fd sharing the source ucontext's IDR, and it snapshots
+ * that ucontext (QUERY_UCONTEXT) onto the matching claimed-VF entry so
+ * the fini(DUMP) SAVE drain can write it into mlx5_vfmig.img. See the
+ * claimed-set note above for why the snapshot rides on the claimed
+ * entry rather than a separate queue.
  */
 int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kernel_driver_id, uint32_t ctxn, int lfd,
 					       pid_t pid);
+
+/*
+ * vfmig_uverbs.c -- mlx5 ucontext uverbs-ioctl QUERY wrappers. Pure
+ * marshaling over MLX5_IB_OBJECT_VFMIG; no plugin state.
+ *
+ *   vfmig_snapshot_uctx()      two-pass QUERY_UCONTEXT: fills @meta and
+ *                              allocates the UAR-index / bfreg-count
+ *                              arrays (static-UAR mode). Returns
+ *                              -EOPNOTSUPP for a dyn-UAR ucontext (whose
+ *                              QUERY surface lands in a later commit).
+ *
+ * Arrays are caller-owned (free()).
+ */
+int vfmig_snapshot_uctx(int fd, struct mlx5_ib_vfmig_ucontext_meta_local *meta_out, uint32_t **uar_out,
+			size_t *uar_n_out, uint32_t **cnt_out, size_t *cnt_n_out);
 
 /*
  * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()
