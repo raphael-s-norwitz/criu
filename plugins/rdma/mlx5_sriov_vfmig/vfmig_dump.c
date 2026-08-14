@@ -495,7 +495,11 @@ void vfmig_drain_claimed_in_fini(void)
 
 	for (c = vfmig_claimed_head; c; c = c->next) {
 		struct vfmig_saved_vf sv;
+		struct vfmig_uctx_image_blob uctx_blob;
+		struct vfmig_uctx_image_blob *uctx = NULL;
 		char cdev_path[PATH_MAX];
+		const char *cdev_for_record;
+		uint32_t ctxn = 0;
 
 		total++;
 		memset(&sv, 0, sizeof(sv));
@@ -507,21 +511,36 @@ void vfmig_drain_claimed_in_fini(void)
 		}
 
 		/*
-		 * source_cdev_path is diagnostic in the VF-firmware layer
-		 * (it becomes a join key for the later device-VMA remap
-		 * layer); a resolution miss is not fatal, so fall back to
-		 * an empty string rather than drop the record.
+		 * source_cdev_path + ctxn come from the ucontext snapshot
+		 * when one was captured (the readlink'd cdev the context
+		 * was opened against). For a firmware-only VF (no seed
+		 * context) fall back to re-resolving the cdev from the
+		 * ibdev; a miss there is not fatal, so use an empty string.
 		 */
-		if (find_uverbs_cdev_for_ibdev(c->ibdev, cdev_path, sizeof(cdev_path)))
-			cdev_path[0] = '\0';
+		if (c->uctx_captured && c->source_cdev_path[0]) {
+			cdev_for_record = c->source_cdev_path;
+			ctxn = c->ctxn;
+		} else {
+			if (find_uverbs_cdev_for_ibdev(c->ibdev, cdev_path, sizeof(cdev_path)))
+				cdev_path[0] = '\0';
+			cdev_for_record = cdev_path;
+		}
 
-		/*
-		 * ctxn is a per-uverbs-context number owned by the later
-		 * context-dump layer; the VF-firmware layer emits one
-		 * record per VF and has no context number, so record 0.
-		 */
-		if (vfmig_append_state_entry(0, c->ibdev, cdev_path, c->pf_bdf, c->vf_id, sv.vhca_id, sv.vf_uuid,
-					     sv.blob_path, sv.blob_size)) {
+		if (c->uctx_captured) {
+			memset(&uctx_blob, 0, sizeof(uctx_blob));
+			uctx_blob.meta = &c->uctx_meta;
+			uctx_blob.meta_len = sizeof(c->uctx_meta);
+			uctx_blob.uar_table = c->uctx_uar_table;
+			uctx_blob.uar_table_len = c->uctx_uar_n * sizeof(*c->uctx_uar_table);
+			uctx_blob.bfreg_count = c->uctx_bfreg_count;
+			uctx_blob.bfreg_count_len = c->uctx_bfreg_n * sizeof(*c->uctx_bfreg_count);
+			uctx_blob.source_devx_uid = c->source_devx_uid;
+			uctx_blob.has_source_devx_uid = true;
+			uctx = &uctx_blob;
+		}
+
+		if (vfmig_append_state_entry(ctxn, c->ibdev, cdev_for_record, c->pf_bdf, c->vf_id, sv.vhca_id,
+					     sv.vf_uuid, sv.blob_path, sv.blob_size, uctx)) {
 			pr_err("vfmig: failed to append state entry for pf=%s vf_id=%u\n", c->pf_bdf, c->vf_id);
 			failed++;
 			continue;
