@@ -20,10 +20,11 @@
  * state -- so vf_image.c reads as the canonical description of the
  * on-disk shape.
  *
- * This is the VF-firmware-state (device-level) schema. The uverbs-
- * context / ib_uobject restore layer carries an extra ucontext UAR
- * snapshot in mlx5_vfmig.proto; those fields are not written or read
- * here and will be handled when that layer lands.
+ * This is the VF-firmware-state (device-level) schema plus the
+ * ucontext UAR snapshot the uverbs-context restore layer replays. The
+ * snapshot is written here as opaque byte buffers via the optional
+ * vfmig_uctx_image_blob passed by the dump hook; this file stays
+ * oblivious to its internal shape (that lives in mlx5_uapi.h).
  */
 
 #include <endian.h>
@@ -161,7 +162,7 @@ int vfmig_drain_save_fd_to_blob(int save_fd, const char *blob_path, uint64_t *ou
  */
 int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *source_cdev_path, const char *pf_bdf,
 			     uint32_t vf_id, uint32_t vhca_id, const uint8_t vf_uuid[16], const char *blob_path,
-			     uint64_t blob_size)
+			     uint64_t blob_size, const struct vfmig_uctx_image_blob *uctx)
 {
 	Mlx5VfmigStateEntry e = MLX5_VFMIG_STATE_ENTRY__INIT;
 	uint8_t zero_uuid[16] = { 0 };
@@ -196,6 +197,35 @@ int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *sourc
 	e.source_cdev_path = (char *)source_cdev_path;
 	e.vf_uuid.data = (uint8_t *)vf_uuid;
 	e.vf_uuid.len = 16;
+
+	/*
+	 * Optional static-UAR ucontext snapshot. A firmware-only record
+	 * (no seed context on the VF) passes uctx == NULL and leaves
+	 * every optional field unset. Each buffer is set independently;
+	 * the dump hook has already enforced the shaping. The dyn-UAR
+	 * variant field is written by a later commit.
+	 */
+	if (uctx) {
+		if (uctx->meta && uctx->meta_len) {
+			e.has_uctx_meta = 1;
+			e.uctx_meta.data = (uint8_t *)uctx->meta;
+			e.uctx_meta.len = uctx->meta_len;
+		}
+		if (uctx->uar_table && uctx->uar_table_len) {
+			e.has_uctx_uar_table = 1;
+			e.uctx_uar_table.data = (uint8_t *)uctx->uar_table;
+			e.uctx_uar_table.len = uctx->uar_table_len;
+		}
+		if (uctx->bfreg_count && uctx->bfreg_count_len) {
+			e.has_uctx_bfreg_count = 1;
+			e.uctx_bfreg_count.data = (uint8_t *)uctx->bfreg_count;
+			e.uctx_bfreg_count.len = uctx->bfreg_count_len;
+		}
+		if (uctx->has_source_devx_uid) {
+			e.has_source_devx_uid = 1;
+			e.source_devx_uid = uctx->source_devx_uid;
+		}
+	}
 
 	plen = mlx5_vfmig_state_entry__get_packed_size(&e);
 	if (plen > 0xffffffffu) {

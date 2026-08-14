@@ -119,4 +119,71 @@ message mlx5_vfmig_state_entry {
 	 * orchestrator-assignable on the destination).
 	 */
 	required bytes		vf_uuid		= 9;
+
+	/*
+	 * VFMIG ucontext snapshot, captured at dump time on the source's
+	 * uverbs cdev fd via MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT (kernel
+	 * UAPI in include/uapi/rdma/mlx5_user_ioctl_cmds.h). Replayed at
+	 * restore time after the destination ucontext is opened with
+	 * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE: the plugin issues
+	 * MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT to seed the destination's
+	 * sys_pages[] with the source's firmware UAR ids verbatim,
+	 * skipping the per-slot ALLOC_UAR firmware commands a normal
+	 * GET_CONTEXT would issue.
+	 *
+	 * Without this snapshot the destination's GET_CONTEXT after
+	 * LOAD_VHCA_STATE returns -EINVAL: the firmware UARs that were
+	 * live on the source VHCA are reserved on the destination VHCA
+	 * (carried over by LOAD_VHCA_STATE), so the normal allocate-UARs
+	 * loop tries to ALLOC_UAR ids the firmware has already claimed.
+	 *
+	 * uctx_meta: opaque serialized `struct
+	 *     mlx5_ib_vfmig_ucontext_meta`. Carried as bytes, not broken
+	 *     out into typed fields, because the kernel handler does a
+	 *     strict bitwise-equality check on the whole struct at
+	 *     RESTORE_UCONTEXT time -- wire byte-identity is exactly what
+	 *     the handler needs, and treating it as opaque keeps the
+	 *     image oblivious to fields future minor kernel revisions may
+	 *     add.
+	 *
+	 * uctx_uar_table: snapshot of sys_pages[], length equals
+	 *     meta.num_sys_pages. Each entry is an opaque 32-bit firmware
+	 *     UAR id. Replayed verbatim by RESTORE_UCONTEXT.
+	 *
+	 * uctx_bfreg_count: snapshot of the per-bfreg count[] array,
+	 *     length equals meta.total_num_bfregs. v0 enforces all
+	 *     entries zero (no live QPs / claimed dyn UARs); kept in the
+	 *     wire format so a future MR/QP restore step can lift the
+	 *     constraint without a schema bump. Opaque bytes for the same
+	 *     wire-shape-locked reason as uctx_meta.
+	 *
+	 * All three are optional purely for compat with the v0 image
+	 * written before this layer landed: an image lacking uctx_* fails
+	 * RESTORE with a clear "image predates ucontext restore support"
+	 * message rather than silently producing a broken ucontext.
+	 *
+	 * These carry the static-UAR (lib_uar_dyn=false) snapshot. A
+	 * dynamic-UAR source ucontext is captured into a separate field
+	 * (uctx_dyn_uar_records) added in a later change; field number 13
+	 * is reserved for it. Exactly one of the two shapes is populated
+	 * per entry, depending on which mode the source ucontext ran in.
+	 */
+	optional bytes		uctx_meta		= 10;
+	optional bytes		uctx_uar_table		= 11;
+	optional bytes		uctx_bfreg_count	= 12;
+
+	/*
+	 * Source-side DEVX uid that owned the ucontext at dump time
+	 * (from QUERY_UCONTEXT's meta.devx_uid). Absent / 0 means a
+	 * non-DEVX libibverbs ucontext.
+	 *
+	 * Image-only metadata: NOT consumed at restore in v0. The v0
+	 * restore path always opens the destination ucontext WITHOUT
+	 * DEVX (adopt_devx_uid forced to 0), because LOAD_VHCA_STATE does
+	 * not preserve the firmware uctx registration table, so a
+	 * non-zero uid is unrecoverable. Recorded as a forward-compat
+	 * hook for a future DEVX-source pass and as a dump-side
+	 * diagnostic.
+	 */
+	optional uint32		source_devx_uid		= 14;
 }

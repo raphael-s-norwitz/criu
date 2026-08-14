@@ -127,11 +127,31 @@ void vfmig_drain_claimed_in_fini(void);
  *   vfmig_read_image() walks mlx5_vfmig.img and returns an in-memory
  *   array of unpacked entries (caller frees each via
  *   mlx5_vfmig_state_entry__free_unpacked + free() the array).
+ *
+ * The optional ucontext-snapshot buffers (uctx_*) are opaque to this
+ * file: it copies the raw bytes into the matching optional proto
+ * fields when the pointer is non-NULL and the length is non-zero, and
+ * leaves the field unset otherwise. A firmware-only record (no seed
+ * context) passes NULL for all of them. The static-UAR snapshot
+ * {uctx_meta, uctx_uar_table [+ uctx_bfreg_count]} is populated for a
+ * context-bearing VF; the shaping/validation is the dump hook's job,
+ * not this writer's. The dyn-UAR variant is added in a later commit.
  */
+struct vfmig_uctx_image_blob {
+	const void *meta;
+	size_t meta_len;
+	const void *uar_table;
+	size_t uar_table_len;
+	const void *bfreg_count;
+	size_t bfreg_count_len;
+	uint32_t source_devx_uid;
+	bool has_source_devx_uid;
+};
+
 int vfmig_drain_save_fd_to_blob(int save_fd, const char *blob_path, uint64_t *out_size);
 int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *source_cdev_path, const char *pf_bdf,
 			     uint32_t vf_id, uint32_t vhca_id, const uint8_t vf_uuid[16], const char *blob_path,
-			     uint64_t blob_size);
+			     uint64_t blob_size, const struct vfmig_uctx_image_blob *uctx);
 int vfmig_read_image(Mlx5VfmigStateEntry ***out_arr, size_t *out_n);
 
 /*
