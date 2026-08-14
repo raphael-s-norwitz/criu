@@ -56,17 +56,23 @@ struct vfmig_claimed_vf {
 	uint32_t vf_id;
 
 	/*
-	 * ucontext dump capture, attached by the RDMA_DUMP_UVERBS_CONTEXT
+	 * ucontext snapshot, attached by the RDMA_DUMP_UVERBS_CONTEXT
 	 * hook (rdma_mlx5_vfmig_plugin_dump_uverbs_context) and consumed
-	 * by the fini(DUMP) drain. v0 captures a single seed context per
-	 * VF (a VF backs one context on the bare-context critical path):
-	 * this hook records the cdev it was opened against and its
-	 * context number; the UAR-state snapshot fields land in a later
+	 * by the fini(DUMP) drain. v0 carries a single snapshot per VF:
+	 * a VF backs one seed context on the bare-context critical path.
+	 * Static-UAR shape only; the dyn-UAR shape lands in a later
 	 * commit.
 	 */
 	bool uctx_captured;
 	uint32_t ctxn;
+	uint32_t source_devx_uid;
 	char source_cdev_path[PATH_MAX];
+
+	struct mlx5_ib_vfmig_ucontext_meta_local uctx_meta;
+	uint32_t *uctx_uar_table;
+	size_t uctx_uar_n;
+	uint32_t *uctx_bfreg_count;
+	size_t uctx_bfreg_n;
 };
 
 static struct vfmig_claimed_vf *vfmig_claimed_head;
@@ -100,6 +106,8 @@ void vfmig_claimed_clear(void)
 
 	for (p = vfmig_claimed_head; p; p = n) {
 		n = p->next;
+		free(p->uctx_uar_table);
+		free(p->uctx_bfreg_count);
 		free(p);
 	}
 	vfmig_claimed_head = NULL;
@@ -108,16 +116,20 @@ void vfmig_claimed_clear(void)
 /*
  * RDMA_DUMP_UVERBS_CONTEXT hook. Core RDMA dump calls this once per
  * uverbs context it walked, handing us @lfd -- a drained cdev fd that
- * shares the source ucontext's object IDR. It records the cdev this
- * context was opened against and its context number on the matching
- * claimed-VF entry; a later commit adds the ucontext UAR-state snapshot
- * taken over the same fd.
+ * shares the source ucontext's object IDR -- so we can snapshot the
+ * ucontext's UAR state via the MLX5_IB_OBJECT_VFMIG QUERY verbs. The
+ * snapshot is attached to the matching claimed-VF entry; the fini(DUMP)
+ * SAVE drain folds it into that VF's image record.
  *
  * The claim hook runs immediately before this one over the same
  * context (both inside core's dump_uverbsfile), so the claimed entry is
  * already present; a missing entry is a structural error, not a
  * runtime condition, and fails the dump (an image record without its
- * ucontext capture is unrestorable).
+ * ucontext snapshot is unrestorable).
+ *
+ * v0 handles static-UAR ucontexts only. A dyn-UAR ucontext makes
+ * QUERY_UCONTEXT return -EOPNOTSUPP; that is failed here with a clear
+ * message until the dyn-UAR QUERY/RESTORE path lands in a later commit.
  *
  * Returns 0 on success (including "not our device" / inactive), -1 on a
  * capture failure that must fail the dump. @kernel_driver_id and @pid
@@ -126,9 +138,13 @@ void vfmig_claimed_clear(void)
 int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kernel_driver_id, uint32_t ctxn, int lfd,
 					       pid_t pid)
 {
+	struct mlx5_ib_vfmig_ucontext_meta_local meta;
+	uint32_t *uar = NULL, *cnt = NULL;
+	size_t uar_n = 0, cnt_n = 0;
 	char link[64], cdev_path[PATH_MAX];
 	struct vfmig_claimed_vf *c;
 	ssize_t ll;
+	int rc;
 
 	(void)kernel_driver_id;
 	(void)pid;
@@ -164,11 +180,30 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
 	}
 	cdev_path[ll] = '\0';
 
+	rc = vfmig_snapshot_uctx(lfd, &meta, &uar, &uar_n, &cnt, &cnt_n);
+	if (rc == -EOPNOTSUPP) {
+		pr_err("vfmig: dump-uctx: ibdev=%s ctxn=%u is a dyn-UAR ucontext; only static-UAR ucontexts are "
+		       "supported so far (dyn-UAR dump/restore lands in a later commit)\n",
+		       ibdev, ctxn);
+		return -1;
+	}
+	if (rc) {
+		pr_err("vfmig: dump-uctx: QUERY_UCONTEXT(ibdev=%s ctxn=%u) failed: %s\n", ibdev, ctxn, strerror(-rc));
+		return -1;
+	}
+	c->uctx_meta = meta;
+	c->uctx_uar_table = uar;
+	c->uctx_uar_n = uar_n;
+	c->uctx_bfreg_count = cnt;
+	c->uctx_bfreg_n = cnt_n;
+	c->source_devx_uid = meta.devx_uid;
+
 	snprintf(c->source_cdev_path, sizeof(c->source_cdev_path), "%s", cdev_path);
 	c->ctxn = ctxn;
 	c->uctx_captured = true;
 
-	pr_info("vfmig: dump-uctx: recorded cdev for ibdev=%s ctxn=%u\n", ibdev, ctxn);
+	pr_info("vfmig: dump-uctx: captured static-UAR ucontext for ibdev=%s ctxn=%u devx_uid=%u\n", ibdev, ctxn,
+		c->source_devx_uid);
 	return 0;
 }
 
