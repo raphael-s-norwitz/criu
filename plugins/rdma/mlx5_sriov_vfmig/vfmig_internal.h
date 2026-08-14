@@ -66,6 +66,17 @@ void vfmig_claimed_add(const char *ibdev, const char *pf_bdf, uint32_t vf_id);
 void vfmig_claimed_clear(void);
 
 /*
+ * Per-ucontext dump capture. rdma_mlx5_vfmig_plugin_dump_uverbs_context()
+ * is the RDMA_DUMP_UVERBS_CONTEXT hook: core RDMA dump hands it a
+ * drained cdev fd sharing the source ucontext's IDR, and it records the
+ * cdev path + context number on the matching claimed-VF entry so the
+ * fini(DUMP) SAVE drain can key off it. The ucontext UAR-state snapshot
+ * this hook takes is added in a later commit.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kernel_driver_id, uint32_t ctxn, int lfd,
+					       pid_t pid);
+
+/*
  * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()
  * is the CHECKPOINT_DEVICES hook: it parks every claimed VF to STOP
  * (SUSPEND_VHCA) at CRIU's freeze point, before task memory is copied.

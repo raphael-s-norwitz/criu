@@ -362,6 +362,7 @@ CR_PLUGIN_REGISTER("rdma_mlx5_vfmig_plugin", rdma_mlx5_vfmig_plugin_init, rdma_m
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, rdma_mlx5_vfmig_plugin_claim_uverbs_context)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA, rdma_mlx5_vfmig_plugin_handle_device_vma)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES, rdma_mlx5_vfmig_plugin_checkpoint_devices)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT, rdma_mlx5_vfmig_plugin_dump_uverbs_context)
 
 /*
  * RDMA sharing policy: EXCLUSIVE.
@@ -384,10 +385,10 @@ CR_PLUGIN_DECLARE_RDMA_SHARING(CR_RDMA_SHARING_EXCLUSIVE);
  *
  * Symmetric with the RCD_MLX5_SRIOV_VFMIG return value of the claim
  * hook above. Dump-time arbitration uses this constant to route a
- * context this plugin claimed back to this plugin for the eventual
- * DUMP_UVERBS_CONTEXT capture, and the restore side uses it to find the
- * plugin that owns the destination cdev open + LOAD dance. Declared
- * alongside the claim so the two halves land together even though the
- * dump/restore hooks themselves come in later commits.
+ * context this plugin claimed back to this plugin for the
+ * DUMP_UVERBS_CONTEXT capture (registered above), and the restore side
+ * uses it to find the plugin that owns the destination cdev open + LOAD
+ * dance. Declared alongside the claim so the two halves land together;
+ * the restore-side hooks come in later commits.
  */
 CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER(RDMA_CRIU_DRIVER__RCD_MLX5_SRIOV_VFMIG);
