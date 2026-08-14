@@ -54,6 +54,19 @@ struct vfmig_claimed_vf {
 	char ibdev[64];
 	char pf_bdf[64];
 	uint32_t vf_id;
+
+	/*
+	 * ucontext dump capture, attached by the RDMA_DUMP_UVERBS_CONTEXT
+	 * hook (rdma_mlx5_vfmig_plugin_dump_uverbs_context) and consumed
+	 * by the fini(DUMP) drain. v0 captures a single seed context per
+	 * VF (a VF backs one context on the bare-context critical path):
+	 * this hook records the cdev it was opened against and its
+	 * context number; the UAR-state snapshot fields land in a later
+	 * commit.
+	 */
+	bool uctx_captured;
+	uint32_t ctxn;
+	char source_cdev_path[PATH_MAX];
 };
 
 static struct vfmig_claimed_vf *vfmig_claimed_head;
@@ -66,7 +79,7 @@ void vfmig_claimed_add(const char *ibdev, const char *pf_bdf, uint32_t vf_id)
 		if (p->vf_id == vf_id && !strcmp(p->pf_bdf, pf_bdf))
 			return; /* already recorded -- one VF, many contexts */
 
-	p = malloc(sizeof(*p));
+	p = calloc(1, sizeof(*p));
 	if (!p) {
 		pr_err("claimed-VF cache: out of memory recording %s (pf=%s vf_id=%u)\n", ibdev, pf_bdf, vf_id);
 		return;
@@ -90,6 +103,73 @@ void vfmig_claimed_clear(void)
 		free(p);
 	}
 	vfmig_claimed_head = NULL;
+}
+
+/*
+ * RDMA_DUMP_UVERBS_CONTEXT hook. Core RDMA dump calls this once per
+ * uverbs context it walked, handing us @lfd -- a drained cdev fd that
+ * shares the source ucontext's object IDR. It records the cdev this
+ * context was opened against and its context number on the matching
+ * claimed-VF entry; a later commit adds the ucontext UAR-state snapshot
+ * taken over the same fd.
+ *
+ * The claim hook runs immediately before this one over the same
+ * context (both inside core's dump_uverbsfile), so the claimed entry is
+ * already present; a missing entry is a structural error, not a
+ * runtime condition, and fails the dump (an image record without its
+ * ucontext capture is unrestorable).
+ *
+ * Returns 0 on success (including "not our device" / inactive), -1 on a
+ * capture failure that must fail the dump. @kernel_driver_id and @pid
+ * are unused -- the fd already targets the right context.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kernel_driver_id, uint32_t ctxn, int lfd,
+					       pid_t pid)
+{
+	char link[64], cdev_path[PATH_MAX];
+	struct vfmig_claimed_vf *c;
+	ssize_t ll;
+
+	(void)kernel_driver_id;
+	(void)pid;
+
+	if (!vfmig_active)
+		return 0;
+
+	for (c = vfmig_claimed_head; c; c = c->next)
+		if (!strcmp(c->ibdev, ibdev))
+			break;
+	if (!c) {
+		pr_err("vfmig: dump-uctx: no claimed VF for ibdev=%s (claim / dump-uctx ordering broken)\n", ibdev);
+		return -1;
+	}
+
+	if (c->uctx_captured) {
+		pr_warn("vfmig: dump-uctx: ibdev=%s already snapshotted (ctxn=%u); v0 keeps the first, ignoring "
+			"ctxn=%u\n",
+			ibdev, c->ctxn, ctxn);
+		return 0;
+	}
+
+	/*
+	 * source_cdev_path via readlink of the drained fd, so the image
+	 * records the exact cdev this context was opened against rather
+	 * than re-deriving it from the ibdev at drain time.
+	 */
+	snprintf(link, sizeof(link), "/proc/self/fd/%d", lfd);
+	ll = readlink(link, cdev_path, sizeof(cdev_path) - 1);
+	if (ll < 0) {
+		pr_perror("vfmig: dump-uctx: readlink(%s)", link);
+		return -1;
+	}
+	cdev_path[ll] = '\0';
+
+	snprintf(c->source_cdev_path, sizeof(c->source_cdev_path), "%s", cdev_path);
+	c->ctxn = ctxn;
+	c->uctx_captured = true;
+
+	pr_info("vfmig: dump-uctx: recorded cdev for ibdev=%s ctxn=%u\n", ibdev, ctxn);
+	return 0;
 }
 
 /*
