@@ -274,6 +274,28 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD = 23,
 
+	/*
+	 * RDMA per-PD restore-side UHW pack. The restore-time twin of
+	 * RDMA_DUMP_UOBJ_PD: core builds the driver-agnostic half of
+	 * UVERBS_METHOD_RESTORE_PD (just the target ufile handle) and
+	 * delegates the driver-private UHW back to the owning plugin,
+	 * keyed by @criu_driver against each plugin's
+	 * cr_rdma_provided_driver (same keying as the CQ/QP UHW pack).
+	 *
+	 * The plugin reshapes the R3UT_PD entry's opaque plugin_blob into
+	 * @uhw (mlx5: the source FW pdn as UHW_IN, so the kernel adopts it
+	 * into a fresh mlx5_ib_pd without ALLOC_PD); core's
+	 * rdma_send_restore_pd() issues the verb and frees @uhw's buffers.
+	 *
+	 * Optional, like the CQ/QP UHW pack: a matched plugin that does
+	 * not register this hook yields an empty @uhw (rc 0) and core
+	 * issues a UHW-less RESTORE_PD -- the rxe path, where a PD carries
+	 * no FW state.
+	 *
+	 * Return: 0 on success, negative errno on failure.
+	 */
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK = 24,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -356,6 +378,8 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK, const Rd
 			 struct rdma_uhw_spec *uhw);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD, const char *ibdev, uint32_t kernel_driver_id, int lfd,
 			 uint32_t ufile_handle, pid_t pid, ProtobufCBinaryData *plugin_blob);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK, const RdmaUobjEntry *e,
+			 struct rdma_uhw_spec *uhw);
 
 /*
  * RDMA sharing policy.

@@ -261,6 +261,23 @@ int rdma_dispatch_dump_uobj_pd(uint32_t criu_driver, const char *ibdev, uint32_t
 			       uint32_t ufile_handle, pid_t pid, ProtobufCBinaryData *plugin_blob);
 
 /*
+ * Restore-side per-PD UHW-pack dispatch (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_restore_pd_uhw_pack()
+ *       The PD twin of rdma_dispatch_restore_cq_uhw_pack(): invokes
+ *       CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK on the single
+ *       loaded plugin whose exported cr_rdma_provided_driver matches
+ *       @criu_driver (the R3UT_PD entry's). The plugin reshapes the
+ *       entry's opaque plugin_blob into @uhw (mlx5: the source FW pdn as
+ *       UHW_IN); core's rdma_send_restore_pd() then issues
+ *       UVERBS_METHOD_RESTORE_PD and frees @uhw's buffers. Returns 0 on
+ *       success (including the no-op case where the plugin exposes no
+ *       hook -- rxe restores handle-only), negative errno on
+ *       no/ambiguous match or hook failure.
+ */
+int rdma_dispatch_restore_pd_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
+
+/*
  * RDMA driver-name resolution (criu/rdma/driver.c):
  *
  *   rdma_driver_name_from_ibdev()
