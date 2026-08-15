@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include "criu-plugin.h"
 #include "images/mlx5_vfmig.pb-c.h"
 #include "images/uverbsfd.pb-c.h"
 #include "mlx5_uapi.h"
@@ -246,5 +247,14 @@ int vfmig_restore_init_all_vfs(void);
 int rdma_mlx5_vfmig_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe);
 int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path, const uint64_t addr, const uint64_t old_pgoff,
 					  uint64_t *new_pgoff, int *plugin_fd);
+
+/*
+ * Per-PD restore UHW pack. rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack()
+ * is the RDMA_RESTORE_UOBJ_PD_UHW_PACK hook: it reshapes the per-PD
+ * plugin_blob the dump hook emitted (a struct mlx5_ib_restore_pd_req_local)
+ * into the UHW_IN of core's UVERBS_METHOD_RESTORE_PD, so the kernel
+ * adopts the source FW pdn without ALLOC_PD.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
 
 #endif /* __CR_VFMIG_INTERNAL_H__ */
