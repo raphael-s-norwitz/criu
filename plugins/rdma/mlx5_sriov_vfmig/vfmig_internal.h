@@ -80,6 +80,19 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
 					       pid_t pid);
 
 /*
+ * Per-PD dump capture. rdma_mlx5_vfmig_plugin_dump_uobj_pd() is the
+ * RDMA_DUMP_UOBJ_PD hook: core's PD walker dispatches it per mlx5 PD
+ * with a shared-IDR cdev fd and the PD's ufile handle, and it QUERY_PDs
+ * the source FW pdn into @plugin_blob (a struct
+ * mlx5_ib_restore_pd_req_local) for the restore side. The source PD's
+ * owning uid (QUERY_PD RESP_UID) is dump-side diagnostic only -- it is
+ * commonly non-zero (default libmlx5 auto-DEVX) and never enforced;
+ * RESTORE_PD adopts the pdn under the destination ucontext's uid.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uobj_pd(const char *ibdev, uint32_t kernel_driver_id, int lfd, uint32_t ufile_handle,
+					pid_t pid, ProtobufCBinaryData *plugin_blob);
+
+/*
  * vfmig_uverbs.c -- mlx5 ucontext uverbs-ioctl QUERY wrappers. Pure
  * marshaling over MLX5_IB_OBJECT_VFMIG; no plugin state.
  *
@@ -89,6 +102,10 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
  *                              -EOPNOTSUPP for a dyn-UAR ucontext.
  *   vfmig_snapshot_dyn_uars()  two-pass QUERY_DYN_UARS: allocates the
  *                              dyn-UAR record array (dyn-UAR mode).
+ *   vfmig_query_pd()           QUERY_PD: fills @blob_out (source FW pdn,
+ *                              the verbatim RESTORE_PD UHW) and @uid_out
+ *                              (source PD's mpd->uid) for the PD the
+ *                              caller resolves by ufile handle.
  *
  * Exactly one of the two applies to any given ucontext; the dump hook
  * tries the static path first and falls back on -EOPNOTSUPP. Arrays
@@ -97,6 +114,7 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
 int vfmig_snapshot_uctx(int fd, struct mlx5_ib_vfmig_ucontext_meta_local *meta_out, uint32_t **uar_out,
 			size_t *uar_n_out, uint32_t **cnt_out, size_t *cnt_n_out);
 int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **records_out, size_t *n_out);
+int vfmig_query_pd(int fd, uint32_t pd_handle, struct mlx5_ib_restore_pd_req_local *blob_out, uint32_t *uid_out);
 
 /*
  * Restore-side ucontext replay (static-UAR mode). Mirror of the QUERY

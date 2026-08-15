@@ -84,6 +84,41 @@
 	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
 
 /*
+ * QUERY_PD method + attrs. Dump-side counterpart to
+ * UVERBS_METHOD_RESTORE_PD: for the PD resolved through UVERBS_OBJECT_PD
+ * on the calling fd's ufile, the kernel emits the FW pdn (as a
+ * mlx5_ib_restore_pd_req, RESP_BLOB) plus the source PD's mpd->uid
+ * (RESP_UID). QUERY_PD is the fifth method in the VFMIG enum, after the
+ * static/dyn ucontext query+restore methods. HANDLE is an IDR ref
+ * (UVERBS_OBJECT_PD, ACCESS_READ); both RESP_* are PTR_OUT.
+ */
+#define MLX5_IB_METHOD_VFMIG_QUERY_PD_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 4)
+#define MLX5_IB_ATTR_VFMIG_QUERY_PD_HANDLE_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_BLOB_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_UID_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+
+/*
+ * Local mirror of include/uapi/rdma/mlx5-abi.h's struct
+ * mlx5_ib_restore_pd_req: the driver-private UHW payload shared by
+ * QUERY_PD (RESP_BLOB, dump) and UVERBS_METHOD_RESTORE_PD (UHW_IN,
+ * restore). Wire layout MUST match the kernel (16 bytes): the kernel
+ * emits it verbatim on dump and ib_copy_from_udata()s it on restore, so
+ * a size/layout drift would corrupt the adopted pdn. reserved /
+ * reserved2 must stay zero (the restore path's "must be 0" checks) and
+ * pad the struct above uverbs' inline-UHW threshold so RESTORE_PD takes
+ * the userspace-pointer UHW path.
+ */
+struct mlx5_ib_restore_pd_req_local {
+	uint32_t pdn;
+	uint32_t reserved;
+	uint64_t reserved2;
+} __attribute__((aligned(8)));
+
+/*
  * Local mirror of include/uapi/rdma/mlx5_user_ioctl_cmds.h's struct
  * mlx5_ib_vfmig_ucontext_meta. Wire layout MUST match the kernel (40
  * bytes) so QUERY_UCONTEXT's uverbs_copy_to and RESTORE_UCONTEXT's
