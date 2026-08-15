@@ -847,6 +847,62 @@ int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path, const uint64_t addr,
 }
 
 /*
+ * RDMA_RESTORE_UOBJ_PD_UHW_PACK hook. The restore-time twin of the PD
+ * dump hook: reshapes the per-PD plugin_blob it emitted into the UHW_IN
+ * of the UVERBS_METHOD_RESTORE_PD verb core issues, so the kernel adopts
+ * the source FW pdn into a fresh mlx5_ib_pd without ALLOC_PD.
+ *
+ * The blob is already a byte-exact struct mlx5_ib_restore_pd_req (pdn +
+ * zeroed reserved/reserved2, as QUERY_PD emitted it), so UHW_IN is the
+ * blob verbatim. The kernel's restore_pd rejects any UHW_OUT
+ * (udata->outlen must be 0), so no out buffer is declared and no verify
+ * template applies. Core owns and frees uhw->in_buf after the ioctl.
+ *
+ * Returns 0 on success, -errno on a malformed blob or OOM.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
+{
+	const struct mlx5_ib_restore_pd_req_local *pb;
+	void *inbuf;
+
+	if (!e || !uhw)
+		return -EINVAL;
+
+	if (!e->has_plugin_blob || e->plugin_blob.len != sizeof(*pb)) {
+		pr_err("vfmig: RESTORE_PD_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected %zu\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, e->has_plugin_blob ? e->plugin_blob.len : (size_t)0,
+		       sizeof(*pb));
+		return -EINVAL;
+	}
+	pb = (const struct mlx5_ib_restore_pd_req_local *)e->plugin_blob.data;
+
+	/*
+	 * Defence in depth: the kernel re-checks these, but catching a
+	 * zero/oversized pdn or a non-zero reserved word here yields a
+	 * plugin-side diagnostic instead of an opaque RESTORE_PD -EINVAL.
+	 */
+	if (pb->pdn == 0 || (pb->pdn & ~0xffffffU) || pb->reserved || pb->reserved2) {
+		pr_err("vfmig: RESTORE_PD_UHW_PACK ufile_handle=%u: bad blob (pdn=%u reserved=%u reserved2=%llu)\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, pb->pdn, pb->reserved,
+		       (unsigned long long)pb->reserved2);
+		return -EINVAL;
+	}
+
+	inbuf = malloc(e->plugin_blob.len);
+	if (!inbuf) {
+		pr_err("vfmig: RESTORE_PD_UHW_PACK out of memory (in_buf %zu bytes)\n", e->plugin_blob.len);
+		return -ENOMEM;
+	}
+	memcpy(inbuf, e->plugin_blob.data, e->plugin_blob.len);
+	uhw->in_buf = inbuf;
+	uhw->in_len = e->plugin_blob.len;
+
+	pr_debug("vfmig: RESTORE_PD_UHW_PACK ufile_handle=%u pdn=%u (uhw_in=%zu)\n",
+		 e->has_ufile_handle ? e->ufile_handle : 0, pb->pdn, uhw->in_len);
+	return 0;
+}
+
+/*
  * Read mlx5_vfmig.img and, for each unique vf_uuid, restore the
  * matching destination VF up to "firmware loaded, bound, ibdev up".
  *
