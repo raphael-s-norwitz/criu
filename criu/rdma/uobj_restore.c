@@ -373,39 +373,97 @@ static bool handle_map_lookup(const struct uobj_handle_map *m, R3UobjType type, 
 
 /*
  * Issue UVERBS_METHOD_RESTORE_PD on @cmd_fd, asking the kernel to mint
- * a PD uobject at the caller-chosen ufile handle @target_handle.
+ * a PD uobject at the ufile handle the dump captured (e->ufile_handle).
  *
- * rxe (v0): the handle is the only input. rxe's kernel-side
- * restore_pd handler reads no driver-private UHW -- a PD carries no FW
- * state -- so no plugin blob is packed. (mlx5 will add a UHW_IN
- * carrying the source FW pdn via its own plugin hook in a later
- * milestone; core stays driver-agnostic.)
+ * Core owns only the driver-agnostic attribute: the target handle,
+ * which rides inline in the attr's data field (uverbs treats a PTR_IN
+ * whose len <= sizeof(data) as an immediate). The driver-private half
+ * -- mlx5: the source FW pdn the kernel adopts into a fresh mlx5_ib_pd
+ * without ALLOC_PD -- is opaque here; the owning plugin reshapes its
+ * per-PD plugin_blob into UHW_IN (and declares any UHW_OUT the kernel's
+ * udata requires, optionally with a verify template) via
+ * CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK, dispatched by
+ * @criu_driver.
  *
- * The handle rides inline in the attr's data field: uverbs treats a
- * PTR_IN whose len <= sizeof(data) as an immediate.
+ * rxe carries no per-PD FW state: its plugin registers no UHW-pack
+ * hook, the dispatch yields an empty @uhw, and this issues a UHW-less
+ * RESTORE_PD -- the handle is the only input.
  *
- * Returns 0 on success or -errno on ioctl failure (a too-old kernel
- * returns -EOPNOTSUPP for the unknown UVERBS_OBJECT_RESTORE).
+ * Returns 0 on success, -errno on ioctl failure (a too-old kernel
+ * returns -EOPNOTSUPP for the unknown UVERBS_OBJECT_RESTORE), or the
+ * negative errno the UHW_PACK dispatch / verify reported.
  */
-static int rdma_send_restore_pd(int cmd_fd, uint32_t kernel_driver_id, uint32_t target_handle)
+static int rdma_send_restore_pd(int cmd_fd, uint32_t criu_driver, uint32_t kernel_driver_id, const RdmaUobjEntry *e)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;
-		struct ib_uverbs_attr attrs[1];
+		struct ib_uverbs_attr attrs[3];
 	} cmd = {};
+	struct rdma_uhw_spec uhw = {};
+	void *uhw_out_actual = NULL;
+	unsigned int n = 0;
+	int rc;
+
+	rc = rdma_dispatch_restore_pd_uhw_pack(criu_driver, e, &uhw);
+	if (rc)
+		return rc; /* dispatch already logged */
+
+	if (uhw.out_len) {
+		uhw_out_actual = malloc(uhw.out_len);
+		if (!uhw_out_actual) {
+			rc = -ENOMEM;
+			goto out_free_uhw;
+		}
+		memset(uhw_out_actual, 0, uhw.out_len);
+	}
 
 	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
 	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_PD;
 	cmd.hdr.driver_id = kernel_driver_id;
-	cmd.hdr.num_attrs = 1;
-	cmd.hdr.length = sizeof(cmd.hdr) + sizeof(cmd.attrs);
 
-	cmd.attrs[0].attr_id = UVERBS_ATTR_RESTORE_PD_HANDLE;
-	cmd.attrs[0].len = sizeof(uint32_t);
-	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[0].data = target_handle;
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_PD_HANDLE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = e->ufile_handle;
+	n++;
 
-	return ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0 ? -errno : 0;
+	if (uhw.out_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_OUT;
+		cmd.attrs[n].len = (uint16_t)uhw.out_len;
+		cmd.attrs[n].flags = 0;
+		cmd.attrs[n].data = (uintptr_t)uhw_out_actual;
+		n++;
+	}
+	if (uhw.in_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
+		cmd.attrs[n].len = (uint16_t)uhw.in_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)uhw.in_buf;
+		n++;
+	}
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0) {
+		rc = -errno;
+		goto out_free_uhw;
+	}
+
+	if (uhw.verify_len > 0 && uhw.verify_len <= uhw.out_len &&
+	    memcmp(uhw_out_actual, uhw.out_buf, uhw.verify_len) != 0) {
+		pr_err("uobj DAG: RESTORE_PD handle=%u UHW_OUT byte-template mismatch (verify_len=%zu)\n",
+		       e->ufile_handle, uhw.verify_len);
+		rc = -EPROTO;
+		goto out_free_uhw;
+	}
+	rc = 0;
+
+out_free_uhw:
+	free(uhw_out_actual);
+	free(uhw.in_buf);
+	free(uhw.out_buf);
+	return rc;
 }
 
 /*
@@ -429,7 +487,7 @@ static int uobj_restore_pd(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 		return -1;
 	}
 
-	rc = rdma_send_restore_pd(cmd_fd, kernel_driver_id, e->ufile_handle);
+	rc = rdma_send_restore_pd(cmd_fd, e->hw_driver_id, kernel_driver_id, e);
 	if (rc) {
 		pr_err("uobj DAG: RESTORE_PD handle=%u on cmd_fd=%d driver=%u failed: %d (%s)\n", e->ufile_handle,
 		       cmd_fd, kernel_driver_id, rc, strerror(rc < 0 ? -rc : rc));
