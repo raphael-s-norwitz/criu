@@ -41,6 +41,8 @@ _Static_assert(sizeof(struct mlx5_ib_vfmig_ucontext_meta_local) == 40,
 	       "mlx5_ib_vfmig_ucontext_meta_local must be 40 bytes (kernel UAPI)");
 _Static_assert(sizeof(struct mlx5_ib_vfmig_dyn_uar_record_local) == 24,
 	       "mlx5_ib_vfmig_dyn_uar_record_local must be 24 bytes (kernel UAPI)");
+_Static_assert(sizeof(struct mlx5_ib_restore_pd_req_local) == 16,
+	       "mlx5_ib_restore_pd_req_local must be 16 bytes (kernel UAPI)");
 
 /*
  * Issue MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT via RDMA_VERBS_IOCTL.
@@ -234,6 +236,58 @@ int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **
 
 	*records_out = recs;
 	*n_out = count;
+	return 0;
+}
+
+/*
+ * Issue MLX5_IB_METHOD_VFMIG_QUERY_PD via RDMA_VERBS_IOCTL for the PD
+ * uobject @pd_handle owns in @fd's ufile-idr. On success @blob_out
+ * carries the source FW pdn (the verbatim RESTORE_PD UHW payload) and
+ * @uid_out the source PD's mpd->uid.
+ *
+ * @fd must be a uverbs cdev fd whose ucontext idr owns @pd_handle
+ * (CRIU's dup of the dumpee's fd): the kernel resolves the handle via
+ * UVERBS_OBJECT_PD / ACCESS_READ, so a wrong fd or handle fails the
+ * verb rather than reading a foreign PD. The HANDLE is an IDR ref --
+ * object id in data, len 0.
+ *
+ * Returns 0 on success, -errno on failure.
+ */
+int vfmig_query_pd(int fd, uint32_t pd_handle, struct mlx5_ib_restore_pd_req_local *blob_out, uint32_t *uid_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[3];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_PD_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_PD_HANDLE_LOCAL;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = pd_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_BLOB_LOCAL;
+	cmd.attrs[n].len = sizeof(*blob_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)blob_out;
+	n++;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_UID_LOCAL;
+	cmd.attrs[n].len = sizeof(*uid_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)uid_out;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
 	return 0;
 }
 
