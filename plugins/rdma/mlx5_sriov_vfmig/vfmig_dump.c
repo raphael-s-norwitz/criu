@@ -223,6 +223,73 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
 }
 
 /*
+ * RDMA_DUMP_UOBJ_PD hook. Core's PD walker dispatches this once per mlx5
+ * PD (keyed by criu_driver), handing us @lfd -- CRIU's dup of the
+ * dumpee's uverbs cdev fd, sharing the source ucontext's object IDR --
+ * and the PD's @ufile_handle. We QUERY_PD that handle for the source FW
+ * pdn and pack it (as the verbatim RESTORE_PD UHW payload) into
+ * @plugin_blob for the restore side to adopt.
+ *
+ * Unlike the per-ucontext hook this needs no claimed-VF bookkeeping: the
+ * blob is self-contained and rides on the core RdmaUobjEntry, not the
+ * per-VF image record. The by-driver dispatch already guarantees the PD
+ * is ours, so there is no ibdev match to redo.
+ *
+ * v0 gate: non-DEVX PDs only (mpd->uid == 0). A DEVX-owned PD (uid != 0)
+ * would need its owning DEVX uid rebuilt on restore, which v0 does not
+ * do, so refuse the dump rather than emit a PD that cannot be adopted.
+ *
+ * Returns 0 on success, -errno on failure (aborts the dump).
+ * @kernel_driver_id and @pid are unused -- @lfd already targets the
+ * right context.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uobj_pd(const char *ibdev, uint32_t kernel_driver_id, int lfd, uint32_t ufile_handle,
+					pid_t pid, ProtobufCBinaryData *plugin_blob)
+{
+	struct mlx5_ib_restore_pd_req_local blob = {};
+	struct mlx5_ib_restore_pd_req_local *out;
+	uint32_t uid = 0;
+	int rc;
+
+	(void)kernel_driver_id;
+	(void)pid;
+
+	if (lfd < 0) {
+		pr_err("vfmig: dump-pd: ibdev=%s handle=%u has no holder cdev fd (dup failed at dump); "
+		       "cannot QUERY_PD\n",
+		       ibdev, ufile_handle);
+		return -EBADF;
+	}
+
+	rc = vfmig_query_pd(lfd, ufile_handle, &blob, &uid);
+	if (rc) {
+		pr_err("vfmig: dump-pd: QUERY_PD(ibdev=%s handle=%u) failed: %d (%s)\n", ibdev, ufile_handle, rc,
+		       strerror(-rc));
+		return rc;
+	}
+
+	if (uid != 0) {
+		pr_err("vfmig: dump-pd: ibdev=%s handle=%u pdn=%u is DEVX-owned (uid=%u); v0 restores non-DEVX PDs "
+		       "only\n",
+		       ibdev, ufile_handle, blob.pdn, uid);
+		return -EOPNOTSUPP;
+	}
+
+	out = malloc(sizeof(*out));
+	if (!out) {
+		pr_err("vfmig: dump-pd: out of memory packing plugin_blob (handle=%u)\n", ufile_handle);
+		return -ENOMEM;
+	}
+	*out = blob;
+
+	plugin_blob->data = (uint8_t *)out;
+	plugin_blob->len = sizeof(*out);
+
+	pr_info("vfmig: dump-pd: ibdev=%s handle=%u pdn=%u uid=%u\n", ibdev, ufile_handle, blob.pdn, uid);
+	return 0;
+}
+
+/*
  * The suspended-VF set: the (pf_bdf, vf_id) pairs CHECKPOINT_DEVICES
  * parked to STOP, so we suspend each VF exactly once (a VF backs several
  * contexts across several pids) and fini(DUMP) resumes exactly what we
