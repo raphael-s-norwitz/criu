@@ -247,6 +247,33 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT = 22,
 
+	/*
+	 * RDMA per-PD dump-side capture. Dispatched by the R3 uobject
+	 * walker (criu/rdma/uobj_dump.c::uobj_pd_cb) once per NLDEV-
+	 * enumerated PD, to the single plugin whose exported
+	 * cr_rdma_provided_driver matches the owning ucontext's
+	 * criu_driver (same keying as RDMA_DUMP_UOBJ_CQ).
+	 *
+	 * A PD has no NLDEV-omitted hw-agnostic per-class attrs, so this
+	 * hook only mallocs the driver-private byte schema into
+	 * @plugin_blob (mlx5: the source FW pdn as a struct
+	 * mlx5_ib_restore_pd_req, read via QUERY_PD on @lfd -- criu's dup
+	 * of the dumpee's uverbs cdev fd, which shares the ucontext IDR
+	 * that resolves @ufile_handle). The caller attaches those bytes
+	 * onto RdmaUobjEntry.plugin_blob, writes them, then frees them.
+	 *
+	 * Optional: a PD carries no FW state on some providers (rxe), so
+	 * a matched plugin that does not register this hook is a valid
+	 * "no per-PD state" case -- the dispatcher returns an empty blob
+	 * (rc 0) and the PD restores handle-only. This is the one dump
+	 * hook that tolerates absence, mirroring the RESTORE_*_UHW_PACK
+	 * dispatchers rather than the CQ/QP dump hooks.
+	 *
+	 * Return: 0 on success, negative errno on failure (aborts the
+	 * dump -- a partially captured ufile would not restore).
+	 */
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD = 23,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -327,6 +354,8 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_QP, const char *ibdev, u
 			 uint32_t ufile_handle, pid_t pid, RdmaQpAttrs *qp_attrs, ProtobufCBinaryData *plugin_blob);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK, const RdmaUobjEntry *e,
 			 struct rdma_uhw_spec *uhw);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD, const char *ibdev, uint32_t kernel_driver_id, int lfd,
+			 uint32_t ufile_handle, pid_t pid, ProtobufCBinaryData *plugin_blob);
 
 /*
  * RDMA sharing policy.

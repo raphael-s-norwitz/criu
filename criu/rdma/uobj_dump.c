@@ -399,8 +399,10 @@ static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
 {
 	struct uobj_walk_ctx *w = arg;
 	struct rdma_dumped_ufile *uf;
+	ProtobufCBinaryData plugin_blob = {};
 	RdmaUobjEntry pe;
 	RdmaPdAttrs attrs;
+	int rc;
 
 	if (!e->has_ctxn || !e->has_restrack_id) {
 		w->n_dropped++;
@@ -436,11 +438,35 @@ static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
 	rdma_pd_attrs__init(&attrs);
 	pe.pd = &attrs;
 
+	/*
+	 * Per-driver PD payload: the plugin issues its QUERY_PD on the
+	 * holder's dup'd cdev fd and mallocs the source FW pdn schema
+	 * into @plugin_blob. A provider with no per-PD state (rxe) yields
+	 * an empty blob and the PD restores handle-only. We attach any
+	 * bytes onto the entry and free them after the write.
+	 */
+	rc = rdma_dispatch_dump_uobj_pd(uf->criu_driver, uf->ibdev, uf->kernel_driver_id, uf->holder_uctx_fd,
+					e->has_ufile_handle ? e->ufile_handle : 0, uf->pid, &plugin_blob);
+	if (rc) {
+		pr_err("uobj DAG: per-PD dispatch failed for pdn=%u on ibdev=%s handle=%u: %d (%s)\n", e->restrack_id,
+		       uf->ibdev, e->has_ufile_handle ? e->ufile_handle : 0, rc, strerror(rc < 0 ? -rc : rc));
+		free(plugin_blob.data);
+		return (w->err = -1);
+	}
+
+	if (plugin_blob.data && plugin_blob.len > 0) {
+		pe.has_plugin_blob = true;
+		pe.plugin_blob = plugin_blob;
+	}
+
 	if (pb_write_one(w->img, &pe, PB_RDMA_UOBJ) < 0) {
 		pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed for ufile_id=%#x pdn=%u\n", pe.ufile_id,
 		       e->restrack_id);
+		free(plugin_blob.data);
 		return (w->err = -1);
 	}
+
+	free(plugin_blob.data);
 
 	/*
 	 * Remember pdn -> ufile so the MR walk (which sees only the parent
