@@ -243,6 +243,24 @@ int rdma_dispatch_restore_cq_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry 
 int rdma_dispatch_restore_qp_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
 
 /*
+ * Dump-side per-PD dispatch (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_dump_uobj_pd()
+ *       Invokes CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD on the single loaded
+ *       plugin whose exported cr_rdma_provided_driver matches
+ *       @criu_driver. Unlike the CQ/QP dump dispatch, a matched plugin
+ *       that does not register the hook is not an error: a PD may carry
+ *       no driver-private state (rxe), so the dispatcher yields an empty
+ *       @plugin_blob (rc 0) and the PD restores handle-only -- it keys
+ *       on provided-driver alone and checks the hook after, like the
+ *       RESTORE_*_UHW_PACK dispatchers. Hard failures: two plugins
+ *       declare the same provided-driver (-EEXIST); no plugin matches
+ *       (-ENOENT).
+ */
+int rdma_dispatch_dump_uobj_pd(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id, int lfd,
+			       uint32_t ufile_handle, pid_t pid, ProtobufCBinaryData *plugin_blob);
+
+/*
  * RDMA driver-name resolution (criu/rdma/driver.c):
  *
  *   rdma_driver_name_from_ibdev()

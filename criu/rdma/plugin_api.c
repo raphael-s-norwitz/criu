@@ -531,3 +531,69 @@ int rdma_dispatch_restore_qp_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry 
 		 winner_name, criu_driver, e && e->has_ufile_handle ? e->ufile_handle : 0);
 	return fn(e, uhw);
 }
+
+/*
+ * Dump-side per-PD dispatch.
+ *
+ * The PD analogue of rdma_dispatch_dump_uobj_cq(): the R3 PD walker
+ * resolves a PD's driver-private capture (mlx5: the source FW pdn, via
+ * MLX5_IB_METHOD_VFMIG_QUERY_PD) through the owning plugin, keyed by
+ * @criu_driver against each plugin's cr_rdma_provided_driver.
+ *
+ * Unlike the CQ/QP dump dispatch we key on provided-driver alone, not
+ * on hook presence: a PD carries no FW state on some providers (rxe),
+ * so a matched plugin that exposes no DUMP_UOBJ_PD hook is a valid "no
+ * per-PD state" case and yields an empty @plugin_blob (rc 0), leaving
+ * the PD to restore handle-only -- mirroring the RESTORE_*_UHW_PACK
+ * dispatchers. Hard failures:
+ *   - two plugins declare the same provided-driver (-EEXIST).
+ *   - no plugin matches (-ENOENT).
+ */
+int rdma_dispatch_dump_uobj_pd(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id, int lfd,
+			       uint32_t ufile_handle, pid_t pid, ProtobufCBinaryData *plugin_blob)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+	const char *winner_name = NULL;
+	CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD_t *fn;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		p = (const int *)dlsym(this->dlhandle, CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != criu_driver)
+			continue;
+
+		if (winner) {
+			pr_err("PD dump (ibdev=%s handle=%u): multiple plugins declare cr_rdma_provided_driver=%u "
+			       "('%s' and '%s'); operator's plugin set is inconsistent.\n",
+			       ibdev ?: "?", ufile_handle, criu_driver, winner_name, this->d->name);
+			return -EEXIST;
+		}
+		winner = this;
+		winner_name = this->d->name;
+	}
+
+	if (!winner) {
+		pr_err("PD dump (ibdev=%s handle=%u): no loaded RDMA plugin exports cr_rdma_provided_driver=%u; "
+		       "cannot capture per-PD driver state.\n",
+		       ibdev ?: "?", ufile_handle, criu_driver);
+		return -ENOENT;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD];
+	if (!fn) {
+		pr_debug("PD dump: plugin '%s' exposes no DUMP_UOBJ_PD; PD restores handle-only "
+			 "(criu_driver=%u ibdev=%s handle=%u)\n",
+			 winner_name, criu_driver, ibdev ?: "?", ufile_handle);
+		return 0;
+	}
+
+	pr_debug("PD dump: dispatching DUMP_UOBJ_PD to plugin '%s' (criu_driver=%u ibdev=%s handle=%u)\n", winner_name,
+		 criu_driver, ibdev ?: "?", ufile_handle);
+	return fn(ibdev, kernel_driver_id, lfd, ufile_handle, pid, plugin_blob);
+}
