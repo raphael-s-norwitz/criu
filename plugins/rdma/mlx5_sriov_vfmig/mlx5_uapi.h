@@ -102,6 +102,30 @@
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
 
 /*
+ * QUERY_CQ method + attrs. Dump-side counterpart to
+ * UVERBS_METHOD_RESTORE_CQ: for the user CQ resolved through
+ * UVERBS_OBJECT_CQ on the calling fd's ufile, the kernel emits the
+ * restore payload (cqn, cqe_size, buf_addr, db_addr as a
+ * mlx5_ib_restore_cq_req RESP_BLOB, byte-equal to the RESTORE_CQ UHW)
+ * plus the cqe / comp_vector / create_flags the restore verb takes as
+ * core attrs. QUERY_CQ is the sixth method in the VFMIG enum, right
+ * after QUERY_PD. HANDLE is an IDR ref (UVERBS_OBJECT_CQ, ACCESS_READ);
+ * all four RESP_* are PTR_OUT and MANDATORY.
+ */
+#define MLX5_IB_METHOD_VFMIG_QUERY_CQ_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 5)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 3)
+#define MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 4)
+
+/*
  * Local mirror of include/uapi/rdma/mlx5-abi.h's struct
  * mlx5_ib_restore_pd_req: the driver-private UHW payload shared by
  * QUERY_PD (RESP_BLOB, dump) and UVERBS_METHOD_RESTORE_PD (UHW_IN,
@@ -138,6 +162,27 @@ struct mlx5_ib_restore_mr_req_local {
 	uint32_t mkey_index;
 	uint32_t reserved;
 	uint64_t reserved2;
+} __attribute__((aligned(8)));
+
+/*
+ * Local mirror of include/uapi/rdma/mlx5-abi.h's struct
+ * mlx5_ib_restore_cq_req: the driver-private payload shared by QUERY_CQ
+ * (RESP_BLOB, dump) and UVERBS_METHOD_RESTORE_CQ (UHW_IN, restore). Wire
+ * layout MUST match the kernel (32 bytes): the kernel emits it verbatim
+ * on dump and ib_copy_from_udata()s it on restore, so a size/layout
+ * drift would corrupt the adopted CQ. @buf_addr / @db_addr are the
+ * source userspace VAs of the CQE ring and doorbell page (the kernel
+ * pins them against the restored mm); @cqn is the FW cqn to adopt (24
+ * bits significant); @cqe_size is 64 or 128. reserved / reserved2 must
+ * stay zero (the restore path's "must be 0" checks).
+ */
+struct mlx5_ib_restore_cq_req_local {
+	uint64_t buf_addr;
+	uint64_t db_addr;
+	uint32_t cqn;
+	uint32_t cqe_size;
+	uint32_t reserved;
+	uint32_t reserved2;
 } __attribute__((aligned(8)));
 
 /*
