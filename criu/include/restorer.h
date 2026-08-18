@@ -208,6 +208,32 @@ struct rst_rdma_mr {
  */
 #define RST_RDMA_CQ_UHW_IN_MAX 40
 
+/*
+ * Per-CQ carrier the stager (rdma_prepare_rdma_cqs) fills and the pie
+ * restorer drains to issue UVERBS_METHOD_RESTORE_CQ after the user VMAs
+ * are laid out (see restore_rdma_cq in criu/pie/restorer.c). The CQ twin
+ * of struct rst_rdma_mr: only the pie-deferred camp (mlx5, whose
+ * RESTORE_CQ pins the source CQE-ring / doorbell pages from current->mm)
+ * uses it; the master-side camp (rxe) never queues here. See
+ * CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE for the split.
+ *
+ * @cmd_fd is a per-CQ high-fd dup of the ucontext cdev (reserved the
+ * same way as struct rst_rdma_mr::cmd_fd); the pie closes it after the
+ * ioctl. The driver-private UHW_IN is packed master-side by the owning
+ * plugin's RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook and carried inline.
+ */
+struct rst_rdma_cq {
+	int cmd_fd;
+	u32 ufile_id; /* diagnostics only */
+	u32 kernel_driver_id;
+	u32 target_handle;
+	u32 cqe;
+	u32 comp_vector;
+	u32 flags;
+	u32 uhw_in_len; /* 0 -> no UHW_IN attr */
+	u8 uhw_in_buf[RST_RDMA_CQ_UHW_IN_MAX];
+};
+
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
@@ -250,6 +276,9 @@ struct task_restore_args {
 
 	struct rst_aio_ring *rings;
 	unsigned int rings_n;
+
+	struct rst_rdma_cq *rdma_cqs;
+	unsigned int rdma_cqs_n;
 
 	struct rst_rdma_mr *rdma_mrs;
 	unsigned int rdma_mrs_n;

@@ -1366,6 +1366,48 @@ out:
 	return ret;
 }
 
+int rdma_prepare_rdma_cqs(struct task_restore_args *ta)
+{
+	struct rdma_pending_cq *p, *n;
+
+	/*
+	 * Anchor ta->rdma_cqs at the current RM_PRIVATE cursor before
+	 * knowing whether anything lands here, so the pool cursor stays
+	 * consistent across the whole prepare_* sequence on the no-CQ path
+	 * (the master-side rxe camp queues nothing).
+	 */
+	ta->rdma_cqs = (struct rst_rdma_cq *)rst_mem_align_cpos(RM_PRIVATE);
+	ta->rdma_cqs_n = 0;
+
+	list_for_each_entry_safe(p, n, &rdma_pending_cqs, link) {
+		struct rst_rdma_cq *r = rst_mem_alloc(sizeof(*r), RM_PRIVATE);
+
+		if (!r) {
+			pr_err("uobj DAG: rst_mem_alloc(RM_PRIVATE) for CQ handle=%u failed\n", p->target_handle);
+			close(p->cmd_fd_dup);
+			return -1;
+		}
+		r->cmd_fd = p->cmd_fd_dup;
+		r->ufile_id = p->ufile_id;
+		r->kernel_driver_id = p->kernel_driver_id;
+		r->target_handle = p->target_handle;
+		r->cqe = p->cqe;
+		r->comp_vector = p->comp_vector;
+		r->flags = p->flags;
+		r->uhw_in_len = p->uhw_in_len;
+		if (p->uhw_in_len)
+			memcpy(r->uhw_in_buf, p->uhw_in_buf, p->uhw_in_len);
+		ta->rdma_cqs_n++;
+
+		list_del(&p->link);
+		xfree(p);
+	}
+
+	if (ta->rdma_cqs_n)
+		pr_info("uobj DAG: staged %u CQ(s) for pie RESTORE_CQ\n", ta->rdma_cqs_n);
+	return 0;
+}
+
 int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 {
 	struct rdma_pending_mr *p, *n;
