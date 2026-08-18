@@ -959,6 +959,66 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e, stru
 	return 0;
 }
 
+_Static_assert(sizeof(struct mlx5_ib_restore_cq_req_local) == 32,
+	       "mlx5_ib_restore_cq_req_local must be 32 bytes (kernel UAPI)");
+
+/*
+ * RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook. The restore-time twin of the CQ
+ * dump hook: reshapes the per-CQ plugin_blob it emitted (a byte-exact
+ * struct mlx5_ib_restore_cq_req) into the UHW_IN of the RESTORE_CQ verb,
+ * so the kernel adopts the source FW cqn -- pinning the source CQE-ring
+ * and doorbell pages at @buf_addr / @db_addr -- without CREATE_CQ. Like
+ * the PD hook the blob is the UHW verbatim; core carries the packed
+ * bytes into the pie restorer (RESTORE_CQ pins user pages, so the verb
+ * runs post-VMA -- see the NEEDS_PIE hook below). Core owns and frees
+ * uhw->in_buf.
+ *
+ * Returns 0 on success, -errno on a malformed blob or OOM.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
+{
+	const struct mlx5_ib_restore_cq_req_local *pb;
+	void *inbuf;
+
+	if (!e || !uhw)
+		return -EINVAL;
+
+	if (!e->has_plugin_blob || e->plugin_blob.len != sizeof(*pb)) {
+		pr_err("vfmig: RESTORE_CQ_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected %zu\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, e->has_plugin_blob ? e->plugin_blob.len : (size_t)0,
+		       sizeof(*pb));
+		return -EINVAL;
+	}
+	pb = (const struct mlx5_ib_restore_cq_req_local *)e->plugin_blob.data;
+
+	/*
+	 * Defence in depth: the kernel re-checks these, but catching a
+	 * zero/oversized cqn, a bad cqe_size or a non-zero reserved word
+	 * here yields a plugin-side diagnostic instead of an opaque
+	 * RESTORE_CQ -EINVAL from the pie.
+	 */
+	if (pb->cqn == 0 || (pb->cqn & ~0xffffffU) || (pb->cqe_size != 64 && pb->cqe_size != 128) || pb->reserved ||
+	    pb->reserved2) {
+		pr_err("vfmig: RESTORE_CQ_UHW_PACK ufile_handle=%u: bad blob (cqn=%u cqe_size=%u reserved=%u "
+		       "reserved2=%u)\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, pb->cqn, pb->cqe_size, pb->reserved, pb->reserved2);
+		return -EINVAL;
+	}
+
+	inbuf = malloc(e->plugin_blob.len);
+	if (!inbuf) {
+		pr_err("vfmig: RESTORE_CQ_UHW_PACK out of memory (in_buf %zu bytes)\n", e->plugin_blob.len);
+		return -ENOMEM;
+	}
+	memcpy(inbuf, e->plugin_blob.data, e->plugin_blob.len);
+	uhw->in_buf = inbuf;
+	uhw->in_len = e->plugin_blob.len;
+
+	pr_debug("vfmig: RESTORE_CQ_UHW_PACK ufile_handle=%u cqn=%u cqe_size=%u (uhw_in=%zu)\n",
+		 e->has_ufile_handle ? e->ufile_handle : 0, pb->cqn, pb->cqe_size, uhw->in_len);
+	return 0;
+}
+
 /*
  * Read mlx5_vfmig.img and, for each unique vf_uuid, restore the
  * matching destination VF up to "firmware loaded, bound, ibdev up".
