@@ -296,6 +296,21 @@ int rdma_dispatch_restore_pd_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry 
 int rdma_dispatch_restore_mr_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
 
 /*
+ * Restore-side per-CQ timing selector (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_restore_cq_needs_pie()
+ *       Asks the plugin whose cr_rdma_provided_driver matches
+ *       @criu_driver whether its CQs restore master-side (rxe: the CQE
+ *       ring is a kernel-page mmap the pie's VMA pass then maps) or must
+ *       defer to the pie (mlx5: RESTORE_CQ pins the source ring /
+ *       doorbell pages from current->mm, so the verb must run after the
+ *       VMAs are laid out). Returns > 0 to defer to the pie, 0 for
+ *       master-side (including the no-op case where the plugin exposes no
+ *       hook), negative errno on no/ambiguous driver match.
+ */
+int rdma_dispatch_restore_cq_needs_pie(uint32_t criu_driver);
+
+/*
  * RDMA driver-name resolution (criu/rdma/driver.c):
  *
  *   rdma_driver_name_from_ibdev()
