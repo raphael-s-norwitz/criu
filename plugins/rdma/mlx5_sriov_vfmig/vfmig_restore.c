@@ -902,6 +902,63 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack(const RdmaUobjEntry *e, stru
 	return 0;
 }
 
+_Static_assert(sizeof(struct mlx5_ib_restore_mr_req_local) == 16,
+	       "mlx5_ib_restore_mr_req_local must be 16 bytes (kernel UAPI)");
+
+/*
+ * RDMA_RESTORE_UOBJ_MR_UHW_PACK hook. Shapes the UHW_IN of the
+ * UVERBS_METHOD_RESTORE_MR verb core issues (from the pie), so the
+ * kernel adopts the source FW mkey preserved across LOAD_VHCA_STATE
+ * into a fresh mlx5_ib_mr without CREATE_MKEY.
+ *
+ * Unlike the PD hook there is no plugin_blob: an MR is dumped by core's
+ * generic QUERY_MR, which carries no driver-private bytes. The FW
+ * mkey_index is instead derived from the entry's wire-visible lkey --
+ * the mlx5 user-MR invariant is lkey == rkey == (mkey_index << 8) |
+ * variant, so mkey_index == lkey >> 8. The kernel cross-checks
+ * (lkey_hint >> 8) == req.mkey_index && lkey_hint == rkey_hint, so a
+ * mismatch (e.g. a stale/rekeyed image) is caught rather than silently
+ * adopting the wrong mkey. Core owns and frees uhw->in_buf after the
+ * ioctl.
+ *
+ * Returns 0 on success, -errno on a missing/implausible lkey or OOM.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
+{
+	struct mlx5_ib_restore_mr_req_local req = {};
+	void *inbuf;
+
+	if (!e || !uhw)
+		return -EINVAL;
+
+	if (!e->mr || !e->mr->has_lkey) {
+		pr_err("vfmig: RESTORE_MR_UHW_PACK ufile_handle=%u: entry has no MR lkey to derive mkey_index from\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0);
+		return -EINVAL;
+	}
+
+	/* mlx5 invariant: lkey == rkey == (mkey_index << 8) | variant. */
+	req.mkey_index = e->mr->lkey >> 8;
+	if (req.mkey_index == 0 || (req.mkey_index & ~0xffffffU)) {
+		pr_err("vfmig: RESTORE_MR_UHW_PACK ufile_handle=%u: implausible mkey_index=%u from lkey=%#x\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, req.mkey_index, e->mr->lkey);
+		return -EINVAL;
+	}
+
+	inbuf = malloc(sizeof(req));
+	if (!inbuf) {
+		pr_err("vfmig: RESTORE_MR_UHW_PACK out of memory (in_buf %zu bytes)\n", sizeof(req));
+		return -ENOMEM;
+	}
+	memcpy(inbuf, &req, sizeof(req));
+	uhw->in_buf = inbuf;
+	uhw->in_len = sizeof(req);
+
+	pr_debug("vfmig: RESTORE_MR_UHW_PACK ufile_handle=%u lkey=%#x mkey_index=%u (uhw_in=%zu)\n",
+		 e->has_ufile_handle ? e->ufile_handle : 0, e->mr->lkey, req.mkey_index, uhw->in_len);
+	return 0;
+}
+
 /*
  * Read mlx5_vfmig.img and, for each unique vf_uuid, restore the
  * matching destination VF up to "firmware loaded, bound, ibdev up".
