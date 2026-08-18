@@ -727,3 +727,66 @@ int rdma_dispatch_restore_mr_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry 
 		 winner_name, criu_driver, e && e->has_ufile_handle ? e->ufile_handle : 0);
 	return fn(e, uhw);
 }
+
+/*
+ * Restore-side per-CQ timing selector.
+ *
+ * Asks the owning plugin (keyed by @criu_driver against each plugin's
+ * cr_rdma_provided_driver, same as the CQ UHW-pack dispatch) whether its
+ * CQs restore master-side (rxe: the ring is a kernel-page mmap the pie's
+ * VMA pass then maps) or must defer to the pie (mlx5: RESTORE_CQ pins the
+ * source ring / doorbell pages from current->mm, so the verb must run
+ * after the VMAs are laid out).
+ *
+ * Like the UHW-pack dispatch we key on provided-driver alone, not on hook
+ * presence: a matched plugin that exposes no NEEDS_PIE hook is the valid
+ * "master-side" default (rc 0). Return value: > 0 defer to pie, 0
+ * master-side. Hard failures:
+ *   - two plugins declare the same provided-driver (-EEXIST).
+ *   - no plugin matches (-ENOENT).
+ */
+int rdma_dispatch_restore_cq_needs_pie(uint32_t criu_driver)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+	const char *winner_name = NULL;
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE_t *fn;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		p = (const int *)dlsym(this->dlhandle, CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != criu_driver)
+			continue;
+
+		if (winner) {
+			pr_err("CQ restore timing: multiple plugins declare cr_rdma_provided_driver=%u "
+			       "('%s' and '%s'); operator's plugin set is inconsistent.\n",
+			       criu_driver, winner_name, this->d->name);
+			return -EEXIST;
+		}
+		winner = this;
+		winner_name = this->d->name;
+	}
+
+	if (!winner) {
+		pr_err("CQ restore timing: no loaded RDMA plugin exports cr_rdma_provided_driver=%u; "
+		       "cannot decide restore timing.\n",
+		       criu_driver);
+		return -ENOENT;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE];
+	if (!fn) {
+		pr_debug("CQ restore timing: plugin '%s' exposes no RESTORE_UOBJ_CQ_NEEDS_PIE; restoring CQ "
+			 "master-side (criu_driver=%u)\n",
+			 winner_name, criu_driver);
+		return 0;
+	}
+
+	return fn();
+}

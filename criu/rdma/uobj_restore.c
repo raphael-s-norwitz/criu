@@ -1168,16 +1168,32 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 		switch (c->e->type) {
 		case R3_UOBJ_TYPE__R3UT_PD:
 			break; /* restored in the first pass */
-		case R3_UOBJ_TYPE__R3UT_CQ:
+		case R3_UOBJ_TYPE__R3UT_CQ: {
 			/*
-			 * CQ is a root like PD (no incoming xrefs in v0) and
-			 * is restored synchronously here on cmd_fd -- it must
-			 * precede the pie's VMA mmap of the ring (see
-			 * rdma_send_restore_cq). Order vs the MR queueing below
-			 * is immaterial: MR only depends on PD.
+			 * CQ is a root like PD (no incoming xrefs in v0), but
+			 * splits by driver on WHERE the RESTORE_CQ verb runs:
+			 * the master-side camp (rxe, needs_pie=0) issues it
+			 * here so it precedes the pie's VMA mmap of the
+			 * kernel-page ring. The pie-deferred camp (mlx5,
+			 * needs_pie>0) needs the verb to run after the pie
+			 * lays out the source ring / doorbell VMAs that its
+			 * pin_user_pages_fast pins; that pie handoff lands in
+			 * a follow-up commit, so for now needs_pie>0 is
+			 * rejected here.
 			 */
-			ret = uobj_restore_cq(cmd_fd, kernel_driver_id, c->e, &map);
+			int pie = rdma_dispatch_restore_cq_needs_pie(c->e->hw_driver_id);
+
+			if (pie < 0) {
+				ret = -1;
+			} else if (pie > 0) {
+				pr_err("uobj DAG: CQ handle=%u requests pie-deferred restore, not yet supported\n",
+				       c->e->ufile_handle);
+				ret = -1;
+			} else {
+				ret = uobj_restore_cq(cmd_fd, kernel_driver_id, c->e, &map);
+			}
 			break;
+		}
 		case R3_UOBJ_TYPE__R3UT_MR:
 			ret = uobj_prepare_mr(cmd_fd, ufile_id, kernel_driver_id, c->e, &map);
 			break;
