@@ -661,11 +661,16 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 
 	/*
-	 * Drain the MRs queued by prepare_fds()'s uverbs cdev restore into
-	 * the pie restorer args. Issued from the pie (not here) because
-	 * RESTORE_MR pins the MR's user pages, which only exist once the
-	 * pie has laid out the VMAs at their original VAs.
+	 * Drain the CQs and MRs queued by prepare_fds()'s uverbs cdev
+	 * restore into the pie restorer args. Issued from the pie (not here)
+	 * because the pie-deferred RESTORE_CQ / RESTORE_MR verbs pin user
+	 * pages that only exist once the pie has laid out the VMAs at their
+	 * original VAs. CQs first: a CQ is a QP xref target (QP joins the
+	 * pie later) and shares the MR ordering constraint.
 	 */
+	if (rdma_prepare_rdma_cqs(ta))
+		return -1;
+
 	if (rdma_prepare_rdma_mrs(ta))
 		return -1;
 

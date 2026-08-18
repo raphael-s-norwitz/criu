@@ -311,6 +311,19 @@ int rdma_dispatch_restore_mr_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry 
 int rdma_dispatch_restore_cq_needs_pie(uint32_t criu_driver);
 
 /*
+ * R3 restore-side pie handoff for CQs (criu/rdma/uobj_restore.c), the CQ
+ * twin of rdma_prepare_rdma_mrs(). Called once from the sigreturn-args
+ * prep in cr-restore.c: bursts the CQs queued by uobj_prepare_cq() (the
+ * pie-deferred camp, mlx5) into ta->rdma_cqs[], each owning a high-fd dup
+ * of its ucontext cdev; the pie blob issues RESTORE_CQ for them after the
+ * user VMAs are laid out (the source ring / doorbell pages must be
+ * present for the kernel's pin_user_pages_fast). Always anchors
+ * ta->rdma_cqs at the current RM_PRIVATE cursor. Returns 0 on success
+ * (including the no-CQ fast path), -1 on a dup / alloc error.
+ */
+int rdma_prepare_rdma_cqs(struct task_restore_args *ta);
+
+/*
  * RDMA driver-name resolution (criu/rdma/driver.c):
  *
  *   rdma_driver_name_from_ibdev()
