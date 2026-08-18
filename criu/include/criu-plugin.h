@@ -296,6 +296,37 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK = 24,
 
+	/*
+	 * RDMA per-MR restore-side UHW pack. The MR twin of the CQ/QP/PD
+	 * UHW-pack hooks, applied to UVERBS_METHOD_RESTORE_MR: core builds
+	 * the driver-agnostic ioctl skeleton (target handle, parent PD
+	 * handle, addr/length/iova, access_flags, lkey/rkey hints, the
+	 * RESP_LKEY/RKEY sinks) from the R3UT_MR entry's rdma_mr_attrs and
+	 * the ufile handle map; the owning plugin shapes the driver-private
+	 * UHW_IN around it, keyed by @criu_driver.
+	 *
+	 * Unlike PD/CQ/QP there is no matching RDMA_DUMP_UOBJ_MR hook: an
+	 * MR carries no dump-time plugin_blob because its FW identity is
+	 * fully recoverable from the wire-visible lkey (mlx5: the kernel
+	 * adopts the mkey_index == lkey >> 8 preserved across
+	 * LOAD_VHCA_STATE). The pack hook therefore derives its UHW from
+	 * the entry's core rdma_mr_attrs, not from a plugin_blob.
+	 *
+	 * Because RESTORE_MR pins the MR's user pages against the restored
+	 * address space, core issues the verb from the pie restorer (after
+	 * the VMA pass), not master-side: this hook runs master-side at
+	 * prepare time and its packed UHW_IN bytes are carried into the pie
+	 * args, so the plugin is invoked while it is still loaded.
+	 *
+	 * Optional, like the other UHW packs: a matched plugin that does
+	 * not register this hook yields an empty @uhw (rc 0) and core
+	 * issues a UHW-less RESTORE_MR -- the rxe path, where the kernel
+	 * mints its own key and no driver UHW is required.
+	 *
+	 * Return: 0 on success, negative errno on failure.
+	 */
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK = 25,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -379,6 +410,8 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_UHW_PACK, const Rd
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_PD, const char *ibdev, uint32_t kernel_driver_id, int lfd,
 			 uint32_t ufile_handle, pid_t pid, ProtobufCBinaryData *plugin_blob);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK, const RdmaUobjEntry *e,
+			 struct rdma_uhw_spec *uhw);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK, const RdmaUobjEntry *e,
 			 struct rdma_uhw_spec *uhw);
 
 /*
