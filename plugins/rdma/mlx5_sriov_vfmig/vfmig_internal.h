@@ -284,4 +284,13 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack(const RdmaUobjEntry *e, stru
  */
 int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
 
+/*
+ * Per-CQ restore UHW pack. rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack()
+ * is the RDMA_RESTORE_UOBJ_CQ_UHW_PACK hook: it reshapes the 32-byte
+ * blob captured at dump into the struct mlx5_ib_restore_cq_req the
+ * kernel's UVERBS_METHOD_RESTORE_CQ expects in UHW_IN (cqn, cqe_size,
+ * source buf_addr / db_addr), validating the blob before it does.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
+
 #endif /* __CR_VFMIG_INTERNAL_H__ */
