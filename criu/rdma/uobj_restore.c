@@ -969,6 +969,140 @@ static int uobj_restore_qp(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 }
 
 /*
+ * CQs resolved in Phase A (the per-ufile dispatch) but issued in the pie
+ * restorer -- the pie-deferred camp (mlx5), whose RESTORE_CQ pins the
+ * source CQE-ring / doorbell pages via pin_user_pages_fast against
+ * current->mm, so the verb must run after the pie blob has mmap'd the
+ * VMAs at their original VAs (issuing it master-side returns -EFAULT).
+ * The master-side camp (rxe) never queues here -- see uobj_restore_cq
+ * and CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE. Each record owns a
+ * high-fd dup of the ucontext cdev; the pie closes it after the ioctl.
+ */
+struct rdma_pending_cq {
+	uint32_t ufile_id;
+	uint32_t kernel_driver_id;
+	uint32_t target_handle;
+	uint32_t cqe;
+	uint32_t comp_vector;
+	uint32_t flags;
+	int cmd_fd_dup;
+	uint32_t uhw_in_len; /* 0 -> UHW-less RESTORE_CQ */
+	uint8_t uhw_in_buf[RST_RDMA_CQ_UHW_IN_MAX];
+	struct list_head link;
+};
+
+static LIST_HEAD(rdma_pending_cqs);
+
+/*
+ * Pie-deferred CQ prepare (mlx5): validate the R3UT_CQ entry, pack its
+ * driver-private UHW_IN master-side while the owning plugin is still
+ * loaded, dup the ucontext cdev to a high fd for the pie, and queue the
+ * record; rdma_prepare_rdma_cqs() later drains it into the restorer
+ * args. Unlike uobj_prepare_mr a CQ has no parent to resolve, but it IS
+ * an xref target (a QP binds its send/recv CQs by restrack id), so we
+ * still record (CQ, restrack_id) -> handle in the map here for the QP
+ * pass -- exactly as the master-side uobj_restore_cq does.
+ */
+static int uobj_prepare_cq(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver_id, const RdmaUobjEntry *e,
+			   struct uobj_handle_map *m)
+{
+	const RdmaCqAttrs *attrs = e->cq;
+	uint8_t uhw_in_buf[RST_RDMA_CQ_UHW_IN_MAX];
+	uint32_t uhw_in_len = 0;
+	uint32_t cqe = 0, comp_vector = 0, flags = 0;
+	struct rdma_pending_cq *p;
+	int dup_fd;
+
+	if (!e->has_ufile_handle) {
+		pr_err("uobj DAG: CQ entry (restrack_id=%u) has no ufile_handle; cannot restore\n",
+		       e->has_restrack_id ? e->restrack_id : 0);
+		return -1;
+	}
+	if (!e->has_restrack_id) {
+		pr_err("uobj DAG: CQ entry (handle=%u) has no restrack_id; QP send/recv-CQ xrefs could not resolve "
+		       "it\n",
+		       e->ufile_handle);
+		return -1;
+	}
+
+	if (attrs) {
+		if (attrs->has_cqe_count)
+			cqe = attrs->cqe_count;
+		if (attrs->has_comp_vector)
+			comp_vector = attrs->comp_vector;
+		if (attrs->has_flags)
+			flags = attrs->flags;
+	}
+
+	/*
+	 * Reshape the driver-private UHW_IN here, master-side, while the
+	 * owning plugin is still loaded: the RESTORE_CQ ioctl runs later in
+	 * the pie (post-VMA, no plugins), so the packed bytes ride inline in
+	 * the queued record. mlx5 packs a struct mlx5_ib_restore_cq_req from
+	 * its per-CQ plugin_blob.
+	 */
+	{
+		struct rdma_uhw_spec uhw = {};
+		int rc = rdma_dispatch_restore_cq_uhw_pack(e->hw_driver_id, e, &uhw);
+
+		if (rc) {
+			pr_err("uobj DAG: CQ handle=%u UHW pack failed: %d (%s)\n", e->ufile_handle, rc,
+			       strerror(rc < 0 ? -rc : rc));
+			free(uhw.in_buf);
+			free(uhw.out_buf);
+			return -1;
+		}
+		if (uhw.out_len) {
+			pr_err("uobj DAG: CQ handle=%u plugin requested UHW_OUT (%zu bytes); the pie RESTORE_CQ "
+			       "path carries UHW_IN only\n",
+			       e->ufile_handle, uhw.out_len);
+			free(uhw.in_buf);
+			free(uhw.out_buf);
+			return -1;
+		}
+		if (uhw.in_len > sizeof(uhw_in_buf)) {
+			pr_err("uobj DAG: CQ handle=%u UHW_IN too large (%zu > %zu)\n", e->ufile_handle, uhw.in_len,
+			       sizeof(uhw_in_buf));
+			free(uhw.in_buf);
+			return -1;
+		}
+		if (uhw.in_len)
+			memcpy(uhw_in_buf, uhw.in_buf, uhw.in_len);
+		uhw_in_len = (uint32_t)uhw.in_len;
+		free(uhw.in_buf);
+	}
+
+	dup_fd = fcntl(cmd_fd, F_DUPFD_CLOEXEC, RDMA_PIE_CMD_FD_MIN);
+	if (dup_fd < 0) {
+		pr_err("uobj DAG: CQ handle=%u: F_DUPFD_CLOEXEC of cdev fd for pie failed: %m\n", e->ufile_handle);
+		return -1;
+	}
+
+	p = xzalloc(sizeof(*p));
+	if (!p) {
+		close(dup_fd);
+		return -1;
+	}
+	p->ufile_id = ufile_id;
+	p->kernel_driver_id = kernel_driver_id;
+	p->target_handle = e->ufile_handle;
+	p->cqe = cqe;
+	p->comp_vector = comp_vector;
+	p->flags = flags;
+	p->cmd_fd_dup = dup_fd;
+	p->uhw_in_len = uhw_in_len;
+	if (uhw_in_len)
+		memcpy(p->uhw_in_buf, uhw_in_buf, uhw_in_len);
+	INIT_LIST_HEAD(&p->link);
+	list_add_tail(&p->link, &rdma_pending_cqs);
+
+	pr_info("uobj DAG: CQ handle=%u queued for pie: cqe=%u comp_vector=%u flags=%#x uhw_in=%u\n", e->ufile_handle,
+		cqe, comp_vector, flags, uhw_in_len);
+
+	return handle_map_add(m, R3_UOBJ_TYPE__R3UT_CQ, e->restrack_id, e->ufile_handle);
+}
+
+/*
  * MRs resolved in Phase A (the per-ufile dispatch) but issued in the
  * pie restorer. The RESTORE_MR ioctl must run in the target's restored
  * address space -- rxe pins the MR's user_addr pages via
@@ -1174,24 +1308,22 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 			 * splits by driver on WHERE the RESTORE_CQ verb runs:
 			 * the master-side camp (rxe, needs_pie=0) issues it
 			 * here so it precedes the pie's VMA mmap of the
-			 * kernel-page ring. The pie-deferred camp (mlx5,
-			 * needs_pie>0) needs the verb to run after the pie
-			 * lays out the source ring / doorbell VMAs that its
-			 * pin_user_pages_fast pins; that pie handoff lands in
-			 * a follow-up commit, so for now needs_pie>0 is
-			 * rejected here.
+			 * kernel-page ring; the pie-deferred camp (mlx5,
+			 * needs_pie>0) queues it via uobj_prepare_cq so the
+			 * verb runs after the pie lays out the source ring /
+			 * doorbell VMAs its pin_user_pages_fast needs. Both
+			 * paths record (CQ, restrack_id) -> handle for the QP
+			 * pass. Order vs the MR queueing below is immaterial:
+			 * MR only depends on PD.
 			 */
 			int pie = rdma_dispatch_restore_cq_needs_pie(c->e->hw_driver_id);
 
-			if (pie < 0) {
+			if (pie < 0)
 				ret = -1;
-			} else if (pie > 0) {
-				pr_err("uobj DAG: CQ handle=%u requests pie-deferred restore, not yet supported\n",
-				       c->e->ufile_handle);
-				ret = -1;
-			} else {
+			else if (pie > 0)
+				ret = uobj_prepare_cq(cmd_fd, ufile_id, kernel_driver_id, c->e, &map);
+			else
 				ret = uobj_restore_cq(cmd_fd, kernel_driver_id, c->e, &map);
-			}
 			break;
 		}
 		case R3_UOBJ_TYPE__R3UT_MR:

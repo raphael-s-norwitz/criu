@@ -198,6 +198,16 @@ struct rst_rdma_mr {
 	u8 uhw_in_buf[RST_RDMA_MR_UHW_IN_MAX];
 };
 
+/*
+ * Upper bound on the driver-private UHW_IN a pie-deferred CQ carries.
+ * The owning plugin packs it master-side (mlx5: a 32-byte struct
+ * mlx5_ib_restore_cq_req -- cqn, cqe_size, buf_addr, db_addr); 40 covers
+ * it with margin. Bounds the master-side staging record queued by
+ * uobj_prepare_cq() (criu/rdma/uobj_restore.c), and later the pie
+ * carrier that ferries it to RESTORE_CQ.
+ */
+#define RST_RDMA_CQ_UHW_IN_MAX 40
+
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
