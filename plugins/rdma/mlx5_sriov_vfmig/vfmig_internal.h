@@ -260,4 +260,16 @@ int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path, const uint64_t addr,
  */
 int rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
 
+/*
+ * Per-MR restore UHW pack. rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack()
+ * is the RDMA_RESTORE_UOBJ_MR_UHW_PACK hook: unlike the PD hook it reads
+ * no plugin_blob (an MR carries none) and instead derives the FW
+ * mkey_index from the entry's wire-visible lkey (mlx5 invariant
+ * lkey == rkey == (mkey_index << 8) | variant), packing a struct
+ * mlx5_ib_restore_mr_req_local into the UHW_IN of core's
+ * UVERBS_METHOD_RESTORE_MR so the kernel adopts the source FW mkey
+ * (preserved across LOAD_VHCA_STATE) without CREATE_MKEY.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
+
 #endif /* __CR_VFMIG_INTERNAL_H__ */
