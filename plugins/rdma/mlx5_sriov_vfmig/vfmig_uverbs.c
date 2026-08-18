@@ -292,6 +292,65 @@ int vfmig_query_pd(int fd, uint32_t pd_handle, struct mlx5_ib_restore_pd_req_loc
 }
 
 /*
+ * QUERY_CQ: for the user CQ at @cq_handle on @fd's ufile, fill @blob_out
+ * (the verbatim RESTORE_CQ UHW: cqn, cqe_size, buf_addr, db_addr) and
+ * the three restore core attrs @cqe_out / @comp_vector_out / @flags_out.
+ * All four RESP attrs are MANDATORY in the kernel handler, so all four
+ * pointers are always supplied. Returns 0 on success, -errno on failure
+ * (the kernel returns -ENXIO for a kernel-mode CQ with no source VAs).
+ */
+int vfmig_query_cq(int fd, uint32_t cq_handle, struct mlx5_ib_restore_cq_req_local *blob_out, uint32_t *cqe_out,
+		   uint32_t *comp_vector_out, uint32_t *flags_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[5];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_CQ_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE_LOCAL;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = cq_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB_LOCAL;
+	cmd.attrs[n].len = sizeof(*blob_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)blob_out;
+	n++;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE_LOCAL;
+	cmd.attrs[n].len = sizeof(*cqe_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)cqe_out;
+	n++;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR_LOCAL;
+	cmd.attrs[n].len = sizeof(*comp_vector_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)comp_vector_out;
+	n++;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS_LOCAL;
+	cmd.attrs[n].len = sizeof(*flags_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)flags_out;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
  * Allocate a fresh ucontext on @fd via the legacy write()-based
  * IB_USER_VERBS_CMD_GET_CONTEXT command, with the mlx5 driver payload
  * appended. @flags carries the MLX5_IB_ALLOC_UCTX_* bits (the restore

@@ -289,6 +289,75 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_pd(const char *ibdev, uint32_t kernel_drive
 }
 
 /*
+ * RDMA_DUMP_UOBJ_CQ hook. Core's CQ walker dispatches this per mlx5 CQ
+ * with a shared-IDR cdev fd and the CQ's ufile handle; QUERY_CQ reads
+ * the restore payload the destination cannot re-derive. Unlike PD, a CQ
+ * has hw-agnostic per-class attrs NLDEV omits (comp_vector, flags) that
+ * the plugin fills into @cq_attrs -- core has already stamped cqe_count
+ * from NLDEV RES_CQE and we must not touch it (we cross-check it against
+ * QUERY_CQ's RESP_CQE and warn on drift). The 32-byte
+ * mlx5_ib_restore_cq_req (cqn, cqe_size, buf_addr, db_addr) rides in
+ * @plugin_blob, byte-equal to what the restore UHW-pack hook re-emits.
+ *
+ * Returns 0 on success, -errno on failure (aborts the dump).
+ * @kernel_driver_id and @pid are unused -- @lfd already targets the
+ * right context.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev, uint32_t kernel_driver_id, int lfd, uint32_t ufile_handle,
+					pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob)
+{
+	struct mlx5_ib_restore_cq_req_local blob = {};
+	struct mlx5_ib_restore_cq_req_local *out;
+	uint32_t resp_cqe = 0, comp_vector = 0, flags = 0;
+	int rc;
+
+	(void)kernel_driver_id;
+	(void)pid;
+
+	if (lfd < 0) {
+		pr_err("vfmig: dump-cq: ibdev=%s handle=%u has no holder cdev fd (dup failed at dump); "
+		       "cannot QUERY_CQ\n",
+		       ibdev, ufile_handle);
+		return -EBADF;
+	}
+
+	rc = vfmig_query_cq(lfd, ufile_handle, &blob, &resp_cqe, &comp_vector, &flags);
+	if (rc) {
+		pr_err("vfmig: dump-cq: QUERY_CQ(ibdev=%s handle=%u) failed: %d (%s)\n", ibdev, ufile_handle, rc,
+		       strerror(-rc));
+		return rc;
+	}
+
+	/*
+	 * cqe_count is core's from NLDEV; leave it. A drift vs QUERY_CQ's
+	 * RESP_CQE would mean the two sources disagree on the ring size --
+	 * warn but keep the NLDEV value the restore verb's CQE attr uses.
+	 */
+	if (cq_attrs->has_cqe_count && cq_attrs->cqe_count != resp_cqe)
+		pr_warn("vfmig: dump-cq: handle=%u NLDEV cqe_count=%u != QUERY_CQ resp_cqe=%u\n", ufile_handle,
+			cq_attrs->cqe_count, resp_cqe);
+
+	cq_attrs->has_comp_vector = true;
+	cq_attrs->comp_vector = comp_vector;
+	cq_attrs->has_flags = true;
+	cq_attrs->flags = flags;
+
+	out = malloc(sizeof(*out));
+	if (!out) {
+		pr_err("vfmig: dump-cq: out of memory packing plugin_blob (handle=%u)\n", ufile_handle);
+		return -ENOMEM;
+	}
+	*out = blob;
+
+	plugin_blob->data = (uint8_t *)out;
+	plugin_blob->len = sizeof(*out);
+
+	pr_info("vfmig: dump-cq: ibdev=%s handle=%u cqn=%u cqe_size=%u cqe=%u comp_vector=%u flags=%#x\n", ibdev,
+		ufile_handle, blob.cqn, blob.cqe_size, resp_cqe, comp_vector, flags);
+	return 0;
+}
+
+/*
  * The suspended-VF set: the (pf_bdf, vf_id) pairs CHECKPOINT_DEVICES
  * parked to STOP, so we suspend each VF exactly once (a VF backs several
  * contexts across several pids) and fini(DUMP) resumes exactly what we
