@@ -172,6 +172,16 @@ struct restore_vma_io {
  * mlx5's FW mkey_index UHW plugs in via its own hook in a later
  * milestone.
  */
+/*
+ * Upper bound on the driver-private UHW_IN a plugin's
+ * RDMA_RESTORE_UOBJ_MR_UHW_PACK hook may stage for the pie's
+ * RESTORE_MR. The bytes are packed master-side (plugins are gone by
+ * pie time) and copied inline into the RM_PRIVATE args, so the buffer
+ * is fixed-size rather than a pointer the pie could not dereference.
+ * 24 covers mlx5's 16-byte struct mlx5_ib_restore_mr_req with margin.
+ */
+#define RST_RDMA_MR_UHW_IN_MAX 24
+
 struct rst_rdma_mr {
 	int cmd_fd;
 	u32 ufile_id; /* diagnostics only */
@@ -184,6 +194,8 @@ struct rst_rdma_mr {
 	u32 access_flags;
 	u32 lkey_hint;
 	u32 rkey_hint;
+	u32 uhw_in_len; /* 0 -> no UHW_IN attr (rxe) */
+	u8 uhw_in_buf[RST_RDMA_MR_UHW_IN_MAX];
 };
 
 struct task_restore_args {

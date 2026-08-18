@@ -997,7 +997,7 @@ static int restore_rdma_mr(struct rst_rdma_mr *r)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;
-		struct ib_uverbs_attr attrs[10];
+		struct ib_uverbs_attr attrs[11];
 	} cmd = {};
 	uint32_t resp_lkey = 0, resp_rkey = 0;
 	unsigned int n = 0;
@@ -1066,6 +1066,20 @@ static int restore_rdma_mr(struct rst_rdma_mr *r)
 	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data = (uintptr_t)&resp_rkey;
 	n++;
+
+	/*
+	 * Driver-private UHW_IN, packed master-side by the owning plugin's
+	 * RDMA_RESTORE_UOBJ_MR_UHW_PACK hook and carried inline in the pie
+	 * args (mlx5: struct mlx5_ib_restore_mr_req). Empty for rxe, which
+	 * needs no driver UHW -- omit the attr entirely in that case.
+	 */
+	if (r->uhw_in_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
+		cmd.attrs[n].len = (uint16_t)r->uhw_in_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)r->uhw_in_buf;
+		n++;
+	}
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);

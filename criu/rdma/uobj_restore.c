@@ -991,6 +991,8 @@ struct rdma_pending_mr {
 	uint32_t lkey;
 	uint32_t rkey;
 	int cmd_fd_dup;
+	uint32_t uhw_in_len; /* 0 -> UHW-less RESTORE_MR (rxe) */
+	uint8_t uhw_in_buf[RST_RDMA_MR_UHW_IN_MAX];
 	struct list_head link;
 };
 
@@ -1009,6 +1011,8 @@ static int uobj_prepare_mr(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver
 	uint32_t parent_pd_handle = 0;
 	bool have_parent = false;
 	const RdmaMrAttrs *attrs = e->mr;
+	uint8_t uhw_in_buf[RST_RDMA_MR_UHW_IN_MAX];
+	uint32_t uhw_in_len = 0;
 	struct rdma_pending_mr *p;
 	int dup_fd;
 
@@ -1051,6 +1055,45 @@ static int uobj_prepare_mr(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver
 	}
 
 	/*
+	 * Reshape the driver-private UHW_IN here, master-side, while the
+	 * owning plugin is still loaded: the RESTORE_MR ioctl runs later in
+	 * the pie (post-VMA, no plugins), so the packed bytes ride inline
+	 * in the queued record. mlx5 packs a struct mlx5_ib_restore_mr_req
+	 * (mkey_index == lkey >> 8); rxe registers no hook and yields an
+	 * empty UHW, leaving core to issue a UHW-less RESTORE_MR.
+	 */
+	{
+		struct rdma_uhw_spec uhw = {};
+		int rc = rdma_dispatch_restore_mr_uhw_pack(e->hw_driver_id, e, &uhw);
+
+		if (rc) {
+			pr_err("uobj DAG: MR handle=%u UHW pack failed: %d (%s)\n", e->ufile_handle, rc,
+			       strerror(rc < 0 ? -rc : rc));
+			free(uhw.in_buf);
+			free(uhw.out_buf);
+			return -1;
+		}
+		if (uhw.out_len) {
+			pr_err("uobj DAG: MR handle=%u plugin requested UHW_OUT (%zu bytes); the pie RESTORE_MR "
+			       "path carries UHW_IN only\n",
+			       e->ufile_handle, uhw.out_len);
+			free(uhw.in_buf);
+			free(uhw.out_buf);
+			return -1;
+		}
+		if (uhw.in_len > sizeof(uhw_in_buf)) {
+			pr_err("uobj DAG: MR handle=%u UHW_IN too large (%zu > %zu)\n", e->ufile_handle, uhw.in_len,
+			       sizeof(uhw_in_buf));
+			free(uhw.in_buf);
+			return -1;
+		}
+		if (uhw.in_len)
+			memcpy(uhw_in_buf, uhw.in_buf, uhw.in_len);
+		uhw_in_len = (uint32_t)uhw.in_len;
+		free(uhw.in_buf);
+	}
+
+	/*
 	 * Per-MR dup so each record owns its transit fd and the pie can
 	 * close them independently. cmd_fd is the plugin-opened ucontext
 	 * cdev; the dup rides above the user-fd reuse range.
@@ -1077,13 +1120,16 @@ static int uobj_prepare_mr(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver
 	p->lkey = attrs->lkey;
 	p->rkey = attrs->rkey;
 	p->cmd_fd_dup = dup_fd;
+	p->uhw_in_len = uhw_in_len;
+	if (uhw_in_len)
+		memcpy(p->uhw_in_buf, uhw_in_buf, uhw_in_len);
 	INIT_LIST_HEAD(&p->link);
 	list_add_tail(&p->link, &rdma_pending_mrs);
 
 	pr_info("uobj DAG: MR handle=%u queued for pie: parent_pd_handle=%u va=%#" PRIx64 " len=%" PRIu64
-		" access=%#x lkey=%#x rkey=%#x iova=%#" PRIx64 "\n",
+		" access=%#x lkey=%#x rkey=%#x iova=%#" PRIx64 " uhw_in=%u\n",
 		e->ufile_handle, parent_pd_handle, (uint64_t)attrs->virt_addr, (uint64_t)attrs->length,
-		attrs->access_flags, attrs->lkey, attrs->rkey, (uint64_t)attrs->iova);
+		attrs->access_flags, attrs->lkey, attrs->rkey, (uint64_t)attrs->iova, uhw_in_len);
 	return 0;
 }
 
@@ -1203,6 +1249,9 @@ int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 		r->access_flags = p->access_flags;
 		r->lkey_hint = p->lkey;
 		r->rkey_hint = p->rkey;
+		r->uhw_in_len = p->uhw_in_len;
+		if (p->uhw_in_len)
+			memcpy(r->uhw_in_buf, p->uhw_in_buf, p->uhw_in_len);
 		ta->rdma_mrs_n++;
 
 		list_del(&p->link);
