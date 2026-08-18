@@ -94,6 +94,16 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_pd(const char *ibdev, uint32_t kernel_drive
 					pid_t pid, ProtobufCBinaryData *plugin_blob);
 
 /*
+ * Per-CQ dump capture. rdma_mlx5_vfmig_plugin_dump_uobj_cq() is the
+ * RDMA_DUMP_UOBJ_CQ hook: core's CQ walker dispatches it per mlx5 CQ
+ * with a shared-IDR cdev fd and the CQ's ufile handle, and it QUERY_CQs
+ * the restore payload (cqn/cqe_size/buf_addr/db_addr into @plugin_blob)
+ * plus the hw-agnostic comp_vector/flags into @cq_attrs.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev, uint32_t kernel_driver_id, int lfd, uint32_t ufile_handle,
+					pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob);
+
+/*
  * vfmig_uverbs.c -- mlx5 ucontext uverbs-ioctl QUERY wrappers. Pure
  * marshaling over MLX5_IB_OBJECT_VFMIG; no plugin state.
  *
@@ -116,6 +126,8 @@ int vfmig_snapshot_uctx(int fd, struct mlx5_ib_vfmig_ucontext_meta_local *meta_o
 			size_t *uar_n_out, uint32_t **cnt_out, size_t *cnt_n_out);
 int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **records_out, size_t *n_out);
 int vfmig_query_pd(int fd, uint32_t pd_handle, struct mlx5_ib_restore_pd_req_local *blob_out, uint32_t *uid_out);
+int vfmig_query_cq(int fd, uint32_t cq_handle, struct mlx5_ib_restore_cq_req_local *blob_out, uint32_t *cqe_out,
+		   uint32_t *comp_vector_out, uint32_t *flags_out);
 
 /*
  * Restore-side ucontext replay (static-UAR mode). Mirror of the QUERY
