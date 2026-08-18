@@ -119,6 +119,28 @@ struct mlx5_ib_restore_pd_req_local {
 } __attribute__((aligned(8)));
 
 /*
+ * Local mirror of include/uapi/rdma/mlx5-abi.h's struct
+ * mlx5_ib_restore_mr_req: the driver-private UHW_IN of
+ * UVERBS_METHOD_RESTORE_MR. Wire layout MUST match the kernel (16
+ * bytes): the restore path ib_copy_from_udata()s it and adopts the FW
+ * mkey (preserved across LOAD_VHCA_STATE) at @mkey_index rather than
+ * re-issuing CREATE_MKEY.
+ *
+ * There is no QUERY_MR counterpart carrying this: unlike the PD blob,
+ * @mkey_index is not dumped -- the plugin derives it at restore from
+ * the wire-visible lkey (mlx5 invariant lkey == rkey ==
+ * (mkey_index << 8) | variant). reserved / reserved2 must stay zero
+ * (the restore path's "must be 0" checks) and pad the struct above
+ * uverbs' inline-UHW threshold so RESTORE_MR takes the userspace-
+ * pointer UHW path.
+ */
+struct mlx5_ib_restore_mr_req_local {
+	uint32_t mkey_index;
+	uint32_t reserved;
+	uint64_t reserved2;
+} __attribute__((aligned(8)));
+
+/*
  * Local mirror of include/uapi/rdma/mlx5_user_ioctl_cmds.h's struct
  * mlx5_ib_vfmig_ucontext_meta. Wire layout MUST match the kernel (40
  * bytes) so QUERY_UCONTEXT's uverbs_copy_to and RESTORE_UCONTEXT's
