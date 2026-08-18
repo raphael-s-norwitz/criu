@@ -278,6 +278,24 @@ int rdma_dispatch_dump_uobj_pd(uint32_t criu_driver, const char *ibdev, uint32_t
 int rdma_dispatch_restore_pd_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
 
 /*
+ * Restore-side per-MR UHW-pack dispatch (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_restore_mr_uhw_pack()
+ *       The MR twin of rdma_dispatch_restore_pd_uhw_pack(): invokes
+ *       CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK on the single
+ *       loaded plugin whose exported cr_rdma_provided_driver matches
+ *       @criu_driver (the R3UT_MR entry's). Unlike PD there is no
+ *       dump-side blob: the plugin derives its UHW from the entry's core
+ *       rdma_mr_attrs (mlx5: mkey_index == lkey >> 8) into @uhw->in_buf.
+ *       Core carries the packed bytes into the pie restorer, which issues
+ *       UVERBS_METHOD_RESTORE_MR after the VMA pass. Returns 0 on success
+ *       (including the no-op case where the plugin exposes no hook -- rxe
+ *       needs no driver UHW), negative errno on no/ambiguous match or
+ *       hook failure.
+ */
+int rdma_dispatch_restore_mr_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
+
+/*
  * RDMA driver-name resolution (criu/rdma/driver.c):
  *
  *   rdma_driver_name_from_ibdev()

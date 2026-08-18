@@ -662,3 +662,68 @@ int rdma_dispatch_restore_pd_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry 
 		 winner_name, criu_driver, e && e->has_ufile_handle ? e->ufile_handle : 0);
 	return fn(e, uhw);
 }
+
+/*
+ * Restore-side per-MR UHW-pack dispatch.
+ *
+ * The MR twin of rdma_dispatch_restore_pd_uhw_pack(): core builds the
+ * driver-agnostic half of UVERBS_METHOD_RESTORE_MR (handle, parent PD,
+ * addr/length/iova, access_flags, lkey/rkey hints) and delegates the
+ * driver-private UHW back to the owning plugin, keyed by @criu_driver
+ * against each plugin's cr_rdma_provided_driver.
+ *
+ * Like the PD/CQ/QP pack dispatch we key on provided-driver alone, not
+ * on hook presence: a matched plugin that exposes no UHW_PACK hook is a
+ * valid "this driver needs no per-MR UHW" case and yields an empty @uhw
+ * (rc 0), leaving core to issue a UHW-less RESTORE_MR (rxe). Hard
+ * failures:
+ *   - two plugins declare the same provided-driver (-EEXIST).
+ *   - no plugin matches (-ENOENT).
+ */
+int rdma_dispatch_restore_mr_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+	const char *winner_name = NULL;
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK_t *fn;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		p = (const int *)dlsym(this->dlhandle, CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != criu_driver)
+			continue;
+
+		if (winner) {
+			pr_err("MR restore (ufile_handle=%u): multiple plugins declare cr_rdma_provided_driver=%u "
+			       "('%s' and '%s'); operator's plugin set is inconsistent.\n",
+			       e && e->has_ufile_handle ? e->ufile_handle : 0, criu_driver, winner_name, this->d->name);
+			return -EEXIST;
+		}
+		winner = this;
+		winner_name = this->d->name;
+	}
+
+	if (!winner) {
+		pr_err("MR restore (ufile_handle=%u): no loaded RDMA plugin exports cr_rdma_provided_driver=%u; "
+		       "cannot reshape per-MR UHW.\n",
+		       e && e->has_ufile_handle ? e->ufile_handle : 0, criu_driver);
+		return -ENOENT;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK];
+	if (!fn) {
+		pr_debug("MR restore: plugin '%s' exposes no RESTORE_UOBJ_MR_UHW_PACK; issuing UHW-less RESTORE_MR "
+			 "(criu_driver=%u)\n",
+			 winner_name, criu_driver);
+		return 0;
+	}
+
+	pr_debug("MR restore: dispatching RESTORE_UOBJ_MR_UHW_PACK to plugin '%s' (criu_driver=%u ufile_handle=%u)\n",
+		 winner_name, criu_driver, e && e->has_ufile_handle ? e->ufile_handle : 0);
+	return fn(e, uhw);
+}
