@@ -358,6 +358,76 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev, uint32_t kernel_drive
 }
 
 /*
+ * RDMA_DUMP_UOBJ_QP hook. Core's QP walker dispatches this per mlx5 QP
+ * with a shared-IDR cdev fd and the QP's ufile handle; QUERY_QP reads the
+ * restore payload the destination cannot re-derive. Core has already
+ * stamped the NLDEV-/query_qp-derived qp_type / qp_state / qpn / psns /
+ * port / cap into @qp_attrs and we must not touch them; the plugin fills
+ * only the hw-agnostic create user_handle (the async-event cookie NLDEV
+ * omits). The 64-byte mlx5_ib_restore_qp_req (WQ-ring / doorbell source
+ * VAs, FW qpn, WQ sizing) rides in @plugin_blob, byte-equal to what the
+ * restore UHW-pack hook re-emits.
+ *
+ * v0 restores flag-less RC/UD QPs: create_flags is captured for
+ * diagnostics but CRIU's RESTORE_QP path does not carry an IB_QP_CREATE_*
+ * attr, so a non-zero value cannot round-trip -- warn if the source QP
+ * had one.
+ *
+ * Returns 0 on success, -errno on failure (aborts the dump).
+ * @kernel_driver_id and @pid are unused -- @lfd already targets the right
+ * context.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_driver_id, int lfd, uint32_t ufile_handle,
+					pid_t pid, RdmaQpAttrs *qp_attrs, ProtobufCBinaryData *plugin_blob)
+{
+	struct mlx5_ib_restore_qp_req_local blob = {};
+	struct mlx5_ib_restore_qp_req_local *out;
+	uint64_t user_handle = 0;
+	uint32_t create_flags = 0;
+	int rc;
+
+	(void)kernel_driver_id;
+	(void)pid;
+
+	if (lfd < 0) {
+		pr_err("vfmig: dump-qp: ibdev=%s handle=%u has no holder cdev fd (dup failed at dump); "
+		       "cannot QUERY_QP\n",
+		       ibdev, ufile_handle);
+		return -EBADF;
+	}
+
+	rc = vfmig_query_qp(lfd, ufile_handle, &blob, &user_handle, &create_flags);
+	if (rc) {
+		pr_err("vfmig: dump-qp: QUERY_QP(ibdev=%s handle=%u) failed: %d (%s)\n", ibdev, ufile_handle, rc,
+		       strerror(-rc));
+		return rc;
+	}
+
+	if (create_flags)
+		pr_warn("vfmig: dump-qp: handle=%u source create_flags=%#x will not round-trip (v0 restores "
+			"flag-less QPs)\n",
+			ufile_handle, create_flags);
+
+	qp_attrs->has_user_handle = true;
+	qp_attrs->user_handle = user_handle;
+
+	out = malloc(sizeof(*out));
+	if (!out) {
+		pr_err("vfmig: dump-qp: out of memory packing plugin_blob (handle=%u)\n", ufile_handle);
+		return -ENOMEM;
+	}
+	*out = blob;
+
+	plugin_blob->data = (uint8_t *)out;
+	plugin_blob->len = sizeof(*out);
+
+	pr_info("vfmig: dump-qp: ibdev=%s handle=%u qpn=%u sq_wqe=%u rq_wqe=%u rq_shift=%u flags=%#x user_handle=%#llx\n",
+		ibdev, ufile_handle, blob.qpn, blob.sq_wqe_count, blob.rq_wqe_count, blob.rq_wqe_shift, blob.flags,
+		(unsigned long long)user_handle);
+	return 0;
+}
+
+/*
  * The suspended-VF set: the (pf_bdf, vf_id) pairs CHECKPOINT_DEVICES
  * parked to STOP, so we suspend each VF exactly once (a VF backs several
  * contexts across several pids) and fini(DUMP) resumes exactly what we
