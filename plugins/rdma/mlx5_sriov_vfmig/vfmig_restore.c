@@ -1093,6 +1093,19 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_cq_needs_pie(void)
 }
 
 /*
+ * RDMA_RESTORE_UOBJ_QP_NEEDS_PIE hook. mlx5's RESTORE_QP pins the source
+ * WQ-ring and doorbell pages (buf_addr / db_addr) via pin_user_pages_fast
+ * against current->mm, so -- like RESTORE_CQ / RESTORE_MR -- the verb
+ * must run in the pie after the VMAs are laid out at their original VAs
+ * (and after the QP's send/recv CQs are restored earlier in the pie).
+ * Return non-zero to opt every mlx5 QP into the pie-deferred path.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_qp_needs_pie(void)
+{
+	return 1;
+}
+
+/*
  * Read mlx5_vfmig.img and, for each unique vf_uuid, restore the
  * matching destination VF up to "firmware loaded, bound, ibdev up".
  *
