@@ -969,6 +969,224 @@ static int uobj_restore_qp(int cmd_fd, uint32_t kernel_driver_id, const RdmaUobj
 }
 
 /*
+ * QPs resolved in the third pass (the per-ufile dispatch) but issued in
+ * the pie restorer -- the pie-deferred camp (mlx5), whose RESTORE_QP pins
+ * the source WQ-ring / doorbell pages via pin_user_pages_fast against
+ * current->mm, so the verb must run after the pie blob has mmap'd the
+ * VMAs at their original VAs (issuing it master-side returns -EFAULT) and
+ * after the QP's send/recv CQs are themselves restored in the pie (the
+ * CQ pie loop precedes the QP pie loop). The master-side camp (rxe) never
+ * queues here -- see uobj_restore_qp and
+ * CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE. Each record owns a
+ * high-fd dup of the ucontext cdev (the pie closes it after the ioctl)
+ * and carries the resolved PD / send-CQ / recv-CQ destination handles (a
+ * QP binds all three), the captured qp_type / qp_state / user_handle /
+ * cap, and the expected qpn to verify against the kernel's RESP_QPN echo.
+ */
+struct rdma_pending_qp {
+	uint32_t ufile_id;
+	uint32_t kernel_driver_id;
+	uint32_t target_handle;
+	uint32_t pd_handle;
+	uint32_t send_cq_handle;
+	uint32_t recv_cq_handle;
+	uint64_t qp_type;
+	uint64_t qp_state;
+	uint64_t user_handle;
+	uint32_t max_send_wr;
+	uint32_t max_recv_wr;
+	uint32_t max_send_sge;
+	uint32_t max_recv_sge;
+	uint32_t max_inline_data;
+	uint32_t expected_qpn;
+	bool has_expected_qpn;
+	int cmd_fd_dup;
+	uint32_t uhw_in_len; /* 0 -> UHW-less RESTORE_QP */
+	uint8_t uhw_in_buf[RST_RDMA_QP_UHW_IN_MAX];
+	struct list_head link;
+};
+
+static LIST_HEAD(rdma_pending_qps);
+
+/*
+ * Pie-deferred QP prepare (mlx5): the QP twin of uobj_prepare_cq. Unlike
+ * a CQ, a QP is not a root -- it binds its parent PD and both CQs -- so
+ * this resolves those three xrefs to their destination handles through
+ * the per-ufile map the PD (pass 1) and CQ (pass 2) passes populated,
+ * exactly as the master-side uobj_restore_qp does. It then validates the
+ * captured qp_type / qp_state / cap, packs the driver-private UHW_IN
+ * master-side while the owning plugin is still loaded (mlx5 reshapes a
+ * struct mlx5_ib_restore_qp_req from its per-QP plugin_blob), dups the
+ * ucontext cdev to a high fd for the pie, and queues the record;
+ * rdma_prepare_rdma_qps() later drains it into the restorer args. A QP is
+ * a leaf (no incoming xrefs), so unlike uobj_prepare_cq it records
+ * nothing in the map.
+ */
+static int uobj_prepare_qp(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver_id, const RdmaUobjEntry *e,
+			   const struct uobj_handle_map *m)
+{
+	const RdmaQpAttrs *attrs = e->qp;
+	const RdmaQpCap *qcap;
+	uint32_t pd_handle = 0, send_cq_handle = 0, recv_cq_handle = 0;
+	bool have_pd = false, have_scq = false, have_rcq = false;
+	uint8_t uhw_in_buf[RST_RDMA_QP_UHW_IN_MAX];
+	uint32_t uhw_in_len = 0;
+	struct rdma_pending_qp *p;
+	int dup_fd;
+
+	if (!e->has_ufile_handle) {
+		pr_err("uobj DAG: QP entry (restrack_id=%u) has no ufile_handle; cannot restore\n",
+		       e->has_restrack_id ? e->restrack_id : 0);
+		return -1;
+	}
+
+	if (!attrs || !attrs->has_qp_type || !attrs->has_state || !attrs->cap) {
+		pr_err("uobj DAG: QP handle=%u missing RESTORE_QP fields (have qp=%d type=%d state=%d cap=%d)\n",
+		       e->ufile_handle, !!attrs, attrs ? attrs->has_qp_type : 0, attrs ? attrs->has_state : 0,
+		       attrs ? (attrs->cap != NULL) : 0);
+		return -1;
+	}
+	qcap = attrs->cap;
+	if (!qcap->has_max_send_wr || !qcap->has_max_recv_wr || !qcap->has_max_send_sge || !qcap->has_max_recv_sge ||
+	    !qcap->has_max_inline_data) {
+		pr_err("uobj DAG: QP handle=%u cap missing fields (swr=%d rwr=%d ssge=%d rsge=%d inl=%d)\n",
+		       e->ufile_handle, qcap->has_max_send_wr, qcap->has_max_recv_wr, qcap->has_max_send_sge,
+		       qcap->has_max_recv_sge, qcap->has_max_inline_data);
+		return -1;
+	}
+
+	/* Resolve the PD / send-CQ / recv-CQ xrefs -- mirror uobj_restore_qp. */
+	for (size_t k = 0; k < e->n_xref; k++) {
+		const RdmaUobjXref *xr = e->xref[k];
+
+		switch (xr->role) {
+		case R3_XREF_ROLE__R3XR_PARENT_PD:
+			if (xr->target_type != R3_UOBJ_TYPE__R3UT_PD) {
+				pr_err("uobj DAG: QP handle=%u parent xref has non-PD target_type %u\n",
+				       e->ufile_handle, xr->target_type);
+				return -1;
+			}
+			if (!handle_map_lookup(m, R3_UOBJ_TYPE__R3UT_PD, xr->target_restrack_id, &pd_handle)) {
+				pr_err("uobj DAG: QP handle=%u parent PD (restrack_id=%u) not restored / "
+				       "unresolvable\n",
+				       e->ufile_handle, xr->target_restrack_id);
+				return -1;
+			}
+			have_pd = true;
+			break;
+		case R3_XREF_ROLE__R3XR_SEND_CQ:
+		case R3_XREF_ROLE__R3XR_RECV_CQ:
+			if (xr->target_type != R3_UOBJ_TYPE__R3UT_CQ) {
+				pr_err("uobj DAG: QP handle=%u %s xref has non-CQ target_type %u\n", e->ufile_handle,
+				       xr->role == R3_XREF_ROLE__R3XR_SEND_CQ ? "send-CQ" : "recv-CQ",
+				       xr->target_type);
+				return -1;
+			}
+			if (!handle_map_lookup(m, R3_UOBJ_TYPE__R3UT_CQ, xr->target_restrack_id,
+					       xr->role == R3_XREF_ROLE__R3XR_SEND_CQ ? &send_cq_handle :
+											&recv_cq_handle)) {
+				pr_err("uobj DAG: QP handle=%u %s (restrack_id=%u) not restored / unresolvable\n",
+				       e->ufile_handle,
+				       xr->role == R3_XREF_ROLE__R3XR_SEND_CQ ? "send-CQ" : "recv-CQ",
+				       xr->target_restrack_id);
+				return -1;
+			}
+			if (xr->role == R3_XREF_ROLE__R3XR_SEND_CQ)
+				have_scq = true;
+			else
+				have_rcq = true;
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (!have_pd || !have_scq || !have_rcq) {
+		pr_err("uobj DAG: QP handle=%u missing an xref (parent_pd=%d send_cq=%d recv_cq=%d)\n",
+		       e->ufile_handle, have_pd, have_scq, have_rcq);
+		return -1;
+	}
+
+	/*
+	 * Reshape the driver-private UHW_IN here, master-side, while the
+	 * owning plugin is still loaded: the RESTORE_QP ioctl runs later in
+	 * the pie (post-VMA, no plugins), so the packed bytes ride inline in
+	 * the queued record. mlx5 packs a struct mlx5_ib_restore_qp_req from
+	 * its per-QP plugin_blob.
+	 */
+	{
+		struct rdma_uhw_spec uhw = {};
+		int rc = rdma_dispatch_restore_qp_uhw_pack(e->hw_driver_id, e, &uhw);
+
+		if (rc) {
+			pr_err("uobj DAG: QP handle=%u UHW pack failed: %d (%s)\n", e->ufile_handle, rc,
+			       strerror(rc < 0 ? -rc : rc));
+			free(uhw.in_buf);
+			free(uhw.out_buf);
+			return -1;
+		}
+		if (uhw.out_len) {
+			pr_err("uobj DAG: QP handle=%u plugin requested UHW_OUT (%zu bytes); the pie RESTORE_QP "
+			       "path carries UHW_IN only\n",
+			       e->ufile_handle, uhw.out_len);
+			free(uhw.in_buf);
+			free(uhw.out_buf);
+			return -1;
+		}
+		if (uhw.in_len > sizeof(uhw_in_buf)) {
+			pr_err("uobj DAG: QP handle=%u UHW_IN too large (%zu > %zu)\n", e->ufile_handle, uhw.in_len,
+			       sizeof(uhw_in_buf));
+			free(uhw.in_buf);
+			return -1;
+		}
+		if (uhw.in_len)
+			memcpy(uhw_in_buf, uhw.in_buf, uhw.in_len);
+		uhw_in_len = (uint32_t)uhw.in_len;
+		free(uhw.in_buf);
+	}
+
+	dup_fd = fcntl(cmd_fd, F_DUPFD_CLOEXEC, RDMA_PIE_CMD_FD_MIN);
+	if (dup_fd < 0) {
+		pr_err("uobj DAG: QP handle=%u: F_DUPFD_CLOEXEC of cdev fd for pie failed: %m\n", e->ufile_handle);
+		return -1;
+	}
+
+	p = xzalloc(sizeof(*p));
+	if (!p) {
+		close(dup_fd);
+		return -1;
+	}
+	p->ufile_id = ufile_id;
+	p->kernel_driver_id = kernel_driver_id;
+	p->target_handle = e->ufile_handle;
+	p->pd_handle = pd_handle;
+	p->send_cq_handle = send_cq_handle;
+	p->recv_cq_handle = recv_cq_handle;
+	p->qp_type = attrs->qp_type;
+	p->qp_state = attrs->state;
+	p->user_handle = attrs->has_user_handle ? attrs->user_handle : 0;
+	p->max_send_wr = qcap->max_send_wr;
+	p->max_recv_wr = qcap->max_recv_wr;
+	p->max_send_sge = qcap->max_send_sge;
+	p->max_recv_sge = qcap->max_recv_sge;
+	p->max_inline_data = qcap->max_inline_data;
+	p->has_expected_qpn = attrs->has_qp_num;
+	p->expected_qpn = attrs->has_qp_num ? attrs->qp_num : 0;
+	p->cmd_fd_dup = dup_fd;
+	p->uhw_in_len = uhw_in_len;
+	if (uhw_in_len)
+		memcpy(p->uhw_in_buf, uhw_in_buf, uhw_in_len);
+	INIT_LIST_HEAD(&p->link);
+	list_add_tail(&p->link, &rdma_pending_qps);
+
+	pr_info("uobj DAG: QP handle=%u queued for pie: pd=%u scq=%u rcq=%u type=%u state=%u uhw_in=%u\n",
+		e->ufile_handle, pd_handle, send_cq_handle, recv_cq_handle, (unsigned)p->qp_type,
+		(unsigned)p->qp_state, uhw_in_len);
+
+	return 0;
+}
+
+/*
  * CQs resolved in Phase A (the per-ufile dispatch) but issued in the pie
  * restorer -- the pie-deferred camp (mlx5), whose RESTORE_CQ pins the
  * source CQE-ring / doorbell pages via pin_user_pages_fast against
@@ -1353,11 +1571,11 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 	 * splits by driver on WHERE the RESTORE_QP verb runs: the
 	 * master-side camp (rxe, needs_pie=0) issues it here so the SQ/RQ
 	 * ring pending-mmap slots exist before the pie's VMA pass; the
-	 * pie-deferred camp (mlx5, needs_pie>0) needs the verb to run after
-	 * the pie lays out the source WQ-ring / doorbell VMAs its
-	 * pin_user_pages_fast pins -- and after its send/recv CQs are
-	 * restored in the pie. That pie handoff lands in a follow-up commit,
-	 * so for now needs_pie>0 is rejected here.
+	 * pie-deferred camp (mlx5, needs_pie>0) queues it via uobj_prepare_qp
+	 * so the verb runs after the pie lays out the source WQ-ring /
+	 * doorbell VMAs its pin_user_pages_fast needs -- and after its
+	 * send/recv CQs are restored in the pie. Both paths resolve the
+	 * QP's parent-PD / send-CQ / recv-CQ handles from the map.
 	 */
 	list_for_each_entry(c, &g->entries, link) {
 		int pie;
@@ -1365,15 +1583,12 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 		if (c->e->type != R3_UOBJ_TYPE__R3UT_QP)
 			continue;
 		pie = rdma_dispatch_restore_qp_needs_pie(c->e->hw_driver_id);
-		if (pie < 0) {
+		if (pie < 0)
 			ret = -1;
-		} else if (pie > 0) {
-			pr_err("uobj DAG: QP handle=%u requests pie-deferred restore, not yet supported\n",
-			       c->e->ufile_handle);
-			ret = -1;
-		} else {
+		else if (pie > 0)
+			ret = uobj_prepare_qp(cmd_fd, ufile_id, kernel_driver_id, c->e, &map);
+		else
 			ret = uobj_restore_qp(cmd_fd, kernel_driver_id, c->e, &map);
-		}
 		if (ret)
 			goto out;
 	}
