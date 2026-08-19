@@ -351,6 +351,61 @@ int vfmig_query_cq(int fd, uint32_t cq_handle, struct mlx5_ib_restore_cq_req_loc
 }
 
 /*
+ * QUERY_QP wrapper: for the user QP resolved through UVERBS_OBJECT_QP on
+ * @fd's ufile at @qp_handle, read the restore payload the destination
+ * cannot re-derive. Fills @blob_out (the verbatim RESTORE_QP UHW: WQ-ring
+ * / doorbell source VAs, FW qpn, WQ sizing) and the create @user_handle_out
+ * / @create_flags_out. All three RESP attrs are MANDATORY in the kernel
+ * handler, so all three pointers are always supplied. Returns 0 on
+ * success, -errno on failure (the kernel returns -EOPNOTSUPP for a
+ * non-RC/UC/UD QP and -ENXIO for a kernel-mode QP with no source VAs).
+ */
+int vfmig_query_qp(int fd, uint32_t qp_handle, struct mlx5_ib_restore_qp_req_local *blob_out,
+		   uint64_t *user_handle_out, uint32_t *create_flags_out)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[4];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_QP_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE_LOCAL;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = qp_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB_LOCAL;
+	cmd.attrs[n].len = sizeof(*blob_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)blob_out;
+	n++;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE_LOCAL;
+	cmd.attrs[n].len = sizeof(*user_handle_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)user_handle_out;
+	n++;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS_LOCAL;
+	cmd.attrs[n].len = sizeof(*create_flags_out);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)create_flags_out;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
  * Allocate a fresh ucontext on @fd via the legacy write()-based
  * IB_USER_VERBS_CMD_GET_CONTEXT command, with the mlx5 driver payload
  * appended. @flags carries the MLX5_IB_ALLOC_UCTX_* bits (the restore
