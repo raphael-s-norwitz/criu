@@ -244,6 +244,46 @@ struct rst_rdma_cq {
  */
 #define RST_RDMA_QP_UHW_IN_MAX 72
 
+/*
+ * Per-QP carrier the stager (rdma_prepare_rdma_qps) fills and the pie
+ * restorer drains to issue UVERBS_METHOD_RESTORE_QP after the user VMAs
+ * are laid out (see restore_rdma_qp in criu/pie/restorer.c). The QP twin
+ * of struct rst_rdma_cq: only the pie-deferred camp (mlx5, whose
+ * RESTORE_QP pins the source WQ-ring / doorbell pages from current->mm)
+ * uses it; the master-side camp (rxe) never queues here. See
+ * CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE for the split.
+ *
+ * @cmd_fd is a per-QP high-fd dup of the ucontext cdev (reserved the
+ * same way as struct rst_rdma_cq::cmd_fd); the pie closes it after the
+ * ioctl. @pd_handle / @send_cq_handle / @recv_cq_handle are the
+ * destination IDR handles the QP binds (resolved master-side). The
+ * qp_type / qp_state / user_handle and the 20-byte cap ride inline; the
+ * driver-private UHW_IN is packed master-side by the owning plugin's
+ * RDMA_RESTORE_UOBJ_QP_UHW_PACK hook and carried inline. @expected_qpn
+ * (when @has_expected_qpn) is verified against the kernel's RESP_QPN.
+ */
+struct rst_rdma_qp {
+	int cmd_fd;
+	u32 ufile_id; /* diagnostics only */
+	u32 kernel_driver_id;
+	u32 target_handle;
+	u32 pd_handle;
+	u32 send_cq_handle;
+	u32 recv_cq_handle;
+	u64 qp_type;
+	u64 qp_state;
+	u64 user_handle;
+	u32 max_send_wr;
+	u32 max_recv_wr;
+	u32 max_send_sge;
+	u32 max_recv_sge;
+	u32 max_inline_data;
+	u32 expected_qpn;
+	u32 has_expected_qpn;
+	u32 uhw_in_len; /* 0 -> no UHW_IN attr */
+	u8 uhw_in_buf[RST_RDMA_QP_UHW_IN_MAX];
+};
+
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
@@ -289,6 +329,9 @@ struct task_restore_args {
 
 	struct rst_rdma_cq *rdma_cqs;
 	unsigned int rdma_cqs_n;
+
+	struct rst_rdma_qp *rdma_qps;
+	unsigned int rdma_qps_n;
 
 	struct rst_rdma_mr *rdma_mrs;
 	unsigned int rdma_mrs_n;

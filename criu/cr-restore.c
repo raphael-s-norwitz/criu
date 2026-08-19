@@ -670,14 +670,17 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 
 	/*
-	 * Drain the CQs and MRs queued by prepare_fds()'s uverbs cdev
+	 * Drain the CQs, QPs and MRs queued by prepare_fds()'s uverbs cdev
 	 * restore into the pie restorer args. Issued from the pie (not here)
-	 * because the pie-deferred RESTORE_CQ / RESTORE_MR verbs pin user
-	 * pages that only exist once the pie has laid out the VMAs at their
-	 * original VAs. CQs first: a CQ is a QP xref target (QP joins the
-	 * pie later) and shares the MR ordering constraint.
+	 * because the pie-deferred RESTORE_CQ / RESTORE_QP / RESTORE_MR verbs
+	 * pin user pages that only exist once the pie has laid out the VMAs
+	 * at their original VAs. CQs before QPs: a CQ is a QP xref target and
+	 * the QP pie loop binds the CQ handles the CQ pie loop installs.
 	 */
 	if (rdma_prepare_rdma_cqs(ta))
+		return -1;
+
+	if (rdma_prepare_rdma_qps(ta))
 		return -1;
 
 	if (rdma_prepare_rdma_mrs(ta))
@@ -3403,6 +3406,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	RST_MEM_FIXUP_PPTR(task_args->vmas);
 	RST_MEM_FIXUP_PPTR(task_args->rings);
 	RST_MEM_FIXUP_PPTR(task_args->rdma_cqs);
+	RST_MEM_FIXUP_PPTR(task_args->rdma_qps);
 	RST_MEM_FIXUP_PPTR(task_args->rdma_mrs);
 	RST_MEM_FIXUP_PPTR(task_args->tcp_socks);
 	RST_MEM_FIXUP_PPTR(task_args->timerfd);
