@@ -353,6 +353,19 @@ int rdma_dispatch_restore_qp_needs_pie(uint32_t criu_driver);
 int rdma_prepare_rdma_cqs(struct task_restore_args *ta);
 
 /*
+ * R3 restore-side pie handoff for QPs (criu/rdma/uobj_restore.c), the QP
+ * twin of rdma_prepare_rdma_cqs(). Called once from the sigreturn-args
+ * prep in cr-restore.c: bursts the QPs queued by uobj_prepare_qp() (the
+ * pie-deferred camp, mlx5) into ta->rdma_qps[], each owning a high-fd dup
+ * of its ucontext cdev and the destination PD / send-CQ / recv-CQ handles
+ * it binds; the pie blob issues RESTORE_QP for them after the user VMAs
+ * are laid out and after the CQ pie loop has restored its send/recv CQs.
+ * Always anchors ta->rdma_qps at the current RM_PRIVATE cursor. Returns 0
+ * on success (including the no-QP fast path), -1 on a dup / alloc error.
+ */
+int rdma_prepare_rdma_qps(struct task_restore_args *ta);
+
+/*
  * RDMA driver-name resolution (criu/rdma/driver.c):
  *
  *   rdma_driver_name_from_ibdev()

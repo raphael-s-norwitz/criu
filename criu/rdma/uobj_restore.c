@@ -1640,6 +1640,58 @@ int rdma_prepare_rdma_cqs(struct task_restore_args *ta)
 	return 0;
 }
 
+int rdma_prepare_rdma_qps(struct task_restore_args *ta)
+{
+	struct rdma_pending_qp *p, *n;
+
+	/*
+	 * Anchor ta->rdma_qps at the current RM_PRIVATE cursor before
+	 * knowing whether anything lands here, so the pool cursor stays
+	 * consistent across the whole prepare_* sequence on the no-QP path
+	 * (the master-side rxe camp queues nothing).
+	 */
+	ta->rdma_qps = (struct rst_rdma_qp *)rst_mem_align_cpos(RM_PRIVATE);
+	ta->rdma_qps_n = 0;
+
+	list_for_each_entry_safe(p, n, &rdma_pending_qps, link) {
+		struct rst_rdma_qp *r = rst_mem_alloc(sizeof(*r), RM_PRIVATE);
+
+		if (!r) {
+			pr_err("uobj DAG: rst_mem_alloc(RM_PRIVATE) for QP handle=%u failed\n", p->target_handle);
+			close(p->cmd_fd_dup);
+			return -1;
+		}
+		r->cmd_fd = p->cmd_fd_dup;
+		r->ufile_id = p->ufile_id;
+		r->kernel_driver_id = p->kernel_driver_id;
+		r->target_handle = p->target_handle;
+		r->pd_handle = p->pd_handle;
+		r->send_cq_handle = p->send_cq_handle;
+		r->recv_cq_handle = p->recv_cq_handle;
+		r->qp_type = p->qp_type;
+		r->qp_state = p->qp_state;
+		r->user_handle = p->user_handle;
+		r->max_send_wr = p->max_send_wr;
+		r->max_recv_wr = p->max_recv_wr;
+		r->max_send_sge = p->max_send_sge;
+		r->max_recv_sge = p->max_recv_sge;
+		r->max_inline_data = p->max_inline_data;
+		r->expected_qpn = p->expected_qpn;
+		r->has_expected_qpn = p->has_expected_qpn;
+		r->uhw_in_len = p->uhw_in_len;
+		if (p->uhw_in_len)
+			memcpy(r->uhw_in_buf, p->uhw_in_buf, p->uhw_in_len);
+		ta->rdma_qps_n++;
+
+		list_del(&p->link);
+		xfree(p);
+	}
+
+	if (ta->rdma_qps_n)
+		pr_info("uobj DAG: staged %u QP(s) for pie RESTORE_QP\n", ta->rdma_qps_n);
+	return 0;
+}
+
 int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 {
 	struct rdma_pending_mr *p, *n;
