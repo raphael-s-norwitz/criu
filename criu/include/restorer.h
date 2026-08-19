@@ -232,6 +232,16 @@ struct rst_rdma_cq {
 	u8 uhw_in_buf[RST_RDMA_CQ_UHW_IN_MAX];
 };
 
+/*
+ * Upper bound on the driver-private UHW_IN a pie-deferred QP carries.
+ * The owning plugin packs it master-side (mlx5: a 64-byte struct
+ * mlx5_ib_restore_qp_req -- WQ-ring / doorbell source VAs, FW qpn, WQ
+ * sizing); 72 covers it with margin. Bounds the master-side staging
+ * record queued by uobj_prepare_qp() (criu/rdma/uobj_restore.c), and
+ * later the pie carrier that ferries it to RESTORE_QP.
+ */
+#define RST_RDMA_QP_UHW_IN_MAX 72
+
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
