@@ -311,6 +311,23 @@ int rdma_dispatch_restore_mr_uhw_pack(uint32_t criu_driver, const RdmaUobjEntry 
 int rdma_dispatch_restore_cq_needs_pie(uint32_t criu_driver);
 
 /*
+ * Restore-side per-QP timing selector (criu/rdma/plugin_api.c):
+ *
+ *   rdma_dispatch_restore_qp_needs_pie()
+ *       The QP twin of rdma_dispatch_restore_cq_needs_pie(): asks the
+ *       plugin whose cr_rdma_provided_driver matches @criu_driver whether
+ *       its QPs restore master-side (rxe: the SQ/RQ ring is a kernel-page
+ *       mmap the pie's VMA pass then maps) or must defer to the pie (mlx5:
+ *       RESTORE_QP pins the source WQ-ring / doorbell pages from
+ *       current->mm, so the verb must run after the VMAs are laid out and
+ *       after the QP's send/recv CQs are restored). Returns > 0 to defer
+ *       to the pie, 0 for master-side (including the no-op case where the
+ *       plugin exposes no hook), negative errno on no/ambiguous driver
+ *       match.
+ */
+int rdma_dispatch_restore_qp_needs_pie(uint32_t criu_driver);
+
+/*
  * R3 restore-side pie handoff for CQs (criu/rdma/uobj_restore.c), the CQ
  * twin of rdma_prepare_rdma_mrs(). Called once from the sigreturn-args
  * prep in cr-restore.c: bursts the CQs queued by uobj_prepare_cq() (the
