@@ -1019,6 +1019,67 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, stru
 	return 0;
 }
 
+_Static_assert(sizeof(struct mlx5_ib_restore_qp_req_local) == 64,
+	       "mlx5_ib_restore_qp_req_local must be 64 bytes (kernel UAPI)");
+
+/*
+ * RDMA_RESTORE_UOBJ_QP_UHW_PACK hook. The restore-time twin of the QP
+ * dump hook: reshapes the per-QP plugin_blob it emitted (a byte-exact
+ * struct mlx5_ib_restore_qp_req) into the UHW_IN of the RESTORE_QP verb,
+ * so the kernel adopts the source FW qpn -- pinning the source WQ-ring
+ * and doorbell pages at @buf_addr / @db_addr -- without CREATE_QP. Like
+ * the CQ hook the blob is the UHW verbatim; core carries the packed bytes
+ * into the pie restorer (RESTORE_QP pins user pages, so the verb runs
+ * post-VMA -- see the NEEDS_PIE hook below). Core owns and frees
+ * uhw->in_buf.
+ *
+ * Returns 0 on success, -errno on a malformed blob or OOM.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
+{
+	const struct mlx5_ib_restore_qp_req_local *pb;
+	void *inbuf;
+
+	if (!e || !uhw)
+		return -EINVAL;
+
+	if (!e->has_plugin_blob || e->plugin_blob.len != sizeof(*pb)) {
+		pr_err("vfmig: RESTORE_QP_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected %zu\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, e->has_plugin_blob ? e->plugin_blob.len : (size_t)0,
+		       sizeof(*pb));
+		return -EINVAL;
+	}
+	pb = (const struct mlx5_ib_restore_qp_req_local *)e->plugin_blob.data;
+
+	/*
+	 * Defence in depth: the kernel re-checks these, but catching a
+	 * zero/oversized qpn or uidx, a v0-illegal split-SQ VA, or a
+	 * non-zero reserved word here yields a plugin-side diagnostic
+	 * instead of an opaque RESTORE_QP -EINVAL from the pie.
+	 */
+	if (pb->qpn == 0 || (pb->qpn & ~0xffffffU) || (pb->uidx & ~0xffffffU) || pb->sq_buf_addr || pb->reserved ||
+	    pb->reserved2) {
+		pr_err("vfmig: RESTORE_QP_UHW_PACK ufile_handle=%u: bad blob (qpn=%u uidx=%u sq_buf_addr=%#llx "
+		       "reserved=%u reserved2=%u)\n",
+		       e->has_ufile_handle ? e->ufile_handle : 0, pb->qpn, pb->uidx,
+		       (unsigned long long)pb->sq_buf_addr, pb->reserved, pb->reserved2);
+		return -EINVAL;
+	}
+
+	inbuf = malloc(e->plugin_blob.len);
+	if (!inbuf) {
+		pr_err("vfmig: RESTORE_QP_UHW_PACK out of memory (in_buf %zu bytes)\n", e->plugin_blob.len);
+		return -ENOMEM;
+	}
+	memcpy(inbuf, e->plugin_blob.data, e->plugin_blob.len);
+	uhw->in_buf = inbuf;
+	uhw->in_len = e->plugin_blob.len;
+
+	pr_debug("vfmig: RESTORE_QP_UHW_PACK ufile_handle=%u qpn=%u sq_wqe=%u rq_wqe=%u (uhw_in=%zu)\n",
+		 e->has_ufile_handle ? e->ufile_handle : 0, pb->qpn, pb->sq_wqe_count, pb->rq_wqe_count, uhw->in_len);
+	return 0;
+}
+
 /*
  * RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE hook. mlx5's RESTORE_CQ pins the source
  * CQE-ring and doorbell pages (buf_addr / db_addr) via
