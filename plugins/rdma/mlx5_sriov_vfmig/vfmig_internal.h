@@ -306,6 +306,15 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_mr_uhw_pack(const RdmaUobjEntry *e, stru
 int rdma_mlx5_vfmig_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
 
 /*
+ * Per-QP restore UHW pack. rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack()
+ * is the RDMA_RESTORE_UOBJ_QP_UHW_PACK hook: it reshapes the 64-byte blob
+ * captured at dump into the struct mlx5_ib_restore_qp_req the kernel's
+ * UVERBS_METHOD_RESTORE_QP expects in UHW_IN (WQ-ring / doorbell source
+ * VAs, FW qpn, WQ sizing), validating the blob before it does.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw);
+
+/*
  * Per-CQ restore timing. rdma_mlx5_vfmig_plugin_restore_uobj_cq_needs_pie()
  * is the RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE hook: it returns 1 because mlx5's
  * RESTORE_CQ pins the source CQE-ring / doorbell pages from current->mm,
