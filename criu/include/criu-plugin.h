@@ -355,6 +355,34 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE = 26,
 
+	/*
+	 * RDMA per-QP restore-timing selector. The QP twin of
+	 * RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE: dispatched by core's
+	 * rdma_restore_uobj_dag_for_ufile() (criu/rdma/uobj_restore.c) once
+	 * per R3UT_QP image entry -- before it decides where to issue the
+	 * RESTORE_QP verb -- to the plugin whose cr_rdma_provided_driver
+	 * matches the entry's criu_driver (same by-driver keying as the
+	 * RESTORE_UOBJ_QP_UHW_PACK hook).
+	 *
+	 * QP restore splits by driver like CQ restore. The rxe camp maps the
+	 * SQ/RQ ring as kernel pages at fixed vm_pgoffs, so RESTORE_QP must
+	 * run master-side, before the pie's VMA pass mmaps the cdev at those
+	 * offsets. The mlx5 camp pins the source WQ-ring and doorbell pages
+	 * from current->mm (like RESTORE_CQ / RESTORE_MR), so its verb must
+	 * run in the pie, after the VMAs are laid out at their original VAs
+	 * -- and after the QP's send/recv CQs have themselves been restored
+	 * (the CQ pie loop precedes the QP pie loop).
+	 *
+	 * A plugin returns non-zero to opt its QPs into the pie-deferred path
+	 * (mlx5), zero to keep them master-side (the rxe default). The hook
+	 * is OPTIONAL: a matched plugin that does not register it keeps the
+	 * master-side path (the dispatcher returns 0).
+	 *
+	 * Return: > 0 to defer to the pie, 0 for master-side, < 0 errno on
+	 * an ambiguous / missing driver match (aborts the restore).
+	 */
+	CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE = 27,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -442,6 +470,7 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_PD_UHW_PACK, const Rd
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK, const RdmaUobjEntry *e,
 			 struct rdma_uhw_spec *uhw);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE, void);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE, void);
 
 /*
  * RDMA sharing policy.

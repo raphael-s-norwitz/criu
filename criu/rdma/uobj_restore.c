@@ -1349,14 +1349,31 @@ int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kern
 	/*
 	 * Third pass: QPs. By now every PD (pass 1) and CQ (pass 2) has
 	 * been reinstalled and recorded in the map, so the QP's
-	 * parent-PD / send-CQ / recv-CQ edges all resolve. Like CQs, QPs
-	 * restore synchronously here on cmd_fd (master side) so the SQ/RQ
-	 * ring pending-mmap slots exist before the pie's VMA pass.
+	 * parent-PD / send-CQ / recv-CQ edges all resolve. Like CQs, a QP
+	 * splits by driver on WHERE the RESTORE_QP verb runs: the
+	 * master-side camp (rxe, needs_pie=0) issues it here so the SQ/RQ
+	 * ring pending-mmap slots exist before the pie's VMA pass; the
+	 * pie-deferred camp (mlx5, needs_pie>0) needs the verb to run after
+	 * the pie lays out the source WQ-ring / doorbell VMAs its
+	 * pin_user_pages_fast pins -- and after its send/recv CQs are
+	 * restored in the pie. That pie handoff lands in a follow-up commit,
+	 * so for now needs_pie>0 is rejected here.
 	 */
 	list_for_each_entry(c, &g->entries, link) {
+		int pie;
+
 		if (c->e->type != R3_UOBJ_TYPE__R3UT_QP)
 			continue;
-		ret = uobj_restore_qp(cmd_fd, kernel_driver_id, c->e, &map);
+		pie = rdma_dispatch_restore_qp_needs_pie(c->e->hw_driver_id);
+		if (pie < 0) {
+			ret = -1;
+		} else if (pie > 0) {
+			pr_err("uobj DAG: QP handle=%u requests pie-deferred restore, not yet supported\n",
+			       c->e->ufile_handle);
+			ret = -1;
+		} else {
+			ret = uobj_restore_qp(cmd_fd, kernel_driver_id, c->e, &map);
+		}
 		if (ret)
 			goto out;
 	}
