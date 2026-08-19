@@ -989,6 +989,41 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 #define UVERBS_ATTR_RESTORE_CQ_RESP_CQE	   7
 #endif
 
+/*
+ * RESTORE_QP shims: same numeric-copy rationale as the RESTORE_CQ block
+ * above (and the master-side mirror in criu/rdma/uobj_restore.c). The
+ * pie-deferred QP camp (mlx5) drives these from restore_rdma_qp below.
+ */
+#ifndef UVERBS_METHOD_RESTORE_QP
+#define UVERBS_METHOD_RESTORE_QP 3
+#endif
+#ifndef UVERBS_ATTR_RESTORE_QP_HANDLE
+#define UVERBS_ATTR_RESTORE_QP_HANDLE	     0
+#define UVERBS_ATTR_RESTORE_QP_PD_HANDLE     1
+#define UVERBS_ATTR_RESTORE_QP_SEND_CQ_HANDLE 2
+#define UVERBS_ATTR_RESTORE_QP_RECV_CQ_HANDLE 3
+#define UVERBS_ATTR_RESTORE_QP_TYPE	     5
+#define UVERBS_ATTR_RESTORE_QP_STATE	     6
+#define UVERBS_ATTR_RESTORE_QP_USER_HANDLE   7
+#define UVERBS_ATTR_RESTORE_QP_CAP	     8
+#define UVERBS_ATTR_RESTORE_QP_RESP_QPN	     11
+#endif
+
+/*
+ * Byte-identical local mirror of struct ib_uverbs_qp_cap (kernel UAPI),
+ * the 20-byte payload of UVERBS_ATTR_RESTORE_QP_CAP -- the pie twin of
+ * the master side's struct ib_uverbs_qp_cap_local (criu/rdma/
+ * uobj_restore.c). Reconstructed on the pie stack from the rst_rdma_qp
+ * fields and passed by pointer.
+ */
+struct rst_qp_cap_local {
+	uint32_t max_send_wr;
+	uint32_t max_recv_wr;
+	uint32_t max_send_sge;
+	uint32_t max_recv_sge;
+	uint32_t max_inline_data;
+};
+
 static int restore_rdma_mr(struct rst_rdma_mr *r)
 {
 	struct {
@@ -1209,6 +1244,133 @@ static int restore_rdma_cq(struct rst_rdma_cq *r)
 
 	pr_info("RDMA: ufile_id=%x RESTORE_CQ(target_handle=%u, cqe=%u, driver_id=%u) ok\n", r->ufile_id,
 		r->target_handle, resp_cqe, r->kernel_driver_id);
+	return 0;
+}
+
+/*
+ * Issue UVERBS_METHOD_RESTORE_QP for one QP queued by the master-side
+ * dispatch (criu/rdma/uobj_restore.c::rdma_prepare_rdma_qps). Runs from
+ * the pie blob after the user VMAs have been laid out -- so mlx5's
+ * pin_user_pages_fast over the source WQ-ring / doorbell VAs succeeds
+ * against the destination task's mm -- and after the CQ pie loop has
+ * restored the QP's send/recv CQs (their IDR handles must already resolve
+ * in the shared ufile). See criu/include/restorer.h::struct rst_rdma_qp
+ * for the timing rationale. The attr encoding mirrors the master-side
+ * rdma_send_restore_qp (this is the pie-deferred camp only, so no UHW_OUT
+ * -- mlx5's RESTORE_QP rejects a non-zero outlen).
+ */
+static int restore_rdma_qp(struct rst_rdma_qp *r)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[11];
+	} cmd = {};
+	struct rst_qp_cap_local cap = {};
+	uint32_t resp_qpn = 0;
+	unsigned int n = 0;
+	int ret;
+
+	cmd.hdr.object_id = UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id = UVERBS_METHOD_RESTORE_QP;
+	cmd.hdr.driver_id = r->kernel_driver_id;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_HANDLE;
+	cmd.attrs[n].len = sizeof(uint32_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->target_handle;
+	n++;
+
+	/* IDR references: object id rides in data, len 0. */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_PD_HANDLE;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->pd_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_SEND_CQ_HANDLE;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->send_cq_handle;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_RECV_CQ_HANDLE;
+	cmd.attrs[n].len = 0;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->recv_cq_handle;
+	n++;
+
+	/* Enum consts ride inline as u64 (kernel uverbs_get_const). */
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_TYPE;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->qp_type;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_STATE;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->qp_state;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_USER_HANDLE;
+	cmd.attrs[n].len = sizeof(uint64_t);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = r->user_handle;
+	n++;
+
+	/* cap is 20 bytes (> inline threshold): ride by pointer. */
+	cap.max_send_wr = r->max_send_wr;
+	cap.max_recv_wr = r->max_recv_wr;
+	cap.max_send_sge = r->max_send_sge;
+	cap.max_recv_sge = r->max_recv_sge;
+	cap.max_inline_data = r->max_inline_data;
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_CAP;
+	cmd.attrs[n].len = sizeof(cap);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&cap;
+	n++;
+
+	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_QP_RESP_QPN;
+	cmd.attrs[n].len = sizeof(resp_qpn);
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = (uintptr_t)&resp_qpn;
+	n++;
+
+	/*
+	 * Driver-private UHW_IN, packed master-side by the owning plugin's
+	 * RDMA_RESTORE_UOBJ_QP_UHW_PACK hook and carried inline in the pie
+	 * args (mlx5: struct mlx5_ib_restore_qp_req -- WQ-ring / doorbell
+	 * source VAs, FW qpn, WQ sizing).
+	 */
+	if (r->uhw_in_len) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_UHW_IN;
+		cmd.attrs[n].len = (uint16_t)r->uhw_in_len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)r->uhw_in_buf;
+		n++;
+	}
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	ret = sys_ioctl(r->cmd_fd, RDMA_VERBS_IOCTL, (unsigned long)&cmd);
+	sys_close(r->cmd_fd);
+	if (ret < 0) {
+		pr_err("RDMA: ufile_id=%x RESTORE_QP(target_handle=%u, pd=%u, scq=%u, rcq=%u, driver_id=%u) "
+		       "failed: %d\n",
+		       r->ufile_id, r->target_handle, r->pd_handle, r->send_cq_handle, r->recv_cq_handle,
+		       r->kernel_driver_id, ret);
+		return -1;
+	}
+
+	if (r->has_expected_qpn && resp_qpn != r->expected_qpn) {
+		pr_err("RDMA: ufile_id=%x RESTORE_QP(target_handle=%u) installed qpn=%u != captured qpn=%u\n",
+		       r->ufile_id, r->target_handle, resp_qpn, r->expected_qpn);
+		return -1;
+	}
+
+	pr_info("RDMA: ufile_id=%x RESTORE_QP(target_handle=%u, qpn=%u, driver_id=%u) ok\n", r->ufile_id,
+		r->target_handle, resp_qpn, r->kernel_driver_id);
 	return 0;
 }
 
@@ -2289,15 +2451,23 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * here so any -EFAULT surfaces against a fully-laid-out mm.
 	 */
 	/*
-	 * CQs before MRs: both are pie-deferred for the same "user pages
-	 * must be laid out first" reason, and a CQ is a QP xref target, so
-	 * it precedes anything binding it. (QP restore joins the pie in a
-	 * later milestone.)
+	 * CQs, then QPs, then MRs: all pie-deferred for the same "user pages
+	 * must be laid out first" reason. A CQ is a QP xref target, so it
+	 * precedes the QP that binds it; the QP's RESTORE_QP resolves its
+	 * send/recv CQ IDR handles, which the CQ loop must have installed in
+	 * the shared ufile first. MRs only depend on their PD (restored
+	 * master-side), so their order vs QPs is immaterial.
 	 */
 	if (args->rdma_cqs_n)
 		pr_info("RDMA: pie restorer: dispatching %u CQ(s)\n", args->rdma_cqs_n);
 	for (i = 0; i < args->rdma_cqs_n; i++)
 		if (restore_rdma_cq(&args->rdma_cqs[i]) < 0)
+			goto core_restore_end;
+
+	if (args->rdma_qps_n)
+		pr_info("RDMA: pie restorer: dispatching %u QP(s)\n", args->rdma_qps_n);
+	for (i = 0; i < args->rdma_qps_n; i++)
+		if (restore_rdma_qp(&args->rdma_qps[i]) < 0)
 			goto core_restore_end;
 
 	if (args->rdma_mrs_n)
