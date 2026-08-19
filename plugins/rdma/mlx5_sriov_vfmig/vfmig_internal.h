@@ -104,6 +104,16 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev, uint32_t kernel_drive
 					pid_t pid, RdmaCqAttrs *cq_attrs, ProtobufCBinaryData *plugin_blob);
 
 /*
+ * Per-QP dump capture. rdma_mlx5_vfmig_plugin_dump_uobj_qp() is the
+ * RDMA_DUMP_UOBJ_QP hook: core's QP walker dispatches it per mlx5 QP with
+ * a shared-IDR cdev fd and the QP's ufile handle, and it QUERY_QPs the
+ * restore payload (WQ-ring / doorbell source VAs, FW qpn, WQ sizing into
+ * @plugin_blob) plus the hw-agnostic create user_handle into @qp_attrs.
+ */
+int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_driver_id, int lfd, uint32_t ufile_handle,
+					pid_t pid, RdmaQpAttrs *qp_attrs, ProtobufCBinaryData *plugin_blob);
+
+/*
  * vfmig_uverbs.c -- mlx5 ucontext uverbs-ioctl QUERY wrappers. Pure
  * marshaling over MLX5_IB_OBJECT_VFMIG; no plugin state.
  *
@@ -128,6 +138,8 @@ int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **
 int vfmig_query_pd(int fd, uint32_t pd_handle, struct mlx5_ib_restore_pd_req_local *blob_out, uint32_t *uid_out);
 int vfmig_query_cq(int fd, uint32_t cq_handle, struct mlx5_ib_restore_cq_req_local *blob_out, uint32_t *cqe_out,
 		   uint32_t *comp_vector_out, uint32_t *flags_out);
+int vfmig_query_qp(int fd, uint32_t qp_handle, struct mlx5_ib_restore_qp_req_local *blob_out,
+		   uint64_t *user_handle_out, uint32_t *create_flags_out);
 
 /*
  * Restore-side ucontext replay (static-UAR mode). Mirror of the QUERY

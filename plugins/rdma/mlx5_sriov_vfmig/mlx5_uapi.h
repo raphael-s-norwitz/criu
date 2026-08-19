@@ -126,6 +126,60 @@
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 4)
 
 /*
+ * QUERY_QP method + attrs. Dump-side counterpart to
+ * UVERBS_METHOD_RESTORE_QP: for the user QP resolved through
+ * UVERBS_OBJECT_QP on the calling fd's ufile, the kernel emits the
+ * restore payload (WQ-ring / doorbell source VAs, FW qpn, WQ sizing as a
+ * mlx5_ib_restore_qp_req RESP_BLOB, byte-equal to the RESTORE_QP UHW)
+ * plus the create user_handle and IB_QP_CREATE_* flags the QPC / NLDEV
+ * do not surface. QUERY_QP is the seventh method in the VFMIG enum, right
+ * after QUERY_CQ. HANDLE is an IDR ref (UVERBS_OBJECT_QP, ACCESS_READ);
+ * all three RESP_* are PTR_OUT and MANDATORY.
+ */
+#define MLX5_IB_METHOD_VFMIG_QUERY_QP_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 6)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE_LOCAL \
+	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 3)
+
+/*
+ * Local mirror of include/uapi/rdma/mlx5-abi.h's struct
+ * mlx5_ib_restore_qp_req: the driver-private payload shared by QUERY_QP
+ * (RESP_BLOB, dump) and UVERBS_METHOD_RESTORE_QP (UHW_IN, restore). Wire
+ * layout MUST match the kernel (64 bytes): the kernel emits it verbatim
+ * on dump and ib_copy_from_udata()s it on restore, so a size/layout
+ * drift would corrupt the adopted QP. @buf_addr / @db_addr are the source
+ * userspace VAs of the WQ ring and doorbell page (the kernel pins them
+ * against the restored mm); @qpn is the FW qpn to adopt (24 bits
+ * significant); @sq_buf_addr is the raw_packet split-SQ VA (0 for v0
+ * RC/UC/UD). @sq_wqe_count / @rq_wqe_count / @rq_wqe_shift size the WQ
+ * ring; @flags is the MLX5_QP_FLAG_* mask. @uidx / @bfreg_index /
+ * @ece_options round-trip via the FW QPC and are validated-and-discarded.
+ * reserved / reserved2 must stay zero (the restore path's "must be 0"
+ * checks).
+ */
+struct mlx5_ib_restore_qp_req_local {
+	uint64_t buf_addr;
+	uint64_t db_addr;
+	uint64_t sq_buf_addr;
+	uint32_t qpn;
+	uint32_t sq_wqe_count;
+	uint32_t rq_wqe_count;
+	uint32_t rq_wqe_shift;
+	uint32_t flags;
+	uint32_t uidx;
+	uint32_t bfreg_index;
+	uint32_t ece_options;
+	uint32_t reserved;
+	uint32_t reserved2;
+} __attribute__((aligned(8)));
+
+/*
  * Local mirror of include/uapi/rdma/mlx5-abi.h's struct
  * mlx5_ib_restore_pd_req: the driver-private UHW payload shared by
  * QUERY_PD (RESP_BLOB, dump) and UVERBS_METHOD_RESTORE_PD (UHW_IN,
