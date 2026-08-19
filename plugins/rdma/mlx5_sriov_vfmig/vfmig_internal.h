@@ -322,4 +322,12 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, stru
  */
 int rdma_mlx5_vfmig_plugin_restore_uobj_cq_needs_pie(void);
 
+/*
+ * Per-QP restore timing. rdma_mlx5_vfmig_plugin_restore_uobj_qp_needs_pie()
+ * is the RDMA_RESTORE_UOBJ_QP_NEEDS_PIE hook: it returns 1 because mlx5's
+ * RESTORE_QP pins the source WQ-ring / doorbell pages from current->mm,
+ * so the verb must run in the pie after the user VMAs are laid out.
+ */
+int rdma_mlx5_vfmig_plugin_restore_uobj_qp_needs_pie(void);
+
 #endif /* __CR_VFMIG_INTERNAL_H__ */
