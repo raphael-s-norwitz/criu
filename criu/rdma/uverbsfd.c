@@ -1,6 +1,10 @@
+#include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <rdma/rdma_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_cmds.h>
@@ -12,8 +16,10 @@
 #include "files.h"
 #include "files-reg.h"
 #include "int.h"
+#include "kerndat.h"
 #include "log.h"
 #include "protobuf.h"
+#include "pstree.h"
 #include "rdma.h"
 #include "rdma/internal.h"
 #include "fdinfo.h"
@@ -284,6 +290,197 @@ static int dump_uverbsfile_cc_precheck(int lfd, uint32_t driver_id, const char *
 	return 0;
 }
 
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_getfd
+#define __NR_pidfd_getfd 438
+#endif
+
+/*
+ * Resolve a uverbs cdev (by its chrdev major/minor) to its ibdev,
+ * backing kernel-driver id, and the CRIU driver id of the plugin that
+ * wins CLAIM arbitration. Everything is derivable from the chrdev alone,
+ * so both dump_uverbsfile() (per-fd, has an fd_parms) and the early
+ * capture pass (has only a pidfd-acquired fd + the cdev rdev) can share
+ * it. Fails the dump closed on an unattributable context.
+ */
+static int rdma_resolve_cdev_identity(unsigned int maj, unsigned int min, char *ibdev, size_t ibsz,
+				      uint32_t *driver_id, int *criu_driver)
+{
+	char driver[64];
+	const char *claimer = NULL;
+	int rcd;
+
+	if (rdma_ibdev_from_chrdev(maj, min, ibdev, ibsz)) {
+		pr_err("Can't resolve ibdev for uverbs cdev %u:%u\n", maj, min);
+		return -1;
+	}
+	if (rdma_driver_name_from_ibdev(ibdev, driver, sizeof(driver))) {
+		pr_err("Can't resolve kernel driver for ibdev '%s'\n", ibdev);
+		return -1;
+	}
+	*driver_id = rdma_driver_name_to_id(driver);
+	if (*driver_id == RDMA_DRIVER_UNKNOWN) {
+		pr_err("Unknown RDMA driver '%s' for ibdev '%s' (uverbs cdev %u:%u)\n", driver, ibdev, maj, min);
+		return -1;
+	}
+	rcd = rdma_arbitrate_plugin_claim(ibdev, *driver_id, &claimer);
+	if (rcd < 0) {
+		pr_err("Plugin arbitration failed for ibdev=%s driver=%s: %d\n", ibdev, driver, rcd);
+		return -1;
+	}
+	if (rcd == RDMA_CRIU_DRIVER__RCD_UNKNOWN) {
+		pr_err("No RDMA CRIU plugin claims ibdev=%s driver=%s (RDMA_DRIVER id=%u)\n", ibdev, driver,
+		       *driver_id);
+		return -1;
+	}
+	*criu_driver = rcd;
+	return 0;
+}
+
+/* Already captured this (pid, ctxn)? A process can hold several fds to
+ * one ucontext (dup / fork-shared table); capture each ucontext once. */
+static bool rdma_ufile_already_captured(pid_t pid, bool has_ctxn, uint32_t ctxn)
+{
+	struct rdma_dumped_ufile *uf;
+
+	list_for_each_entry(uf, &rdma_dumped_ufiles, link) {
+		if (uf->pid != pid || uf->has_ctxn != has_ctxn)
+			continue;
+		if (!has_ctxn || uf->ctxn == ctxn)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Early uverbs-context capture, one dumpee at a time. Walks /proc/<pid>/fd
+ * for /dev/infiniband/uverbsN cdev fds (the async-event evfd is an anon
+ * inode, so it's skipped), and for each distinct ucontext resolves its
+ * ibdev/driver/plugin from the cdev rdev, reads its ctxn from fdinfo, and
+ * dups the *same* struct file out of the (SEIZE-stopped) dumpee via
+ * pidfd_getfd -- a re-open of /proc/<pid>/fd/N would mint a fresh, empty
+ * ucontext, so pidfd_getfd is mandatory. The dup is stashed as the
+ * ufile's holder_uctx_fd for the capture walk; uvfe_id is left 0 and
+ * back-filled by dump_uverbsfile() once file collection assigns it.
+ */
+static int rdma_capture_pid_uverbs(pid_t pid)
+{
+	char path[64];
+	DIR *d;
+	struct dirent *de;
+	int pidfd = -1, ret = -1;
+
+	snprintf(path, sizeof(path), "/proc/%d/fd", pid);
+	d = opendir(path);
+	if (!d) {
+		pr_perror("rdma capture: opendir %s", path);
+		return -1;
+	}
+
+	while ((de = readdir(d))) {
+		char link[PATH_MAX];
+		ssize_t n;
+		struct stat st;
+		UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
+		char ibdev[64];
+		uint32_t driver_id;
+		int criu_driver = 0, fd_no, uctx_fd;
+
+		if (de->d_name[0] == '.')
+			continue;
+
+		n = readlinkat(dirfd(d), de->d_name, link, sizeof(link) - 1);
+		if (n < 0)
+			continue;
+		link[n] = '\0';
+		if (strncmp(link, "/dev/infiniband/uverbs", strlen("/dev/infiniband/uverbs")) != 0)
+			continue;
+
+		if (fstatat(dirfd(d), de->d_name, &st, 0) < 0 || !S_ISCHR(st.st_mode))
+			continue;
+
+		fd_no = atoi(de->d_name);
+
+		if (parse_fdinfo_pid(pid, fd_no, FD_TYPES__UVERBSFD, &uve)) {
+			pr_err("rdma capture: parse fdinfo for pid=%d fd=%d (%s) failed\n", pid, fd_no, link);
+			goto out;
+		}
+
+		if (rdma_ufile_already_captured(pid, uve.has_ctxn, uve.ctxn))
+			continue;
+
+		if (rdma_resolve_cdev_identity(major(st.st_rdev), minor(st.st_rdev), ibdev, sizeof(ibdev),
+					       &driver_id, &criu_driver))
+			goto out;
+
+		if (!kdat.has_pidfd_getfd) {
+			pr_err("rdma capture: pidfd_getfd is required to dup the dumpee's uverbs context "
+			       "(pid=%d %s) but the kernel does not support it\n",
+			       pid, link);
+			goto out;
+		}
+
+		if (pidfd < 0) {
+			pidfd = syscall(__NR_pidfd_open, pid, 0);
+			if (pidfd < 0) {
+				pr_perror("rdma capture: pidfd_open(%d)", pid);
+				goto out;
+			}
+		}
+
+		uctx_fd = syscall(__NR_pidfd_getfd, pidfd, fd_no, 0);
+		if (uctx_fd < 0) {
+			pr_perror("rdma capture: pidfd_getfd(pid=%d fd=%d %s)", pid, fd_no, link);
+			goto out;
+		}
+
+		/* uvfe_id deferred: dump_uverbsfile() back-fills it. */
+		if (rdma_note_dumped_ufile(0, uve.has_ctxn, uve.ctxn, criu_driver, driver_id, pid, ibdev,
+					   uctx_fd))
+			goto out;
+
+		pr_info("rdma capture: pid=%d ibdev=%s ctxn=%u (fd=%d) captured for uobj DAG\n", pid, ibdev,
+			uve.has_ctxn ? uve.ctxn : 0, fd_no);
+	}
+
+	ret = 0;
+out:
+	if (pidfd >= 0)
+		close(pidfd);
+	closedir(d);
+	return ret;
+}
+
+/*
+ * Early uverbs-context discovery pass (see rdma.h). Runs after the RDMA
+ * coverage/exclusivity checks and *before* the datapath freeze
+ * (checkpoint_devices) and the memory snapshot: it records the tree's
+ * uverbs contexts (dup'ing each holder cdev via pidfd_getfd) so the
+ * uobject DAG walk has a live handle to each context, and
+ * dump_uverbsfile() back-fills each record's image id during file
+ * collection. The walk itself (rdma_capture_uobj_dag) still runs at
+ * end-of-dump for now; a follow-on change moves it here, ahead of the
+ * freeze.
+ */
+int rdma_capture_uverbs_contexts(struct pstree_item *root)
+{
+	struct pstree_item *item;
+
+	if (!root)
+		return 0;
+
+	for_each_pstree_item(item) {
+		if (!item->pid || item->pid->real <= 0)
+			continue;
+		if (rdma_capture_pid_uverbs(item->pid->real))
+			return -1;
+	}
+
+	return 0;
+}
+
 static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 {
 	UverbsFileEntry uve = UVERBS_FILE_ENTRY__INIT;
@@ -292,7 +489,6 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	const char *claimer = NULL;
 	char ibdev[64];
 	char driver[64];
-	int uctx_fd = -1;
 	int rcd;
 	int ret = -1;
 
@@ -401,24 +597,15 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 		goto out;
 
 	/*
-	 * Record this context for the end-of-dump uobject DAG walk
-	 * (rdma_dump_uobj_dag): it joins NLDEV-enumerated uobjects back to
-	 * their owning ufile by ctxn, so it needs the (ctxn, uvfe_id,
-	 * criu_driver, ibdev) tuple we just committed to the image.
-	 *
-	 * Also stash an O_CLOEXEC dup of lfd. lfd is the parasite-drained
-	 * (SCM_RIGHTS) fd -- the dumpee's real struct file, sharing its
-	 * ucontext IDR -- so the MR walk can QUERY_MR against it for the
-	 * user_addr / iova / access_flags NLDEV never exposes. The dup
-	 * outlives this callback (lfd is closed right after) and the walk
-	 * owns it. A dup failure yields -1: the walk then fails closed for
-	 * any MR on this context rather than emitting an unrestorable MR.
+	 * Back-fill this context's image id onto the record the early
+	 * capture pass (rdma_capture_uverbs_contexts) already made before
+	 * the datapath freeze. The uobject DAG walk ran there, on the live
+	 * device, using a pidfd_getfd dup of this same ucontext; the emit
+	 * phase reads uvfe_id back off the record to stamp each entry's
+	 * ufile_id. A context with no capture record is a dump bug -- fail
+	 * closed.
 	 */
-	uctx_fd = fcntl(lfd, F_DUPFD_CLOEXEC, 0);
-	if (uctx_fd < 0)
-		pr_warn("Can't dup uverbs cdev fd for MR QUERY on ibdev=%s: %m\n", ibdev);
-
-	ret = rdma_note_dumped_ufile(uve.id, uve.has_ctxn, uve.ctxn, rcd, uve.driver_id, p->pid, ibdev, uctx_fd);
+	ret = rdma_bind_dumped_ufile_id(p->pid, uve.has_ctxn, uve.ctxn, uve.id);
 out:
 	xfree(uve.ib_dev);
 	xfree(uve.driver_name);

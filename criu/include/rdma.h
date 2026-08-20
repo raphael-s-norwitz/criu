@@ -44,6 +44,18 @@ int rdma_check_dump_coverage(struct pstree_item *root);
 int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
 
 /*
+ * Early uverbs-context discovery pass (criu/rdma/uverbsfd.c). Runs from
+ * cr_dump_tasks() after the RDMA coverage / exclusivity checks and
+ * *before* checkpoint_devices(): walks each dumpee's /proc/<pid>/fd,
+ * pidfd_getfd-dups every holder uverbs cdev (a plain re-open would mint a
+ * fresh empty ucontext), and records the tree's contexts with their
+ * ufile_id deferred. dump_uverbsfile() back-fills each id later, during
+ * file collection. No-op for trees with no RDMA contexts. Returns 0 on
+ * success/skip, -1 on any failure (fails the dump closed).
+ */
+int rdma_capture_uverbs_contexts(struct pstree_item *root);
+
+/*
  * Per-uobject DAG dump, capture half (criu/rdma/uobj_dump.c). Walks each
  * in-tree ibdev's uobjects over NLDEV + per-driver plugin queries and
  * packs each built entry into an in-memory capture list with its
