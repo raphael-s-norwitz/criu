@@ -1,19 +1,25 @@
 /*
- * R3 dump-side: per-ucontext uobject DAG walker (single-pass).
+ * Dump-side: per-ucontext uobject DAG walker, split into a capture
+ * phase and an emit phase.
  *
- * Runs once at end-of-dump, after every pstree task has been
- * dump_one_task'd -- so dump_uverbsfile() in uverbsfd.c has recorded
- * every checkpointed uverbs context (with its now-assigned uvfe_id)
- * onto rdma_dumped_ufiles. For each in-tree ucontext, asks NLDEV to
- * enumerate its uobjects and emits one rdma_uobj_entry per uobject
- * into rdma_uobj.img.
+ * Capture (rdma_capture_uobj_dag): for each in-tree ucontext, asks
+ * NLDEV to enumerate its uobjects and, per class, issues the live
+ * queries the entry needs (core QUERY_MR, the standard QUERY_QP for
+ * cap, and the owning plugin's QUERY_CQ / QUERY_QP). Each built
+ * rdma_uobj_entry is packed into an in-memory capture list with its
+ * ufile_id deferred.
  *
- * Single-pass: the walk runs after file collection, so each ufile's
- * image id (uvfe_id) is already known and lands straight into the
- * emitted entry -- there is no early-capture / late-emit split. The
- * split (early pidfd_getfd capture, before the datapath freeze) is a
- * follow-on milestone for in-flight datapath state; PD carries no such
- * state, so a plain NLDEV walk after the freeze suffices here.
+ * Emit (rdma_emit_uobj_dag): serializes the capture list to
+ * rdma_uobj.img, binding each entry's ufile_id from its ucontext's
+ * assigned image id (uvfe_id).
+ *
+ * Both phases currently run back-to-back at end-of-dump, after file
+ * collection has recorded every ucontext (with its uvfe_id). Splitting
+ * the order-sensitive enumeration from the order-insensitive
+ * serialization is deliberate groundwork: a later change moves capture
+ * ahead of checkpoint_devices() (so a QP's live QUERY_QP hits an
+ * unsuspended command ring) while emit stays late, once file collection
+ * has assigned each context its uvfe_id.
  *
  * v0 scope (rxe PD + MR + CQ + QP): PD, MR, CQ and QP discovery +
  * image emission. PD carries no per-driver state (empty plugin_blob);
@@ -24,8 +30,7 @@
  * and the owning plugin (RDMA_DUMP_UOBJ_QP) supplies the driver-private
  * wire state + user_handle via QUERY_QP, and the hw-agnostic create-time
  * cap comes from the standard QUERY_QP verb issued in core. The SRQ arm
- * and the
- * early-capture split land with their milestones.
+ * lands with its milestone.
  *
  * Field provenance is documented inline in images/rdma_uobj.proto.
  * Briefly:
@@ -125,6 +130,38 @@ static void rdma_drop_dumped_ufiles(void)
 		if (uf->holder_uctx_fd >= 0)
 			close(uf->holder_uctx_fd);
 		xfree(uf);
+	}
+}
+
+/*
+ * A single uobject captured during the walk, packed to an owned byte
+ * buffer with its RdmaUobjEntry.ufile_id deliberately left 0 and
+ * late-bound at emit time (rdma_emit_uobj_dag) from @uf->uvfe_id.
+ * Deferring the id keeps capture independent of file collection, so a
+ * later change can run capture before each ucontext has been assigned
+ * its uverbs-file id. @uf outlives both phases (rdma_dumped_ufiles is
+ * freed only after emit). Packing rather than deep-copying the message
+ * keeps the nested attrs / plugin_blob lifetime trivial: the caller's
+ * stack-local entry can be torn down immediately.
+ */
+struct rdma_captured_uobj {
+	struct list_head link;
+	const struct rdma_dumped_ufile *uf;
+	void *packed;
+	size_t packed_len;
+	int type; /* R3UobjType, diagnostics only */
+};
+
+static LIST_HEAD(rdma_captured_uobjs);
+
+static void rdma_drop_captured_uobjs(void)
+{
+	struct rdma_captured_uobj *c, *n;
+
+	list_for_each_entry_safe(c, n, &rdma_captured_uobjs, link) {
+		list_del(&c->link);
+		xfree(c->packed);
+		xfree(c);
 	}
 }
 
@@ -324,11 +361,44 @@ struct uobj_ibdev {
 /* Cross-walk state shared with the per-resource callbacks. */
 struct uobj_walk_ctx {
 	struct uobj_ibdev *ib;
-	struct cr_img *img;
 	int n_emitted;
 	int n_dropped;
 	int err;
 };
+
+/*
+ * Terminal step for every per-resource callback: snapshot the built
+ * entry into the capture list. Packs @e (with ufile_id still 0) into an
+ * owned buffer keyed to @uf, so the caller's stack-local entry and its
+ * nested attrs / plugin_blob can be freed immediately, exactly as the
+ * pb_write_one() it replaces allowed. ufile_id is late-bound in
+ * rdma_emit_uobj_dag() from @uf->uvfe_id. Does not touch n_emitted --
+ * callers keep their own accounting.
+ */
+static int uobj_emit(struct uobj_walk_ctx *w, const struct rdma_dumped_ufile *uf, RdmaUobjEntry *e)
+{
+	struct rdma_captured_uobj *c;
+	size_t len = rdma_uobj_entry__get_packed_size(e);
+	void *buf;
+
+	buf = xmalloc(len);
+	if (!buf)
+		return (w->err = -1);
+	rdma_uobj_entry__pack(e, buf);
+
+	c = xzalloc(sizeof(*c));
+	if (!c) {
+		xfree(buf);
+		return (w->err = -1);
+	}
+	c->uf = uf;
+	c->packed = buf;
+	c->packed_len = len;
+	c->type = e->type;
+	INIT_LIST_HEAD(&c->link);
+	list_add_tail(&c->link, &rdma_captured_uobjs);
+	return 0;
+}
 
 static struct uobj_ibdev *uobj_ibdev_find(struct list_head *head, const char *ibdev)
 {
@@ -415,7 +485,6 @@ static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	rdma_uobj_entry__init(&pe);
-	pe.ufile_id = uf->uvfe_id;
 	pe.hw_driver_id = uf->criu_driver;
 	pe.type = R3_UOBJ_TYPE__R3UT_PD;
 	pe.has_restrack_id = true;
@@ -459,9 +528,8 @@ static int uobj_pd_cb(const struct rdma_nl_res_entry *e, void *arg)
 		pe.plugin_blob = plugin_blob;
 	}
 
-	if (pb_write_one(w->img, &pe, PB_RDMA_UOBJ) < 0) {
-		pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed for ufile_id=%#x pdn=%u\n", pe.ufile_id,
-		       e->restrack_id);
+	if (uobj_emit(w, uf, &pe) < 0) {
+		pr_err("uobj DAG: capture(pack) failed for PD pdn=%u on ibdev=%s\n", e->restrack_id, uf->ibdev);
 		free(plugin_blob.data);
 		return (w->err = -1);
 	}
@@ -532,7 +600,6 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	rdma_uobj_entry__init(&pe);
-	pe.ufile_id = uf->uvfe_id;
 	pe.hw_driver_id = uf->criu_driver;
 	pe.type = R3_UOBJ_TYPE__R3UT_MR;
 	pe.has_restrack_id = true;
@@ -563,8 +630,8 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	pe.n_xref = 1;
 	pe.xref = xrefs;
 
-	if (pb_write_one(w->img, &pe, PB_RDMA_UOBJ) < 0) {
-		pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed for ufile_id=%#x mrn=%u\n", pe.ufile_id,
+	if (uobj_emit(w, uf, &pe) < 0) {
+		pr_err("uobj DAG: capture(pack) failed for MR mrn=%u\n",
 		       e->restrack_id);
 		return (w->err = -1);
 	}
@@ -618,7 +685,6 @@ static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	rdma_uobj_entry__init(&pe);
-	pe.ufile_id = uf->uvfe_id;
 	pe.hw_driver_id = uf->criu_driver;
 	pe.type = R3_UOBJ_TYPE__R3UT_CQ;
 	pe.has_restrack_id = true;
@@ -651,8 +717,8 @@ static int uobj_cq_cb(const struct rdma_nl_res_entry *e, void *arg)
 		pe.plugin_blob = plugin_blob;
 	}
 
-	if (pb_write_one(w->img, &pe, PB_RDMA_UOBJ) < 0) {
-		pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed for ufile_id=%#x cqn=%u\n", pe.ufile_id,
+	if (uobj_emit(w, uf, &pe) < 0) {
+		pr_err("uobj DAG: capture(pack) failed for CQ cqn=%u\n",
 		       e->restrack_id);
 		free(plugin_blob.data);
 		return (w->err = -1);
@@ -727,7 +793,6 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	rdma_uobj_entry__init(&pe);
-	pe.ufile_id = uf->uvfe_id;
 	pe.hw_driver_id = uf->criu_driver;
 	pe.type = R3_UOBJ_TYPE__R3UT_QP;
 	pe.has_ufile_handle = true;
@@ -826,8 +891,8 @@ static int uobj_qp_cb(const struct rdma_nl_res_entry *e, void *arg)
 	pe.n_xref = 3;
 	pe.xref = xrefs;
 
-	if (pb_write_one(w->img, &pe, PB_RDMA_UOBJ) < 0) {
-		pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed for ufile_id=%#x lqpn=%u\n", pe.ufile_id,
+	if (uobj_emit(w, uf, &pe) < 0) {
+		pr_err("uobj DAG: capture(pack) failed for QP lqpn=%u\n",
 		       e->qp.lqpn);
 		free(plugin_blob.data);
 		return (w->err = -1);
@@ -854,11 +919,10 @@ static int devidx_resolver_cb(uint32_t dev_index, const char *ibdev, void *arg)
 	return 0;
 }
 
-int rdma_dump_uobj_dag(void)
+int rdma_capture_uobj_dag(void)
 {
 	struct rdma_dumped_ufile *uf;
 	struct uobj_ibdev *ib, *ib_next;
-	struct cr_img *img = NULL;
 	LIST_HEAD(ibdevs);
 	int ret = -1;
 
@@ -894,18 +958,14 @@ int rdma_dump_uobj_dag(void)
 		}
 	}
 
-	img = open_image(CR_FD_RDMA_UOBJ, O_DUMP);
-	if (!img) {
-		pr_err("uobj DAG: open_image(rdma-uobj, O_DUMP) failed\n");
-		goto out;
-	}
-
 	/*
 	 * 3. Per-ibdev walk: PDs first (their pdn -> ufile map is the join
-	 * key the MR walk resolves parents against), then MRs.
+	 * key the MR walk resolves parents against), then MRs. Each built
+	 * entry is packed into the capture list (ufile_id deferred) and
+	 * serialized later by rdma_emit_uobj_dag().
 	 */
 	list_for_each_entry(ib, &ibdevs, link) {
-		struct uobj_walk_ctx w = { .ib = ib, .img = img };
+		struct uobj_walk_ctx w = { .ib = ib };
 		int pd_emitted, pd_dropped;
 		int mr_emitted, mr_dropped;
 		int cq_emitted, cq_dropped;
@@ -975,14 +1035,81 @@ int rdma_dump_uobj_dag(void)
 
 	ret = 0;
 out:
-	if (img)
-		close_image(img);
 	list_for_each_entry_safe(ib, ib_next, &ibdevs, link) {
 		list_del(&ib->link);
 		xfree(ib->ufiles);
 		xfree(ib->pd_map);
 		xfree(ib);
 	}
+	/*
+	 * The holder cdev dups exist only for this walk (QUERY_MR / plugin
+	 * QUERY_CQ / QUERY_QP). Close them now -- the emit phase serializes
+	 * from the already-packed capture list and needs no fd -- but keep
+	 * the ufile records: emit reads each one's uvfe_id, recorded by
+	 * dump_uverbsfile() during file collection.
+	 */
+	list_for_each_entry(uf, &rdma_dumped_ufiles, link) {
+		if (uf->holder_uctx_fd >= 0) {
+			close(uf->holder_uctx_fd);
+			uf->holder_uctx_fd = -1;
+		}
+	}
+	if (ret) {
+		rdma_drop_captured_uobjs();
+		rdma_drop_dumped_ufiles();
+	}
+	return ret;
+}
+
+/*
+ * Emit phase: serialize the captured uobjects to rdma_uobj.img, binding
+ * each entry's ufile_id from its ufile's uvfe_id (recorded by
+ * dump_uverbsfile() during file collection). Order-insensitive, runs
+ * after the memory snapshot. Drains the capture + ufile lists.
+ */
+int rdma_emit_uobj_dag(void)
+{
+	struct rdma_captured_uobj *c;
+	struct cr_img *img = NULL;
+	int ret = -1;
+
+	if (list_empty(&rdma_captured_uobjs)) {
+		pr_debug("uobj DAG: nothing captured, no rdma_uobj.img\n");
+		ret = 0;
+		goto out;
+	}
+
+	img = open_image(CR_FD_RDMA_UOBJ, O_DUMP);
+	if (!img) {
+		pr_err("uobj DAG: open_image(rdma-uobj, O_DUMP) failed\n");
+		goto out;
+	}
+
+	list_for_each_entry(c, &rdma_captured_uobjs, link) {
+		RdmaUobjEntry *e;
+
+		e = rdma_uobj_entry__unpack(NULL, c->packed_len, c->packed);
+		if (!e) {
+			pr_err("uobj DAG: failed to unpack captured entry (type=%d) for emission\n", c->type);
+			goto out;
+		}
+		/* Late-bind the ufile id now that file collection has run. */
+		e->ufile_id = c->uf->uvfe_id;
+
+		if (pb_write_one(img, e, PB_RDMA_UOBJ) < 0) {
+			pr_err("uobj DAG: pb_write_one(rdma_uobj.img) failed for ufile_id=%#x type=%u\n",
+			       e->ufile_id, e->type);
+			rdma_uobj_entry__free_unpacked(e, NULL);
+			goto out;
+		}
+		rdma_uobj_entry__free_unpacked(e, NULL);
+	}
+
+	ret = 0;
+out:
+	if (img)
+		close_image(img);
+	rdma_drop_captured_uobjs();
 	rdma_drop_dumped_ufiles();
 	return ret;
 }

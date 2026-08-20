@@ -44,19 +44,28 @@ int rdma_check_dump_coverage(struct pstree_item *root);
 int rdma_check_cross_tree_exclusivity(struct pstree_item *root);
 
 /*
- * R3 per-uobject DAG dump (criu/rdma/uobj_dump.c). Runs once at
- * end-of-dump, after every pstree task has been dumped (so
- * dump_uverbsfile() has recorded every checkpointed uverbs context).
- * For each dumped context, asks NLDEV to enumerate its uobjects and
- * writes one rdma_uobj_entry per uobject to rdma_uobj.img.
+ * Per-uobject DAG dump, capture half (criu/rdma/uobj_dump.c). Walks each
+ * in-tree ibdev's uobjects over NLDEV + per-driver plugin queries and
+ * packs each built entry into an in-memory capture list with its
+ * ufile_id deferred. Currently invoked at end-of-dump, back-to-back with
+ * the emit half; a later change moves it ahead of the datapath freeze.
  *
-ssh  * v0 scope (rxe PD + MR + CQ): emits R3UT_PD / R3UT_MR / R3UT_CQ
- * records. No-op (and writes no image) for trees that hold no RDMA
- * contexts. Returns 0 on success or a no-op skip, -1 on any netlink /
- * image-write failure (fails the dump closed, consistent with the
- * pre-suspend coverage gate).
+ * v0 scope (rxe PD + MR + CQ + QP). No-op (captures nothing) for trees
+ * that hold no RDMA contexts. Returns 0 on success or a no-op skip, -1
+ * on any netlink / query failure (fails the dump closed, consistent with
+ * the pre-suspend coverage gate).
  */
-int rdma_dump_uobj_dag(void);
+int rdma_capture_uobj_dag(void);
+
+/*
+ * Per-uobject DAG dump, emit half (criu/rdma/uobj_dump.c). Runs at
+ * end-of-dump, after every pstree task has been dumped (so
+ * dump_uverbsfile() has recorded each context's image id). Serializes
+ * the capture list to rdma_uobj.img, binding each entry's ufile_id from
+ * its context's uvfe_id. No-op (and writes no image) when nothing was
+ * captured. Returns -1 on any image-write failure.
+ */
+int rdma_emit_uobj_dag(void);
 
 /*
  * R3 restore-side read+collect pass on rdma_uobj.img
