@@ -58,6 +58,7 @@ struct rdma_dumped_ufile {
 	uint32_t ctxn;
 	bool has_ctxn;
 	uint32_t uvfe_id;
+	bool has_uvfe_id; /* uvfe_id back-filled by rdma_bind_dumped_ufile_id() */
 	uint32_t criu_driver;
 	uint32_t kernel_driver_id;
 	uint32_t dev_index; /* filled lazily in rdma_dump_uobj_dag */
@@ -69,13 +70,28 @@ struct rdma_dumped_ufile {
 extern struct list_head rdma_dumped_ufiles;
 
 /*
- * Record a just-dumped uverbs context for the end-of-dump uobject DAG
- * walk. Copies @ibdev; takes ownership of @holder_uctx_fd (closed by
- * rdma_dump_uobj_dag(), or immediately here on allocation failure).
- * Returns 0 on success, -1 on allocation failure.
+ * Record a captured uverbs context for the uobject DAG walk. Copies
+ * @ibdev; takes ownership of @holder_uctx_fd (closed by the capture
+ * walk, or immediately here on allocation failure). @uvfe_id is left 0
+ * at early-capture time and back-filled later by rdma_bind_dumped_ufile_id()
+ * once file collection assigns the context its image id. Returns 0 on
+ * success, -1 on allocation failure.
  */
 int rdma_note_dumped_ufile(uint32_t uvfe_id, bool has_ctxn, uint32_t ctxn,
 			   uint32_t criu_driver, uint32_t kernel_driver_id,
 			   pid_t pid, const char *ibdev, int holder_uctx_fd);
+
+/*
+ * Back-fill the image id of an already-captured uverbs context. Called
+ * from dump_uverbsfile() during file collection, once the fd has been
+ * assigned its UverbsFileEntry.id: the early-capture pass recorded the
+ * context (by pid + ctxn) with uvfe_id left 0, and the emit phase reads
+ * it back off the ufile. Returns 0 if the context was found and bound,
+ * -1 if no capture record matches (a context the early pass missed is a
+ * dump bug -- fail closed). A process holding several fds to the same
+ * ctxn binds the first; later fds keep it.
+ */
+int rdma_bind_dumped_ufile_id(pid_t pid, bool has_ctxn, uint32_t ctxn,
+			      uint32_t uvfe_id);
 
 #endif /* __CR_RDMA_INTERNAL_H__ */

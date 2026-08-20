@@ -133,6 +133,33 @@ static void rdma_drop_dumped_ufiles(void)
 	}
 }
 
+int rdma_bind_dumped_ufile_id(pid_t pid, bool has_ctxn, uint32_t ctxn, uint32_t uvfe_id)
+{
+	struct rdma_dumped_ufile *uf;
+
+	list_for_each_entry(uf, &rdma_dumped_ufiles, link) {
+		if (uf->pid != pid || uf->has_ctxn != has_ctxn)
+			continue;
+		if (has_ctxn && uf->ctxn != ctxn)
+			continue;
+		/*
+		 * First fd to a shared ctxn wins: a process can hold several
+		 * fds (dup / fork-shared table) to one ucontext, but the
+		 * uobjects restore under a single ufile.
+		 */
+		if (!uf->has_uvfe_id) {
+			uf->uvfe_id = uvfe_id;
+			uf->has_uvfe_id = true;
+		}
+		return 0;
+	}
+
+	pr_err("uobj DAG: no captured uverbs context for pid=%d ctxn=%u to bind image id %#x "
+	       "(early capture missed it?)\n",
+	       pid, has_ctxn ? ctxn : 0, uvfe_id);
+	return -1;
+}
+
 /*
  * A single uobject captured during the walk, packed to an owned byte
  * buffer with its RdmaUobjEntry.ufile_id deliberately left 0 and

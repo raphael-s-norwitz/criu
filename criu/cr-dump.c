@@ -2239,6 +2239,15 @@ int cr_dump_tasks(pid_t pid)
 	if (rdma_check_cross_tree_exclusivity(root_item))
 		goto err;
 
+	/*
+	 * Discover the tree's uverbs contexts while the RDMA datapath is
+	 * still live (before checkpoint_devices()): dups each dumpee's
+	 * uverbs cdev via pidfd_getfd so the end-of-dump uobject DAG walk
+	 * has a live handle to every context. No-op for trees with no RDMA.
+	 */
+	if (rdma_capture_uverbs_contexts(root_item))
+		goto err;
+
 	if (checkpoint_devices())
 		goto err;
 
