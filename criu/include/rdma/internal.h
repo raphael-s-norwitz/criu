@@ -94,4 +94,14 @@ int rdma_note_dumped_ufile(uint32_t uvfe_id, bool has_ctxn, uint32_t ctxn,
 int rdma_bind_dumped_ufile_id(pid_t pid, bool has_ctxn, uint32_t ctxn,
 			      uint32_t uvfe_id);
 
+/*
+ * Capture phase (criu/rdma/uobj_dump.c). Runs from the early
+ * uverbs-context capture pass, before the datapath freeze: walks each
+ * in-tree ibdev's uobjects over NLDEV + per-driver plugin queries on the
+ * live command ring, and packs each built entry into an in-memory
+ * capture list with its ufile_id deferred. rdma_emit_uobj_dag() (in
+ * rdma.h) serializes that list later, after file collection.
+ */
+int rdma_capture_uobj_dag(void);
+
 #endif /* __CR_RDMA_INTERNAL_H__ */

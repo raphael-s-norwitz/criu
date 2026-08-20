@@ -1,25 +1,25 @@
 /*
- * Dump-side: per-ucontext uobject DAG walker, split into a capture
- * phase and an emit phase.
+ * Dump-side: per-ucontext uobject DAG walker (two-phase).
  *
- * Capture (rdma_capture_uobj_dag): for each in-tree ucontext, asks
- * NLDEV to enumerate its uobjects and, per class, issues the live
- * queries the entry needs (core QUERY_MR, the standard QUERY_QP for
- * cap, and the owning plugin's QUERY_CQ / QUERY_QP). Each built
- * rdma_uobj_entry is packed into an in-memory capture list with its
- * ufile_id deferred.
+ * Phase 1 -- capture (rdma_capture_uobj_dag), driven from the early
+ * uverbs-context capture pass in uverbsfd.c *before* the datapath
+ * freeze: for each in-tree ucontext, asks NLDEV to enumerate its
+ * uobjects and, per class, issues the live queries the entry needs
+ * (core QUERY_MR, the standard QUERY_QP for cap, and the owning
+ * plugin's QUERY_CQ / QUERY_QP). Each built rdma_uobj_entry is packed
+ * into an in-memory capture list with its ufile_id deferred.
  *
- * Emit (rdma_emit_uobj_dag): serializes the capture list to
- * rdma_uobj.img, binding each entry's ufile_id from its ucontext's
- * assigned image id (uvfe_id).
+ * Phase 2 -- emit (rdma_emit_uobj_dag), at end-of-dump, after every
+ * pstree task has been dump_one_task'd so dump_uverbsfile() has
+ * back-filled each context's image id (uvfe_id): serializes the capture
+ * list to rdma_uobj.img, late-binding each entry's ufile_id.
  *
- * Both phases currently run back-to-back at end-of-dump, after file
- * collection has recorded every ucontext (with its uvfe_id). Splitting
- * the order-sensitive enumeration from the order-insensitive
- * serialization is deliberate groundwork: a later change moves capture
- * ahead of checkpoint_devices() (so a QP's live QUERY_QP hits an
- * unsuspended command ring) while emit stays late, once file collection
- * has assigned each context its uvfe_id.
+ * The split exists because the capture queries must hit a *live*
+ * command ring: on a migration VF, checkpoint_devices() parks the
+ * datapath to STOP before the per-task dump, so a QP QUERY_QP issued
+ * after the freeze (the old single-pass design) times out against the
+ * suspended FW. Capturing before the freeze -- and emitting after file
+ * collection assigns uvfe_id -- keeps both halves correct.
  *
  * v0 scope (rxe PD + MR + CQ + QP): PD, MR, CQ and QP discovery +
  * image emission. PD carries no per-driver state (empty plugin_blob);
@@ -162,14 +162,15 @@ int rdma_bind_dumped_ufile_id(pid_t pid, bool has_ctxn, uint32_t ctxn, uint32_t 
 
 /*
  * A single uobject captured during the walk, packed to an owned byte
- * buffer with its RdmaUobjEntry.ufile_id deliberately left 0 and
- * late-bound at emit time (rdma_emit_uobj_dag) from @uf->uvfe_id.
- * Deferring the id keeps capture independent of file collection, so a
- * later change can run capture before each ucontext has been assigned
- * its uverbs-file id. @uf outlives both phases (rdma_dumped_ufiles is
- * freed only after emit). Packing rather than deep-copying the message
- * keeps the nested attrs / plugin_blob lifetime trivial: the caller's
- * stack-local entry can be torn down immediately.
+ * buffer with its RdmaUobjEntry.ufile_id deliberately left 0. Capture
+ * runs early -- before CRIU's file collection has assigned the owning
+ * ucontext its uverbs-file id -- so everything except ufile_id is known
+ * now; we snapshot the packed entry here and late-bind ufile_id at emit
+ * time (rdma_emit_uobj_dag), reading it off @uf->uvfe_id once
+ * dump_uverbsfile() has back-filled it. @uf outlives both phases
+ * (rdma_dumped_ufiles is freed only after emit). Packing rather than
+ * deep-copying the message keeps the nested attrs / plugin_blob lifetime
+ * trivial: the caller's stack-local entry can be torn down immediately.
  */
 struct rdma_captured_uobj {
 	struct list_head link;
@@ -987,9 +988,11 @@ int rdma_capture_uobj_dag(void)
 
 	/*
 	 * 3. Per-ibdev walk: PDs first (their pdn -> ufile map is the join
-	 * key the MR walk resolves parents against), then MRs. Each built
-	 * entry is packed into the capture list (ufile_id deferred) and
-	 * serialized later by rdma_emit_uobj_dag().
+	 * key the MR walk resolves parents against), then MRs. The walk
+	 * runs before the datapath freeze, so the QP NLDEV fill's firmware
+	 * QUERY_QP and CRIU's per-QP cap query hit a live command ring; the
+	 * built entries are packed into the capture list (ufile_id deferred)
+	 * and serialized later by rdma_emit_uobj_dag().
 	 */
 	list_for_each_entry(ib, &ibdevs, link) {
 		struct uobj_walk_ctx w = { .ib = ib };
@@ -1072,8 +1075,8 @@ out:
 	 * The holder cdev dups exist only for this walk (QUERY_MR / plugin
 	 * QUERY_CQ / QUERY_QP). Close them now -- the emit phase serializes
 	 * from the already-packed capture list and needs no fd -- but keep
-	 * the ufile records: emit reads each one's uvfe_id, recorded by
-	 * dump_uverbsfile() during file collection.
+	 * the ufile records: emit reads each one's uvfe_id, back-filled by
+	 * dump_uverbsfile() after this returns.
 	 */
 	list_for_each_entry(uf, &rdma_dumped_ufiles, link) {
 		if (uf->holder_uctx_fd >= 0) {
@@ -1090,9 +1093,9 @@ out:
 
 /*
  * Emit phase: serialize the captured uobjects to rdma_uobj.img, binding
- * each entry's ufile_id from its ufile's uvfe_id (recorded by
- * dump_uverbsfile() during file collection). Order-insensitive, runs
- * after the memory snapshot. Drains the capture + ufile lists.
+ * each entry's ufile_id from its ufile's now-assigned uvfe_id (back-
+ * filled by dump_uverbsfile() during file collection). Order-insensitive,
+ * runs after the memory snapshot. Drains the capture + ufile lists.
  */
 int rdma_emit_uobj_dag(void)
 {
