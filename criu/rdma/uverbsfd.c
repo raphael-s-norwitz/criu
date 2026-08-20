@@ -454,15 +454,13 @@ out:
 }
 
 /*
- * Early uverbs-context discovery pass (see rdma.h). Runs after the RDMA
+ * Early uverbs-context capture pass (see rdma.h). Runs after the RDMA
  * coverage/exclusivity checks and *before* the datapath freeze
  * (checkpoint_devices) and the memory snapshot: it records the tree's
- * uverbs contexts (dup'ing each holder cdev via pidfd_getfd) so the
- * uobject DAG walk has a live handle to each context, and
- * dump_uverbsfile() back-fills each record's image id during file
- * collection. The walk itself (rdma_capture_uobj_dag) still runs at
- * end-of-dump for now; a follow-on change moves it here, ahead of the
- * freeze.
+ * uverbs contexts and drives the order-sensitive half of the uobject DAG
+ * (rdma_capture_uobj_dag) while the device is still live, so the QP
+ * enumeration's firmware QUERY_QP and the per-QP cap query hit a live
+ * command ring rather than a suspended VF.
  */
 int rdma_capture_uverbs_contexts(struct pstree_item *root)
 {
@@ -478,7 +476,11 @@ int rdma_capture_uverbs_contexts(struct pstree_item *root)
 			return -1;
 	}
 
-	return 0;
+	/* No uverbs contexts in the tree -> nothing to capture. */
+	if (list_empty(&rdma_dumped_ufiles))
+		return 0;
+
+	return rdma_capture_uobj_dag();
 }
 
 static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)

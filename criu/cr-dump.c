@@ -2242,10 +2242,14 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	/*
-	 * Discover the tree's uverbs contexts while the RDMA datapath is
-	 * still live (before checkpoint_devices()): dups each dumpee's
-	 * uverbs cdev via pidfd_getfd so the end-of-dump uobject DAG walk
-	 * has a live handle to every context. No-op for trees with no RDMA.
+	 * Uobject DAG capture. Runs while the RDMA datapath is still
+	 * live (before checkpoint_devices()) and before the memory
+	 * snapshot: it dups each dumpee's uverbs cdev via pidfd_getfd and
+	 * drives the order-sensitive half of the uobject DAG walk (NLDEV
+	 * enumeration + plugin QUERY_QP/CQ/PD/MR on a live command ring).
+	 * The serialization half (rdma_emit_uobj_dag) runs after the
+	 * per-task dump below, once file collection has assigned each
+	 * context its uverbs-file id. No-op for trees with no RDMA.
 	 */
 	if (rdma_capture_uverbs_contexts(root_item))
 		goto err;
@@ -2287,17 +2291,12 @@ int cr_dump_tasks(pid_t pid)
 	}
 
 	/*
-	 * Per-uobject DAG. Runs now that every task has been dumped, so
-	 * dump_uverbsfile() has recorded every checkpointed uverbs context
-	 * (with its assigned image id). The capture half walks NLDEV once
-	 * per in-tree ibdev into an in-memory list; the emit half serializes
-	 * it to rdma_uobj.img. Both are no-ops for trees with no RDMA
-	 * contexts. (A later change moves capture ahead of the datapath
-	 * freeze; emit stays here.)
+	 * Per-uobject DAG emit. The order-sensitive capture ran earlier
+	 * (rdma_capture_uverbs_contexts, before the datapath freeze); this
+	 * serializes the captured uobjects to rdma_uobj.img now that
+	 * dump_uverbsfile() has assigned each context its uverbs-file id.
+	 * No-op for trees that hold no RDMA contexts.
 	 */
-	if (rdma_capture_uobj_dag())
-		goto err;
-
 	if (rdma_emit_uobj_dag())
 		goto err;
 
