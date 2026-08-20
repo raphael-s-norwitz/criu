@@ -2276,12 +2276,18 @@ int cr_dump_tasks(pid_t pid)
 	}
 
 	/*
-	 * R3 per-uobject DAG. Runs now that every task has been dumped, so
+	 * Per-uobject DAG. Runs now that every task has been dumped, so
 	 * dump_uverbsfile() has recorded every checkpointed uverbs context
-	 * (with its assigned image id). Walks NLDEV once per in-tree ibdev
-	 * and writes rdma_uobj.img. No-op for trees with no RDMA contexts.
+	 * (with its assigned image id). The capture half walks NLDEV once
+	 * per in-tree ibdev into an in-memory list; the emit half serializes
+	 * it to rdma_uobj.img. Both are no-ops for trees with no RDMA
+	 * contexts. (A later change moves capture ahead of the datapath
+	 * freeze; emit stays here.)
 	 */
-	if (rdma_dump_uobj_dag())
+	if (rdma_capture_uobj_dag())
+		goto err;
+
+	if (rdma_emit_uobj_dag())
 		goto err;
 
 	ret = run_plugins(DUMP_DEVICES_LATE, pid);
