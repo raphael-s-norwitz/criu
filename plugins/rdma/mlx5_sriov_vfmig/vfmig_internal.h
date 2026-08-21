@@ -208,6 +208,19 @@ struct vfmig_rendezvous {
  */
 int vfmig_rendezvous_load(const uint8_t vf_uuid[16], struct vfmig_rendezvous *out);
 
+/* Barrier phase label (on the wire and in logs). */
+#define VFMIG_BARRIER_PHASE_RESTORE "R1"
+
+/*
+ * Run the cross-host barrier described by @rz at @phase: block until a
+ * connection has been established with every peer (each edge tie-broken
+ * by endpoint string so exactly one side connects), or the descriptor
+ * timeout elapses. The sockets are CRIU's own, opened and closed within
+ * the call (never captured/restored). Returns 0 on success, -1 on
+ * timeout/error.
+ */
+int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase);
+
 /*
  * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()
  * is the CHECKPOINT_DEVICES hook: it parks every claimed VF to STOP
