@@ -212,9 +212,10 @@ int vfmig_rendezvous_load(const uint8_t vf_uuid[16], struct vfmig_rendezvous *ou
 #define VFMIG_BARRIER_PHASE_RESTORE "R1"
 
 /*
- * Run the cross-host barrier described by @rz at @phase: block until our
- * READY has been sent to every peer over a TCP connection (each edge
- * tie-broken by endpoint string so exactly one side connects), or the
+ * Run the cross-host barrier described by @rz at @phase: block until a
+ * matching READY has been exchanged with every peer (each edge
+ * tie-broken by endpoint string so exactly one side connects; both sides
+ * validate the peer's {magic, version, phase, session}), or the
  * descriptor timeout elapses. The sockets are CRIU's own, opened and
  * closed within the call (never captured/restored). Returns 0 on
  * success, -1 on timeout/error.
