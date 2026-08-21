@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,6 +36,7 @@
 
 #include "criu-log.h"
 
+#include "vfmig_barrier_wire.h"
 #include "vfmig_internal.h"
 
 #ifdef LOG_PREFIX
@@ -258,27 +260,65 @@ static int barrier_connect_once(const struct vfmig_rz_endpoint *ep)
 	return fd;
 }
 
+static void fill_msg(struct vfmig_barrier_msg *m, const struct vfmig_rendezvous *rz, const char *phase)
+{
+	memset(m, 0, sizeof(*m));
+	m->magic = VFMIG_BARRIER_MAGIC;
+	m->version = VFMIG_BARRIER_VERSION;
+	m->listen_port = rz->listen.port;
+	snprintf(m->phase, sizeof(m->phase), "%s", phase);
+	snprintf(m->session, sizeof(m->session), "%s", rz->session);
+	memcpy(m->vf_uuid, rz->vf_uuid, 16);
+	snprintf(m->listen_ip, sizeof(m->listen_ip), "%s", rz->listen.ip);
+}
+
+static int write_full(int fd, const void *buf, size_t n)
+{
+	const char *p = buf;
+
+	while (n) {
+		ssize_t w = write(fd, p, n);
+
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		p += w;
+		n -= (size_t)w;
+	}
+	return 0;
+}
+
+/* Announce our READY on a connected edge. Returns 0 on success. */
+static int barrier_send(int fd, const struct vfmig_barrier_msg *m)
+{
+	int one = 1;
+
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	return write_full(fd, m, sizeof(*m));
+}
+
 /*
- * Cross-host rendezvous: block until a TCP connection has been
- * established with every listed peer, or the descriptor timeout elapses.
+ * Cross-host rendezvous: block until our READY has been sent to every
+ * listed peer over a TCP connection, or the descriptor timeout elapses.
  * Each edge is tie-broken by endpoint string so exactly one side
- * connects and the other accepts (no double-connect). An established
- * connection means the peer has reached the barrier point; completion is
- * gated on the count.
+ * connects and the other accepts (no double-connect); the edge counts
+ * once we have sent our vfmig_barrier_msg on it.
  *
  * Single interleaved loop: each pass makes one connect attempt on every
  * un-satisfied connector edge and briefly polls the listen socket for an
- * inbound connection, tracking satisfied edges in done[] so a connect
- * retry never double-counts. This keeps a down connector peer from
- * blocking ready acceptor edges. Payload is exchanged separately (the
- * READY message carrying peer identity + phase/session is layered on
- * top), so an accepted connection is not yet attributed to a specific
- * acceptor edge -- it satisfies the first pending acceptor slot. The
- * sockets are CRIU's own, opened and closed within the call. Returns 0
- * on success, -1 on timeout/error.
+ * inbound connection, tracking satisfied edges in done[] so a retry
+ * never double-counts. This keeps a down connector peer from blocking
+ * ready acceptor edges. This is the send half -- reading and validating
+ * the peer's READY (which also lets an accepted connection be attributed
+ * to a specific acceptor edge, rather than the first pending slot) is
+ * layered on top. The sockets are CRIU's own, opened and closed within
+ * the call. Returns 0 on success, -1 on timeout/error.
  */
 int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase)
 {
+	struct vfmig_barrier_msg mine;
 	bool is_connector[VFMIG_RZ_MAX_PEERS];
 	bool done[VFMIG_RZ_MAX_PEERS];
 	size_t remaining = rz->n_peers;
@@ -286,6 +326,8 @@ int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase)
 	int listen_fd = -1;
 	size_t i;
 	int rc = -1;
+
+	fill_msg(&mine, rz, phase);
 
 	/*
 	 * Tie-break each edge by endpoint string: the lexicographically
@@ -318,12 +360,14 @@ int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase)
 			fd = barrier_connect_once(&rz->peers[i]);
 			if (fd < 0)
 				continue;	/* peer not listening yet */
+			if (!barrier_send(fd, &mine)) {
+				done[i] = true;
+				remaining--;
+				progress = true;
+				pr_info("vfmig: barrier[%s]: connected peer %s:%u ok\n", phase, rz->peers[i].ip,
+					rz->peers[i].port);
+			}
 			close(fd);
-			done[i] = true;
-			remaining--;
-			progress = true;
-			pr_info("vfmig: barrier[%s]: connected peer %s:%u ok\n", phase, rz->peers[i].ip,
-				rz->peers[i].port);
 		}
 		if (!remaining)
 			break;
@@ -339,16 +383,18 @@ int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase)
 			int cfd = accept(listen_fd, NULL, NULL);
 
 			if (cfd >= 0) {
-				/* Satisfy the first pending acceptor edge. */
-				for (i = 0; i < rz->n_peers; i++) {
-					if (done[i] || is_connector[i])
-						continue;
-					done[i] = true;
-					remaining--;
-					progress = true;
-					pr_info("vfmig: barrier[%s]: accepted peer edge %s:%u ok\n", phase,
-						rz->peers[i].ip, rz->peers[i].port);
-					break;
+				if (!barrier_send(cfd, &mine)) {
+					/* Satisfy the first pending acceptor edge. */
+					for (i = 0; i < rz->n_peers; i++) {
+						if (done[i] || is_connector[i])
+							continue;
+						done[i] = true;
+						remaining--;
+						progress = true;
+						pr_info("vfmig: barrier[%s]: accepted peer edge %s:%u ok\n", phase,
+							rz->peers[i].ip, rz->peers[i].port);
+						break;
+					}
 				}
 				close(cfd);
 			}
