@@ -165,6 +165,17 @@ int vfmig_restore_uctx(int fd, const uint32_t *uar_table, size_t uar_n, const ui
 int vfmig_restore_dyn_uars(int fd, const struct mlx5_ib_vfmig_dyn_uar_record_local *records, size_t n_records);
 
 /*
+ * vfmig_dpstate.c -- shared SUSPEND/RESUME_VHCA ioctl helpers. Each
+ * opens /dev/mlx5_vfmig/<pf_bdf> for the one ioctl and passes @dir_flags
+ * straight through: 0 drives the fused RUNNING<->STOP pair, a subset of
+ * MLX5_VFMIG_DIR_FLAG_* (INITIATOR: RUNNING<->RUNNING_P2P, RESPONDER:
+ * RUNNING_P2P<->STOP) drives a single ladder edge. Both idempotent;
+ * return 0 on success (kernel no-op included) or -1 on open/ioctl error.
+ */
+int vfmig_dp_suspend(const char *pf_bdf, uint32_t vf_id, uint32_t dir_flags);
+int vfmig_dp_resume(const char *pf_bdf, uint32_t vf_id, uint32_t dir_flags);
+
+/*
  * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()
  * is the CHECKPOINT_DEVICES hook: it parks every claimed VF to STOP
  * (SUSPEND_VHCA) at CRIU's freeze point, before task memory is copied.
