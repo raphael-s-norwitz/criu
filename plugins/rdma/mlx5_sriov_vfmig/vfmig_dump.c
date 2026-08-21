@@ -510,13 +510,13 @@ static int vfmig_query_vf_uuid(const char *pf_bdf, uint32_t vf_id, uint8_t out[1
  *   legacy  (no rendezvous descriptor for this vf_uuid): the fused
  *           RUNNING -> STOP suspend (all-or-nothing), as before.
  *   barrier (a per-VHCA descriptor exists): the fused suspend is split
- *           into its two ladder edges, SUSPEND(INITIATOR) -> RUNNING_P2P
- *           then SUSPEND(RESPONDER) -> STOP. This commit wires the split
- *           only; the D1 rendezvous that belongs between the edges (block
- *           until every peer's initiator is parked before we drop our
- *           responder) is added on top. Back-to-back the two edges are
- *           identical to the fused suspend, so behaviour is unchanged
- *           until that rendezvous lands.
+ *           around a D1 cross-host rendezvous. SUSPEND(INITIATOR) ->
+ *           RUNNING_P2P, then block until every peer's initiator is
+ *           parked, then SUSPEND(RESPONDER) -> STOP -- so no peer's
+ *           responder is dropped while a peer initiator can still
+ *           originate. A rendezvous or RESPONDER-step failure rolls the
+ *           VF back to RUNNING and fails the dump (never leave a VF in
+ *           STOP with a still-live peer).
  *
  * Barrier mode is resolved by vf_uuid -> descriptor: an unreadable uuid
  * is treated as legacy (the capture path refuses an unstamped VF anyway)
@@ -545,6 +545,12 @@ static int vfmig_suspend_one_vf(const char *pf_bdf, uint32_t vf_id)
 	} else {
 		if (vfmig_dp_suspend(pf_bdf, vf_id, MLX5_VFMIG_DIR_FLAG_INITIATOR))
 			return -1;
+		if (vfmig_barrier_run(&rz, VFMIG_BARRIER_PHASE_DUMP)) {
+			pr_err("vfmig: barrier[D1]: pf=%s vf_id=%u rendezvous failed; resuming and failing dump\n",
+			       pf_bdf, vf_id);
+			(void)vfmig_dp_resume(pf_bdf, vf_id, 0);
+			return -1;
+		}
 		if (vfmig_dp_suspend(pf_bdf, vf_id, MLX5_VFMIG_DIR_FLAG_RESPONDER)) {
 			(void)vfmig_dp_resume(pf_bdf, vf_id, 0);
 			return -1;
