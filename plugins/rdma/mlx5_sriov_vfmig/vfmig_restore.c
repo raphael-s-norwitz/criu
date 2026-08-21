@@ -90,10 +90,13 @@ struct vfmig_restored_vf {
 	 * Cross-host barrier state, armed after the VF is bound
 	 * (vfmig_barrier_arm): barrier_mode iff a rendezvous descriptor
 	 * exists for this VHCA, with the parsed descriptor cached in rz
-	 * for the restore-side rendezvous.
+	 * for the restore-side rendezvous. barrier_done latches once the
+	 * R1 rendezvous has completed, so the host-global resume-late hook
+	 * runs it exactly once per VF.
 	 */
 	struct vfmig_rendezvous rz;
 	bool barrier_mode;
+	bool barrier_done;
 };
 static struct vfmig_restored_vf *vfmig_restored_vfs;
 
@@ -1138,6 +1141,38 @@ static int vfmig_barrier_arm(struct vfmig_restored_vf *v)
 
 	v->barrier_mode = true;
 	pr_info("vfmig: barrier: pf=%s vf_id=%u armed (rendezvous descriptor loaded)\n", v->pf_bdf, v->vf_id);
+	return 0;
+}
+
+/*
+ * RESUME_DEVICES_LATE hook. This is where the restore side runs its
+ * cross-host R1 rendezvous: no host may release its datapath until every
+ * peer has finished restoring. The app is still frozen when this fires,
+ * so nothing egresses before the hook returns regardless.
+ *
+ * Invoked once per alive pstree item, but the restored-VF set is
+ * host-global, so barrier_done dedups the rendezvous to once per VF.
+ * Legacy VFs (no descriptor) are skipped. This commit establishes the
+ * hook and its per-VF bookkeeping; the rendezvous transport it drives is
+ * layered on top.
+ */
+int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid)
+{
+	struct vfmig_restored_vf *v;
+	int pending = 0;
+
+	(void)pid;
+
+	if (!vfmig_active)
+		return -ENOTSUP;
+
+	for (v = vfmig_restored_vfs; v; v = v->next)
+		if (v->barrier_mode && !v->barrier_done)
+			pending++;
+	if (!pending)
+		return 0;	/* legacy-only tree, or already done */
+
+	pr_info("vfmig: RESUME_DEVICES_LATE: %d barrier-mode VF(s) pending R1 rendezvous\n", pending);
 	return 0;
 }
 
