@@ -476,6 +476,32 @@ void vfmig_suspended_clear(void)
 }
 
 /*
+ * Park one claimed VF's datapath and record it in the suspended set so
+ * fini(DUMP) resumes exactly what we parked. Today this is the fused
+ * RUNNING -> STOP suspend (all-or-nothing); the cross-host barrier later
+ * splits it around a rendezvous, which is why the per-VF decision lives
+ * in its own seam rather than inline in the hook loop.
+ *
+ * If we park a VF but cannot remember it (OOM), roll the suspend back and
+ * fail rather than strand the source in STOP -- the kernel's
+ * SR-IOV-teardown force-resume is only a last resort. Returns 0 on
+ * success, -1 on suspend or tracking failure.
+ */
+static int vfmig_suspend_one_vf(const char *pf_bdf, uint32_t vf_id)
+{
+	if (vfmig_dp_suspend(pf_bdf, vf_id, 0))
+		return -1;
+
+	if (vfmig_suspended_add(pf_bdf, vf_id)) {
+		pr_err("vfmig: checkpoint: OOM tracking suspended pf=%s vf_id=%u; rolling back suspend\n", pf_bdf,
+		       vf_id);
+		(void)vfmig_dp_resume(pf_bdf, vf_id, 0);
+		return -1;
+	}
+	return 0;
+}
+
+/*
  * CHECKPOINT_DEVICES hook. Fires at CRIU's freeze point (seize.c), once
  * per alive task, before any task memory is copied into the image. Park
  * every claimed VF's datapath to STOP via SUSPEND_VHCA so no peer RDMA
@@ -503,20 +529,8 @@ int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid)
 	for (c = vfmig_claimed_head; c; c = c->next) {
 		if (vfmig_suspended_lookup(c->pf_bdf, c->vf_id))
 			continue;
-		if (vfmig_dp_suspend(c->pf_bdf, c->vf_id, 0))
+		if (vfmig_suspend_one_vf(c->pf_bdf, c->vf_id))
 			return -1;
-		if (vfmig_suspended_add(c->pf_bdf, c->vf_id)) {
-			/*
-			 * Parked but out of memory to remember it -> fini
-			 * would not resume it. Roll the suspend back and fail
-			 * the dump rather than strand the source (the kernel's
-			 * SR-IOV-teardown force-resume is only a last resort).
-			 */
-			pr_err("vfmig: checkpoint: OOM tracking suspended pf=%s vf_id=%u; rolling back suspend\n",
-			       c->pf_bdf, c->vf_id);
-			(void)vfmig_dp_resume(c->pf_bdf, c->vf_id, 0);
-			return -1;
-		}
 		parked++;
 	}
 
