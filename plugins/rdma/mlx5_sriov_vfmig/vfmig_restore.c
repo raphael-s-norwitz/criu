@@ -85,6 +85,15 @@ struct vfmig_restored_vf {
 	char vf_bdf[64];
 	char dest_ibdev[64];
 	char dest_cdev_path[PATH_MAX];
+
+	/*
+	 * Cross-host barrier state, armed after the VF is bound
+	 * (vfmig_barrier_arm): barrier_mode iff a rendezvous descriptor
+	 * exists for this VHCA, with the parsed descriptor cached in rz
+	 * for the restore-side rendezvous.
+	 */
+	struct vfmig_rendezvous rz;
+	bool barrier_mode;
 };
 static struct vfmig_restored_vf *vfmig_restored_vfs;
 
@@ -1106,6 +1115,33 @@ int rdma_mlx5_vfmig_plugin_restore_uobj_qp_needs_pie(void)
 }
 
 /*
+ * Arm the cross-host barrier for a freshly-bound VF: load its per-VHCA
+ * rendezvous descriptor and, if present, mark the VF barrier-mode and
+ * cache the parsed descriptor on @v. Absent descriptor => legacy (no
+ * barrier). A malformed descriptor fails closed, so a bad migration
+ * config surfaces here at bind rather than mid-restore.
+ *
+ * Arming only resolves + validates the descriptor; the restore-side
+ * rendezvous that consumes @v->rz is layered on top. Returns 0 (both
+ * barrier and legacy), -1 on a malformed descriptor.
+ */
+static int vfmig_barrier_arm(struct vfmig_restored_vf *v)
+{
+	int rc = vfmig_rendezvous_load(v->vf_uuid, &v->rz);
+
+	if (rc < 0)
+		return -1;
+	if (rc == 1) {
+		v->barrier_mode = false;
+		return 0;	/* legacy: no descriptor */
+	}
+
+	v->barrier_mode = true;
+	pr_info("vfmig: barrier: pf=%s vf_id=%u armed (rendezvous descriptor loaded)\n", v->pf_bdf, v->vf_id);
+	return 0;
+}
+
+/*
  * Read mlx5_vfmig.img and, for each unique vf_uuid, restore the
  * matching destination VF up to "firmware loaded, bound, ibdev up".
  *
@@ -1252,6 +1288,9 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 			"dest_ibdev=%s dest_cdev=%s\n",
 			uuid_str, e->pf_bdf, e->vf_id, v->pf_bdf, v->vf_id, v->vf_bdf, v->dest_ibdev,
 			v->dest_cdev_path);
+
+		if (vfmig_barrier_arm(v))
+			goto err;
 	}
 
 	if (!run_phase_b)

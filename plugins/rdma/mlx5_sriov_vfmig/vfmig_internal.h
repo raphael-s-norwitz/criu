@@ -176,6 +176,39 @@ int vfmig_dp_suspend(const char *pf_bdf, uint32_t vf_id, uint32_t dir_flags);
 int vfmig_dp_resume(const char *pf_bdf, uint32_t vf_id, uint32_t dir_flags);
 
 /*
+ * vfmig_barrier.c -- per-VHCA cross-host rendezvous descriptor. The
+ * descriptor is a host-local key=value file, a property of the
+ * provisioned VHCA, written by the pre-restore binary / orchestrator; it
+ * names this VHCA's control endpoint and its migration peers. Its
+ * absence means legacy (no barrier); its presence selects barrier mode.
+ */
+#define VFMIG_RZ_MAX_PEERS 15
+#define VFMIG_RZ_DIR	   "/run/criu-vfmig/rendezvous"
+
+struct vfmig_rz_endpoint {
+	char	 ip[64];	/* IPv4/IPv6 literal or hostname */
+	uint16_t port;
+};
+
+struct vfmig_rendezvous {
+	char			 session[64];	/* per-migration id */
+	uint8_t			 vf_uuid[16];	/* this VHCA's identity */
+	struct vfmig_rz_endpoint listen;	/* our control endpoint */
+	struct vfmig_rz_endpoint peers[VFMIG_RZ_MAX_PEERS];
+	size_t			 n_peers;
+	int			 timeout_ms;	/* whole-barrier deadline */
+	int			 retry_ms;	/* connect backoff */
+};
+
+/*
+ * Load the rendezvous descriptor for @vf_uuid from
+ * VFMIG_RZ_DIR/<uuid-hex>.desc. Returns 0 loaded (barrier mode, *out
+ * populated), 1 absent (legacy mode, *out untouched), -1 malformed or
+ * unreadable (fail closed).
+ */
+int vfmig_rendezvous_load(const uint8_t vf_uuid[16], struct vfmig_rendezvous *out);
+
+/*
  * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()
  * is the CHECKPOINT_DEVICES hook: it parks every claimed VF to STOP
  * (SUSPEND_VHCA) at CRIU's freeze point, before task memory is copied.
