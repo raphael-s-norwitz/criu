@@ -476,48 +476,6 @@ void vfmig_suspended_clear(void)
 }
 
 /*
- * Drive one VF's datapath run-state via the per-PF cdev: SUSPEND_VHCA
- * (RUNNING -> STOP) or RESUME_VHCA (STOP -> RUNNING), both with flags=0
- * (the fused ladder walking both direction steps in one call). Both are
- * idempotent in the kernel, so re-issuing against a VF already at the
- * requested depth is a no-op. Returns 0 on success, -1 otherwise.
- */
-static int vfmig_vf_set_datapath(const char *pf_bdf, uint32_t vf_id, bool suspend)
-{
-	char cdev_path[PATH_MAX];
-	int cdev_fd, rc;
-
-	snprintf(cdev_path, sizeof(cdev_path), "%s/%s", MLX5_VFMIG_DEV_DIR, pf_bdf);
-	cdev_fd = open(cdev_path, O_RDWR | O_CLOEXEC);
-	if (cdev_fd < 0) {
-		pr_perror("vfmig: open(%s)", cdev_path);
-		return -1;
-	}
-
-	if (suspend) {
-		struct mlx5_vfmig_suspend_vhca s;
-
-		memset(&s, 0, sizeof(s));
-		s.vf_id = vf_id;
-		s.flags = 0;
-		rc = ioctl(cdev_fd, MLX5_VFMIG_IOC_SUSPEND_VHCA, &s);
-	} else {
-		struct mlx5_vfmig_resume_vhca r;
-
-		memset(&r, 0, sizeof(r));
-		r.vf_id = vf_id;
-		r.flags = 0;
-		rc = ioctl(cdev_fd, MLX5_VFMIG_IOC_RESUME_VHCA, &r);
-	}
-
-	if (rc)
-		pr_perror("vfmig: %s_VHCA(pf=%s vf_id=%u)", suspend ? "SUSPEND" : "RESUME", pf_bdf, vf_id);
-
-	close(cdev_fd);
-	return rc ? -1 : 0;
-}
-
-/*
  * CHECKPOINT_DEVICES hook. Fires at CRIU's freeze point (seize.c), once
  * per alive task, before any task memory is copied into the image. Park
  * every claimed VF's datapath to STOP via SUSPEND_VHCA so no peer RDMA
@@ -545,7 +503,7 @@ int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid)
 	for (c = vfmig_claimed_head; c; c = c->next) {
 		if (vfmig_suspended_lookup(c->pf_bdf, c->vf_id))
 			continue;
-		if (vfmig_vf_set_datapath(c->pf_bdf, c->vf_id, true))
+		if (vfmig_dp_suspend(c->pf_bdf, c->vf_id, 0))
 			return -1;
 		if (vfmig_suspended_add(c->pf_bdf, c->vf_id)) {
 			/*
@@ -556,7 +514,7 @@ int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid)
 			 */
 			pr_err("vfmig: checkpoint: OOM tracking suspended pf=%s vf_id=%u; rolling back suspend\n",
 			       c->pf_bdf, c->vf_id);
-			(void)vfmig_vf_set_datapath(c->pf_bdf, c->vf_id, false);
+			(void)vfmig_dp_resume(c->pf_bdf, c->vf_id, 0);
 			return -1;
 		}
 		parked++;
@@ -583,7 +541,7 @@ void vfmig_resume_suspended_vfs(void)
 
 	for (p = vfmig_suspended_head; p; p = n) {
 		n = p->next;
-		if (vfmig_vf_set_datapath(p->pf_bdf, p->vf_id, false))
+		if (vfmig_dp_resume(p->pf_bdf, p->vf_id, 0))
 			failed++;
 		else
 			resumed++;

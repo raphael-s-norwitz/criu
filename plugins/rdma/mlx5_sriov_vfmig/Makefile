@@ -69,6 +69,7 @@ PLUGIN_LDFLAGS += $(shell pkg-config --libs libprotobuf-c)
 #
 PLUGIN_SRCS := rdma_mlx5_vfmig_plugin.c
 PLUGIN_SRCS += vfmig_pci.c
+PLUGIN_SRCS += vfmig_dpstate.c
 PLUGIN_SRCS += vfmig_dump.c
 PLUGIN_SRCS += vfmig_uverbs.c
 PLUGIN_SRCS += vf_image.c
