@@ -20,11 +20,17 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "criu-log.h"
@@ -170,4 +176,112 @@ bad_ep:
 malformed:
 	fclose(f);
 	return -1;
+}
+
+/* ---------------- barrier transport ---------------- */
+
+static int64_t now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Bind+listen a TCP socket on rz->listen. Returns fd or -1. */
+static int barrier_listen(const struct vfmig_rendezvous *rz)
+{
+	struct addrinfo hints, *res, *ai;
+	char portstr[8];
+	int fd = -1;
+
+	snprintf(portstr, sizeof(portstr), "%u", rz->listen.port);
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
+	if (getaddrinfo(rz->listen.ip, portstr, &hints, &res)) {
+		pr_err("vfmig: barrier: getaddrinfo(listen %s:%s) failed\n", rz->listen.ip, portstr);
+		return -1;
+	}
+	for (ai = res; ai; ai = ai->ai_next) {
+		int one = 1;
+
+		fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+		if (fd < 0)
+			continue;
+		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+		if (!bind(fd, ai->ai_addr, ai->ai_addrlen) && !listen(fd, VFMIG_RZ_MAX_PEERS))
+			break;
+		close(fd);
+		fd = -1;
+	}
+	freeaddrinfo(res);
+	if (fd < 0)
+		pr_perror("vfmig: barrier: bind/listen %s:%u", rz->listen.ip, rz->listen.port);
+	return fd;
+}
+
+/*
+ * Cross-host rendezvous, accept side: block until every peer has
+ * connected to our listen socket, or the descriptor timeout elapses. An
+ * inbound connection means a peer has reached the barrier point;
+ * completion is gated on the count.
+ *
+ * This establishes the rendezvous as the listener half -- it waits for
+ * peers to connect to us. The connector half (we connect to peers,
+ * tie-broken per edge so exactly one side connects) is layered on top,
+ * as is the READY message that carries peer identity + phase/session (so
+ * an accepted connection can be attributed to a specific edge). The
+ * sockets are CRIU's own, opened and closed within the call. Returns 0
+ * on success, -1 on timeout/error.
+ */
+int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase)
+{
+	size_t remaining = rz->n_peers;
+	int64_t deadline = now_ms() + rz->timeout_ms;
+	int listen_fd = -1;
+	int rc = -1;
+
+	listen_fd = barrier_listen(rz);
+	if (listen_fd < 0)
+		return -1;
+
+	pr_info("vfmig: barrier[%s] session=%s: waiting for %zu peer(s) to connect, timeout=%dms\n", phase,
+		rz->session, rz->n_peers, rz->timeout_ms);
+
+	while (remaining) {
+		struct timeval tv;
+		fd_set rfds;
+
+		if (now_ms() >= deadline)
+			break;
+		FD_ZERO(&rfds);
+		FD_SET(listen_fd, &rfds);
+		tv.tv_sec = 0;
+		tv.tv_usec = rz->retry_ms * 1000;
+		if (select(listen_fd + 1, &rfds, NULL, NULL, &tv) > 0 && FD_ISSET(listen_fd, &rfds)) {
+			int cfd = accept(listen_fd, NULL, NULL);
+
+			if (cfd >= 0) {
+				remaining--;
+				pr_info("vfmig: barrier[%s]: accepted peer connection (%zu of %zu still pending)\n",
+					phase, remaining, rz->n_peers);
+				close(cfd);
+			}
+		}
+	}
+
+	if (remaining) {
+		pr_err("vfmig: barrier[%s] session=%s TIMED OUT: %zu of %zu peer(s) still pending after %dms\n", phase,
+		       rz->session, remaining, rz->n_peers, rz->timeout_ms);
+		rc = -1;
+	} else {
+		pr_info("vfmig: barrier[%s] session=%s: all %zu peer(s) reached rendezvous\n", phase, rz->session,
+			rz->n_peers);
+		rc = 0;
+	}
+
+	close(listen_fd);
+	return rc;
 }
