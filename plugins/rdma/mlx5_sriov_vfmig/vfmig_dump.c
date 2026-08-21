@@ -475,22 +475,81 @@ void vfmig_suspended_clear(void)
 	vfmig_suspended_head = NULL;
 }
 
+/* Read the orchestrator-stamped vf_uuid for one VF (QUERY_VF). */
+static int vfmig_query_vf_uuid(const char *pf_bdf, uint32_t vf_id, uint8_t out[16])
+{
+	struct mlx5_vfmig_query_vf qv;
+	char cdev_path[PATH_MAX];
+	int fd, rc;
+
+	snprintf(cdev_path, sizeof(cdev_path), "%s/%s", MLX5_VFMIG_DEV_DIR, pf_bdf);
+	fd = open(cdev_path, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		pr_perror("vfmig: query_vf_uuid: open(%s)", cdev_path);
+		return -1;
+	}
+
+	memset(&qv, 0, sizeof(qv));
+	qv.vf_id = vf_id;
+	rc = ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, &qv);
+	close(fd);
+	if (rc) {
+		pr_perror("vfmig: query_vf_uuid: QUERY_VF(pf=%s vf_id=%u)", pf_bdf, vf_id);
+		return -1;
+	}
+
+	memcpy(out, qv.vf_uuid, 16);
+	return 0;
+}
+
 /*
- * Park one claimed VF's datapath and record it in the suspended set so
- * fini(DUMP) resumes exactly what we parked. Today this is the fused
- * RUNNING -> STOP suspend (all-or-nothing); the cross-host barrier later
- * splits it around a rendezvous, which is why the per-VF decision lives
- * in its own seam rather than inline in the hook loop.
+ * Park one claimed VF's datapath to STOP and record it in the suspended
+ * set so fini(DUMP) resumes exactly what we parked. The per-VF decision
+ * lives in its own seam because the ladder differs by mode:
  *
- * If we park a VF but cannot remember it (OOM), roll the suspend back and
- * fail rather than strand the source in STOP -- the kernel's
- * SR-IOV-teardown force-resume is only a last resort. Returns 0 on
- * success, -1 on suspend or tracking failure.
+ *   legacy  (no rendezvous descriptor for this vf_uuid): the fused
+ *           RUNNING -> STOP suspend (all-or-nothing), as before.
+ *   barrier (a per-VHCA descriptor exists): the fused suspend is split
+ *           into its two ladder edges, SUSPEND(INITIATOR) -> RUNNING_P2P
+ *           then SUSPEND(RESPONDER) -> STOP. This commit wires the split
+ *           only; the D1 rendezvous that belongs between the edges (block
+ *           until every peer's initiator is parked before we drop our
+ *           responder) is added on top. Back-to-back the two edges are
+ *           identical to the fused suspend, so behaviour is unchanged
+ *           until that rendezvous lands.
+ *
+ * Barrier mode is resolved by vf_uuid -> descriptor: an unreadable uuid
+ * is treated as legacy (the capture path refuses an unstamped VF anyway)
+ * and a malformed descriptor fails closed. If we park a VF but cannot
+ * remember it (OOM), roll the suspend back and fail rather than strand
+ * the source in STOP -- the kernel's SR-IOV-teardown force-resume is only
+ * a last resort. Returns 0 on success, -1 on resolve/suspend/tracking
+ * failure.
  */
 static int vfmig_suspend_one_vf(const char *pf_bdf, uint32_t vf_id)
 {
-	if (vfmig_dp_suspend(pf_bdf, vf_id, 0))
+	struct vfmig_rendezvous rz;
+	uint8_t vf_uuid[16];
+	int mode;
+
+	if (vfmig_query_vf_uuid(pf_bdf, vf_id, vf_uuid))
+		mode = 1; /* unreadable uuid -> legacy fused suspend */
+	else
+		mode = vfmig_rendezvous_load(vf_uuid, &rz);
+	if (mode < 0)
 		return -1;
+
+	if (mode == 1) {
+		if (vfmig_dp_suspend(pf_bdf, vf_id, 0))
+			return -1;
+	} else {
+		if (vfmig_dp_suspend(pf_bdf, vf_id, MLX5_VFMIG_DIR_FLAG_INITIATOR))
+			return -1;
+		if (vfmig_dp_suspend(pf_bdf, vf_id, MLX5_VFMIG_DIR_FLAG_RESPONDER)) {
+			(void)vfmig_dp_resume(pf_bdf, vf_id, 0);
+			return -1;
+		}
+	}
 
 	if (vfmig_suspended_add(pf_bdf, vf_id)) {
 		pr_err("vfmig: checkpoint: OOM tracking suspended pf=%s vf_id=%u; rolling back suspend\n", pf_bdf,
