@@ -188,6 +188,15 @@ static int64_t now_ms(void)
 	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static int endpoint_cmp(const struct vfmig_rz_endpoint *a, const struct vfmig_rz_endpoint *b)
+{
+	int c = strcmp(a->ip, b->ip);
+
+	if (c)
+		return c;
+	return (int)a->port - (int)b->port;
+}
+
 /* Bind+listen a TCP socket on rz->listen. Returns fd or -1. */
 static int barrier_listen(const struct vfmig_rendezvous *rz)
 {
@@ -222,34 +231,99 @@ static int barrier_listen(const struct vfmig_rendezvous *rz)
 	return fd;
 }
 
+/* One connect attempt to @ep. Returns fd or -1. */
+static int barrier_connect_once(const struct vfmig_rz_endpoint *ep)
+{
+	struct addrinfo hints, *res, *ai;
+	char portstr[8];
+	int fd = -1;
+
+	snprintf(portstr, sizeof(portstr), "%u", ep->port);
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_NUMERICSERV;
+	if (getaddrinfo(ep->ip, portstr, &hints, &res))
+		return -1;
+	for (ai = res; ai; ai = ai->ai_next) {
+		fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+		if (fd < 0)
+			continue;
+		if (!connect(fd, ai->ai_addr, ai->ai_addrlen))
+			break;
+		close(fd);
+		fd = -1;
+	}
+	freeaddrinfo(res);
+	return fd;
+}
+
 /*
- * Cross-host rendezvous, accept side: block until every peer has
- * connected to our listen socket, or the descriptor timeout elapses. An
- * inbound connection means a peer has reached the barrier point;
- * completion is gated on the count.
+ * Cross-host rendezvous: block until a TCP connection has been
+ * established with every listed peer, or the descriptor timeout elapses.
+ * Each edge is tie-broken by endpoint string so exactly one side
+ * connects and the other accepts (no double-connect). An established
+ * connection means the peer has reached the barrier point; completion is
+ * gated on the count.
  *
- * This establishes the rendezvous as the listener half -- it waits for
- * peers to connect to us. The connector half (we connect to peers,
- * tie-broken per edge so exactly one side connects) is layered on top,
- * as is the READY message that carries peer identity + phase/session (so
- * an accepted connection can be attributed to a specific edge). The
- * sockets are CRIU's own, opened and closed within the call. Returns 0
- * on success, -1 on timeout/error.
+ * Two-phase for now: connect all our connector edges (each retried until
+ * the peer's listener is up), then accept all our acceptor edges. This
+ * serializes the connector edges -- a down connector peer blocks ready
+ * acceptor edges until the deadline; the interleaved per-edge accounting
+ * layered on top removes that. Payload is exchanged separately (the
+ * READY message carrying peer identity + phase/session is layered on
+ * top), so an accepted connection is not yet attributed to a specific
+ * acceptor edge. The sockets are CRIU's own, opened and closed within
+ * the call. Returns 0 on success, -1 on timeout/error.
  */
 int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase)
 {
+	bool is_connector[VFMIG_RZ_MAX_PEERS];
+	struct timespec retry = {
+		.tv_sec = 0,
+		.tv_nsec = (long)rz->retry_ms * 1000000,
+	};
 	size_t remaining = rz->n_peers;
 	int64_t deadline = now_ms() + rz->timeout_ms;
 	int listen_fd = -1;
+	size_t i;
 	int rc = -1;
+
+	/*
+	 * Tie-break each edge by endpoint string: the lexicographically
+	 * smaller side connects, the larger accepts. Exactly one
+	 * connection per peer, no double-connect.
+	 */
+	for (i = 0; i < rz->n_peers; i++)
+		is_connector[i] = endpoint_cmp(&rz->listen, &rz->peers[i]) < 0;
 
 	listen_fd = barrier_listen(rz);
 	if (listen_fd < 0)
 		return -1;
 
-	pr_info("vfmig: barrier[%s] session=%s: waiting for %zu peer(s) to connect, timeout=%dms\n", phase,
-		rz->session, rz->n_peers, rz->timeout_ms);
+	pr_info("vfmig: barrier[%s] session=%s: rendezvous with %zu peer(s), timeout=%dms\n", phase, rz->session,
+		rz->n_peers, rz->timeout_ms);
 
+	/* Phase 1: connect our connector edges, retrying until each is up. */
+	for (i = 0; i < rz->n_peers && remaining; i++) {
+		int fd = -1;
+
+		if (!is_connector[i])
+			continue;
+		while (now_ms() < deadline) {
+			fd = barrier_connect_once(&rz->peers[i]);
+			if (fd >= 0)
+				break;
+			nanosleep(&retry, NULL);	/* peer not listening yet */
+		}
+		if (fd < 0)
+			break;	/* deadline hit; reported below */
+		close(fd);
+		remaining--;
+		pr_info("vfmig: barrier[%s]: connected peer %s:%u ok\n", phase, rz->peers[i].ip, rz->peers[i].port);
+	}
+
+	/* Phase 2: accept our acceptor edges. */
 	while (remaining) {
 		struct timeval tv;
 		fd_set rfds;
