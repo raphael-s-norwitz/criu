@@ -320,6 +320,17 @@ int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path, const uint64_t addr,
 					  uint64_t *new_pgoff, int *plugin_fd);
 
 /*
+ * Restore-side cross-host rendezvous. rdma_mlx5_vfmig_plugin_resume_devices_late()
+ * is the RESUME_DEVICES_LATE hook: the point at which the restore side
+ * runs its R1 rendezvous so no host releases its datapath until all peers
+ * have finished restoring. Invoked once per alive task; the restored-VF
+ * set is host-global, so it dedups via barrier_done. Legacy VFs (no
+ * descriptor) are skipped. The rendezvous transport it drives is added
+ * on top.
+ */
+int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid);
+
+/*
  * Per-PD restore UHW pack. rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack()
  * is the RDMA_RESTORE_UOBJ_PD_UHW_PACK hook: it reshapes the per-PD
  * plugin_blob the dump hook emitted (a struct mlx5_ib_restore_pd_req_local)

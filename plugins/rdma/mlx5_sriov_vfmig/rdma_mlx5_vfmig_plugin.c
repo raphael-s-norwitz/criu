@@ -400,6 +400,7 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE,
 			rdma_mlx5_vfmig_plugin_restore_uobj_qp_needs_pie)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, rdma_mlx5_vfmig_plugin_open_uverbs_cdev)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, rdma_mlx5_vfmig_plugin_update_vma_map)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, rdma_mlx5_vfmig_plugin_resume_devices_late)
 
 /*
  * RDMA sharing policy: EXCLUSIVE.
