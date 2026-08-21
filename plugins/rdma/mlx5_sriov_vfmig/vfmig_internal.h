@@ -208,7 +208,8 @@ struct vfmig_rendezvous {
  */
 int vfmig_rendezvous_load(const uint8_t vf_uuid[16], struct vfmig_rendezvous *out);
 
-/* Barrier phase label (on the wire and in logs). */
+/* Barrier phase labels (on the wire and in logs). */
+#define VFMIG_BARRIER_PHASE_DUMP    "D1"
 #define VFMIG_BARRIER_PHASE_RESTORE "R1"
 
 /*
