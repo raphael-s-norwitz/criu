@@ -116,10 +116,10 @@ int main(void)
 
 	/* 2. Append two entries, read them back, compare every field. */
 	rc = vfmig_append_state_entry(7, "mlx5_2", "/dev/infiniband/uverbs2", "0000:08:00.0", 3, 0x123, uuid_a,
-				      "mlx5_vfmig-pf0000:08:00.0-vf3.blob", 65536);
+				      "mlx5_vfmig-pf0000:08:00.0-vf3.blob", 65536, NULL);
 	CHECK(rc == 0, "append entry A");
 	rc = vfmig_append_state_entry(9, "mlx5_5", "/dev/infiniband/uverbs5", "0000:08:00.1", 1, 0x456, uuid_b,
-				      "mlx5_vfmig-pf0000:08:00.1-vf1.blob", 131072);
+				      "mlx5_vfmig-pf0000:08:00.1-vf1.blob", 131072, NULL);
 	CHECK(rc == 0, "append entry B");
 
 	rc = vfmig_read_image(&arr, &n);
@@ -147,7 +147,7 @@ int main(void)
 
 	/* 3. All-zero vf_uuid is refused. */
 	rc = vfmig_append_state_entry(1, "mlx5_2", "/dev/infiniband/uverbs2", "0000:08:00.0", 0, 0, uuid_zero,
-				      "x.blob", 0);
+				      "x.blob", 0, NULL);
 	CHECK(rc == -1, "append with all-zero vf_uuid is refused");
 
 	/* 4. drain_save_fd_to_blob: fd -> blob file with right size + bytes. */
