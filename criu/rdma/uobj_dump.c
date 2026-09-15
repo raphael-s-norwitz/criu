@@ -1353,3 +1353,54 @@ out:
 	rdma_drop_dumped_ufiles();
 	return ret;
 }
+
+/*
+ * Quiesce every ibdev the capture ran against, once each, before the
+ * memory snapshot.
+ *
+ * Walks the captured-ufile list rather than the process tree: many
+ * contexts, and many processes, can share one ibdev, but the hardware
+ * quiesce is a property of the device. De-duplicating here is what lets
+ * the hook be dispatched by owner like every other RDMA hook -- see
+ * CR_PLUGIN_HOOK__RDMA_SUSPEND_IBDEV for why CHECKPOINT_DEVICES is the
+ * wrong home for it.
+ *
+ * A plugin that does not own a given ibdev answers -ENOTSUP and is
+ * skipped; anything else non-zero aborts the dump, because a device left
+ * running would be snapshotted mid-DMA.
+ */
+int rdma_suspend_captured_ibdevs(void)
+{
+	struct rdma_dumped_ufile *uf, *prev;
+	int suspended = 0, ret;
+
+	list_for_each_entry(uf, &rdma_dumped_ufiles, link) {
+		bool seen = false;
+
+		/* One ibdev, many contexts: quiesce it once. */
+		list_for_each_entry(prev, &rdma_dumped_ufiles, link) {
+			if (prev == uf)
+				break;
+			if (prev->criu_driver == uf->criu_driver && !strcmp(prev->ibdev, uf->ibdev)) {
+				seen = true;
+				break;
+			}
+		}
+		if (seen)
+			continue;
+
+		ret = rdma_dispatch_suspend_ibdev(uf->criu_driver, uf->ibdev);
+		if (ret == -ENOTSUP)
+			continue;
+		if (ret < 0) {
+			pr_err("uobj DAG: suspend of ibdev=%s (criu_driver=%u) failed: %d\n", uf->ibdev,
+			       uf->criu_driver, ret);
+			return -1;
+		}
+		suspended++;
+	}
+
+	if (suspended)
+		pr_info("uobj DAG: quiesced %d ibdev datapath(s) before the memory dump\n", suspended);
+	return 0;
+}
