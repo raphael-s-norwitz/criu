@@ -252,9 +252,15 @@ struct rdma_query_mr_resp {
  * deterministic for a given image, and the binder cross-checks the line
  * count against the number of dma-buf MRs it finds.
  *
- * The exported fds stay open for the rest of the dump: the recreator
- * records them by fd, so closing them here would invalidate the file
- * before anyone read it.
+ * The exported fds stay open until the recreator has recorded them --
+ * closing them here would invalidate the file before anyone read it --
+ * and are not CLOEXEC, because the recreator is reached by exec and the
+ * numbers have to still name the same buffers on the far side of it. The
+ * kernel hands them out CLOEXEC, so that has to be undone explicitly.
+ *
+ * Whoever drives the recreator closes them once it returns; each one is a
+ * reference on the exporter's buffer, and the checkpoint exists to let
+ * that memory go.
  */
 #define DMABUF_FDS_IMG "dmabuf_fds"
 
@@ -767,7 +773,9 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 		if (dmabuf_fds_append(rc, &dmabuf_index))
 			return (w->err = -1);
 		has_dmabuf_index = true;
-		/* Left open on purpose -- see DMABUF_FDS_IMG above. */
+		/* Left open, and inheritable -- see DMABUF_FDS_IMG above. */
+		if (fcntl(rc, F_SETFD, 0))
+			pr_perror("uobj DAG: clear CLOEXEC on exported dma-buf fd %d", rc);
 	} else if (rc != -EOPNOTSUPP) {
 		pr_err("uobj DAG: MR_EXPORT_DMABUF_FD handle=%u on ibdev=%s failed: %d (%s)\n",
 		       e->ufile_handle, w->ib->ibdev, rc, strerror(-rc));
