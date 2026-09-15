@@ -1342,6 +1342,7 @@ struct rdma_pending_mr {
 	uint32_t access_flags;
 	uint32_t lkey;
 	uint32_t rkey;
+	bool is_dmabuf;
 	int cmd_fd_dup;
 	uint32_t uhw_in_len; /* 0 -> UHW-less RESTORE_MR (rxe) */
 	uint8_t uhw_in_buf[RST_RDMA_MR_UHW_IN_MAX];
@@ -1471,6 +1472,14 @@ static int uobj_prepare_mr(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver
 	p->access_flags = attrs->access_flags;
 	p->lkey = attrs->lkey;
 	p->rkey = attrs->rkey;
+	/*
+	 * dmabuf_index is stamped at dump for exactly those MRs whose
+	 * buffer MR_EXPORT_DMABUF_FD could hand out, so it is the record of
+	 * which registration verb created this MR. RESTORE_MR is told that
+	 * rather than left to deduce it from a missing user VA, which a
+	 * device-memory MR and an implicit ODP MR also lack.
+	 */
+	p->is_dmabuf = attrs->has_dmabuf_index;
 	p->cmd_fd_dup = dup_fd;
 	p->uhw_in_len = uhw_in_len;
 	if (uhw_in_len)
@@ -1482,6 +1491,47 @@ static int uobj_prepare_mr(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver
 		" access=%#x lkey=%#x rkey=%#x iova=%#" PRIx64 " uhw_in=%u\n",
 		e->ufile_handle, parent_pd_handle, (uint64_t)attrs->virt_addr, (uint64_t)attrs->length,
 		attrs->access_flags, attrs->lkey, attrs->rkey, (uint64_t)attrs->iova, uhw_in_len);
+	return 0;
+}
+
+/*
+ * Visit every DMA-BUF-backed MR captured under @ufile_id.
+ *
+ * The collected groups outlive the restore (they are never freed), so a
+ * late pass can walk the same entries the restore dispatcher used without
+ * re-reading the image. Only MRs carrying a dmabuf_index qualify: that
+ * field is written exactly for MRs whose backing is an exporter's, which
+ * are the ones RESTORE_MR adopted unbacked.
+ *
+ * Deliberately not routed through rdma_restore_uobj_dag_for_ufile(). That
+ * dispatcher reserves handles, topo-sorts PD before CQ before MR/QP, packs
+ * per-type UHW and decides master-versus-pie; binding an already-restored
+ * object is none of those, and giving it a second mode would make every
+ * one of those steps ask which mode it is running in.
+ */
+int rdma_uobj_foreach_dmabuf_mr(uint32_t ufile_id, rdma_dmabuf_mr_fn cb, void *arg)
+{
+	struct uobj_ufile_group *g = rdma_uobj_group_lookup(ufile_id);
+	struct uobj_collected *c;
+	int ret;
+
+	if (!g)
+		return 0;
+
+	list_for_each_entry(c, &g->entries, link) {
+		RdmaUobjEntry *e = c->e;
+
+		if (e->type != R3_UOBJ_TYPE__R3UT_MR || !e->mr)
+			continue;
+		if (!e->mr->has_dmabuf_index)
+			continue;
+
+		ret = cb(e->ufile_handle, e->mr->has_lkey ? e->mr->lkey : 0,
+			 e->mr->dmabuf_index, arg);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 
@@ -1723,6 +1773,7 @@ int rdma_prepare_rdma_mrs(struct task_restore_args *ta)
 		r->access_flags = p->access_flags;
 		r->lkey_hint = p->lkey;
 		r->rkey_hint = p->rkey;
+		r->is_dmabuf = p->is_dmabuf;
 		r->uhw_in_len = p->uhw_in_len;
 		if (p->uhw_in_len)
 			memcpy(r->uhw_in_buf, p->uhw_in_buf, p->uhw_in_len);

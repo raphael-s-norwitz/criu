@@ -142,6 +142,22 @@ message rdma_mr_attrs {
 	optional uint32		lkey			= 10;	/* identity hint */
 	optional uint32		rkey			= 11;	/* identity hint */
 	optional uint64		iova			= 12;
+	/*
+	 * Present only for a DMA-BUF-backed MR: its position in the
+	 * dmabuf_fds image file, counting from zero.
+	 *
+	 * Such an MR has no user VA (virt_addr is 0, its pages being the
+	 * exporter's), so RESTORE_MR adopts the mkey with nothing behind it
+	 * and something has to point it back at the recreated buffer later.
+	 * dmabuf_fds carries the fds, rewritten in place by whoever recreated
+	 * them; this index says which of its lines belongs to this MR.
+	 *
+	 * An explicit index rather than "the Nth dma-buf MR you happen to
+	 * walk": the two orders would have to agree, nothing would enforce
+	 * it, and a divergence binds each MR to the wrong buffer without
+	 * failing.
+	 */
+	optional uint32		dmabuf_index		= 13;
 };
 
 /*

@@ -101,7 +101,8 @@
 LIST_HEAD(rdma_dumped_ufiles);
 
 int rdma_note_dumped_ufile(uint32_t uvfe_id, bool has_ctxn, uint32_t ctxn, uint32_t criu_driver,
-			   uint32_t kernel_driver_id, pid_t pid, const char *ibdev, int holder_uctx_fd)
+			   uint32_t kernel_driver_id, pid_t pid, const char *ibdev, int holder_uctx_fd,
+			   int holder_fd_no)
 {
 	struct rdma_dumped_ufile *uf = xzalloc(sizeof(*uf));
 
@@ -117,6 +118,7 @@ int rdma_note_dumped_ufile(uint32_t uvfe_id, bool has_ctxn, uint32_t ctxn, uint3
 	uf->kernel_driver_id = kernel_driver_id;
 	uf->pid = pid;
 	uf->holder_uctx_fd = holder_uctx_fd;
+	uf->holder_fd_no = holder_fd_no;
 	snprintf(uf->ibdev, sizeof(uf->ibdev), "%.*s", (int)(sizeof(uf->ibdev) - 1), ibdev);
 	INIT_LIST_HEAD(&uf->link);
 	list_add_tail(&uf->link, &rdma_dumped_ufiles);
@@ -135,7 +137,8 @@ static void rdma_drop_dumped_ufiles(void)
 	}
 }
 
-int rdma_bind_dumped_ufile_id(pid_t pid, bool has_ctxn, uint32_t ctxn, uint32_t uvfe_id)
+int rdma_bind_dumped_ufile_id(pid_t pid, bool has_ctxn, uint32_t ctxn, uint32_t uvfe_id,
+			      int *holder_fd_no_out)
 {
 	struct rdma_dumped_ufile *uf;
 
@@ -153,6 +156,8 @@ int rdma_bind_dumped_ufile_id(pid_t pid, bool has_ctxn, uint32_t ctxn, uint32_t 
 			uf->uvfe_id = uvfe_id;
 			uf->has_uvfe_id = true;
 		}
+		if (holder_fd_no_out)
+			*holder_fd_no_out = uf->holder_fd_no;
 		return 0;
 	}
 
@@ -253,8 +258,16 @@ struct rdma_query_mr_resp {
  */
 #define DMABUF_FDS_IMG "dmabuf_fds"
 
-static int dmabuf_fds_append(int fd)
+/*
+ * Append @fd and return the zero-based line it landed on, which the MR's
+ * image entry records as its dmabuf_index. An explicit index rather than
+ * "the Nth dma-buf MR you happen to walk": the dump-side and restore-side
+ * orders would otherwise have to agree with nothing enforcing it, and a
+ * divergence binds each MR to the wrong buffer without failing.
+ */
+static int dmabuf_fds_append(int fd, uint32_t *index_out)
 {
+	static uint32_t next_index;
 	char line[32];
 	int img_fd, len, ret;
 
@@ -270,7 +283,12 @@ static int dmabuf_fds_append(int fd)
 	if (ret)
 		pr_perror("uobj DAG: write %s", DMABUF_FDS_IMG);
 	close(img_fd);
-	return ret;
+
+	if (ret)
+		return -1;
+
+	*index_out = next_index++;
+	return 0;
 }
 
 /*
@@ -696,6 +714,8 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	RdmaMrAttrs attrs;
 	RdmaUobjXref xref;
 	RdmaUobjXref *xrefs[1];
+	bool has_dmabuf_index = false;
+	uint32_t dmabuf_index = 0;
 	int rc;
 
 	if (!e->has_restrack_id || !e->mr.has_pdn) {
@@ -744,8 +764,9 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	if (rc >= 0) {
 		pr_debug("uobj DAG: MR handle=%u on ibdev=%s is dma-buf backed, exported fd=%d\n",
 			 e->ufile_handle, w->ib->ibdev, rc);
-		if (dmabuf_fds_append(rc))
+		if (dmabuf_fds_append(rc, &dmabuf_index))
 			return (w->err = -1);
+		has_dmabuf_index = true;
 		/* Left open on purpose -- see DMABUF_FDS_IMG above. */
 	} else if (rc != -EOPNOTSUPP) {
 		pr_err("uobj DAG: MR_EXPORT_DMABUF_FD handle=%u on ibdev=%s failed: %d (%s)\n",
@@ -774,6 +795,10 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	attrs.rkey = resp.rkey;
 	attrs.has_iova = true;
 	attrs.iova = resp.iova;
+	if (has_dmabuf_index) {
+		attrs.has_dmabuf_index = true;
+		attrs.dmabuf_index = dmabuf_index;
+	}
 	pe.mr = &attrs;
 
 	rdma_uobj_xref__init(&xref);
