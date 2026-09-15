@@ -194,6 +194,12 @@ struct rst_rdma_mr {
 	u32 access_flags;
 	u32 lkey_hint;
 	u32 rkey_hint;
+	/*
+	 * Selects the RESTORE_MR lane: a DMA-BUF MR is named as such
+	 * instead of being recognised by having no user VA, which a
+	 * device-memory MR and an implicit ODP MR also have.
+	 */
+	u8 is_dmabuf;
 	u32 uhw_in_len; /* 0 -> no UHW_IN attr (rxe) */
 	u8 uhw_in_buf[RST_RDMA_MR_UHW_IN_MAX];
 };

@@ -65,6 +65,7 @@ struct rdma_dumped_ufile {
 	bool has_dev_index;
 	char ibdev[64];
 	int holder_uctx_fd;
+	int holder_fd_no; /* the fd number @pid held the cdev at */
 	struct list_head link;
 };
 extern struct list_head rdma_dumped_ufiles;
@@ -79,7 +80,8 @@ extern struct list_head rdma_dumped_ufiles;
  */
 int rdma_note_dumped_ufile(uint32_t uvfe_id, bool has_ctxn, uint32_t ctxn,
 			   uint32_t criu_driver, uint32_t kernel_driver_id,
-			   pid_t pid, const char *ibdev, int holder_uctx_fd);
+			   pid_t pid, const char *ibdev, int holder_uctx_fd,
+			   int holder_fd_no);
 
 /*
  * Back-fill the image id of an already-captured uverbs context. Called
@@ -92,7 +94,7 @@ int rdma_note_dumped_ufile(uint32_t uvfe_id, bool has_ctxn, uint32_t ctxn,
  * ctxn binds the first; later fds keep it.
  */
 int rdma_bind_dumped_ufile_id(pid_t pid, bool has_ctxn, uint32_t ctxn,
-			      uint32_t uvfe_id);
+			      uint32_t uvfe_id, int *holder_fd_no_out);
 
 /*
  * Capture phase (criu/rdma/uobj_dump.c). Runs from the early

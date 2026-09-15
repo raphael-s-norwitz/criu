@@ -38,6 +38,17 @@
 /* FIXME: Probably replace with linked list or hasmap/xarray. */
 static u32 ctxn_uverbsfd_id_map[MAX_PROCESS_CONTEXTS];
 
+/*
+ * Every uverbs context collected from the image, in collection order.
+ * file_desc lookups are by id and there is no iterator, but the late
+ * dma-buf MR bind pass needs to visit them all.
+ */
+struct uverbs_collected_ufile {
+	UverbsFileEntry *uvfe;
+	struct list_head link;
+};
+static LIST_HEAD(uverbs_collected_ufiles);
+
 bool is_async_eventfd(char *link)
 {
 	return is_anon_link_type(link, "[infinibandevent]");
@@ -438,7 +449,7 @@ static int rdma_capture_pid_uverbs(pid_t pid)
 
 		/* uvfe_id deferred: dump_uverbsfile() back-fills it. */
 		if (rdma_note_dumped_ufile(0, uve.has_ctxn, uve.ctxn, criu_driver, driver_id, pid, ibdev,
-					   uctx_fd))
+					   uctx_fd, fd_no))
 			goto out;
 
 		pr_info("rdma capture: pid=%d ibdev=%s ctxn=%u (fd=%d) captured for uobj DAG\n", pid, ibdev,
@@ -503,6 +514,7 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	const char *claimer = NULL;
 	char ibdev[64];
 	char driver[64];
+	int holder_fd_no = -1;
 	int rcd;
 	int ret = -1;
 
@@ -601,15 +613,6 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 		goto out;
 	}
 
-	fe.type = FD_TYPES__UVERBSFD;
-	fe.id = uve.id;
-	fe.uvfd = &uve;
-
-	img = img_from_set(glob_imgset, CR_FD_FILES);
-	ret = pb_write_one(img, &fe, PB_FILE);
-	if (ret)
-		goto out;
-
 	/*
 	 * Back-fill this context's image id onto the record the early
 	 * capture pass (rdma_capture_uverbs_contexts) already made before
@@ -618,8 +621,36 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	 * phase reads uvfe_id back off the record to stamp each entry's
 	 * ufile_id. A context with no capture record is a dump bug -- fail
 	 * closed.
+	 *
+	 * Must precede the pb_write_one() below: it also yields the holder
+	 * fd number, which goes into the same entry.
 	 */
-	ret = rdma_bind_dumped_ufile_id(p->pid, uve.has_ctxn, uve.ctxn, uve.id);
+	ret = rdma_bind_dumped_ufile_id(p->pid, uve.has_ctxn, uve.ctxn, uve.id, &holder_fd_no);
+	if (ret)
+		goto out;
+	if (holder_fd_no >= 0) {
+		/*
+		 * Where the restored task will hold this cdev: its pid is
+		 * preserved by criu and setup_and_serve_out() reinstalls the
+		 * fd at its original number, so the pair still addresses this
+		 * context once the task is running. The dma-buf MR bind pass
+		 * needs that, criu's own fd on the context being long gone by
+		 * then.
+		 */
+		uve.holder_pid = p->pid;
+		uve.has_holder_pid = true;
+		uve.holder_fd = holder_fd_no;
+		uve.has_holder_fd = true;
+	}
+
+	fe.type = FD_TYPES__UVERBSFD;
+	fe.id = uve.id;
+	fe.uvfd = &uve;
+
+	img = img_from_set(glob_imgset, CR_FD_FILES);
+	ret = pb_write_one(img, &fe, PB_FILE);
+	if (ret)
+		goto out;
 out:
 	xfree(uve.ib_dev);
 	xfree(uve.driver_name);
@@ -773,6 +804,15 @@ static int collect_one_uverbsfd(void *o, ProtobufCMessage *base, struct cr_img *
 	ui->uvfe = pb_msg(base, UverbsFileEntry);
 	file_desc_add(&ui->d, ui->uvfe->id, &uverbs_desc_ops);
 
+	{
+		struct uverbs_collected_ufile *cu = xzalloc(sizeof(*cu));
+
+		if (!cu)
+			return -1;
+		cu->uvfe = ui->uvfe;
+		list_add_tail(&cu->link, &uverbs_collected_ufiles);
+	}
+
 	pr_info("Collected uverbsfd ctxn %d\n", ui->uvfe->ctxn);
 
 	return 0;
@@ -784,3 +824,214 @@ struct collect_image_info uverbsfd_cinfo = {
 	.priv_size = sizeof(struct uverbsfd_file_info),
 	.collect = collect_one_uverbsfd,
 };
+
+/* ---------------- late DMA-BUF MR bind pass ---------------- */
+
+struct dmabuf_bind_ctx {
+	int cmd_fd;
+	uint32_t driver_id;
+	const int *fds;
+	unsigned int n_fds;
+	unsigned int n_bound;
+	const char *ibdev;
+};
+
+/*
+ * UAPI lag shim, as in uobj_dump.c: UVERBS_METHOD_MR_BIND_DMABUF is the 9th
+ * entry of enum uverbs_methods_mr, its attributes the 1st and 2nd of enum
+ * uverbs_attrs_mr_bind_dmabuf_ids. Numeric copies so criu builds against
+ * kernel headers that predate the verb.
+ */
+#ifndef UVERBS_METHOD_MR_BIND_DMABUF
+#define UVERBS_METHOD_MR_BIND_DMABUF 8
+#endif
+#ifndef UVERBS_ATTR_MR_BIND_DMABUF_HANDLE
+#define UVERBS_ATTR_MR_BIND_DMABUF_HANDLE 0
+#endif
+#ifndef UVERBS_ATTR_MR_BIND_DMABUF_FD
+#define UVERBS_ATTR_MR_BIND_DMABUF_FD 1
+#endif
+
+/*
+ * Point unbound MR @handle at @dmabuf_fd, keeping the key. Core uverb,
+ * the restore half of the UNBIND_DMABUF issued at dump; -EINVAL if the
+ * MR is not in the unbound state, -EOPNOTSUPP if the driver lacks it.
+ */
+static int rdma_send_bind_dmabuf_mr(int cmd_fd, uint32_t driver_id, uint32_t handle, int dmabuf_fd)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[2];
+	} cmd = {};
+
+	cmd.hdr.length = sizeof(cmd.hdr) + 2 * sizeof(cmd.attrs[0]);
+	cmd.hdr.object_id = UVERBS_OBJECT_MR;
+	cmd.hdr.method_id = UVERBS_METHOD_MR_BIND_DMABUF;
+	cmd.hdr.num_attrs = 2;
+	cmd.hdr.driver_id = driver_id;
+
+	cmd.attrs[0].attr_id = UVERBS_ATTR_MR_BIND_DMABUF_HANDLE;
+	cmd.attrs[0].len = 0;
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = handle;
+
+	/* RAW_FD wire form: len == 0, the fd in .data as a signed 64-bit. */
+	cmd.attrs[1].attr_id = UVERBS_ATTR_MR_BIND_DMABUF_FD;
+	cmd.attrs[1].len = 0;
+	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].data = (uint64_t)(int64_t)dmabuf_fd;
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd))
+		return -errno;
+	return 0;
+}
+
+static int dmabuf_bind_one_mr(uint32_t ufile_handle, uint32_t lkey, uint32_t dmabuf_index, void *arg)
+{
+	struct dmabuf_bind_ctx *c = arg;
+	int ret;
+
+	if (dmabuf_index >= c->n_fds) {
+		pr_err("rdma dmabuf bind: MR handle=%u on ibdev=%s wants dmabuf_fds line %u but the file has %u\n",
+		       ufile_handle, c->ibdev, dmabuf_index, c->n_fds);
+		return -1;
+	}
+
+	ret = rdma_send_bind_dmabuf_mr(c->cmd_fd, c->driver_id, ufile_handle, c->fds[dmabuf_index]);
+	if (ret) {
+		pr_err("rdma dmabuf bind: BIND_DMABUF handle=%u lkey=%#x fd=%d on ibdev=%s failed: %d (%s)\n",
+		       ufile_handle, lkey, c->fds[dmabuf_index], c->ibdev, ret, strerror(-ret));
+		return -1;
+	}
+
+	pr_info("rdma dmabuf bind: MR handle=%u lkey=%#x on ibdev=%s bound to dmabuf_fds[%u]=%d\n", ufile_handle,
+		lkey, c->ibdev, dmabuf_index, c->fds[dmabuf_index]);
+	c->n_bound++;
+	return 0;
+}
+
+/*
+ * Read dmabuf_fds into @fds. Returns the count, 0 if the file is absent
+ * (a checkpoint with no DMA-BUF-backed MRs), -1 on error.
+ */
+static int dmabuf_fds_read(int *fds, unsigned int max)
+{
+	char buf[32];
+	unsigned int n = 0;
+	FILE *f;
+	int img_fd;
+
+	img_fd = openat(get_service_fd(IMG_FD_OFF), "dmabuf_fds", O_RDONLY | O_CLOEXEC);
+	if (img_fd < 0)
+		return errno == ENOENT ? 0 : -1;
+
+	f = fdopen(img_fd, "r");
+	if (!f) {
+		close(img_fd);
+		return -1;
+	}
+
+	while (fgets(buf, sizeof(buf), f)) {
+		char *end = NULL;
+		long v;
+
+		if (buf[0] == '\n')
+			continue;
+		if (n >= max) {
+			pr_err("rdma dmabuf bind: dmabuf_fds has more than %u lines\n", max);
+			fclose(f);
+			return -1;
+		}
+		errno = 0;
+		v = strtol(buf, &end, 10);
+		if (errno || v < 0 || (*end != '\n' && *end != '\0')) {
+			pr_err("rdma dmabuf bind: malformed dmabuf_fds line %u\n", n);
+			fclose(f);
+			return -1;
+		}
+		fds[n++] = (int)v;
+	}
+
+	fclose(f);
+	return (int)n;
+}
+
+#define DMABUF_MAX_FDS 256
+
+/*
+ * Point every restored DMA-BUF-backed MR back at its buffer.
+ *
+ * Runs after RESUME_DEVICES_LATE, which is the earliest the buffers exist:
+ * the plugin that owns them (a GPU plugin, say) recreates them there, and
+ * rewrites dmabuf_fds in place with the fds they came back as. Until then
+ * each such MR is an identity with nothing behind it, RESTORE_MR having
+ * adopted its mkey unbacked.
+ *
+ * criu's own fd on the ucontext is long gone by now -- it was dup2'd into
+ * the task and closed -- so the cdev is fetched back out of the restored
+ * task with pidfd_getfd, using the pid and fd number recorded at dump. Both
+ * survive: criu restores a task under its original pid and reinstalls each
+ * fd at its original number.
+ */
+int rdma_bind_dmabuf_mrs_late(void)
+{
+	struct uverbs_collected_ufile *cu;
+	int fds[DMABUF_MAX_FDS];
+	unsigned int total_bound = 0;
+	int n_fds, ret = 0;
+
+	n_fds = dmabuf_fds_read(fds, DMABUF_MAX_FDS);
+	if (n_fds < 0)
+		return -1;
+	if (n_fds == 0)
+		return 0;
+
+	list_for_each_entry(cu, &uverbs_collected_ufiles, link) {
+		UverbsFileEntry *uvfe = cu->uvfe;
+		struct dmabuf_bind_ctx c = {};
+		int pidfd, cmd_fd;
+
+		if (!uvfe->has_holder_pid || !uvfe->has_holder_fd)
+			continue;
+
+		pidfd = syscall(__NR_pidfd_open, uvfe->holder_pid, 0);
+		if (pidfd < 0) {
+			pr_perror("rdma dmabuf bind: pidfd_open(%u)", uvfe->holder_pid);
+			return -1;
+		}
+		cmd_fd = syscall(__NR_pidfd_getfd, pidfd, uvfe->holder_fd, 0);
+		close(pidfd);
+		if (cmd_fd < 0) {
+			pr_perror("rdma dmabuf bind: pidfd_getfd(pid=%u fd=%u)", uvfe->holder_pid,
+				  uvfe->holder_fd);
+			return -1;
+		}
+
+		c.cmd_fd = cmd_fd;
+		c.driver_id = uvfe->driver_id;
+		c.fds = fds;
+		c.n_fds = (unsigned int)n_fds;
+		c.ibdev = uvfe->ib_dev ?: "?";
+
+		ret = rdma_uobj_foreach_dmabuf_mr(uvfe->id, dmabuf_bind_one_mr, &c);
+		close(cmd_fd);
+		if (ret)
+			return -1;
+
+		total_bound += c.n_bound;
+	}
+
+	/*
+	 * Every line is a buffer some MR asked for. A shortfall means the
+	 * image and the walk disagree about which MRs are dma-buf backed,
+	 * which would otherwise surface as an MR that silently never gets
+	 * its memory back.
+	 */
+	if (total_bound != (unsigned int)n_fds) {
+		pr_err("rdma dmabuf bind: bound %u MR(s) but dmabuf_fds has %d line(s)\n", total_bound, n_fds);
+		return -1;
+	}
+
+	pr_info("rdma dmabuf bind: %u DMA-BUF MR(s) rebound\n", total_bound);
+	return 0;
+}

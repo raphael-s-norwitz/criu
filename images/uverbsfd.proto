@@ -32,6 +32,22 @@ message uverbs_file_entry {
 	 * claims the ibdev on the destination.
 	 */
 	optional uint32		criu_driver	= 6;
+	/*
+	 * Where this context was open at dump time: the holding task's pid
+	 * and the fd number it held it at.
+	 *
+	 * Both survive the cycle -- criu restores a task under its original
+	 * pid, and setup_and_serve_out() reinstalls each fd at its original
+	 * number -- so together they address the same cdev in the restored
+	 * process. That is what lets late restore work, after the task is
+	 * running again, reach the context: criu's own fd on it is long
+	 * gone by then (it was dup2'd into the task and closed), so the only
+	 * way back in is pidfd_getfd against the restored task.
+	 *
+	 * Recorded for the dma-buf MR bind pass; nothing else consumes them.
+	 */
+	optional uint32		holder_pid	= 7;
+	optional uint32		holder_fd	= 8;
 };
 
 message uverbs_async_ev_file_entry {

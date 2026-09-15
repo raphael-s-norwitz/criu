@@ -991,6 +991,11 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 #define UVERBS_ATTR_RESTORE_MR_RKEY_HINT    7
 #define UVERBS_ATTR_RESTORE_MR_RESP_LKEY    8
 #define UVERBS_ATTR_RESTORE_MR_RESP_RKEY    9
+#define UVERBS_ATTR_RESTORE_MR_FLAGS	    10
+#define UVERBS_ATTR_RESTORE_MR_FD	    11
+#endif
+#ifndef IB_UVERBS_RESTORE_MR_DMABUF
+#define IB_UVERBS_RESTORE_MR_DMABUF (1 << 0)
 #endif
 
 /*
@@ -1071,11 +1076,26 @@ static int restore_rdma_mr(struct rst_rdma_mr *r)
 	cmd.attrs[n].data = r->parent_pd_handle;
 	n++;
 
-	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_ADDR;
-	cmd.attrs[n].len = sizeof(uint64_t);
-	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attrs[n].data = r->addr;
-	n++;
+	/*
+	 * Exactly one lane. A DMA-BUF MR is named as such rather than being
+	 * left to look like one: an MR with no user VA is also what a
+	 * device-memory MR and an implicit ODP MR look like. The fd is
+	 * omitted because the exporter has not recreated the buffer yet --
+	 * the late bind pass does that once it has.
+	 */
+	if (r->is_dmabuf) {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_FLAGS;
+		cmd.attrs[n].len = sizeof(uint32_t);
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = IB_UVERBS_RESTORE_MR_DMABUF;
+		n++;
+	} else {
+		cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_ADDR;
+		cmd.attrs[n].len = sizeof(uint64_t);
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = r->addr;
+		n++;
+	}
 
 	cmd.attrs[n].attr_id = UVERBS_ATTR_RESTORE_MR_LENGTH;
 	cmd.attrs[n].len = sizeof(uint64_t);

@@ -2338,6 +2338,14 @@ skip_ns_bouncing:
 			pr_debug("restore late stage hook for external plugin failed\n");
 	}
 
+	/*
+	 * Whoever recreated the DMA-BUF-backed objects above has rewritten
+	 * dmabuf_fds with the fds they came back as; bind the MRs that have
+	 * been waiting, unbacked, since RESTORE_MR adopted their mkeys.
+	 */
+	if (rdma_bind_dmabuf_mrs_late())
+		goto out_kill_network_unlocked;
+
 	ret = run_scripts(ACT_PRE_RESUME);
 	if (ret)
 		pr_err("Pre-resume script ret code %d\n", ret);

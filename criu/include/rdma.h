@@ -101,6 +101,14 @@ int rdma_collect_uobj_dag(void);
  * @ufile_id has no DAG group. Returns -1 on the first restore failure.
  */
 int rdma_restore_uobj_dag_for_ufile(int cmd_fd, uint32_t ufile_id, uint32_t kernel_driver_id);
+/*
+ * Callback for rdma_uobj_foreach_dmabuf_mr(): one DMA-BUF-backed MR, by
+ * the ufile handle it was restored at, its wire lkey, and its line in the
+ * dmabuf_fds image file. Returning non-zero stops the walk.
+ */
+typedef int (*rdma_dmabuf_mr_fn)(uint32_t ufile_handle, uint32_t lkey,
+				 uint32_t dmabuf_index, void *arg);
+int rdma_uobj_foreach_dmabuf_mr(uint32_t ufile_id, rdma_dmabuf_mr_fn cb, void *arg);
 
 struct task_restore_args;
 
@@ -119,6 +127,14 @@ struct task_restore_args;
  * path), -1 on a missing-field / unresolved-parent / dup / alloc error.
  */
 int rdma_prepare_rdma_mrs(struct task_restore_args *ta);
+
+/*
+ * Point every restored DMA-BUF-backed MR back at its buffer, after the
+ * late device-resume hooks have recreated them and rewritten dmabuf_fds
+ * with the fds they came back as. No-op when the image has no dmabuf_fds.
+ * Returns 0 on success, -1 on failure.
+ */
+int rdma_bind_dmabuf_mrs_late(void);
 
 /*
  * RDMA plugin queries (criu/rdma/plugin_api.c):
