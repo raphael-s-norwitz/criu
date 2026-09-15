@@ -2346,6 +2346,15 @@ skip_ns_bouncing:
 	if (rdma_bind_dmabuf_mrs_late())
 		goto out_kill_network_unlocked;
 
+	/*
+	 * Only now can a restored ibdev actually serve traffic: until the
+	 * bind above, an MR restored over a dma-buf is a key with no memory
+	 * behind it. A plugin that coordinates with remote peers releases
+	 * them here, not at RESUME_DEVICES_LATE, which runs before any of
+	 * that is true.
+	 */
+	rdma_resume_collected_ibdevs();
+
 	ret = run_scripts(ACT_PRE_RESUME);
 	if (ret)
 		pr_err("Pre-resume script ret code %d\n", ret);

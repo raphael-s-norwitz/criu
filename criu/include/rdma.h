@@ -142,7 +142,13 @@ int rdma_bind_dmabuf_mrs_late(void);
  * for trees with no RDMA. See CR_PLUGIN_HOOK__RDMA_SUSPEND_IBDEV.
  */
 int rdma_suspend_captured_ibdevs(void);
-int rdma_dispatch_suspend_ibdev(uint32_t criu_driver, const char *ibdev);
+
+/*
+ * Bring those ibdevs back online after rdma_bind_dmabuf_mrs_late() has
+ * bound the restored MRs. See CR_PLUGIN_HOOK__RDMA_RESUME_IBDEV; the
+ * per-device dispatchers live below, after the pb-c include they need.
+ */
+int rdma_resume_collected_ibdevs(void);
 
 /*
  * RDMA plugin queries (criu/rdma/plugin_api.c):
@@ -181,6 +187,20 @@ int rdma_plugin_sharing_policy_by_name(const char *plugin_name);
  */
 #include "images/uverbsfd.pb-c.h"
 int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe);
+
+/*
+ * Per-ibdev quiesce/resume, routed to the plugin that claimed the device
+ * by CR_PLUGIN_RDMA_PROVIDED_DRIVER. Driven by
+ * rdma_suspend_captured_ibdevs() at dump and
+ * rdma_resume_collected_ibdevs() at restore, once per distinct ibdev.
+ *
+ * The resume side takes the whole entry, like the cdev open above and
+ * unlike its dump-side twin, because uvfe->ib_dev names the *source*
+ * host's device: on a migration the destination ibdev is called
+ * something else, and only the owning plugin can map between them.
+ */
+int rdma_dispatch_suspend_ibdev(uint32_t criu_driver, const char *ibdev);
+int rdma_dispatch_resume_ibdev(const UverbsFileEntry *uvfe);
 
 /*
  * Dump-side per-ucontext dispatch (criu/rdma/plugin_api.c):

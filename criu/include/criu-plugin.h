@@ -422,6 +422,41 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_SUSPEND_IBDEV = 28,
 
+	/*
+	 * The restore-side twin of RDMA_SUSPEND_IBDEV: whatever a plugin
+	 * must do for an ibdev once it can actually serve traffic again.
+	 * Dispatched once per distinct ibdev the restore collected a uverbs
+	 * file for, routed by CR_PLUGIN_RDMA_PROVIDED_DRIVER.
+	 *
+	 * Takes the whole UverbsFileEntry, like RDMA_OPEN_UVERBS_CDEV and
+	 * unlike its dump-side twin, because @uvfe->ib_dev is the *source*
+	 * host's name for the device. On a migration the destination ibdev
+	 * is called something else, so only the plugin -- which resolved
+	 * source to destination when it loaded the VF -- can say which
+	 * local device this entry means. A bare name would work solely when
+	 * dumping and restoring on one host.
+	 *
+	 * Runs after rdma_bind_dmabuf_mrs_late(), which is the point of
+	 * having it rather than reusing RESUME_DEVICES_LATE. An MR restored
+	 * over a dma-buf is an unbacked shell until that pass points it at
+	 * the buffer a GPU plugin recreated; anything that lets peers start
+	 * writing to this host's rkeys has to come after it, or the first
+	 * thing a peer touches is a key with no memory behind it.
+	 * RESUME_DEVICES_LATE runs before the bind pass and so cannot serve.
+	 *
+	 * Note the dependency is really per ibdev, not global: a plugin
+	 * coordinating with remote peers does so per device, and it is that
+	 * device's own MRs that must be bound first. A single bind pass
+	 * over every MR makes "after the pass" sufficient today.
+	 *
+	 * Return: 0 on success, -ENOTSUP if the plugin does not own @ibdev,
+	 * < 0 errno on failure. Like RESUME_DEVICES_LATE a failure is
+	 * logged and does not abort the restore -- by this point the
+	 * process is restored, and tearing it down over a late coordination
+	 * failure would be worse than surfacing it.
+	 */
+	CR_PLUGIN_HOOK__RDMA_RESUME_IBDEV = 29,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -511,6 +546,7 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK, const Rd
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_SUSPEND_IBDEV, const char *ibdev);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESUME_IBDEV, const UverbsFileEntry *uvfe);
 
 /*
  * RDMA sharing policy.
