@@ -1035,3 +1035,58 @@ int rdma_bind_dmabuf_mrs_late(void)
 	pr_info("rdma dmabuf bind: %u DMA-BUF MR(s) rebound\n", total_bound);
 	return 0;
 }
+
+/*
+ * Let every ibdev the restore collected a uverbs file for come back
+ * online, once each, after rdma_bind_dmabuf_mrs_late() has pointed the
+ * restored MRs at real memory.
+ *
+ * Its own pass rather than something hung off the bind loop: that loop
+ * returns early when the image carries no dma-buf fds at all, and an
+ * ibdev with no DMA-BUF-backed MRs still has to be resumed.
+ *
+ * A failure is reported but neither stops the walk nor fails the restore.
+ * The process is already restored by this point; tearing it down over a
+ * late coordination failure would be worse than surfacing it.
+ */
+int rdma_resume_collected_ibdevs(void)
+{
+	struct uverbs_collected_ufile *cu, *prev;
+	int resumed = 0, failed = 0, ret;
+
+	list_for_each_entry(cu, &uverbs_collected_ufiles, link) {
+		const char *ibdev = cu->uvfe->ib_dev ?: "?";
+		bool seen = false;
+
+		if (!cu->uvfe->has_criu_driver)
+			continue;
+
+		/* One ibdev, many contexts: resume it once. */
+		list_for_each_entry(prev, &uverbs_collected_ufiles, link) {
+			if (prev == cu)
+				break;
+			if (prev->uvfe->has_criu_driver && prev->uvfe->criu_driver == cu->uvfe->criu_driver &&
+			    !strcmp(prev->uvfe->ib_dev ?: "?", ibdev)) {
+				seen = true;
+				break;
+			}
+		}
+		if (seen)
+			continue;
+
+		ret = rdma_dispatch_resume_ibdev(cu->uvfe);
+		if (ret == -ENOTSUP)
+			continue;
+		if (ret < 0) {
+			pr_err("rdma: resume of ibdev=%s (criu_driver=%u) failed: %d\n", ibdev,
+			       cu->uvfe->criu_driver, ret);
+			failed++;
+			continue;
+		}
+		resumed++;
+	}
+
+	if (resumed || failed)
+		pr_info("rdma: resumed %d ibdev(s) after the DMA-BUF bind pass, %d failed\n", resumed, failed);
+	return 0;
+}

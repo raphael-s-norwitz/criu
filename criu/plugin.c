@@ -60,6 +60,7 @@ static cr_plugin_desc_t *cr_gen_plugin_desc(void *h, char *path)
 	__assign_hook(PAUSE_DEVICES, "cr_plugin_pause_devices");
 	__assign_hook(CHECKPOINT_DEVICES, "cr_plugin_checkpoint_devices");
 	__assign_hook(RDMA_SUSPEND_IBDEV, "cr_plugin_rdma_suspend_ibdev");
+	__assign_hook(RDMA_RESUME_IBDEV, "cr_plugin_rdma_resume_ibdev");
 	__assign_hook(POST_FORKING, "cr_plugin_post_forking");
 	__assign_hook(RESTORE_INIT, "cr_plugin_restore_init");
 	__assign_hook(DUMP_DEVICES_LATE, "cr_plugin_dump_devices_late");
