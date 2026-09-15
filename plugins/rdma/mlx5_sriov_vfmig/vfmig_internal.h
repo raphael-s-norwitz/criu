@@ -224,13 +224,14 @@ int vfmig_rendezvous_load(const uint8_t vf_uuid[16], struct vfmig_rendezvous *ou
 int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase);
 
 /*
- * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_checkpoint_devices()
- * is the CHECKPOINT_DEVICES hook: it parks every claimed VF to STOP
- * (SUSPEND_VHCA) at CRIU's freeze point, before task memory is copied.
+ * Snapshot-ordering datapath suspend. rdma_mlx5_vfmig_plugin_suspend_ibdev()
+ * is the RDMA_SUSPEND_IBDEV hook: core dispatches it once per captured
+ * ibdev, and it parks that VF to STOP (SUSPEND_VHCA) before task memory is
+ * copied.
  * vfmig_resume_suspended_vfs() resumes that set (RESUME_VHCA) from
  * fini(DUMP); vfmig_suspended_clear() drops it at init()/fini() reset.
  */
-int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid);
+int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev);
 void vfmig_resume_suspended_vfs(void);
 void vfmig_suspended_clear(void);
 
@@ -335,15 +336,14 @@ int rdma_mlx5_vfmig_plugin_update_vma_map(const char *path, const uint64_t addr,
 					  uint64_t *new_pgoff, int *plugin_fd);
 
 /*
- * Restore-side cross-host rendezvous. rdma_mlx5_vfmig_plugin_resume_devices_late()
- * is the RESUME_DEVICES_LATE hook: the point at which the restore side
- * runs its R1 rendezvous so no host releases its datapath until all peers
- * have finished restoring. Invoked once per alive task; the restored-VF
- * set is host-global, so it dedups via barrier_done. Legacy VFs (no
- * descriptor) are skipped. The rendezvous transport it drives is added
- * on top.
+ * Restore-side cross-host rendezvous. rdma_mlx5_vfmig_plugin_resume_ibdev()
+ * is the RDMA_RESUME_IBDEV hook: core dispatches it once per restored
+ * ibdev, after the DMA-BUF bind pass, and it runs that VF's R1 rendezvous
+ * so no host releases its datapath until that VF's peers have finished
+ * restoring. Legacy VFs (no descriptor) decline. The rendezvous transport
+ * it drives is added on top.
  */
-int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid);
+int rdma_mlx5_vfmig_plugin_resume_ibdev(const UverbsFileEntry *uvfe);
 
 /*
  * Per-PD restore UHW pack. rdma_mlx5_vfmig_plugin_restore_uobj_pd_uhw_pack()

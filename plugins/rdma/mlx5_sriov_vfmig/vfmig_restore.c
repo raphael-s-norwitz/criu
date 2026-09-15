@@ -1145,10 +1145,23 @@ static int vfmig_barrier_arm(struct vfmig_restored_vf *v)
 }
 
 /*
- * RESUME_DEVICES_LATE hook. Run the R1 rendezvous for every barrier-mode
- * restored VF so no host releases its datapath until all peers have
- * reached the barrier. The app is still frozen when this fires, so
- * nothing egresses before R1 regardless.
+ * RDMA_RESUME_IBDEV hook. Run the R1 rendezvous for the restored VF
+ * behind @ibdev, so no host releases its datapath until that VF's peers
+ * have reached the barrier.
+ *
+ * Core dispatches this once per collected ibdev, after
+ * rdma_bind_dmabuf_mrs_late(). That ordering is the point: releasing
+ * peers means they may start writing to this VF's rkeys immediately, and
+ * until the bind pass runs an MR restored over a dma-buf is a key with no
+ * memory behind it. The rendezvous used to sit on RESUME_DEVICES_LATE,
+ * which runs before the bind -- and which it also consumed, starving the
+ * GPU plugin whose own hook recreates the very buffers those MRs bind to.
+ *
+ * The peer set is per VHCA, not per host: the descriptor names this VF's
+ * own endpoint and the VHCAs it exchanges traffic with, so two VFs on one
+ * host rendezvous with different peers. Dispatching per ibdev matches
+ * that -- a VF is exactly one ibdev -- and replaces the old walk of the
+ * whole restored set with barrier_done as a dedup.
  *
  * The rendezvous never re-toggles the datapath. The restored initiator
  * has stayed RUNNING across the whole restore because the uctx replay
@@ -1158,48 +1171,52 @@ static int vfmig_barrier_arm(struct vfmig_restored_vf *v)
  * (initiator parked across the rendezvous) is a kernel/FW follow-up; see
  * the design doc and kernel handoff.
  *
- * Invoked once per alive pstree item, but the restored-VF set is
- * host-global, so barrier_done dedups to one rendezvous per VF. Legacy
- * VFs (no descriptor) are skipped. On a rendezvous failure the VF stays
- * RUNNING (no safe hold available) and we surface -1; cr-restore.c does
- * not abort the restore on this hook's error, so a failure degrades to a
- * running-but-uncoordinated VF the orchestrator must health-check.
+ * Legacy VFs (no descriptor) answer -ENOTSUP: nothing to coordinate. On a
+ * rendezvous failure the VF stays RUNNING (no safe hold available) and we
+ * surface -1; cr-restore.c does not fail the restore on this hook, so it
+ * degrades to a running-but-uncoordinated VF the orchestrator must
+ * health-check.
  */
-int rdma_mlx5_vfmig_plugin_resume_devices_late(int pid)
+int rdma_mlx5_vfmig_plugin_resume_ibdev(const UverbsFileEntry *uvfe)
 {
+	struct vfmig_restored_ctx *c;
 	struct vfmig_restored_vf *v;
-	int pending = 0, done = 0, failed = 0;
-
-	(void)pid;
 
 	if (!vfmig_active)
 		return -ENOTSUP;
+	if (!uvfe->has_ctxn)
+		return -ENOTSUP;
+
+	/*
+	 * uvfe->ib_dev names the source device, so resolve through the
+	 * per-context cache instead: ctxn identifies the context we
+	 * restored, and its destination cdev path identifies the local VF.
+	 */
+	for (c = vfmig_restored_ctxs; c; c = c->next)
+		if (c->source_ctxn == uvfe->ctxn)
+			break;
+	if (!c)
+		return -ENOTSUP;
 
 	for (v = vfmig_restored_vfs; v; v = v->next)
-		if (v->barrier_mode && !v->barrier_done)
-			pending++;
-	if (!pending)
-		return 0;	/* legacy-only tree, or already done */
+		if (!strcmp(v->dest_cdev_path, c->dest_cdev_path))
+			break;
+	if (!v)
+		return -ENOTSUP;
 
-	for (v = vfmig_restored_vfs; v; v = v->next) {
-		if (!v->barrier_mode || v->barrier_done)
-			continue;
+	if (!v->barrier_mode || v->barrier_done)
+		return -ENOTSUP; /* legacy VF, or already rendezvoused */
 
-		if (vfmig_barrier_run(&v->rz, VFMIG_BARRIER_PHASE_RESTORE)) {
-			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous failed; VF left RUNNING (no safe "
-			       "hold)\n",
-			       v->pf_bdf, v->vf_id);
-			failed++;
-			continue;
-		}
-		v->barrier_done = true;
-		done++;
-		pr_info("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous done (initiator already RUNNING)\n", v->pf_bdf,
-			v->vf_id);
+	if (vfmig_barrier_run(&v->rz, VFMIG_BARRIER_PHASE_RESTORE)) {
+		pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous failed; VF left RUNNING (no safe hold)\n",
+		       v->pf_bdf, v->vf_id);
+		return -1;
 	}
 
-	pr_info("vfmig: RESUME_DEVICES_LATE: done=%d failed=%d\n", done, failed);
-	return failed ? -1 : 0;
+	v->barrier_done = true;
+	pr_info("vfmig: barrier[R1]: pf=%s vf_id=%u (%s) rendezvous done (initiator already RUNNING)\n", v->pf_bdf,
+		v->vf_id, v->dest_ibdev);
+	return 0;
 }
 
 /*

@@ -581,26 +581,40 @@ static int vfmig_suspend_one_vf(const char *pf_bdf, uint32_t vf_id)
  * if a VF that must be parked fails to suspend -- a dump that cannot
  * quiesce the datapath must fail rather than snapshot a live one.
  */
-int rdma_mlx5_vfmig_plugin_checkpoint_devices(int pid)
+/*
+ * Park the VF behind @ibdev before the memory snapshot.
+ *
+ * One device, one call: core dispatches this once per ibdev it captured a
+ * context on, so the de-duplication that used to live here -- this ran per
+ * pid, and a VF backs many contexts across many processes -- is gone. What
+ * a VF corresponds to in verbs terms is exactly an ib_device, which is why
+ * the core can key the dispatch on @ibdev and leave the VF to us.
+ *
+ * Every user of this VF is inside the snapshot tree by the time we get
+ * here: the plugin declares CR_RDMA_SHARING_EXCLUSIVE and
+ * rdma_check_cross_tree_exclusivity() has already refused the dump
+ * otherwise. So parking cannot stall a process that is not being
+ * checkpointed.
+ */
+int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev)
 {
 	struct vfmig_claimed_vf *c;
-	int parked = 0;
-
-	(void)pid;
 
 	if (!vfmig_active)
 		return -ENOTSUP;
 
-	for (c = vfmig_claimed_head; c; c = c->next) {
-		if (vfmig_suspended_lookup(c->pf_bdf, c->vf_id))
-			continue;
-		if (vfmig_suspend_one_vf(c->pf_bdf, c->vf_id))
-			return -1;
-		parked++;
-	}
+	for (c = vfmig_claimed_head; c; c = c->next)
+		if (!strcmp(c->ibdev, ibdev))
+			break;
+	if (!c)
+		return -ENOTSUP;
 
-	if (parked)
-		pr_info("vfmig: checkpoint: parked %d VF datapath(s) before memory dump\n", parked);
+	if (vfmig_suspended_lookup(c->pf_bdf, c->vf_id))
+		return 0;
+	if (vfmig_suspend_one_vf(c->pf_bdf, c->vf_id))
+		return -1;
+
+	pr_info("vfmig: parked VF datapath pf=%s vf_id=%u (%s) before memory dump\n", c->pf_bdf, c->vf_id, ibdev);
 	return 0;
 }
 
