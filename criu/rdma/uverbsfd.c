@@ -469,6 +469,18 @@ int rdma_capture_uverbs_contexts(struct pstree_item *root)
 	if (!root)
 		return 0;
 
+	/*
+	 * dmabuf_fds is appended to, one line per exported MR, so a file left
+	 * in the image directory by an earlier dump would put its stale fd
+	 * numbers ahead of ours -- and the cuda plugin hands the file to
+	 * cuda-checkpoint whenever it exists, even if this dump exports
+	 * nothing. Start every dump without one.
+	 */
+	if (unlinkat(get_service_fd(IMG_FD_OFF), "dmabuf_fds", 0) && errno != ENOENT) {
+		pr_perror("rdma capture: remove stale dmabuf_fds");
+		return -1;
+	}
+
 	for_each_pstree_item(item) {
 		if (!item->pid || item->pid->real <= 0)
 			continue;

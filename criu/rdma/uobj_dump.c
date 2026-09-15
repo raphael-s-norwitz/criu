@@ -68,6 +68,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -89,6 +90,7 @@
 #include "rdma.h"
 #include "rdma/internal.h"
 #include "rdma_netlink.h"
+#include "servicefd.h"
 #include "xmalloc.h"
 
 #include "images/rdma_uobj.pb-c.h"
@@ -223,6 +225,111 @@ struct rdma_query_mr_resp {
 	uint64_t user_addr;
 	uint32_t access_flags;
 };
+
+/*
+ * DMA-BUF-backed MRs: the "dmabuf_fds" image file.
+ *
+ * A dma-buf MR's pages belong to an exporter, not to the address space
+ * being dumped, so nothing in the process image describes them and
+ * RESTORE_MR has nothing to pin -- it adopts the mkey as a bare identity.
+ * Re-pointing it at the recreated buffer after restore needs a way to get
+ * from "the Nth dma-buf this checkpoint referenced" to "the fd it came back
+ * as", because a recreated dma_buf has no recognisable relationship to the
+ * original: same buffer, fresh fd number, fresh inode.
+ *
+ * The convention is deliberately minimal: one decimal fd per line, in the
+ * order the MR walk exported them. Whoever recreates the buffers rewrites
+ * each line's fd in place -- never reordering, never dropping -- and the
+ * binder walks dma-buf MRs in this same order.
+ *
+ * Position is the only link, so the order here and the order the binder
+ * uses must both be the MR walk's. That is NLDEV enumeration order,
+ * deterministic for a given image, and the binder cross-checks the line
+ * count against the number of dma-buf MRs it finds.
+ *
+ * The exported fds stay open for the rest of the dump: the recreator
+ * records them by fd, so closing them here would invalidate the file
+ * before anyone read it.
+ */
+#define DMABUF_FDS_IMG "dmabuf_fds"
+
+static int dmabuf_fds_append(int fd)
+{
+	char line[32];
+	int img_fd, len, ret;
+
+	img_fd = openat(get_service_fd(IMG_FD_OFF), DMABUF_FDS_IMG,
+			O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+	if (img_fd < 0) {
+		pr_perror("uobj DAG: open %s", DMABUF_FDS_IMG);
+		return -1;
+	}
+
+	len = snprintf(line, sizeof(line), "%d\n", fd);
+	ret = write(img_fd, line, len) == len ? 0 : -1;
+	if (ret)
+		pr_perror("uobj DAG: write %s", DMABUF_FDS_IMG);
+	close(img_fd);
+	return ret;
+}
+
+/*
+ * UAPI lag shim for the DMA-BUF MR methods on UVERBS_OBJECT_MR (enum
+ * uverbs_methods_mr / uverbs_attrs_mr_*_dmabuf_ids in the kernel's
+ * include/uapi/rdma/ib_user_ioctl_cmds.h), same numeric-copy rationale as
+ * the RESTORE_* blocks in uobj_restore.c: the kernel matches by integer at
+ * wire time, never by enumerator name, so a stable copy here is enough to
+ * drive a kernel that has the support, and one that does not returns
+ * -EOPNOTSUPP for the unknown method -- the already-handled "kernel too
+ * old" signal. Without these, criu builds only against freshly installed
+ * kernel headers, which is not a requirement anywhere else in the tree.
+ */
+#ifndef UVERBS_METHOD_MR_EXPORT_DMABUF_FD
+#define UVERBS_METHOD_MR_EXPORT_DMABUF_FD 6
+#endif
+#ifndef UVERBS_ATTR_MR_EXPORT_DMABUF_FD_HANDLE
+#define UVERBS_ATTR_MR_EXPORT_DMABUF_FD_HANDLE 0
+#endif
+#ifndef UVERBS_ATTR_MR_EXPORT_DMABUF_FD_RESP_FD
+#define UVERBS_ATTR_MR_EXPORT_DMABUF_FD_RESP_FD 1
+#endif
+
+/*
+ * Export the dma_buf behind MR @handle, if it has one.
+ *
+ * Doubles as the "is this a dma-buf MR?" test: the verb answers
+ * -EOPNOTSUPP for an MR that is not DMA-BUF-backed, so no separate query
+ * is needed. Returns the new fd, -ENOTSUP for an ordinary MR, or -errno.
+ */
+static int rdma_export_mr_dmabuf_fd(int cmd_fd, uint32_t driver_id, uint32_t handle)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[2];
+	} cmd = {};
+	int32_t out_fd = -1;
+
+	cmd.hdr.length = sizeof(cmd.hdr) + 2 * sizeof(cmd.attrs[0]);
+	cmd.hdr.object_id = UVERBS_OBJECT_MR;
+	cmd.hdr.method_id = UVERBS_METHOD_MR_EXPORT_DMABUF_FD;
+	cmd.hdr.num_attrs = 2;
+	/* Core uverb, but the dispatcher validates driver_id regardless. */
+	cmd.hdr.driver_id = driver_id;
+
+	cmd.attrs[0].attr_id = UVERBS_ATTR_MR_EXPORT_DMABUF_FD_HANDLE;
+	cmd.attrs[0].len = 0;
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = handle;
+
+	cmd.attrs[1].attr_id = UVERBS_ATTR_MR_EXPORT_DMABUF_FD_RESP_FD;
+	cmd.attrs[1].len = sizeof(out_fd);
+	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].data = (uintptr_t)&out_fd;
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd))
+		return -errno;
+	return out_fd;
+}
 
 /*
  * Issue UVERBS_METHOD_QUERY_MR on @cmd_fd (the holder's dup'd uverbs
@@ -624,6 +731,25 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	if (rc) {
 		pr_err("uobj DAG: QUERY_MR handle=%u on ibdev=%s driver=%u failed: %d (%s)\n", e->ufile_handle,
 		       w->ib->ibdev, uf->kernel_driver_id, rc, strerror(rc < 0 ? -rc : rc));
+		return (w->err = -1);
+	}
+
+	/*
+	 * If this MR is DMA-BUF-backed, record its buffer now. resp.user_addr
+	 * is 0 for such an MR (its pages are the exporter's), which is what
+	 * makes RESTORE_MR adopt it unbacked; the line written here is how the
+	 * restore side finds the recreated buffer to bind it to.
+	 */
+	rc = rdma_export_mr_dmabuf_fd(uf->holder_uctx_fd, uf->kernel_driver_id, e->ufile_handle);
+	if (rc >= 0) {
+		pr_debug("uobj DAG: MR handle=%u on ibdev=%s is dma-buf backed, exported fd=%d\n",
+			 e->ufile_handle, w->ib->ibdev, rc);
+		if (dmabuf_fds_append(rc))
+			return (w->err = -1);
+		/* Left open on purpose -- see DMABUF_FDS_IMG above. */
+	} else if (rc != -EOPNOTSUPP) {
+		pr_err("uobj DAG: MR_EXPORT_DMABUF_FD handle=%u on ibdev=%s failed: %d (%s)\n",
+		       e->ufile_handle, w->ib->ibdev, rc, strerror(-rc));
 		return (w->err = -1);
 	}
 
