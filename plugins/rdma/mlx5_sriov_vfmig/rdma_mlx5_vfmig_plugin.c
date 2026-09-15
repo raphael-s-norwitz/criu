@@ -184,14 +184,16 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 	 * success and failure paths, so a failed dump never strands a VF in
 	 * STOP. The resume must follow the drain: SAVE captures the parked
 	 * VF as-is, so quiescing it until after the blob is read keeps the
-	 * capture consistent.
+	 * capture consistent. On a failed dump core has normally resumed
+	 * them already, before rebinding the MRs, and lifted the fences
+	 * after; this is the backstop for a resume that did not happen. The
+	 * fences are core's alone to lift: one left up guards an MR core
+	 * could not rebind.
 	 */
 	if (stage == CR_PLUGIN_STAGE__DUMP) {
 		if (ret == 0)
 			vfmig_drain_claimed_in_fini();
 		vfmig_resume_suspended_vfs();
-		if (ret != 0)
-			vfmig_lift_claimed_fences();
 	}
 
 	/*

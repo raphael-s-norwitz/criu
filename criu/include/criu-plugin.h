@@ -414,11 +414,18 @@ enum {
 	 * @ibdev is the core's name for the device; a plugin maps it to
 	 * whatever its hardware actually quiesces (for mlx5 SR-IOV
 	 * migration, the VF behind it). Resuming is the plugin's own
-	 * business on the dump path -- it already owns a fini(DUMP) drain
+	 * business on a completed dump -- it already owns a fini(DUMP) drain
 	 * that un-parks exactly what it parked.
 	 *
+	 * On an aborted dump core calls the hook again with @resume set,
+	 * before it rebinds the DMA-BUF MRs the walk unbound: the rebind
+	 * issues device commands, which a parked device cannot complete. That
+	 * happens inside cr_plugin_fini(DUMP), after the exit hooks of the
+	 * plugins that are not RDMA-class and before this plugin's own.
+	 *
 	 * Return: 0 on success, -ENOTSUP if the plugin does not own @ibdev,
-	 * < 0 errno on failure. A failure aborts the dump.
+	 * < 0 errno on failure. A failure to suspend aborts the dump; a
+	 * failure to resume is logged.
 	 */
 	CR_PLUGIN_HOOK__RDMA_SUSPEND_IBDEV = 28,
 
@@ -468,12 +475,20 @@ enum {
 	 * Dispatched once per captured ibdev, after its QPs are walked and
 	 * before its MRs, routed by CR_PLUGIN_RDMA_PROVIDED_DRIVER like
 	 * RDMA_SUSPEND_IBDEV. After the QPs because a fence drops the ACKs
-	 * their outstanding sends still wait for. Undoing it is the plugin's
-	 * business: on the source it must outlive the dumpee, and a device
-	 * state that is saved with it carries it to the destination.
+	 * their outstanding sends still wait for. After a completed dump,
+	 * undoing it is the plugin's business: on the source it must outlive
+	 * the dumpee, and a device state that is saved with it carries it to
+	 * the destination.
+	 *
+	 * On an aborted dump core calls the hook again with @lift set, once
+	 * it has rebound the ibdev's DMA-BUF MRs: lifted any earlier, the
+	 * peers' writes land on MRs that are still unbound. An ibdev with an
+	 * MR that could not be rebound is left fenced. Like the resume, this
+	 * runs inside cr_plugin_fini(DUMP), before this plugin's exit hook.
 	 *
 	 * Return: 0 on success, -ENOTSUP if the plugin does not own @ibdev or
-	 * has nothing to fence, < 0 errno on failure. A failure aborts the dump.
+	 * has nothing to fence, < 0 errno on failure. A failure to fence
+	 * aborts the dump; a failure to lift is logged.
 	 */
 	CR_PLUGIN_HOOK__RDMA_FENCE_IBDEV = 30,
 
@@ -565,9 +580,9 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_MR_UHW_PACK, const Rd
 			 struct rdma_uhw_spec *uhw);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_CQ_NEEDS_PIE, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE, void);
-DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_SUSPEND_IBDEV, const char *ibdev);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_SUSPEND_IBDEV, const char *ibdev, bool resume);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESUME_IBDEV, const UverbsFileEntry *uvfe);
-DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_FENCE_IBDEV, const char *ibdev);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_FENCE_IBDEV, const char *ibdev, bool lift);
 
 /*
  * RDMA sharing policy.

@@ -245,16 +245,15 @@ int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase);
  * vfmig_resume_suspended_vfs() resumes that set (RESUME_VHCA) from
  * fini(DUMP); vfmig_suspended_clear() drops it at init()/fini() reset.
  */
-int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev);
+int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev, bool resume);
 void vfmig_resume_suspended_vfs(void);
 
 /*
  * RDMA_FENCE_IBDEV: fence the VF behind @ibdev before the uobject walk,
- * keeping the handles in its claimed-VF entry. vfmig_lift_claimed_fences()
- * lifts them again after a failed dump.
+ * keeping the handles in its claimed-VF entry; with @lift, lift it again
+ * after a failed dump.
  */
-int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev);
-void vfmig_lift_claimed_fences(void);
+int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift);
 void vfmig_suspended_clear(void);
 
 /*

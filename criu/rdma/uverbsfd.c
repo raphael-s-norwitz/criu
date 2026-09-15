@@ -857,7 +857,7 @@ struct dmabuf_bind_ctx {
  * the restore half of the UNBIND_DMABUF issued at dump; -EINVAL if the
  * MR is not in the unbound state, -EOPNOTSUPP if the driver lacks it.
  */
-static int rdma_send_bind_dmabuf_mr(int cmd_fd, uint32_t driver_id, uint32_t handle, int dmabuf_fd)
+int rdma_send_bind_dmabuf_mr(int cmd_fd, uint32_t driver_id, uint32_t handle, int dmabuf_fd)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;

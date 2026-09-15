@@ -2109,6 +2109,11 @@ static int cr_dump_finish(int ret)
 	if (arch_set_thread_regs(root_item, true) < 0)
 		return -1;
 
+	/*
+	 * Also finishes the RDMA side of the dump, between the device
+	 * plugins' exit hooks and the RDMA plugins' -- see rdma_finish_dump()
+	 * for what an aborted dump puts back, and in which order.
+	 */
 	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 
 	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
@@ -2267,6 +2272,24 @@ int cr_dump_tasks(pid_t pid)
 
 	if (checkpoint_devices())
 		goto err;
+
+	if (fault_injected(FI_DUMP_AFTER_RDMA_UNBIND)) {
+		pr_err("fault injection: failing the dump with the DMA-BUF MRs unbound\n");
+		goto err;
+	}
+
+	/*
+	 * The GPU plugins have had their look at the exported dma-buf fds,
+	 * so drop them: each is a reference on the exporter's buffer, which
+	 * is the memory a checkpoint exists to release. An abort from here on
+	 * rebinds the MRs to the buffers the plugins' rollback recreates.
+	 */
+	rdma_release_exported_dmabufs();
+
+	if (fault_injected(FI_DUMP_AFTER_DMABUF_RELEASE)) {
+		pr_err("fault injection: failing the dump with the exported dma-bufs released\n");
+		goto err;
+	}
 
 	if (collect_pstree_ids())
 		goto err;
