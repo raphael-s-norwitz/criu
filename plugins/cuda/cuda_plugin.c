@@ -697,10 +697,27 @@ int cuda_plugin_checkpoint_devices(int pid)
 		return -1;
 	}
 
-	task_info->checkpointed = 1;
 	status = cuda_process_checkpoint_action(pid, ACTION_CHECKPOINT, 0, msg_buf, sizeof(msg_buf));
 	if (status) {
 		pr_err("CHECKPOINT_DEVICES failed with %s\n", msg_buf);
+		/*
+		 * This flag is what makes the dump-abort path attempt an
+		 * ACTION_RESTORE to unwind. Setting it before the action, as
+		 * this did, meant a checkpoint that failed outright was still
+		 * "rolled back" -- and the restore of a process that was never
+		 * checkpointed fails with "the operation cannot be performed
+		 * in the present state", a second error that reads like an
+		 * independent fault and buries the real one.
+		 *
+		 * Assuming the other way is no better: a checkpoint can fail
+		 * partway and leave state that genuinely needs unwinding. So
+		 * ask rather than assume.
+		 */
+		task_info->checkpointed = (get_cuda_state(pid) == CUDA_TASK_CHECKPOINTED);
+		if (task_info->checkpointed)
+			pr_info("cuda: checkpoint failed but pid %d is checkpointed; will unwind\n", pid);
+	} else {
+		task_info->checkpointed = 1;
 	}
 
 	/*
