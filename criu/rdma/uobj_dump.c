@@ -317,6 +317,40 @@ static int dmabuf_fds_append(int fd, uint32_t *index_out)
 #ifndef UVERBS_ATTR_MR_EXPORT_DMABUF_FD_RESP_FD
 #define UVERBS_ATTR_MR_EXPORT_DMABUF_FD_RESP_FD 1
 #endif
+#ifndef UVERBS_METHOD_MR_UNBIND_DMABUF
+#define UVERBS_METHOD_MR_UNBIND_DMABUF 7
+#endif
+#ifndef UVERBS_ATTR_MR_UNBIND_DMABUF_HANDLE
+#define UVERBS_ATTR_MR_UNBIND_DMABUF_HANDLE 0
+#endif
+
+/*
+ * Detach MR @handle from its dma-buf, keeping the key. Core uverb, so it
+ * is driver-agnostic; a driver that does not implement it answers
+ * -EOPNOTSUPP, same as a kernel too old to know the method at all.
+ */
+static int rdma_send_unbind_dmabuf_mr(int cmd_fd, uint32_t driver_id, uint32_t handle)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[1];
+	} cmd = {};
+
+	cmd.hdr.length = sizeof(cmd.hdr) + sizeof(cmd.attrs[0]);
+	cmd.hdr.object_id = UVERBS_OBJECT_MR;
+	cmd.hdr.method_id = UVERBS_METHOD_MR_UNBIND_DMABUF;
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.driver_id = driver_id;
+
+	cmd.attrs[0].attr_id = UVERBS_ATTR_MR_UNBIND_DMABUF_HANDLE;
+	cmd.attrs[0].len = 0;
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[0].data = handle;
+
+	if (ioctl(cmd_fd, RDMA_VERBS_IOCTL, &cmd))
+		return -errno;
+	return 0;
+}
 
 /*
  * Export the dma_buf behind MR @handle, if it has one.
@@ -761,10 +795,18 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	}
 
 	/*
-	 * If this MR is DMA-BUF-backed, record its buffer now. resp.user_addr
-	 * is 0 for such an MR (its pages are the exporter's), which is what
-	 * makes RESTORE_MR adopt it unbacked; the line written here is how the
-	 * restore side finds the recreated buffer to bind it to.
+	 * If this MR is DMA-BUF-backed, record its buffer and then separate
+	 * the MR from it. The record is how the restore side finds the
+	 * recreated buffer to bind to; the separation is what makes the
+	 * device state worth saving at all, since the DMA addresses in the
+	 * MR's translations name the exporter's memory and cannot be
+	 * reproduced anywhere else.
+	 *
+	 * Unbinding is criu's job, not the application's. A process being
+	 * checkpointed has no reason to know it is being checkpointed, and
+	 * an MR left bound is saved describing memory that will be gone --
+	 * and comes back as a live mkey, which the device then refuses to
+	 * re-point.
 	 */
 	rc = rdma_export_mr_dmabuf_fd(uf->holder_uctx_fd, uf->kernel_driver_id, e->ufile_handle);
 	if (rc >= 0) {
@@ -776,6 +818,15 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 		/* Left open, and inheritable -- see DMABUF_FDS_IMG above. */
 		if (fcntl(rc, F_SETFD, 0))
 			pr_perror("uobj DAG: clear CLOEXEC on exported dma-buf fd %d", rc);
+
+		rc = rdma_send_unbind_dmabuf_mr(uf->holder_uctx_fd, uf->kernel_driver_id,
+						e->ufile_handle);
+		if (rc) {
+			pr_err("uobj DAG: UNBIND_DMABUF handle=%u on ibdev=%s failed: %d (%s)\n",
+			       e->ufile_handle, w->ib->ibdev, rc, strerror(-rc));
+			return (w->err = -1);
+		}
+		pr_debug("uobj DAG: MR handle=%u unbound from its dma-buf\n", e->ufile_handle);
 	} else if (rc != -EOPNOTSUPP) {
 		pr_err("uobj DAG: MR_EXPORT_DMABUF_FD handle=%u on ibdev=%s failed: %d (%s)\n",
 		       e->ufile_handle, w->ib->ibdev, rc, strerror(-rc));
