@@ -329,6 +329,115 @@ static int dmabuf_fds_append(int fd, uint32_t *index_out)
  * is driver-agnostic; a driver that does not implement it answers
  * -EOPNOTSUPP, same as a kernel too old to know the method at all.
  */
+/*
+ * Every ibdev this dump has parked or fenced, so an aborted dump can undo
+ * both, in order, while the plugins are still loaded. @unbacked marks an
+ * ibdev with an MR the rollback could not rebind, or whose buffers were
+ * already released: its fence must stay up.
+ */
+struct rdma_held_ibdev {
+	struct rdma_held_ibdev *next;
+	uint32_t criu_driver;
+	char ibdev[64];
+	bool suspended;
+	bool fenced;
+	bool unbacked;
+};
+
+static struct rdma_held_ibdev *rdma_held_ibdevs;
+
+static struct rdma_held_ibdev *rdma_find_held_ibdev(const char *ibdev)
+{
+	struct rdma_held_ibdev *h;
+
+	for (h = rdma_held_ibdevs; h; h = h->next)
+		if (!strcmp(h->ibdev, ibdev))
+			return h;
+	return NULL;
+}
+
+/*
+ * Find or add @ibdev's record. Called before the device is changed, so
+ * that running out of memory fails the dump with nothing to undo.
+ */
+static struct rdma_held_ibdev *rdma_hold_ibdev(uint32_t criu_driver, const char *ibdev)
+{
+	struct rdma_held_ibdev *h = rdma_find_held_ibdev(ibdev);
+
+	if (h)
+		return h;
+	h = xzalloc(sizeof(*h));
+	if (!h)
+		return NULL;
+	h->criu_driver = criu_driver;
+	snprintf(h->ibdev, sizeof(h->ibdev), "%s", ibdev);
+	h->next = rdma_held_ibdevs;
+	rdma_held_ibdevs = h;
+	return h;
+}
+
+/*
+ * Every MR this dump has unbound, with the fd its buffer was exported to
+ * and the line of dmabuf_fds that fd was recorded on.
+ *
+ * The unbind is the one step of the dump that changes the dumpee: its MR
+ * stops describing anything. Every other device-side change we make is
+ * undone if the dump aborts -- vfmig un-parks the VF, the cuda plugin
+ * unwinds its checkpoint -- so this follows the same convention rather
+ * than leaving a resumed process holding dead lkeys.
+ *
+ * What an aborted dump rebinds to depends on how far it got. Before a
+ * device plugin checkpointed the buffer, the exported fd still names the
+ * memory the process uses. After, the plugin's rollback recreates the
+ * buffer and rewrites the MR's line of dmabuf_fds with the fd it came back
+ * as, and that is the one to bind -- the exported fd names memory the
+ * process no longer has. So the record outlives the release of the
+ * exported fd (@dmabuf_fd becomes -1 then), and is dropped only when the
+ * dump finishes.
+ */
+struct rdma_unbound_mr {
+	struct rdma_unbound_mr *next;
+	int uctx_fd;
+	uint32_t driver_id;
+	uint32_t handle;
+	int dmabuf_fd;
+	uint32_t index;
+	char ibdev[64];
+};
+
+static struct rdma_unbound_mr *rdma_unbound_mrs;
+
+static void rdma_note_unbound_mr(int uctx_fd, uint32_t driver_id, uint32_t handle, int dmabuf_fd, uint32_t index,
+				 const char *ibdev)
+{
+	struct rdma_unbound_mr *u = xzalloc(sizeof(*u));
+
+	if (!u) {
+		pr_err("uobj DAG: out of memory recording unbound MR handle=%u for rollback\n", handle);
+		return;
+	}
+	/*
+	 * Our own dup of the holder cdev, not @uctx_fd itself: the walk's
+	 * dups are closed the moment it finishes (see rdma_capture_uobj_dag),
+	 * well before the abort path could want to rebind, and by then the
+	 * number may name something else entirely -- another ufile, whose
+	 * MR handles mean something different.
+	 */
+	u->uctx_fd = fcntl(uctx_fd, F_DUPFD_CLOEXEC, 0);
+	if (u->uctx_fd < 0) {
+		pr_perror("uobj DAG: dup holder cdev for rollback of MR handle=%u", handle);
+		xfree(u);
+		return;
+	}
+	u->driver_id = driver_id;
+	u->handle = handle;
+	u->dmabuf_fd = dmabuf_fd;
+	u->index = index;
+	snprintf(u->ibdev, sizeof(u->ibdev), "%s", ibdev);
+	u->next = rdma_unbound_mrs;
+	rdma_unbound_mrs = u;
+}
+
 static int rdma_send_unbind_dmabuf_mr(int cmd_fd, uint32_t driver_id, uint32_t handle)
 {
 	struct {
@@ -810,14 +919,16 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 	 */
 	rc = rdma_export_mr_dmabuf_fd(uf->holder_uctx_fd, uf->kernel_driver_id, e->ufile_handle);
 	if (rc >= 0) {
+		int dmabuf_fd = rc; /* rc is reused for the unbind below */
+
 		pr_debug("uobj DAG: MR handle=%u on ibdev=%s is dma-buf backed, exported fd=%d\n",
-			 e->ufile_handle, w->ib->ibdev, rc);
-		if (dmabuf_fds_append(rc, &dmabuf_index))
+			 e->ufile_handle, w->ib->ibdev, dmabuf_fd);
+		if (dmabuf_fds_append(dmabuf_fd, &dmabuf_index))
 			return (w->err = -1);
 		has_dmabuf_index = true;
 		/* Left open, and inheritable -- see DMABUF_FDS_IMG above. */
-		if (fcntl(rc, F_SETFD, 0))
-			pr_perror("uobj DAG: clear CLOEXEC on exported dma-buf fd %d", rc);
+		if (fcntl(dmabuf_fd, F_SETFD, 0))
+			pr_perror("uobj DAG: clear CLOEXEC on exported dma-buf fd %d", dmabuf_fd);
 
 		rc = rdma_send_unbind_dmabuf_mr(uf->holder_uctx_fd, uf->kernel_driver_id,
 						e->ufile_handle);
@@ -826,6 +937,8 @@ static int uobj_mr_cb(const struct rdma_nl_res_entry *e, void *arg)
 			       e->ufile_handle, w->ib->ibdev, rc, strerror(-rc));
 			return (w->err = -1);
 		}
+		rdma_note_unbound_mr(uf->holder_uctx_fd, uf->kernel_driver_id, e->ufile_handle, dmabuf_fd,
+				     dmabuf_index, w->ib->ibdev);
 		pr_debug("uobj DAG: MR handle=%u unbound from its dma-buf\n", e->ufile_handle);
 	} else if (rc != -EOPNOTSUPP) {
 		pr_err("uobj DAG: MR_EXPORT_DMABUF_FD handle=%u on ibdev=%s failed: %d (%s)\n",
@@ -1161,6 +1274,7 @@ int rdma_capture_uobj_dag(void)
 {
 	struct rdma_dumped_ufile *uf;
 	struct uobj_ibdev *ib, *ib_next;
+	struct rdma_held_ibdev *held;
 	LIST_HEAD(ibdevs);
 	int ret = -1;
 
@@ -1264,11 +1378,18 @@ int rdma_capture_uobj_dag(void)
 		 * the QPs above had to see their own traffic acknowledged, and
 		 * a fence drops the ACKs too.
 		 */
-		r = rdma_dispatch_fence_ibdev(ib->ufiles[0]->criu_driver, ib->ibdev);
+		held = rdma_hold_ibdev(ib->ufiles[0]->criu_driver, ib->ibdev);
+		if (!held) {
+			pr_err("uobj DAG: out of memory recording ibdev '%s' for rollback\n", ib->ibdev);
+			goto out;
+		}
+		r = rdma_dispatch_fence_ibdev(ib->ufiles[0]->criu_driver, ib->ibdev, false);
 		if (r < 0 && r != -ENOTSUP) {
 			pr_err("uobj DAG: fence of ibdev '%s' failed: %d\n", ib->ibdev, r);
 			goto out;
 		}
+		if (r == 0)
+			held->fenced = true;
 
 		r = rdma_nl_for_each_resource(ib->dev_index, ib->ibdev, RDMA_NL_RES_MR, uobj_mr_cb, &w);
 		if (r < 0 || w.err) {
@@ -1382,6 +1503,7 @@ out:
 int rdma_suspend_captured_ibdevs(void)
 {
 	struct rdma_dumped_ufile *uf, *prev;
+	struct rdma_held_ibdev *held;
 	int suspended = 0, ret;
 
 	list_for_each_entry(uf, &rdma_dumped_ufiles, link) {
@@ -1399,7 +1521,12 @@ int rdma_suspend_captured_ibdevs(void)
 		if (seen)
 			continue;
 
-		ret = rdma_dispatch_suspend_ibdev(uf->criu_driver, uf->ibdev);
+		held = rdma_hold_ibdev(uf->criu_driver, uf->ibdev);
+		if (!held) {
+			pr_err("uobj DAG: out of memory recording ibdev=%s for rollback\n", uf->ibdev);
+			return -1;
+		}
+		ret = rdma_dispatch_suspend_ibdev(uf->criu_driver, uf->ibdev, false);
 		if (ret == -ENOTSUP)
 			continue;
 		if (ret < 0) {
@@ -1407,10 +1534,194 @@ int rdma_suspend_captured_ibdevs(void)
 			       uf->criu_driver, ret);
 			return -1;
 		}
+		held->suspended = true;
 		suspended++;
 	}
 
 	if (suspended)
 		pr_info("uobj DAG: quiesced %d ibdev datapath(s) before the memory dump\n", suspended);
 	return 0;
+}
+
+/*
+ * Drop the exported fds once the device plugins have checkpointed the
+ * buffers behind them.
+ *
+ * Holding an exported fd keeps the exporter's buffer alive, which is the
+ * memory a GPU checkpoint exists to release. The records stay: an abort
+ * after this point still rebinds, to whatever a device plugin's rollback
+ * recreates (see struct rdma_unbound_mr).
+ */
+void rdma_release_exported_dmabufs(void)
+{
+	struct rdma_unbound_mr *u;
+	int closed = 0;
+
+	for (u = rdma_unbound_mrs; u; u = u->next) {
+		if (u->dmabuf_fd < 0)
+			continue;
+		if (close(u->dmabuf_fd) == 0)
+			closed++;
+		u->dmabuf_fd = -1;
+	}
+
+	if (closed)
+		pr_info("uobj DAG: released %d exported DMA-BUF fd(s)\n", closed);
+}
+
+/*
+ * The fd on line @index of dmabuf_fds, or -1. A device plugin that
+ * recreated the buffers during its rollback has rewritten the lines with
+ * the fds they came back as, in this process's table.
+ */
+static int dmabuf_fds_line(uint32_t index)
+{
+	char line[32];
+	uint32_t i = 0;
+	int img_fd, fd = -1;
+	FILE *f;
+
+	img_fd = openat(get_service_fd(IMG_FD_OFF), DMABUF_FDS_IMG, O_RDONLY | O_CLOEXEC);
+	if (img_fd < 0)
+		return -1;
+	f = fdopen(img_fd, "r");
+	if (!f) {
+		close(img_fd);
+		return -1;
+	}
+	while (fgets(line, sizeof(line), f)) {
+		if (i++ == index) {
+			fd = atoi(line);
+			break;
+		}
+	}
+	fclose(f);
+	return fd;
+}
+
+/*
+ * Rebind every MR this dump unbound, for an aborted dump whose process is
+ * about to run again.
+ *
+ * To the buffer a device plugin recreated, if its line of dmabuf_fds now
+ * names a different fd than the one exported -- the plugin had
+ * checkpointed the buffer and has restored it. Otherwise to the exported
+ * fd, if it is still open: nothing was checkpointed and it still names the
+ * process's memory. With neither, the MR stays unbacked and its ibdev keeps
+ * its fence.
+ *
+ * A rebind failure is reported and the walk continues: the dump has
+ * already failed, and abandoning the remaining MRs would make that worse.
+ */
+static void rdma_rebind_unbound_mrs(void)
+{
+	int rebound = 0, recreated = 0, failed = 0;
+	struct rdma_unbound_mr *u;
+
+	for (u = rdma_unbound_mrs; u; u = u->next) {
+		int line_fd = dmabuf_fds_line(u->index);
+		int fd = u->dmabuf_fd;
+		int ret;
+
+		if (line_fd >= 0 && line_fd != u->dmabuf_fd) {
+			fd = line_fd;
+			recreated++;
+		}
+		if (fd < 0) {
+			pr_err("uobj DAG: rollback: MR handle=%u on ibdev=%s has no buffer to rebind to; "
+			       "it stays unbacked\n",
+			       u->handle, u->ibdev);
+			ret = -ENOENT;
+		} else {
+			ret = rdma_send_bind_dmabuf_mr(u->uctx_fd, u->driver_id, u->handle, fd);
+			if (ret)
+				pr_err("uobj DAG: rollback: MR handle=%u on ibdev=%s could not be rebound to fd %d: "
+				       "%d (%s); it stays unbacked\n",
+				       u->handle, u->ibdev, fd, ret, strerror(-ret));
+		}
+		if (ret) {
+			struct rdma_held_ibdev *h = rdma_find_held_ibdev(u->ibdev);
+
+			if (h)
+				h->unbacked = true;
+			failed++;
+		} else {
+			rebound++;
+		}
+	}
+
+	if (rebound || failed)
+		pr_warn("uobj DAG: dump aborted: rebound %d MR(s), %d left unbacked (%d to a recreated buffer)\n",
+			rebound, failed, recreated);
+}
+
+/*
+ * Drop the unbound-MR records and whatever fds they still hold. The fds a
+ * device plugin imported into dmabuf_fds are not ours to close: the plugin
+ * put them there, and a bound MR holds its own reference anyway.
+ */
+static void rdma_forget_unbound_mrs(void)
+{
+	struct rdma_unbound_mr *u, *n;
+
+	for (u = rdma_unbound_mrs; u; u = n) {
+		n = u->next;
+		if (u->dmabuf_fd >= 0)
+			close(u->dmabuf_fd);
+		close(u->uctx_fd);
+		xfree(u);
+	}
+	rdma_unbound_mrs = NULL;
+}
+
+/*
+ * Finish the dump's RDMA side, from cr_plugin_fini(): after the device
+ * plugins' exit hooks, before the RDMA plugins'.
+ *
+ * On an aborted dump, put the ibdevs back as the process left them:
+ * resume, rebind, lift -- each step needs the one before it. A rebind
+ * issues device commands a parked device cannot complete, and a fence
+ * lifted before the rebind lets peers' writes land on MRs that are still
+ * unbound. The rebind must also follow the device plugins' rollback, which
+ * is what recreates a checkpointed buffer; and the resume and lift need
+ * the RDMA plugins, which is why they are torn down last.
+ */
+void rdma_finish_dump(bool aborted)
+{
+	struct rdma_held_ibdev *h, *n;
+	int r;
+
+	if (aborted) {
+		for (h = rdma_held_ibdevs; h; h = h->next) {
+			if (!h->suspended)
+				continue;
+			r = rdma_dispatch_suspend_ibdev(h->criu_driver, h->ibdev, true);
+			if (r < 0)
+				pr_err("uobj DAG: dump aborted: resume of ibdev=%s failed: %d\n", h->ibdev, r);
+		}
+
+		rdma_rebind_unbound_mrs();
+
+		for (h = rdma_held_ibdevs; h; h = h->next) {
+			if (!h->fenced)
+				continue;
+			if (h->unbacked) {
+				pr_err("uobj DAG: dump aborted: ibdev=%s has an unbacked MR; leaving it fenced\n",
+				       h->ibdev);
+				continue;
+			}
+			r = rdma_dispatch_fence_ibdev(h->criu_driver, h->ibdev, true);
+			if (r < 0)
+				pr_err("uobj DAG: dump aborted: lifting the fence on ibdev=%s failed: %d\n", h->ibdev,
+				       r);
+		}
+	}
+
+	rdma_forget_unbound_mrs();
+
+	for (h = rdma_held_ibdevs; h; h = n) {
+		n = h->next;
+		xfree(h);
+	}
+	rdma_held_ibdevs = NULL;
 }

@@ -396,30 +396,6 @@ static const char *dmabuf_fds_path(char *buf, size_t len)
  * The numbers stay in the file. They are the dump-side record, and the
  * restore side rewrites them wholesale rather than resolving them.
  */
-static void dmabuf_fds_release(void)
-{
-	char path[PATH_MAX];
-	char line[32];
-	int n = 0;
-	FILE *f;
-
-	if (!dmabuf_fds_path(path, sizeof(path)))
-		return;
-
-	f = fopen(path, "r");
-	if (!f)
-		return;
-	while (fgets(line, sizeof(line), f)) {
-		if (line[0] == '\n' || line[0] == '\0')
-			continue;
-		if (close(atoi(line)) == 0)
-			n++;
-	}
-	fclose(f);
-
-	if (n)
-		pr_info("cuda: released %d exported DMA-BUF fd(s)\n", n);
-}
 
 /*
  * Pull the recreated DMA-BUF fds out of the restored process and into our
@@ -719,15 +695,6 @@ int cuda_plugin_checkpoint_devices(int pid)
 	} else {
 		task_info->checkpointed = 1;
 	}
-
-	/*
-	 * Whether or not that succeeded: these fds are ours, opened by
-	 * MR_EXPORT_DMABUF_FD during the uobject walk, and each is a
-	 * reference on the exporter's buffer -- exactly the memory the
-	 * checkpoint exists to release. cuda-checkpoint has had its look at
-	 * them by now either way.
-	 */
-	dmabuf_fds_release();
 
 	int_ret = interrupt_restore_thread(restore_tid, &save_sigset);
 	return status != 0 ? -1 : int_ret;

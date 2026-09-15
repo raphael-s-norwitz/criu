@@ -106,4 +106,11 @@ int rdma_bind_dumped_ufile_id(pid_t pid, bool has_ctxn, uint32_t ctxn,
  */
 int rdma_capture_uobj_dag(void);
 
+/*
+ * UVERBS_METHOD_MR_BIND_DMABUF on @handle. Used by the restore-side late
+ * bind pass, and by the dump-side rollback in uobj_dump.c when an aborted
+ * dump has to put back the MRs it unbound.
+ */
+int rdma_send_bind_dmabuf_mr(int cmd_fd, uint32_t driver_id, uint32_t handle, int dmabuf_fd);
+
 #endif /* __CR_RDMA_INTERNAL_H__ */

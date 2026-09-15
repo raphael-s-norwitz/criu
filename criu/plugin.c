@@ -13,6 +13,7 @@
 #include "servicefd.h"
 #include "common/list.h"
 #include "log.h"
+#include "rdma.h"
 
 cr_plugin_ctl_t cr_plugin_ctl = {
 	.head.next = &cr_plugin_ctl.head,
@@ -183,27 +184,54 @@ error_close:
 	return -1;
 }
 
+static void cr_plugin_teardown(plugin_desc_t *this, int stage, int ret)
+{
+	void *h = this->dlhandle;
+	size_t i;
+
+	list_del(&this->list);
+	if (this->d->exit)
+		this->d->exit(stage, ret);
+
+	for (i = 0; i < this->d->max_hooks; i++) {
+		if (!list_empty(&this->link[i]))
+			list_del(&this->link[i]);
+	}
+
+	if (this->d->version == CRIU_PLUGIN_VERSION_OLD)
+		xfree(this->d);
+	dlclose(h);
+}
+
+/* An RDMA-class plugin: one the RDMA dispatchers route ibdevs to. */
+static bool cr_plugin_is_rdma(plugin_desc_t *this)
+{
+	return this->dlhandle && dlsym(this->dlhandle, CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+}
+
+/*
+ * Tear the plugins down, RDMA-class ones last, finishing the dump's RDMA
+ * work in between.
+ *
+ * A device plugin rolls its device back from its exit hook when a dump
+ * fails -- cuda recreates the GPU buffers there -- and an aborted dump's
+ * RDMA rollback must come after that, because the MRs it rebinds have to
+ * point at the recreated buffers. It also needs the RDMA plugins, to
+ * resume the ibdevs and lift their fences, so they go last.
+ */
 void cr_plugin_fini(int stage, int ret)
 {
 	plugin_desc_t *this, *tmp;
 
-	list_for_each_entry_safe(this, tmp, &cr_plugin_ctl.head, list) {
-		void *h = this->dlhandle;
-		size_t i;
+	list_for_each_entry_safe(this, tmp, &cr_plugin_ctl.head, list)
+		if (!cr_plugin_is_rdma(this))
+			cr_plugin_teardown(this, stage, ret);
 
-		list_del(&this->list);
-		if (this->d->exit)
-			this->d->exit(stage, ret);
+	if (stage == CR_PLUGIN_STAGE__DUMP)
+		rdma_finish_dump(ret != 0);
 
-		for (i = 0; i < this->d->max_hooks; i++) {
-			if (!list_empty(&this->link[i]))
-				list_del(&this->link[i]);
-		}
-
-		if (this->d->version == CRIU_PLUGIN_VERSION_OLD)
-			xfree(this->d);
-		dlclose(h);
-	}
+	list_for_each_entry_safe(this, tmp, &cr_plugin_ctl.head, list)
+		cr_plugin_teardown(this, stage, ret);
 }
 
 int cr_plugin_init(int stage)

@@ -561,6 +561,19 @@ static int vfmig_suspended_add(const char *pf_bdf, uint32_t vf_id)
 	return 0;
 }
 
+static void vfmig_suspended_remove(struct vfmig_suspended_vf *victim)
+{
+	struct vfmig_suspended_vf **pp;
+
+	for (pp = &vfmig_suspended_head; *pp; pp = &(*pp)->next) {
+		if (*pp == victim) {
+			*pp = victim->next;
+			free(victim);
+			return;
+		}
+	}
+}
+
 void vfmig_suspended_clear(void)
 {
 	struct vfmig_suspended_vf *p, *n;
@@ -657,9 +670,10 @@ static int vfmig_suspend_one_vf(const char *pf_bdf, uint32_t vf_id)
  * otherwise. So parking cannot stall a process that is not being
  * checkpointed.
  */
-int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev)
+int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev, bool resume)
 {
 	struct vfmig_claimed_vf *c;
+	struct vfmig_suspended_vf *p;
 
 	if (!vfmig_active)
 		return -ENOTSUP;
@@ -670,7 +684,20 @@ int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev)
 	if (!c)
 		return -ENOTSUP;
 
-	if (vfmig_suspended_lookup(c->pf_bdf, c->vf_id))
+	p = vfmig_suspended_lookup(c->pf_bdf, c->vf_id);
+	if (resume) {
+		/* Aborted dump: un-park now, so core can rebind the MRs. */
+		if (!p)
+			return 0;
+		if (vfmig_dp_resume(c->pf_bdf, c->vf_id, 0))
+			return -1;
+		vfmig_suspended_remove(p);
+		pr_info("vfmig: resumed VF datapath pf=%s vf_id=%u (%s) after an aborted dump\n", c->pf_bdf,
+			c->vf_id, ibdev);
+		return 0;
+	}
+
+	if (p)
 		return 0;
 	if (vfmig_suspend_one_vf(c->pf_bdf, c->vf_id))
 		return -1;
@@ -697,8 +724,11 @@ int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev)
  * in then would move its QPs past the saved state. SAVE carries the fence
  * to the destination, which lifts it with the handles kept here and
  * written into the VF's image record.
+ *
+ * With @lift, the dump was aborted and core has rebound the VF's MRs: the
+ * dumpee carries on, so let its traffic back in.
  */
-int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev)
+int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift)
 {
 	struct vfmig_claimed_vf *c;
 	struct vfmig_rendezvous rz;
@@ -713,6 +743,18 @@ int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev)
 			break;
 	if (!c)
 		return -ENOTSUP;
+
+	if (lift) {
+		if (!c->fenced)
+			return 0;
+		if (vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_LIFT, 0, &c->fence))
+			return -1;
+		c->fenced = false;
+		pr_info("vfmig: lifted RoCE RX fence pf=%s vf_id=%u (%s) after an aborted dump\n", c->pf_bdf,
+			c->vf_id, ibdev);
+		return 0;
+	}
+
 	if (c->fenced)
 		return 0;
 
@@ -734,22 +776,6 @@ int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev)
 	pr_info("vfmig: fenced RoCE RX pf=%s vf_id=%u (%s): table 0x%x group 0x%x\n", c->pf_bdf, c->vf_id, ibdev,
 		c->fence.table_id, c->fence.group_id);
 	return 0;
-}
-
-/*
- * After a failed dump the dumpee carries on on these VFs, so let their
- * traffic back in. Called from fini(DUMP) after the resume.
- */
-void vfmig_lift_claimed_fences(void)
-{
-	struct vfmig_claimed_vf *c;
-
-	for (c = vfmig_claimed_head; c; c = c->next) {
-		if (!c->fenced)
-			continue;
-		if (!vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_LIFT, 0, &c->fence))
-			c->fenced = false;
-	}
 }
 
 /*

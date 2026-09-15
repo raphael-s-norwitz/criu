@@ -857,7 +857,7 @@ int rdma_dispatch_restore_qp_needs_pie(uint32_t criu_driver)
  * no hardware datapath to park -- rxe, for instance -- and is a no-op,
  * not an error.
  */
-int rdma_dispatch_suspend_ibdev(uint32_t criu_driver, const char *ibdev)
+int rdma_dispatch_suspend_ibdev(uint32_t criu_driver, const char *ibdev, bool resume)
 {
 	plugin_desc_t *this;
 	plugin_desc_t *winner = NULL;
@@ -898,14 +898,14 @@ int rdma_dispatch_suspend_ibdev(uint32_t criu_driver, const char *ibdev)
 		return -ENOTSUP;
 	}
 
-	return fn(ibdev);
+	return fn(ibdev, resume);
 }
 
 /*
  * Route an ibdev fence the same way. A matched plugin that does not
  * register the hook has nothing to fence.
  */
-int rdma_dispatch_fence_ibdev(uint32_t criu_driver, const char *ibdev)
+int rdma_dispatch_fence_ibdev(uint32_t criu_driver, const char *ibdev, bool lift)
 {
 	plugin_desc_t *this;
 	plugin_desc_t *winner = NULL;
@@ -946,7 +946,7 @@ int rdma_dispatch_fence_ibdev(uint32_t criu_driver, const char *ibdev)
 		return -ENOTSUP;
 	}
 
-	return fn(ibdev);
+	return fn(ibdev, lift);
 }
 
 /*
