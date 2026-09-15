@@ -2254,6 +2254,17 @@ int cr_dump_tasks(pid_t pid)
 	if (rdma_capture_uverbs_contexts(root_item))
 		goto err;
 
+	/*
+	 * Quiesce the RDMA devices the capture above ran against, before
+	 * any memory is snapshotted. Separate from checkpoint_devices()
+	 * because the unit differs: that hook is per pid and is where GPU
+	 * plugins tear down per-process device state, while an RDMA
+	 * datapath is quiesced per device, for every user at once. Sharing
+	 * one hook also let whichever plugin ran first starve the other.
+	 */
+	if (rdma_suspend_captured_ibdevs())
+		goto err;
+
 	if (checkpoint_devices())
 		goto err;
 
