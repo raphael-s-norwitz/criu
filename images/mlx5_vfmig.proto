@@ -207,4 +207,13 @@ message mlx5_vfmig_state_entry {
 	 * diagnostic.
 	 */
 	optional uint32		source_devx_uid		= 14;
+
+	/*
+	 * Firmware handles of the RoCE RX fence raised on the source VF
+	 * (MLX5_VFMIG_IOC_RX_FENCE) before its objects were captured. SAVE
+	 * carries the fence, so the destination comes up fenced, and these
+	 * are what lift it there. Absent when the source was not fenced.
+	 */
+	optional uint32		fence_table_id		= 15;
+	optional uint32		fence_group_id		= 16;
 }

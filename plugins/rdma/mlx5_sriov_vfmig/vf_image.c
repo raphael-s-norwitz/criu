@@ -162,7 +162,8 @@ int vfmig_drain_save_fd_to_blob(int save_fd, const char *blob_path, uint64_t *ou
  */
 int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *source_cdev_path, const char *pf_bdf,
 			     uint32_t vf_id, uint32_t vhca_id, const uint8_t vf_uuid[16], const char *blob_path,
-			     uint64_t blob_size, const struct vfmig_uctx_image_blob *uctx)
+			     uint64_t blob_size, const struct vfmig_uctx_image_blob *uctx,
+			     const struct vfmig_rx_fence_handles *fence)
 {
 	Mlx5VfmigStateEntry e = MLX5_VFMIG_STATE_ENTRY__INIT;
 	uint8_t zero_uuid[16] = { 0 };
@@ -197,6 +198,12 @@ int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *sourc
 	e.source_cdev_path = (char *)source_cdev_path;
 	e.vf_uuid.data = (uint8_t *)vf_uuid;
 	e.vf_uuid.len = 16;
+	if (fence) {
+		e.has_fence_table_id = 1;
+		e.fence_table_id = fence->table_id;
+		e.has_fence_group_id = 1;
+		e.fence_group_id = fence->group_id;
+	}
 
 	/*
 	 * Optional ucontext snapshot. A firmware-only record (no seed
