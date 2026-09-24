@@ -140,6 +140,7 @@ int vfmig_query_cq(int fd, uint32_t cq_handle, struct mlx5_ib_restore_cq_req_loc
 		   uint32_t *comp_vector_out, uint32_t *flags_out);
 int vfmig_query_qp(int fd, uint32_t qp_handle, struct mlx5_ib_restore_qp_req_local *blob_out,
 		   uint64_t *user_handle_out, uint32_t *create_flags_out);
+int vfmig_query_qp_sq_psn(int fd, uint32_t qp_handle, struct mlx5_ib_vfmig_qp_sq_psn_local *psn_out);
 
 /*
  * Restore-side ucontext replay (static-UAR mode). Mirror of the QUERY

@@ -146,6 +146,18 @@
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
 #define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS_LOCAL \
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 3)
+/*
+ * Optional RESP_SQ_PSN: the QP's requester PSNs from its live QPC. Nothing
+ * the QP sent is outstanding when last_acked_psn == next_send_psn - 1,
+ * modulo 2^24 (a READ counts once its responses have arrived).
+ */
+#define MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 4)
+
+struct mlx5_ib_vfmig_qp_sq_psn_local {
+	uint32_t next_send_psn;
+	uint32_t last_acked_psn;
+};
 
 /*
  * Local mirror of include/uapi/rdma/mlx5-abi.h's struct

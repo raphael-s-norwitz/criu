@@ -40,6 +40,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -381,6 +383,93 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_cq(const char *ibdev, uint32_t kernel_drive
  * @kernel_driver_id and @pid are unused -- @lfd already targets the right
  * context.
  */
+/*
+ * How long a QP may take to have everything it sent acknowledged. Long: a
+ * healthy QP needs one round trip or a few retransmits, and this only
+ * bounds a peer that has stopped answering, which must abort the dump
+ * rather than hang it.
+ */
+#define VFMIG_QP_DRAIN_TIMEOUT_S	60
+
+static double vfmig_now(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/*
+ * Wait until everything an RC QP has sent is acknowledged: last_acked_psn
+ * == next_send_psn - 1, modulo 2^24, with a READ acknowledged by its
+ * responses. The dumpee is frozen and posts nothing new, so this ends once
+ * the peer has answered what is already in flight. It must end before the
+ * MR walk: an unacknowledged WRITE can be retransmitted, reading its MR
+ * again, and the walk unbinds DMA-BUF MRs. It must also come before the
+ * VF's fence, which would drop the ACKs.
+ *
+ * Only RC QPs in RTS or SQD have anything to wait for. A kernel without
+ * VFMIG_QUERY_QP's RESP_SQ_PSN cannot say; the QP is dumped without waiting.
+ */
+static int vfmig_wait_qp_acked(const char *ibdev, int lfd, uint32_t ufile_handle, const RdmaQpAttrs *qp_attrs)
+{
+	enum { IB_QPT_RC_LOCAL = 2, IB_QPS_RTS_LOCAL = 3, IB_QPS_SQD_LOCAL = 4 };
+	struct mlx5_ib_vfmig_qp_sq_psn_local psn;
+	double start = vfmig_now(), next_report = start + 5;
+	unsigned int outstanding, first_outstanding = 0, polls = 0, sleep_us = 100;
+	int rc;
+
+	if (!qp_attrs->has_qp_type || qp_attrs->qp_type != IB_QPT_RC_LOCAL || !qp_attrs->has_state ||
+	    (qp_attrs->state != IB_QPS_RTS_LOCAL && qp_attrs->state != IB_QPS_SQD_LOCAL)) {
+		pr_info("vfmig: dump-qp: ibdev=%s handle=%u: not an RC QP in RTS/SQD (type %d state %d); no drain\n",
+			ibdev, ufile_handle, qp_attrs->has_qp_type ? (int)qp_attrs->qp_type : -1,
+			qp_attrs->has_state ? (int)qp_attrs->state : -1);
+		return 0;
+	}
+
+	for (;;) {
+		rc = vfmig_query_qp_sq_psn(lfd, ufile_handle, &psn);
+		if (rc == -EPROTONOSUPPORT) {
+			pr_warn("vfmig: dump-qp: ibdev=%s handle=%u: kernel reports no SQ PSNs; "
+				"not waiting for outstanding sends\n",
+				ibdev, ufile_handle);
+			return 0;
+		}
+		if (rc) {
+			pr_err("vfmig: dump-qp: QUERY_QP(ibdev=%s handle=%u) for SQ PSNs failed: %d (%s)\n", ibdev,
+			       ufile_handle, rc, strerror(-rc));
+			return rc;
+		}
+		outstanding = (psn.next_send_psn - 1 - psn.last_acked_psn) & 0xffffff;
+		if (!polls++)
+			first_outstanding = outstanding;
+		if (!outstanding)
+			break;
+
+		if (vfmig_now() - start > VFMIG_QP_DRAIN_TIMEOUT_S) {
+			pr_err("vfmig: dump-qp: ibdev=%s handle=%u: %u PSNs still unacknowledged after %d s "
+			       "(next_send_psn=%#x last_acked_psn=%#x); aborting the dump\n",
+			       ibdev, ufile_handle, outstanding, VFMIG_QP_DRAIN_TIMEOUT_S, psn.next_send_psn,
+			       psn.last_acked_psn);
+			return -ETIMEDOUT;
+		}
+		if (vfmig_now() > next_report) {
+			pr_warn("vfmig: dump-qp: ibdev=%s handle=%u: waiting for %u PSNs to be acknowledged\n", ibdev,
+				ufile_handle, outstanding);
+			next_report += 5;
+		}
+		usleep(sleep_us);
+		if (sleep_us < 10000)
+			sleep_us *= 2;
+	}
+
+	pr_info("vfmig: dump-qp: ibdev=%s handle=%u: %u PSNs outstanding at first check, all acknowledged "
+		"after %.6f s and %u queries (next_send_psn=%#x last_acked_psn=%#x)\n",
+		ibdev, ufile_handle, first_outstanding, vfmig_now() - start, polls, psn.next_send_psn,
+		psn.last_acked_psn);
+	return 0;
+}
+
 int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_driver_id, int lfd, uint32_t ufile_handle,
 					pid_t pid, RdmaQpAttrs *qp_attrs, ProtobufCBinaryData *plugin_blob)
 {
@@ -411,6 +500,10 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_drive
 		pr_warn("vfmig: dump-qp: handle=%u source create_flags=%#x will not round-trip (v0 restores "
 			"flag-less QPs)\n",
 			ufile_handle, create_flags);
+
+	rc = vfmig_wait_qp_acked(ibdev, lfd, ufile_handle, qp_attrs);
+	if (rc)
+		return rc;
 
 	qp_attrs->has_user_handle = true;
 	qp_attrs->user_handle = user_handle;
