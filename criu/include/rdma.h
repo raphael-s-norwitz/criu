@@ -200,6 +200,7 @@ int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe);
  * something else, and only the owning plugin can map between them.
  */
 int rdma_dispatch_suspend_ibdev(uint32_t criu_driver, const char *ibdev);
+int rdma_dispatch_fence_ibdev(uint32_t criu_driver, const char *ibdev);
 int rdma_dispatch_resume_ibdev(const UverbsFileEntry *uvfe);
 
 /*
