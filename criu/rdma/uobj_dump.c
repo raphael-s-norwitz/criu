@@ -1218,6 +1218,17 @@ int rdma_capture_uobj_dag(void)
 			goto out;
 		}
 
+		/*
+		 * Hold peers' traffic off this ibdev before the walk changes
+		 * anything on it: the MR walk below unbinds DMA-BUF MRs that
+		 * peer writes would otherwise land on.
+		 */
+		r = rdma_dispatch_fence_ibdev(ib->ufiles[0]->criu_driver, ib->ibdev);
+		if (r < 0 && r != -ENOTSUP) {
+			pr_err("uobj DAG: fence of ibdev '%s' failed: %d\n", ib->ibdev, r);
+			goto out;
+		}
+
 		r = rdma_nl_for_each_resource(ib->dev_index, ib->ibdev, RDMA_NL_RES_PD, uobj_pd_cb, &w);
 		if (r < 0 || w.err) {
 			pr_err("uobj DAG: pd walk failed on ibdev '%s' (idx=%u): r=%d err=%d\n", ib->ibdev,
