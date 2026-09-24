@@ -459,16 +459,18 @@ enum {
 
 	/*
 	 * Stop peers' traffic from reaching an ibdev's QPs, before the uobject
-	 * walk changes anything on it. The dumpee is frozen by now but the
+	 * walk unbinds anything on it. The dumpee is frozen by now but the
 	 * device is not: until RDMA_SUSPEND_IBDEV parks it, peers keep writing,
 	 * and the walk unbinds DMA-BUF MRs those writes may land on. A plugin
 	 * that can hold that traffic off -- for mlx5 SR-IOV migration, a fence
 	 * dropping every RoCE packet to the VF -- does so here.
 	 *
-	 * Dispatched once per captured ibdev, at the top of its walk, routed by
-	 * CR_PLUGIN_RDMA_PROVIDED_DRIVER like RDMA_SUSPEND_IBDEV. Undoing it is
-	 * the plugin's business: on the source it must outlive the dumpee, and
-	 * a device state that is saved with it carries it to the destination.
+	 * Dispatched once per captured ibdev, after its QPs are walked and
+	 * before its MRs, routed by CR_PLUGIN_RDMA_PROVIDED_DRIVER like
+	 * RDMA_SUSPEND_IBDEV. After the QPs because a fence drops the ACKs
+	 * their outstanding sends still wait for. Undoing it is the plugin's
+	 * business: on the source it must outlive the dumpee, and a device
+	 * state that is saved with it carries it to the destination.
 	 *
 	 * Return: 0 on success, -ENOTSUP if the plugin does not own @ibdev or
 	 * has nothing to fence, < 0 errno on failure. A failure aborts the dump.

@@ -1198,7 +1198,8 @@ int rdma_capture_uobj_dag(void)
 
 	/*
 	 * 3. Per-ibdev walk: PDs first (their pdn -> ufile map is the join
-	 * key the MR walk resolves parents against), then MRs. The walk
+	 * key the QP and MR walks resolve parents against), then CQs, QPs, the
+	 * fence, and MRs last. The walk
 	 * runs before the datapath freeze, so the QP NLDEV fill's firmware
 	 * QUERY_QP and CRIU's per-QP cap query hit a live command ring; the
 	 * built entries are packed into the capture list (ufile_id deferred)
@@ -1207,25 +1208,14 @@ int rdma_capture_uobj_dag(void)
 	list_for_each_entry(ib, &ibdevs, link) {
 		struct uobj_walk_ctx w = { .ib = ib };
 		int pd_emitted, pd_dropped;
-		int mr_emitted, mr_dropped;
 		int cq_emitted, cq_dropped;
+		int qp_emitted, qp_dropped;
 		int r;
 
 		if (!ib->has_dev_index) {
 			pr_err("uobj DAG: ibdev '%s' had no dev_index (disappeared between dump and uobj walk?); "
 			       "aborting\n",
 			       ib->ibdev);
-			goto out;
-		}
-
-		/*
-		 * Hold peers' traffic off this ibdev before the walk changes
-		 * anything on it: the MR walk below unbinds DMA-BUF MRs that
-		 * peer writes would otherwise land on.
-		 */
-		r = rdma_dispatch_fence_ibdev(ib->ufiles[0]->criu_driver, ib->ibdev);
-		if (r < 0 && r != -ENOTSUP) {
-			pr_err("uobj DAG: fence of ibdev '%s' failed: %d\n", ib->ibdev, r);
 			goto out;
 		}
 
@@ -1239,21 +1229,7 @@ int rdma_capture_uobj_dag(void)
 		pd_dropped = w.n_dropped;
 		w.n_emitted = w.n_dropped = 0;
 
-		r = rdma_nl_for_each_resource(ib->dev_index, ib->ibdev, RDMA_NL_RES_MR, uobj_mr_cb, &w);
-		if (r < 0 || w.err) {
-			pr_err("uobj DAG: mr walk failed on ibdev '%s' (idx=%u): r=%d err=%d\n", ib->ibdev,
-			       ib->dev_index, r, w.err);
-			goto out;
-		}
-		mr_emitted = w.n_emitted;
-		mr_dropped = w.n_dropped;
-		w.n_emitted = w.n_dropped = 0;
-
-		/*
-		 * CQs join by ctxn like PDs (no pdn dependency), so ordering
-		 * against the MR walk is immaterial; kept after MR to keep the
-		 * emit order PD -> MR -> CQ.
-		 */
+		/* CQs join by ctxn like PDs, with no pdn dependency. */
 		r = rdma_nl_for_each_resource(ib->dev_index, ib->ibdev, RDMA_NL_RES_CQ, uobj_cq_cb, &w);
 		if (r < 0 || w.err) {
 			pr_err("uobj DAG: cq walk failed on ibdev '%s' (idx=%u): r=%d err=%d\n", ib->ibdev,
@@ -1265,11 +1241,12 @@ int rdma_capture_uobj_dag(void)
 		w.n_emitted = w.n_dropped = 0;
 
 		/*
-		 * QPs join by pdn like MRs, so the PD walk must precede them;
-		 * their SEND_CQ/RECV_CQ xref targets are CQ entries, but image
-		 * order is immaterial (restore topo-sorts via the xref graph),
-		 * so the QP walk lands last to keep the emit order
-		 * PD -> MR -> CQ -> QP.
+		 * QPs join by pdn, so the PD walk must precede them; their
+		 * SEND_CQ/RECV_CQ xref targets are CQ entries, but image order
+		 * is immaterial (restore topo-sorts via the xref graph). They
+		 * come before the MRs because the per-QP dispatch is where a
+		 * plugin waits for each QP to finish what it has sent: nothing
+		 * may still be reading an MR when the MR walk unbinds it.
 		 */
 		r = rdma_nl_for_each_resource(ib->dev_index, ib->ibdev, RDMA_NL_RES_QP, uobj_qp_cb, &w);
 		if (r < 0 || w.err) {
@@ -1277,11 +1254,33 @@ int rdma_capture_uobj_dag(void)
 			       ib->dev_index, r, w.err);
 			goto out;
 		}
+		qp_emitted = w.n_emitted;
+		qp_dropped = w.n_dropped;
+		w.n_emitted = w.n_dropped = 0;
+
+		/*
+		 * Hold peers' traffic off this ibdev before the MR walk unbinds
+		 * DMA-BUF MRs their writes would otherwise land on. Not earlier:
+		 * the QPs above had to see their own traffic acknowledged, and
+		 * a fence drops the ACKs too.
+		 */
+		r = rdma_dispatch_fence_ibdev(ib->ufiles[0]->criu_driver, ib->ibdev);
+		if (r < 0 && r != -ENOTSUP) {
+			pr_err("uobj DAG: fence of ibdev '%s' failed: %d\n", ib->ibdev, r);
+			goto out;
+		}
+
+		r = rdma_nl_for_each_resource(ib->dev_index, ib->ibdev, RDMA_NL_RES_MR, uobj_mr_cb, &w);
+		if (r < 0 || w.err) {
+			pr_err("uobj DAG: mr walk failed on ibdev '%s' (idx=%u): r=%d err=%d\n", ib->ibdev,
+			       ib->dev_index, r, w.err);
+			goto out;
+		}
 
 		pr_info("uobj DAG: ibdev=%s pd(emitted=%d dropped=%d) mr(emitted=%d dropped=%d) "
 			"cq(emitted=%d dropped=%d) qp(emitted=%d dropped=%d) (in-tree-ufiles=%zu)\n",
-			ib->ibdev, pd_emitted, pd_dropped, mr_emitted, mr_dropped, cq_emitted, cq_dropped,
-			w.n_emitted, w.n_dropped, ib->n_ufiles);
+			ib->ibdev, pd_emitted, pd_dropped, w.n_emitted, w.n_dropped, cq_emitted, cq_dropped,
+			qp_emitted, qp_dropped, ib->n_ufiles);
 	}
 
 	ret = 0;
