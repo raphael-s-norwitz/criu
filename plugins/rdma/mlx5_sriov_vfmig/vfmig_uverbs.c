@@ -406,6 +406,57 @@ int vfmig_query_qp(int fd, uint32_t qp_handle, struct mlx5_ib_restore_qp_req_loc
 }
 
 /*
+ * VFMIG_QUERY_QP for RESP_SQ_PSN alone. The method's other outputs are
+ * mandatory, so they are requested into scratch space. RESP_SQ_PSN is sent
+ * as mandatory too: a kernel without it then fails the call with
+ * -EPROTONOSUPPORT instead of ignoring the attribute and leaving @psn_out
+ * zeroed.
+ */
+int vfmig_query_qp_sq_psn(int fd, uint32_t qp_handle, struct mlx5_ib_vfmig_qp_sq_psn_local *psn_out)
+{
+	struct mlx5_ib_restore_qp_req_local blob;
+	uint32_t create_flags;
+	uint64_t user_handle;
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[5];
+	} cmd = {};
+	struct {
+		uint16_t id;
+		uint16_t len;
+		void *data;
+	} outs[] = {
+		{ MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB_LOCAL, sizeof(blob), &blob },
+		{ MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE_LOCAL, sizeof(user_handle), &user_handle },
+		{ MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS_LOCAL, sizeof(create_flags), &create_flags },
+		{ MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN_LOCAL, sizeof(*psn_out), psn_out },
+	};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id = MLX5_IB_OBJECT_VFMIG_LOCAL;
+	cmd.hdr.method_id = MLX5_IB_METHOD_VFMIG_QUERY_QP_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_MLX5;
+
+	cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE_LOCAL;
+	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data = qp_handle;
+	n++;
+	for (unsigned int i = 0; i < sizeof(outs) / sizeof(outs[0]); i++, n++) {
+		cmd.attrs[n].attr_id = outs[i].id;
+		cmd.attrs[n].len = outs[i].len;
+		cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attrs[n].data = (uintptr_t)outs[i].data;
+	}
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
  * Allocate a fresh ucontext on @fd via the legacy write()-based
  * IB_USER_VERBS_CMD_GET_CONTEXT command, with the mlx5 driver payload
  * appended. @flags carries the MLX5_IB_ALLOC_UCTX_* bits (the restore
