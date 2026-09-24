@@ -190,6 +190,8 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 		if (ret == 0)
 			vfmig_drain_claimed_in_fini();
 		vfmig_resume_suspended_vfs();
+		if (ret != 0)
+			vfmig_lift_claimed_fences();
 	}
 
 	/*
@@ -401,6 +403,7 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE,
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, rdma_mlx5_vfmig_plugin_open_uverbs_cdev)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, rdma_mlx5_vfmig_plugin_update_vma_map)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESUME_IBDEV, rdma_mlx5_vfmig_plugin_resume_ibdev)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_FENCE_IBDEV, rdma_mlx5_vfmig_plugin_fence_ibdev)
 
 /*
  * RDMA sharing policy: EXCLUSIVE.

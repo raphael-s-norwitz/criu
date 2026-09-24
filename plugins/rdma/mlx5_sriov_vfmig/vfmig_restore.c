@@ -97,6 +97,16 @@ struct vfmig_restored_vf {
 	struct vfmig_rendezvous rz;
 	bool barrier_mode;
 	bool barrier_done;
+
+	/*
+	 * The source's RoCE RX fence, which LOAD brought back with the VF.
+	 * @fenced is false when the source was not fenced, but a restored VF
+	 * has its steering held off either way, so RDMA_RESUME_IBDEV always
+	 * lifts it, once, and latches @fence_lifted.
+	 */
+	bool fenced;
+	struct vfmig_rx_fence_handles fence;
+	bool fence_lifted;
 };
 static struct vfmig_restored_vf *vfmig_restored_vfs;
 
@@ -1147,7 +1157,8 @@ static int vfmig_barrier_arm(struct vfmig_restored_vf *v)
 /*
  * RDMA_RESUME_IBDEV hook. Run the R1 rendezvous for the restored VF
  * behind @ibdev, so no host releases its datapath until that VF's peers
- * have reached the barrier.
+ * have reached the barrier, then lift the RX fence the VF came up with
+ * from LOAD. A failed rendezvous leaves the fence up.
  *
  * Core dispatches this once per collected ibdev, after
  * rdma_bind_dmabuf_mrs_late(). That ordering is the point: releasing
@@ -1204,18 +1215,25 @@ int rdma_mlx5_vfmig_plugin_resume_ibdev(const UverbsFileEntry *uvfe)
 	if (!v)
 		return -ENOTSUP;
 
-	if (!v->barrier_mode || v->barrier_done)
-		return -ENOTSUP; /* legacy VF, or already rendezvoused */
-
-	if (vfmig_barrier_run(&v->rz, VFMIG_BARRIER_PHASE_RESTORE)) {
-		pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous failed; VF left RUNNING (no safe hold)\n",
-		       v->pf_bdf, v->vf_id);
-		return -1;
+	if (v->barrier_mode && !v->barrier_done) {
+		if (vfmig_barrier_run(&v->rz, VFMIG_BARRIER_PHASE_RESTORE)) {
+			pr_err("vfmig: barrier[R1]: pf=%s vf_id=%u rendezvous failed; VF left fenced\n", v->pf_bdf,
+			       v->vf_id);
+			return -1;
+		}
+		v->barrier_done = true;
+		pr_info("vfmig: barrier[R1]: pf=%s vf_id=%u (%s) rendezvous done (initiator already RUNNING)\n",
+			v->pf_bdf, v->vf_id, v->dest_ibdev);
 	}
 
-	v->barrier_done = true;
-	pr_info("vfmig: barrier[R1]: pf=%s vf_id=%u (%s) rendezvous done (initiator already RUNNING)\n", v->pf_bdf,
-		v->vf_id, v->dest_ibdev);
+	if (!v->fence_lifted) {
+		if (vfmig_dp_rx_fence(v->pf_bdf, v->vf_id, MLX5_VFMIG_RX_FENCE_LIFT,
+				      v->fenced ? 0 : MLX5_VFMIG_RX_FENCE_F_NO_TABLE, &v->fence))
+			return -1;
+		v->fence_lifted = true;
+		pr_info("vfmig: lifted RoCE RX fence pf=%s vf_id=%u (%s)%s\n", v->pf_bdf, v->vf_id, v->dest_ibdev,
+			v->fenced ? "" : " (none raised on the source)");
+	}
 	return 0;
 }
 
@@ -1359,6 +1377,11 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 		snprintf(v->vf_bdf, sizeof(v->vf_bdf), "%s", vf_bdf);
 		snprintf(v->dest_ibdev, sizeof(v->dest_ibdev), "%s", dest_ibdev);
 		snprintf(v->dest_cdev_path, sizeof(v->dest_cdev_path), "%s", dest_cdev_path);
+		if (e->has_fence_table_id && e->has_fence_group_id) {
+			v->fenced = true;
+			v->fence.table_id = e->fence_table_id;
+			v->fence.group_id = e->fence_group_id;
+		}
 		v->next = vfmig_restored_vfs;
 		vfmig_restored_vfs = v;
 

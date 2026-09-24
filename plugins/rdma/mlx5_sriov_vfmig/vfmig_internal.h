@@ -175,6 +175,19 @@ int vfmig_restore_dyn_uars(int fd, const struct mlx5_ib_vfmig_dyn_uar_record_loc
 int vfmig_dp_suspend(const char *pf_bdf, uint32_t vf_id, uint32_t dir_flags);
 int vfmig_dp_resume(const char *pf_bdf, uint32_t vf_id, uint32_t dir_flags);
 
+/* A RoCE RX fence's firmware handles, from MLX5_VFMIG_IOC_RX_FENCE. */
+struct vfmig_rx_fence_handles {
+	uint32_t table_id;
+	uint32_t group_id;
+};
+
+/*
+ * MLX5_VFMIG_IOC_RX_FENCE: @op RAISE fills @h, LIFT takes it, or ignores it
+ * with MLX5_VFMIG_RX_FENCE_F_NO_TABLE in @flags. Returns 0 or -1 (logged).
+ */
+int vfmig_dp_rx_fence(const char *pf_bdf, uint32_t vf_id, uint32_t op, uint32_t flags,
+		      struct vfmig_rx_fence_handles *h);
+
 /*
  * vfmig_barrier.c -- per-VHCA cross-host rendezvous descriptor. The
  * descriptor is a host-local key=value file, a property of the
@@ -233,6 +246,14 @@ int vfmig_barrier_run(const struct vfmig_rendezvous *rz, const char *phase);
  */
 int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev);
 void vfmig_resume_suspended_vfs(void);
+
+/*
+ * RDMA_FENCE_IBDEV: fence the VF behind @ibdev before the uobject walk,
+ * keeping the handles in its claimed-VF entry. vfmig_lift_claimed_fences()
+ * lifts them again after a failed dump.
+ */
+int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev);
+void vfmig_lift_claimed_fences(void);
 void vfmig_suspended_clear(void);
 
 /*
@@ -284,7 +305,8 @@ struct vfmig_uctx_image_blob {
 int vfmig_drain_save_fd_to_blob(int save_fd, const char *blob_path, uint64_t *out_size);
 int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *source_cdev_path, const char *pf_bdf,
 			     uint32_t vf_id, uint32_t vhca_id, const uint8_t vf_uuid[16], const char *blob_path,
-			     uint64_t blob_size, const struct vfmig_uctx_image_blob *uctx);
+			     uint64_t blob_size, const struct vfmig_uctx_image_blob *uctx,
+			     const struct vfmig_rx_fence_handles *fence);
 int vfmig_read_image(Mlx5VfmigStateEntry ***out_arr, size_t *out_n);
 
 /*

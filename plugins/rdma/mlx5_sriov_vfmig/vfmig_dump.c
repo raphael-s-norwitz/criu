@@ -55,6 +55,10 @@ struct vfmig_claimed_vf {
 	char pf_bdf[64];
 	uint32_t vf_id;
 
+	/* RoCE RX fence raised by the RDMA_FENCE_IBDEV hook, if any. */
+	bool fenced;
+	struct vfmig_rx_fence_handles fence;
+
 	/*
 	 * ucontext snapshot, attached by the RDMA_DUMP_UVERBS_CONTEXT
 	 * hook (rdma_mlx5_vfmig_plugin_dump_uverbs_context) and consumed
@@ -619,6 +623,56 @@ int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev)
 }
 
 /*
+ * Fence the VF behind @ibdev: from here on no RoCE packet reaches its QPs.
+ * Core calls this before the uobject walk touches the VF, since the walk
+ * unbinds DMA-BUF MRs that peers are still writing to.
+ *
+ * The fence is never lifted on a good dump. The source runs again after
+ * fini(DUMP) resumes it, until the dumpee is killed, and anything it took
+ * in then would move its QPs past the saved state. SAVE carries the fence
+ * to the destination, which lifts it with the handles kept here and
+ * written into the VF's image record.
+ */
+int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev)
+{
+	struct vfmig_claimed_vf *c;
+
+	if (!vfmig_active)
+		return -ENOTSUP;
+
+	for (c = vfmig_claimed_head; c; c = c->next)
+		if (!strcmp(c->ibdev, ibdev))
+			break;
+	if (!c)
+		return -ENOTSUP;
+	if (c->fenced)
+		return 0;
+
+	if (vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_RAISE, 0, &c->fence))
+		return -1;
+	c->fenced = true;
+	pr_info("vfmig: fenced RoCE RX pf=%s vf_id=%u (%s): table 0x%x group 0x%x\n", c->pf_bdf, c->vf_id, ibdev,
+		c->fence.table_id, c->fence.group_id);
+	return 0;
+}
+
+/*
+ * After a failed dump the dumpee carries on on these VFs, so let their
+ * traffic back in. Called from fini(DUMP) after the resume.
+ */
+void vfmig_lift_claimed_fences(void)
+{
+	struct vfmig_claimed_vf *c;
+
+	for (c = vfmig_claimed_head; c; c = c->next) {
+		if (!c->fenced)
+			continue;
+		if (!vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_LIFT, 0, &c->fence))
+			c->fenced = false;
+	}
+}
+
+/*
  * Resume every VF this dump parked at CHECKPOINT_DEVICES. Called from
  * fini(DUMP) after the SAVE drain, on both the success and failure
  * paths: the snapshot is complete (or lost) either way, and a VF left in
@@ -816,7 +870,8 @@ void vfmig_drain_claimed_in_fini(void)
 		}
 
 		if (vfmig_append_state_entry(ctxn, c->ibdev, cdev_for_record, c->pf_bdf, c->vf_id, sv.vhca_id,
-					     sv.vf_uuid, sv.blob_path, sv.blob_size, uctx)) {
+					     sv.vf_uuid, sv.blob_path, sv.blob_size, uctx,
+					     c->fenced ? &c->fence : NULL)) {
 			pr_err("vfmig: failed to append state entry for pf=%s vf_id=%u\n", c->pf_bdf, c->vf_id);
 			failed++;
 			continue;
