@@ -600,59 +600,23 @@ static int vfmig_query_vf_uuid(const char *pf_bdf, uint32_t vf_id, uint8_t out[1
 }
 
 /*
- * Park one claimed VF's datapath to STOP and record it in the suspended
- * set so fini(DUMP) resumes exactly what we parked. The per-VF decision
- * lives in its own seam because the ladder differs by mode:
+ * Park one claimed VF's datapath to STOP with the fused RUNNING -> STOP
+ * suspend (all-or-nothing), and record it in the suspended set so
+ * fini(DUMP) resumes exactly what we parked. The cross-host rendezvous no
+ * longer splits it: by now the VF's QPs have nothing outstanding and its
+ * fence drops everything arriving, so no peer traffic is left for the
+ * suspend's order to protect. The rendezvous runs before the fence, in
+ * rdma_mlx5_vfmig_plugin_fence_ibdev().
  *
- *   legacy  (no rendezvous descriptor for this vf_uuid): the fused
- *           RUNNING -> STOP suspend (all-or-nothing), as before.
- *   barrier (a per-VHCA descriptor exists): the fused suspend is split
- *           around a D1 cross-host rendezvous. SUSPEND(INITIATOR) ->
- *           RUNNING_P2P, then block until every peer's initiator is
- *           parked, then SUSPEND(RESPONDER) -> STOP -- so no peer's
- *           responder is dropped while a peer initiator can still
- *           originate. A rendezvous or RESPONDER-step failure rolls the
- *           VF back to RUNNING and fails the dump (never leave a VF in
- *           STOP with a still-live peer).
- *
- * Barrier mode is resolved by vf_uuid -> descriptor: an unreadable uuid
- * is treated as legacy (the capture path refuses an unstamped VF anyway)
- * and a malformed descriptor fails closed. If we park a VF but cannot
- * remember it (OOM), roll the suspend back and fail rather than strand
- * the source in STOP -- the kernel's SR-IOV-teardown force-resume is only
- * a last resort. Returns 0 on success, -1 on resolve/suspend/tracking
- * failure.
+ * If we park a VF but cannot remember it (OOM), roll the suspend back and
+ * fail rather than strand the source in STOP -- the kernel's
+ * SR-IOV-teardown force-resume is only a last resort. Returns 0 on
+ * success, -1 on suspend/tracking failure.
  */
 static int vfmig_suspend_one_vf(const char *pf_bdf, uint32_t vf_id)
 {
-	struct vfmig_rendezvous rz;
-	uint8_t vf_uuid[16];
-	int mode;
-
-	if (vfmig_query_vf_uuid(pf_bdf, vf_id, vf_uuid))
-		mode = 1; /* unreadable uuid -> legacy fused suspend */
-	else
-		mode = vfmig_rendezvous_load(vf_uuid, &rz);
-	if (mode < 0)
+	if (vfmig_dp_suspend(pf_bdf, vf_id, 0))
 		return -1;
-
-	if (mode == 1) {
-		if (vfmig_dp_suspend(pf_bdf, vf_id, 0))
-			return -1;
-	} else {
-		if (vfmig_dp_suspend(pf_bdf, vf_id, MLX5_VFMIG_DIR_FLAG_INITIATOR))
-			return -1;
-		if (vfmig_barrier_run(&rz, VFMIG_BARRIER_PHASE_DUMP)) {
-			pr_err("vfmig: barrier[D1]: pf=%s vf_id=%u rendezvous failed; resuming and failing dump\n",
-			       pf_bdf, vf_id);
-			(void)vfmig_dp_resume(pf_bdf, vf_id, 0);
-			return -1;
-		}
-		if (vfmig_dp_suspend(pf_bdf, vf_id, MLX5_VFMIG_DIR_FLAG_RESPONDER)) {
-			(void)vfmig_dp_resume(pf_bdf, vf_id, 0);
-			return -1;
-		}
-	}
 
 	if (vfmig_suspended_add(pf_bdf, vf_id)) {
 		pr_err("vfmig: checkpoint: OOM tracking suspended pf=%s vf_id=%u; rolling back suspend\n", pf_bdf,
@@ -717,8 +681,16 @@ int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev)
 
 /*
  * Fence the VF behind @ibdev: from here on no RoCE packet reaches its QPs.
- * Core calls this before the uobject walk touches the VF, since the walk
- * unbinds DMA-BUF MRs that peers are still writing to.
+ * Core calls this after the uobject walk has waited for the VF's QPs to
+ * have their sends acknowledged, and before it unbinds the VF's DMA-BUF
+ * MRs, which peers may still be writing to.
+ *
+ * In barrier mode (a rendezvous descriptor exists for the VF), first wait
+ * for every peer VF to reach this point too. A fence drops the ACKs a
+ * peer's outstanding sends are waiting for, so no VF may fence while a
+ * peer is still draining. Barrier mode is resolved by vf_uuid ->
+ * descriptor: an unreadable uuid is treated as legacy (the capture path
+ * refuses an unstamped VF anyway) and a malformed descriptor fails closed.
  *
  * The fence is never lifted on a good dump. The source runs again after
  * fini(DUMP) resumes it, until the dumpee is killed, and anything it took
@@ -729,6 +701,9 @@ int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev)
 int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev)
 {
 	struct vfmig_claimed_vf *c;
+	struct vfmig_rendezvous rz;
+	uint8_t vf_uuid[16];
+	int mode;
 
 	if (!vfmig_active)
 		return -ENOTSUP;
@@ -740,6 +715,18 @@ int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev)
 		return -ENOTSUP;
 	if (c->fenced)
 		return 0;
+
+	if (vfmig_query_vf_uuid(c->pf_bdf, c->vf_id, vf_uuid))
+		mode = 1; /* unreadable uuid -> legacy: no rendezvous */
+	else
+		mode = vfmig_rendezvous_load(vf_uuid, &rz);
+	if (mode < 0)
+		return -1;
+	if (mode == 0 && vfmig_barrier_run(&rz, VFMIG_BARRIER_PHASE_DUMP)) {
+		pr_err("vfmig: barrier[D1]: pf=%s vf_id=%u (%s) rendezvous failed; failing dump\n", c->pf_bdf,
+		       c->vf_id, ibdev);
+		return -1;
+	}
 
 	if (vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_RAISE, 0, &c->fence))
 		return -1;
