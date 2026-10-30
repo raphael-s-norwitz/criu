@@ -1242,11 +1242,14 @@ int rdma_mlx5_vfmig_plugin_resume_ibdev(const UverbsFileEntry *uvfe)
  * matching destination VF up to "firmware loaded, bound, ibdev up".
  *
  * Per entry: validate the vf_uuid, resolve it to a destination
- * (pf_bdf, vf_id), enforce that the destination vf_id equals the source
- * vf_id, resolve the destination VF's PCI BDF, then -- unless the VF is
- * already bound -- drive LOAD_VHCA_STATE + MARK_RESTORED and bind it to
- * mlx5_core; finally resolve the dest ibdev and cdev path and record
- * the tuple.
+ * (pf_bdf, vf_id) -- which need not be the source slot: the kernel now
+ * gives every VF of a PF the same IOVA window, so a saved image replays
+ * onto any VF, not just the index it was dumped from -- resolve the
+ * destination VF's PCI BDF, then -- unless the VF is already bound --
+ * drive LOAD_VHCA_STATE + MARK_RESTORED and bind it to mlx5_core;
+ * finally resolve the dest ibdev and cdev path and record the tuple.
+ * The source (pf_bdf, vf_id) is kept as checkpoint metadata and in the
+ * logs; everything the restore drives is keyed on the destination.
  *
  * Any per-entry failure aborts the whole restore (goto err): a VF-level
  * restore is all-or-nothing from the operator's point of view.
@@ -1325,21 +1328,14 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 			goto err;
 
 		/*
-		 * The destination vf_id slot must equal the source vf_id.
-		 * The kernel's per-VF IOVA window is keyed on vf_id and the
-		 * firmware E-Switch vport is keyed on vf_id+1, so cross-slot
-		 * LOAD is not supported. Surface it as a distinct error so
-		 * the operator fixes the destination provisioning rather
-		 * than chasing a kernel-side LOAD-time -EINVAL.
+		 * The destination vf_id need not equal the source vf_id.
+		 * The kernel reserves the same IOVA window on every VF of a
+		 * PF (independent of vf_id), so an image saved on one VF
+		 * replays onto any VF of the PF. We keep the source vf_id as
+		 * checkpoint metadata (see the mapping log below) but drive
+		 * the LOAD, bind and all subsequent restore work against the
+		 * resolved destination slot.
 		 */
-		if (dest_vf_id != e->vf_id) {
-			pr_err("vfmig: ctxn=%u source(pf=%s vf_id=%u): found vf_uuid=%s on (pf=%s, vf_id=%u) but "
-			       "image was dumped from vf_id=%u; the orchestrator must provision the matching vf_id "
-			       "slot on the destination and stamp the UUID there. Cross-slot LOAD is not "
-			       "supported.\n",
-			       e->ctxn, e->pf_bdf, e->vf_id, uuid_str, dest_pf_bdf, dest_vf_id, e->vf_id);
-			goto err;
-		}
 
 		if (vfmig_resolve_vf_bdf(dest_pf_bdf, dest_vf_id, vf_bdf, sizeof(vf_bdf)))
 			goto err;
