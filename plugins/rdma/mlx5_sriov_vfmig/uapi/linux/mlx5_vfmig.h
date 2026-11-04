@@ -27,12 +27,26 @@
  *   Latch VF @vf_id as having had its firmware state restored. A later
  *   mlx5_core probe of that VF consumes the bit to skip re-init of state
  *   that was loaded out of band. Returns 0 on success, -EINVAL if @vf_id
- *   is out of range or @reserved is non-zero, -EALREADY if the bit was
- *   already set.
+ *   is out of range or @flags carries unknown bits, -EALREADY if the bit
+ *   was already set and no @flags were requested.
+ *
+ *   @flags:
+ *     MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME -- snapshot-ordering restore
+ *       mirror: the next probe applies LOAD_VHCA_STATE but leaves the
+ *       VHCA parked (STOP) instead of resuming it, so CRIU can bring the
+ *       datapath live with an explicit MLX5_VFMIG_IOC_RESUME_VHCA at
+ *       RESUME_DEVICES_LATE, once every MR/ring VMA has been restored.
+ *       Honored even when the restored bit is already set (e.g. installed
+ *       by the LOAD ioctl's close()), in which case the call is a no-op
+ *       success rather than -EALREADY.
  */
+#define MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME	(1u << 0)
+#define MLX5_VFMIG_MARK_RESTORED_FLAG_ALL \
+	(MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME)
+
 struct mlx5_vfmig_mark_restored {
 	__u32 vf_id;	/* in */
-	__u32 reserved;
+	__u32 flags;	/* in: subset of MLX5_VFMIG_MARK_RESTORED_FLAG_* */
 };
 
 #define MLX5_VFMIG_IOC_MARK_RESTORED \
@@ -75,6 +89,19 @@ struct mlx5_vfmig_get_vhca_id {
  *     vf_uuid:   16-byte orchestrator-stamped per-VF identity tag set
  *                via MLX5_VFMIG_IOC_SET_VF_UUID. All-zeros means unset.
  *                Cleared on SR-IOV teardown (sriov_numvfs=0).
+ *     vf_state:  MLX5_VFMIG_VF_STATE_* flags, read from the VF itself at
+ *                the time of the call:
+ *       BOUND      the VF is bound to a driver.
+ *       FROM_LOAD  the VF is bound to mlx5_core and came up from
+ *                  LOAD_VHCA_STATE. Unlike @restored, which is consumed
+ *                  by the probe, this holds until the VF is unbound, so
+ *                  it tells a restored VF apart from one probed normally
+ *                  (including a restored VF unbound and bound again).
+ *       UNKNOWN    a probe or remove of the VF is in progress; the other
+ *                  bits are 0 and mean nothing. Query again later.
+ *                A kernel without this field reports 0 for a bound VF, so
+ *                check BOUND against sysfs before trusting a clear
+ *                FROM_LOAD.
  *
  *   ABI note: this struct grew to add @vf_uuid + @reserved_out. The
  *   encoded ioctl number changes with the struct size (sizeof in the
@@ -90,8 +117,13 @@ struct mlx5_vfmig_query_vf {
 	__u8  vf_uuid[16];	/* out: orchestrator-stamped UUID,
 				 *      all-zeros if unset
 				 */
-	__u8  reserved_out[8];	/* out: zeroed */
+	__u8  vf_state;		/* out: MLX5_VFMIG_VF_STATE_* */
+	__u8  reserved_out[7];	/* out: zeroed */
 };
+
+#define MLX5_VFMIG_VF_STATE_BOUND	(1u << 0)
+#define MLX5_VFMIG_VF_STATE_FROM_LOAD	(1u << 1)
+#define MLX5_VFMIG_VF_STATE_UNKNOWN	(1u << 2)
 
 #define MLX5_VFMIG_IOC_QUERY_VF \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x03, struct mlx5_vfmig_query_vf)
@@ -383,36 +415,105 @@ struct mlx5_vfmig_load_state {
  *   any LOAD_VHCA_STATE. CRIU never writes a UUID -- both dump and
  *   restore only READ @vf_uuid via QUERY_VF.
  *
+ *   A UUID identifies at most one VF per PF, so the VF that reports it is
+ *   unambiguous. Uniqueness across PFs or hosts is not enforced: the
+ *   source and destination of a migration carry the same UUID.
+ *
  *   Lifecycle:
  *     - Initial state on sriov_numvfs=N: all-zeros (unset).
  *     - SET_VF_UUID(vf_id, U) first call:      @vf_uuid := U.
  *     - SET_VF_UUID(vf_id, U) repeat (same U): no-op, returns 0.
  *     - SET_VF_UUID(vf_id, V), V != U, U != 0: -EBUSY, unchanged. Guards
  *         against re-tagging a slot that already carries an identity.
+ *     - SET_VF_UUID(vf_id, U), U on another VF of the PF: -EEXIST,
+ *         unchanged.
+ *     - SET_VF_UUID(vf_id, U, F_CLEAR), slot == U: all-zeros.
  *     - sriov_numvfs=0 / PF unload:            all-zeros (torn down).
  *
- *   "Set once until teardown": to repurpose a vf_id slot for a different
- *   workload, cycle sriov_numvfs=0 -> N first (the same cycle that already
- *   tears down the slot's other per-VF resources). Idempotent re-stamps
- *   with the same UUID need no teardown.
+ *   To hand a UUID from one VF to another on the same PF, clear it from
+ *   the holder with F_CLEAR and then stamp it on the new VF. Clearing is
+ *   allowed while the VF is bound to a driver; the UUID is only a tag and
+ *   no VF state depends on it. Otherwise the slot is set once until
+ *   sriov_numvfs=0.
+ *
+ *   @flags:
+ *     MLX5_VFMIG_SET_VF_UUID_F_CLEAR -- compare-and-clear: @vf_uuid
+ *       carries the UUID the caller expects @vf_id to hold, and the slot
+ *       is zeroed only if it matches. A mismatch leaves the slot as is.
  *
  *   Errors:
  *     -EFAULT  copy_from_user.
- *     -EINVAL  @vf_id out of range, @reserved non-zero, or @vf_uuid
+ *     -EINVAL  @vf_id out of range, @flags has unknown bits, or @vf_uuid
  *              all-zeros (all-zeros is the "unset" sentinel and is
- *              rejected as a write).
- *     -EBUSY   a different non-zero UUID is already set on @vf_id.
+ *              rejected both as a write and as an expected value).
+ *     -EBUSY   set: a different non-zero UUID is already set on @vf_id.
+ *              F_CLEAR: @vf_id holds a different UUID.
+ *     -EEXIST  set: another VF of this PF already holds @vf_uuid.
+ *     -ENOENT  F_CLEAR: @vf_id holds no UUID.
  *     -ENODEV  PF is gone.
+ *
+ *   Kernels without F_CLEAR required @flags to be 0 and fail it -EINVAL.
  */
+#define MLX5_VFMIG_SET_VF_UUID_F_CLEAR	(1u << 0)
+#define MLX5_VFMIG_SET_VF_UUID_FLAG_ALL \
+	(MLX5_VFMIG_SET_VF_UUID_F_CLEAR)
+
 struct mlx5_vfmig_set_vf_uuid {
 	__u32 vf_id;		/* in  */
-	__u32 reserved;		/* in: must be 0 */
-	__u8  vf_uuid[16];	/* in: orchestrator-supplied 16-byte
-				 *     UUID; must not be all-zeros.
+	__u32 flags;		/* in: subset of MLX5_VFMIG_SET_VF_UUID_FLAG_* */
+	__u8  vf_uuid[16];	/* in: UUID to stamp, or with F_CLEAR the
+				 *     UUID expected on @vf_id; must not be
+				 *     all-zeros.
 				 */
 };
 
 #define MLX5_VFMIG_IOC_SET_VF_UUID \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x12, struct mlx5_vfmig_set_vf_uuid)
+
+/*
+ * MLX5_VFMIG_IOC_RECYCLE_VF:
+ *   Return a used VF @vf_id to a loadable state without changing
+ *   sriov_numvfs, so it can be the destination of a later LOAD. Works on
+ *   a VF that ran normally and on one that came up from a LOAD.
+ *
+ *   Preconditions:
+ *     - The VF is not bound to any driver.
+ *     - No UUID is stamped on it. Move the UUID off with
+ *       SET_VF_UUID(F_CLEAR) first; recycle never clears it, so a VF
+ *       still carrying a workload identity is refused.
+ *     - No SAVE_VHCA_STATE or LOAD_VHCA_STATE fd is open for it.
+ *
+ *   Effect, in order:
+ *     1. FLR the VF (pci_reset_function_locked()). If this fails nothing
+ *        else is changed.
+ *     2. Drop any staged LOAD and the "restored" latch, along with a
+ *        MARK_RESTORED DEFER_RESUME request, and reset the VF's datapath
+ *        state to RUNNING.
+ *     3. If the VF is tracked, destroy its IOVA arena. Pages left in it
+ *        are freed and counted in dmesg.
+ *
+ *   Postconditions: the VF is in the state right after SR-IOV enable.
+ *   QUERY_VF reports restored=0, tracked=0 and an unset UUID. Run the
+ *   usual bootstrap (SET_TRACKED, ENABLE_MIGRATABLE) before it is bound
+ *   or loaded again. The migratable cap may survive the FLR; that is
+ *   harmless, since ENABLE_MIGRATABLE on a VF that already has it is a
+ *   no-op.
+ *
+ *   Errors:
+ *     -EFAULT  copy_from_user.
+ *     -EINVAL  @vf_id out of range or @flags non-zero.
+ *     -ENODEV  the VF pci_dev is missing, or the PF is gone.
+ *     -EBUSY   the VF is bound, or a SAVE/LOAD fd is open for it.
+ *     -EEXIST  a UUID is stamped on the VF.
+ *     other    from the FLR (e.g. -ENOTTY: no reset method), with no
+ *              state changed.
+ */
+struct mlx5_vfmig_recycle_vf {
+	__u32 vf_id;		/* in  */
+	__u32 flags;		/* in: must be 0 */
+};
+
+#define MLX5_VFMIG_IOC_RECYCLE_VF \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x16, struct mlx5_vfmig_recycle_vf)
 
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
