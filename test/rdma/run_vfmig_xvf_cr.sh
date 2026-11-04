@@ -17,17 +17,18 @@
 #     mlx5_vfmig.img + firmware blob + ucontext snapshot. The UUID is
 #     stamped on SRC_VF only.
 #
-#   destination provisioning: SR-IOV is reprovisioned and the checkpoint
-#     UUID is stamped on DST_VF *only* (SRC_VF is left a fresh, unstamped
-#     VF). This is the critical bit the UUID-first discovery relies on:
-#     exactly one VF on the host carries the UUID, so the restore scan
-#     cannot reselect the source slot and skip the LOAD.
+#   destination provisioning: the source VF, still bound and still
+#     holding the UUID after the dump, is recycled in place (unbind,
+#     clear_vf_uuid, recycle_vf) instead of tearing SR-IOV down, and the
+#     checkpoint UUID is stamped on DST_VF only. With SRC_VF == DST_VF the
+#     recycled source is the destination: the rollback case.
 #
 #   firmware prerestore: the standalone mlx5_vfmig_restore_vf tool matches
-#     the image's UUID to DST_VF, runs LOAD_VHCA_STATE against DST_VF
-#     (asserted via "vfmig: loaded ... vf_id=DST_VF"; NOT a skipped
-#     "already bound" shortcut), and binds the destination VF. The
-#     source->dest mapping log must show vf_id=SRC_VF -> vf_id=DST_VF.
+#     the image's UUID to DST_VF, decides from QUERY_VF that the unbound
+#     VF needs the LOAD, runs LOAD_VHCA_STATE against it ("vfmig: loaded
+#     ... vf_id=DST_VF") and binds it. The source->dest mapping log must
+#     show vf_id=SRC_VF -> vf_id=DST_VF, and criu restore must then see
+#     the VF as having come up from the LOAD (vf_state BOUND|FROM_LOAD).
 #
 #   context restore: `criu restore` brings the process back on the
 #     destination VF; the plugin's init(RESTORE) + OPEN_UVERBS_CDEV +
@@ -124,6 +125,26 @@ ensure_dma_domain() {
 	note "VF $bdf iommu_group type $t -> $(cat "$type_f")"
 }
 
+vf_bdf()   { readlink "$PF_DEV/virtfn$1" | xargs basename; }
+vf_query() { "$VFMIG_TOOL" "$PF" query_vf "$1"; }
+
+# Return VF $1 to its state right after SR-IOV enable without touching
+# sriov_numvfs: unbind it, take its UUID off, RECYCLE_VF. Unbinding a
+# restored VF logs "poll_health ... Fatal error 3 detected" in dmesg; that
+# is a known kernel issue, not a failure.
+recycle_slot() {
+	local vf="$1" bdf uuid
+	bdf="$(vf_bdf "$vf")"
+	if [[ -e "/sys/bus/pci/devices/$bdf/driver" ]]; then
+		echo "$bdf" >"/sys/bus/pci/devices/$bdf/driver/unbind"
+	fi
+	uuid="$(vf_query "$vf" | sed -nE 's/.* vf_uuid=([^ ]+) .*/\1/p')"
+	if [[ -n "$uuid" && "$uuid" != "<unset>" ]]; then
+		"$VFMIG_TOOL" "$PF" clear_vf_uuid "$vf" "$uuid"
+	fi
+	"$VFMIG_TOOL" "$PF" recycle_vf "$vf"
+}
+
 resolve_vf_ibdev() {
 	local vf_bdf="$1" ib target
 	for ib in /sys/class/infiniband/*; do
@@ -145,6 +166,8 @@ sect "Preconditions"
 [[ "$EUID" -eq 0 ]] || need_hw "not root (VF provisioning + cdev ioctls need root)"
 command -v "$VFMIG_TOOL" >/dev/null 2>&1 \
 	|| need_hw "orchestrator CLI '$VFMIG_TOOL' not found (set VFMIG_TOOL=...)"
+[[ "$("$VFMIG_TOOL" 2>&1 || true)" == *recycle_vf* ]] \
+	|| need_hw "orchestrator CLI '$VFMIG_TOOL' has no recycle_vf (rebuild it from the kernel tree)"
 [[ -x "$CRIU" ]]   || need_hw "missing criu at $CRIU (set CRIU=... or build the repo)"
 [[ -x "$HOLDER" ]] || need_hw "uverbs_ctx_holder not built ('make -C $HERE')"
 command -v systemd-run >/dev/null 2>&1 \
@@ -230,17 +253,14 @@ note "image dir has mlx5_vfmig.img + firmware blob + ucontext snapshot"
 # ---------------------------------------------------------------------------
 # Reprovision; stamp the UUID on the DESTINATION VF only (DST_VF)
 # ---------------------------------------------------------------------------
-sect "Provision the destination VF (vf_id=$DST_VF, unbound)"
-# Tear everything down and reprovision. Stamp the checkpoint UUID on
-# DST_VF *only*: the migrated VF "leaves" the source, and -- critically --
-# the restore-side scan matches the first VF carrying the UUID, so leaving
-# it on SRC_VF (while that VF stays bound) could reselect the source and
-# skip the LOAD. Here SRC_VF comes back as a fresh, unstamped VF.
-echo 0 >"$SRIOV_NUMVFS"
-sleep 0.5
-echo 0 >"$PF_DEV/sriov_drivers_autoprobe"
-echo "$NUMVFS" >"$SRIOV_NUMVFS"
-DEST_BDF="$(readlink "$PF_DEV/virtfn$DST_VF" | xargs basename)"
+sect "Recycle the source VF, provision the destination (vf_id=$DST_VF, unbound)"
+# After the dump the source VF is still bound and still holds the UUID.
+# Recycle it in place rather than tearing SR-IOV down: unbind, take the
+# UUID off, RECYCLE_VF. With SRC_VF == DST_VF this is the rollback case:
+# the recycled source is then the destination.
+recycle_slot "$SRC_VF"
+note "source VF vf_id=$SRC_VF recycled: $(vf_query "$SRC_VF")"
+DEST_BDF="$(vf_bdf "$DST_VF")"
 ensure_dma_domain "$DEST_BDF"
 # Tracked so QUERY_VF surfaces the stamped vf_uuid; stamp only on DST_VF.
 # Deliberately do NOT bind or enable_migratable -- the restore tool's LOAD
@@ -249,13 +269,7 @@ ensure_dma_domain "$DEST_BDF"
 "$VFMIG_TOOL" "$PF" set_vf_uuid "$DST_VF" "$VF_UUID"
 [[ ! -e "/sys/bus/pci/devices/$DEST_BDF/driver" ]] \
 	|| die "destination VF $DEST_BDF is already bound before prerestore (expected unbound)"
-if [[ "$SRC_VF" != "$DST_VF" ]]; then
-	SRC_SLOT_BDF="$(readlink "$PF_DEV/virtfn$SRC_VF" | xargs basename)"
-	[[ ! -e "/sys/bus/pci/devices/$SRC_SLOT_BDF/driver" ]] \
-		|| die "source slot VF $SRC_SLOT_BDF is bound; it must not carry the UUID or be reselected"
-	note "source slot vf_id=$SRC_VF (vf_bdf=$SRC_SLOT_BDF) left unbound/unstamped"
-fi
-note "destination VF: vf_id=$DST_VF vf_bdf=$DEST_BDF (unbound; UUID stamped)"
+note "destination VF: $(vf_query "$DST_VF")"
 
 sect "Firmware prerestore (mlx5_vfmig_restore_vf: LOAD onto DST_VF + bind)"
 FLOG="$WORKDIR/fw_restore.log"
@@ -269,8 +283,8 @@ grep -qaE "vfmig: matched ctxn=[0-9]+ source\(pf=$PF vf_id=$SRC_VF\) -> dest\(pf
 # A real LOAD must have run against DST_VF -- not a skipped "already bound".
 grep -qaE "vfmig: loaded pf=$PF vf_id=$DST_VF \([0-9]+ bytes\)" "$FLOG" \
 	|| { cat "$FLOG" >&2; die "LOAD_VHCA_STATE did not run against dest vf_id=$DST_VF"; }
-! grep -qaE 'already bound to mlx5_core; skipping LOAD_VHCA_STATE' "$FLOG" \
-	|| { cat "$FLOG" >&2; die "restore skipped LOAD (dest already bound) -- UUID likely on the wrong VF"; }
+grep -qaE "vfmig: dest vf_id=$DST_VF \(vf_bdf=$DEST_BDF\) vf_state=0x0 .*: unbound -> LOAD_VHCA_STATE \+ bind" "$FLOG" \
+	|| { cat "$FLOG" >&2; die "restore did not decide to LOAD the unbound destination"; }
 grep -qaE "vfmig: restored VF: vf_uuid=$VF_UUID .*source\(pf=$PF vf_id=$SRC_VF\) -> dest\(pf=$PF vf_id=$DST_VF .* dest_ibdev=[^ ]+ dest_cdev=[^ ]+" "$FLOG" \
 	|| { cat "$FLOG" >&2; die "prerestore tool did not complete a cross-slot VF restore"; }
 [[ -e "/sys/bus/pci/devices/$DEST_BDF/driver" ]] \
@@ -296,6 +310,11 @@ RESTORED_PID="$(cat "$PIDFILE" 2>/dev/null || true)"
 [[ -n "$RESTORED_PID" ]] || die "criu restore wrote no pidfile"
 kill -0 "$RESTORED_PID" 2>/dev/null || die "restored process (pid=$RESTORED_PID) is not alive"
 note "criu restore completed (restored pid=$RESTORED_PID)"
+
+# init(RESTORE) must have found the VF the tool bound and recognised it
+# as having come up from the LOAD, not merely bound.
+grep -qaE "vfmig: dest vf_id=$DST_VF \(vf_bdf=$DEST_BDF\) vf_state=0x3 .*: came up from LOAD_VHCA_STATE -> skipping LOAD_VHCA_STATE" "$RLOG" \
+	|| { grep -aE 'vfmig: dest vf_id=' "$RLOG" >&2 || true; die "criu restore did not see the destination as restored (FROM_LOAD)"; }
 
 # The restore-side hooks must all have fired against the destination cdev.
 grep -qaE 'vfmig: cached ctxn=[0-9]+ .* mode=(static|dyn-UAR) ' "$RLOG" \
