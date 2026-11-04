@@ -31,7 +31,8 @@
  * VF, so init(RESTORE)'s Phase A finds every VF bound and reported by
  * QUERY_VF as having come up from LOAD_VHCA_STATE, and skips LOAD -- it
  * only re-discovers + caches. A destination that is bound but did not
- * come up from a LOAD is refused (vfmig_dest_decide). Both static-UAR
+ * come up from a LOAD, or whose LOAD a restore already used, is refused
+ * (vfmig_dest_decide). Both static-UAR
  * (RESTORE_UCONTEXT) and dynamic-UAR (RESTORE_DYN_UARS) source
  * ucontexts are supported; the two modes are mutually exclusive per
  * entry.
@@ -376,10 +377,12 @@ static int vfmig_query_one_vf(const char *pf_bdf, uint32_t vf_id, struct mlx5_vf
 	return rc ? -1 : 0;
 }
 
-#define VFMIG_VF_STATE_FMT "vf_state=0x%x (bound=%u from_load=%u unknown=%u) restored=%u tracked=%u"
+#define VFMIG_VF_STATE_FMT \
+	"vf_state=0x%x (bound=%u from_load=%u claimed=%u unknown=%u) restored=%u tracked=%u"
 #define VFMIG_VF_STATE_ARGS(q)                                                                        \
 	(q)->vf_state, !!((q)->vf_state & MLX5_VFMIG_VF_STATE_BOUND),                                 \
 		!!((q)->vf_state & MLX5_VFMIG_VF_STATE_FROM_LOAD),                                    \
+		!!((q)->vf_state & MLX5_VFMIG_VF_STATE_CLAIMED),                                      \
 		!!((q)->vf_state & MLX5_VFMIG_VF_STATE_UNKNOWN), (q)->restored, (q)->tracked
 
 /*
@@ -421,6 +424,12 @@ enum vfmig_dest_action {
  * Phase B, as an opaque GET_CONTEXT EINVAL. QUERY_VF's FROM_LOAD says
  * whether the VF's current probe came up from LOAD_VHCA_STATE, so
  * refuse here, before anything is loaded or replayed.
+ *
+ * FROM_LOAD alone does not say whose LOAD it was: a restored VF whose
+ * process was killed, or dumped again, stays FROM_LOAD until it is
+ * unbound. CLAIMED says a restore already opened a restore-mode
+ * ucontext on it, so only an unclaimed FROM_LOAD VF holds state no
+ * restore has used yet.
  *
  * A kernel without vf_state reports 0 for every VF. If sysfs shows the
  * VF bound while QUERY_VF does not, query again, since it may have
@@ -465,6 +474,15 @@ static int vfmig_dest_decide(const char *pf_bdf, uint32_t vf_id, const char *vf_
 			vf_id, vf_bdf, VFMIG_VF_STATE_ARGS(&q));
 		*action = VFMIG_DEST_LOAD;
 		return 0;
+	}
+
+	if ((q.vf_state & MLX5_VFMIG_VF_STATE_FROM_LOAD) && (q.vf_state & MLX5_VFMIG_VF_STATE_CLAIMED)) {
+		pr_err("vfmig: dest vf_id=%u (vf_bdf=%s) " VFMIG_VF_STATE_FMT ": came up from LOAD_VHCA_STATE, but "
+		       "a restore already used that LOAD, so the VF no longer holds this image's state. Unbind it, "
+		       "clear its UUID (SET_VF_UUID F_CLEAR) and RECYCLE_VF it, then SET_TRACKED + "
+		       "ENABLE_MIGRATABLE and restamp the UUID\n",
+		       vf_id, vf_bdf, VFMIG_VF_STATE_ARGS(&q));
+		return -1;
 	}
 
 	if (q.vf_state & MLX5_VFMIG_VF_STATE_FROM_LOAD) {
@@ -810,6 +828,16 @@ static int vfmig_park_fd_high(int fd)
  * enforced. A no-op once the fd is cached (dest_cdev_fd >= 0). Returns
  * 0 on success, -1 on any failure.
  */
+static void vfmig_explain_get_context_einval(const struct vfmig_restored_ctx *c, int rc)
+{
+	if (rc != -EINVAL)
+		return;
+	pr_err("vfmig: %s ctxn=%u: the kernel refuses a restore-mode ucontext on a VF that did not come up from "
+	       "LOAD_VHCA_STATE, or whose LOAD another restore already used; dmesg 'VFMIG_RESTORE ucontext "
+	       "refused' says which. Recycle the VF and restore again\n",
+	       c->dest_cdev_path, c->source_ctxn);
+}
+
 static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 {
 	int fd, rc;
@@ -835,6 +863,7 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE, static) on %s ctxn=%u failed: %d (%s) "
 			       "[source_devx_uid=%u (image-only, not consumed at restore)]\n",
 			       c->dest_cdev_path, c->source_ctxn, rc, strerror(-rc), c->source_devx_uid);
+			vfmig_explain_get_context_einval(c, rc);
 			close(fd);
 			return -1;
 		}
@@ -880,6 +909,7 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE|DYN_UAR) on %s ctxn=%u failed: %d (%s) "
 			       "[source_devx_uid=%u (image-only, not consumed at restore)]\n",
 			       c->dest_cdev_path, c->source_ctxn, rc, strerror(-rc), c->source_devx_uid);
+			vfmig_explain_get_context_einval(c, rc);
 			close(fd);
 			return -1;
 		}
