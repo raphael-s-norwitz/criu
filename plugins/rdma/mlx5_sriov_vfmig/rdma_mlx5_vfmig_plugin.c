@@ -155,7 +155,7 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 	 * Restore-side firmware discovery + per-context cache build. The
 	 * prerestore contract has the standalone tool (or orchestrator)
 	 * already load + bind the destination VFs, so this re-discovers
-	 * them (Phase A finds them bound and skips LOAD) and parses the
+	 * them (Phase A finds them bound from a LOAD and skips it) and parses the
 	 * image's ucontext snapshots into the cache the OPEN_UVERBS_CDEV
 	 * hook consumes (Phase B). An empty image is a no-op; a mismatch
 	 * (image entries but no matching tracked VF) fails init, which

@@ -3,7 +3,7 @@
  *
  * The VF firmware layer here is the LOAD counterpart to the fini(DUMP)
  * SAVE drain in vfmig_dump.c: it matches each image entry's vf_uuid to
- * a destination VF, and -- unless the VF is already bound -- drives
+ * a destination VF, and -- unless the VF already came up from a LOAD -- drives
  * ENABLE_MIGRATABLE + SET_TRACKED + LOAD_VHCA_STATE (streaming the
  * firmware blob off the image dir) + MARK_RESTORED and binds it to
  * mlx5_core, then waits for and resolves the destination ibdev and
@@ -28,8 +28,10 @@
  *
  * The prerestore contract for `criu restore`: the standalone tool (or
  * the orchestrator) has already loaded the VF firmware and bound the
- * VF, so init(RESTORE)'s Phase A finds every VF already bound and skips
- * LOAD -- it only re-discovers + caches. Both static-UAR
+ * VF, so init(RESTORE)'s Phase A finds every VF bound and reported by
+ * QUERY_VF as having come up from LOAD_VHCA_STATE, and skips LOAD -- it
+ * only re-discovers + caches. A destination that is bound but did not
+ * come up from a LOAD is refused (vfmig_dest_decide). Both static-UAR
  * (RESTORE_UCONTEXT) and dynamic-UAR (RESTORE_DYN_UARS) source
  * ucontexts are supported; the two modes are mutually exclusive per
  * entry.
@@ -309,19 +311,10 @@ static int vfmig_resolve_vf_bdf(const char *pf_bdf, uint32_t vf_id, char *out, s
 /*
  * Is @vf_bdf bound to any kernel driver?
  *
- * Returns 1 if /sys/bus/pci/devices/<vf_bdf>/driver exists (the VF is
- * already bound -- e.g. a prior restore-vf run already drove LOAD +
- * bind on it), 0 if it does not (the orchestrator-provisioned-but-
- * unbound state this path expects), or -1 on a sysfs error the caller
- * should treat as fatal.
- *
- * We use the sysfs driver symlink rather than QUERY_VF.restored on
- * purpose: the kernel consumes the `restored` bit at VF-probe time (it
- * is cleared as soon as the bind triggers the VF's driver load), so any
- * post-bind QUERY_VF reads it back as 0 regardless of whether a LOAD +
- * MARK_RESTORED cycle ran moments earlier. Under the orchestrator
- * contract -- the destination VF is created unbound and only this path
- * binds it -- "bound to a driver" is a clean "already restored" signal.
+ * Returns 1 if /sys/bus/pci/devices/<vf_bdf>/driver exists, 0 if it
+ * does not, or -1 on a sysfs error the caller should treat as fatal.
+ * vfmig_dest_decide() only uses it to recognise a kernel whose QUERY_VF
+ * predates vf_state.
  */
 static int vfmig_is_vf_bound(const char *vf_bdf)
 {
@@ -337,6 +330,132 @@ static int vfmig_is_vf_bound(const char *vf_bdf)
 	if (errno == ENOENT)
 		return 0;
 	pr_perror("vfmig: lstat(%s) for bind check", path);
+	return -1;
+}
+
+static int vfmig_query_one_vf(const char *pf_bdf, uint32_t vf_id, struct mlx5_vfmig_query_vf *q)
+{
+	char path[PATH_MAX];
+	int fd, rc;
+
+	snprintf(path, sizeof(path), "%s/%s", MLX5_VFMIG_DEV_DIR, pf_bdf);
+	fd = open(path, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		pr_perror("vfmig: open(%s)", path);
+		return -1;
+	}
+	memset(q, 0, sizeof(*q));
+	q->vf_id = vf_id;
+	rc = ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, q);
+	if (rc)
+		pr_perror("vfmig: QUERY_VF(pf=%s vf_id=%u)", pf_bdf, vf_id);
+	close(fd);
+	return rc ? -1 : 0;
+}
+
+#define VFMIG_VF_STATE_FMT "vf_state=0x%x (bound=%u from_load=%u unknown=%u) restored=%u tracked=%u"
+#define VFMIG_VF_STATE_ARGS(q)                                                                        \
+	(q)->vf_state, !!((q)->vf_state & MLX5_VFMIG_VF_STATE_BOUND),                                 \
+		!!((q)->vf_state & MLX5_VFMIG_VF_STATE_FROM_LOAD),                                    \
+		!!((q)->vf_state & MLX5_VFMIG_VF_STATE_UNKNOWN), (q)->restored, (q)->tracked
+
+/*
+ * QUERY_VF @vf_id until its vf_state is known. The kernel reports
+ * UNKNOWN while a probe or remove of the VF holds its device lock, and
+ * also when the VF's pci_dev is missing.
+ */
+#define VFMIG_VF_STATE_TRIES 20
+static int vfmig_query_vf_state(const char *pf_bdf, uint32_t vf_id, const char *vf_bdf,
+				struct mlx5_vfmig_query_vf *q)
+{
+	int tries;
+
+	for (tries = 0; tries < VFMIG_VF_STATE_TRIES; tries++) {
+		if (vfmig_query_one_vf(pf_bdf, vf_id, q))
+			return -1;
+		if (!(q->vf_state & MLX5_VFMIG_VF_STATE_UNKNOWN))
+			return 0;
+		usleep(100 * 1000);
+	}
+	pr_err("vfmig: dest vf_id=%u (vf_bdf=%s): QUERY_VF still reports an unknown state after %d tries: a "
+	       "probe or remove of the VF is in progress, or its PCI device is gone\n",
+	       vf_id, vf_bdf, VFMIG_VF_STATE_TRIES);
+	return -1;
+}
+
+enum vfmig_dest_action {
+	VFMIG_DEST_LOAD,	/* unbound and nothing staged: LOAD + bind */
+	VFMIG_DEST_RESTORED,	/* already came up from a LOAD: skip it */
+};
+
+/*
+ * Decide what to do with the destination VF a vf_uuid resolved to.
+ *
+ * "Bound" alone does not mean "restored": a VF bound by autoprobe, a
+ * restored VF unbound and bound again, or a source VF left bound after
+ * its dump are all bound without holding the image's state, and a
+ * restore-mode ucontext on any of them is refused by the kernel only in
+ * Phase B, as an opaque GET_CONTEXT EINVAL. QUERY_VF's FROM_LOAD says
+ * whether the VF's current probe came up from LOAD_VHCA_STATE, so
+ * refuse here, before anything is loaded or replayed.
+ *
+ * A kernel without vf_state reports 0 for every VF. If sysfs shows the
+ * VF bound while QUERY_VF does not, query again, since it may have
+ * bound in between; if it still does not, the kernel is that old one
+ * and the bound VF is taken as restored, as before vf_state existed.
+ *
+ * Returns 0 with *@action set, or -1 (logged) to refuse.
+ */
+static int vfmig_dest_decide(const char *pf_bdf, uint32_t vf_id, const char *vf_bdf, enum vfmig_dest_action *action)
+{
+	struct mlx5_vfmig_query_vf q;
+	int sysfs_bound;
+
+	if (vfmig_query_vf_state(pf_bdf, vf_id, vf_bdf, &q))
+		return -1;
+	sysfs_bound = vfmig_is_vf_bound(vf_bdf);
+	if (sysfs_bound < 0)
+		return -1;
+	if (sysfs_bound && !(q.vf_state & MLX5_VFMIG_VF_STATE_BOUND)) {
+		if (vfmig_query_vf_state(pf_bdf, vf_id, vf_bdf, &q))
+			return -1;
+		if (!(q.vf_state & MLX5_VFMIG_VF_STATE_BOUND)) {
+			pr_warn("vfmig: dest vf_id=%u (vf_bdf=%s) is bound but QUERY_VF reports no vf_state: this "
+				"kernel predates it, so the VF cannot be verified as restored. Skipping "
+				"LOAD_VHCA_STATE on trust\n",
+				vf_id, vf_bdf);
+			*action = VFMIG_DEST_RESTORED;
+			return 0;
+		}
+	}
+
+	if (!(q.vf_state & MLX5_VFMIG_VF_STATE_BOUND)) {
+		if (q.restored) {
+			pr_err("vfmig: dest vf_id=%u (vf_bdf=%s) " VFMIG_VF_STATE_FMT ": unbound but a "
+			       "LOAD_VHCA_STATE is already staged on it. Another restore got there first, or an "
+			       "earlier one failed before the bind. RECYCLE_VF it and restamp its UUID before "
+			       "retrying\n",
+			       vf_id, vf_bdf, VFMIG_VF_STATE_ARGS(&q));
+			return -1;
+		}
+		pr_info("vfmig: dest vf_id=%u (vf_bdf=%s) " VFMIG_VF_STATE_FMT ": unbound -> LOAD_VHCA_STATE + bind\n",
+			vf_id, vf_bdf, VFMIG_VF_STATE_ARGS(&q));
+		*action = VFMIG_DEST_LOAD;
+		return 0;
+	}
+
+	if (q.vf_state & MLX5_VFMIG_VF_STATE_FROM_LOAD) {
+		pr_info("vfmig: dest vf_id=%u (vf_bdf=%s) " VFMIG_VF_STATE_FMT ": came up from LOAD_VHCA_STATE -> "
+			"skipping LOAD_VHCA_STATE\n",
+			vf_id, vf_bdf, VFMIG_VF_STATE_ARGS(&q));
+		*action = VFMIG_DEST_RESTORED;
+		return 0;
+	}
+
+	pr_err("vfmig: dest vf_id=%u (vf_bdf=%s) " VFMIG_VF_STATE_FMT ": bound but did not come up from "
+	       "LOAD_VHCA_STATE. Unbind it, clear its UUID (SET_VF_UUID F_CLEAR) and RECYCLE_VF it, then "
+	       "SET_TRACKED + ENABLE_MIGRATABLE and restamp the UUID\n",
+	       vf_id, vf_bdf, VFMIG_VF_STATE_ARGS(&q));
 	return -1;
 }
 
@@ -1245,8 +1364,10 @@ int rdma_mlx5_vfmig_plugin_resume_ibdev(const UverbsFileEntry *uvfe)
  * (pf_bdf, vf_id) -- which need not be the source slot: the kernel now
  * gives every VF of a PF the same IOVA window, so a saved image replays
  * onto any VF, not just the index it was dumped from -- resolve the
- * destination VF's PCI BDF, then -- unless the VF is already bound --
- * drive LOAD_VHCA_STATE + MARK_RESTORED and bind it to mlx5_core;
+ * destination VF's PCI BDF, decide from its QUERY_VF state whether it
+ * needs the LOAD, already has it, or must be refused
+ * (vfmig_dest_decide), and if needed drive LOAD_VHCA_STATE +
+ * MARK_RESTORED and bind it to mlx5_core;
  * finally resolve the dest ibdev and cdev path and record the tuple.
  * The source (pf_bdf, vf_id) is kept as checkpoint metadata and in the
  * logs; everything the restore drives is keyed on the destination.
@@ -1305,7 +1426,7 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 		struct vfmig_restored_vf *v;
 		char dest_pf_bdf[64];
 		uint32_t dest_vf_id;
-		int dest_bound;
+		enum vfmig_dest_action action;
 		char vf_bdf[64], dest_ibdev[64];
 		char dest_cdev_path[PATH_MAX];
 		char uuid_str[VFMIG_UUID_STR_LEN];
@@ -1344,15 +1465,10 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 			"vf_uuid=%s\n",
 			e->ctxn, e->pf_bdf, e->vf_id, dest_pf_bdf, dest_vf_id, vf_bdf, uuid_str);
 
-		dest_bound = vfmig_is_vf_bound(vf_bdf);
-		if (dest_bound < 0)
+		if (vfmig_dest_decide(dest_pf_bdf, dest_vf_id, vf_bdf, &action))
 			goto err;
 
-		if (dest_bound) {
-			pr_info("vfmig: dest vf_id=%u (vf_bdf=%s) already bound to mlx5_core; skipping "
-				"LOAD_VHCA_STATE\n",
-				dest_vf_id, vf_bdf);
-		} else {
+		if (action == VFMIG_DEST_LOAD) {
 			if (vfmig_load_one_vf(dest_pf_bdf, dest_vf_id, e->blob_path, e->blob_size))
 				goto err;
 			if (vfmig_driver_override_and_bind(vf_bdf))
