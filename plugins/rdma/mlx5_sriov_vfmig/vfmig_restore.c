@@ -195,7 +195,7 @@ static void vfmig_uuid_to_str(const uint8_t u[16], char out[VFMIG_UUID_STR_LEN])
 
 /*
  * Scan every PF cdev under /dev/mlx5_vfmig, run QUERY_VF on every VF,
- * and return the first (pf_bdf, vf_id) whose vf_uuid bitwise-matches
+ * and return the one (pf_bdf, vf_id) whose vf_uuid bitwise-matches
  * @target.
  *
  * QUERY_VF with vf_id=0 always populates @num_vfs even when it returns
@@ -205,14 +205,26 @@ static void vfmig_uuid_to_str(const uint8_t u[16], char out[VFMIG_UUID_STR_LEN])
  * first ioctl is logged and skipped so one misbehaving PF does not
  * poison the search across the whole host.
  *
- * With a 2^128 UUID space, two VFs on one host reporting the same UUID
- * is an orchestrator bug, so first match wins. Returns 0 on match (with
- * @pf_bdf_out / @vf_id_out set), -ENOENT if no VF carries @target, or
- * -1 on a hard error (e.g. /dev/mlx5_vfmig unreadable).
+ * The kernel refuses a UUID another VF of the same PF holds, but not
+ * one held on another PF, so two matches on one host are possible: a
+ * source VF that kept the UUID after its dump, or an orchestrator bug.
+ * Either way picking one could restore onto the wrong VF, so the whole
+ * host is scanned and more than one match is refused, listing them.
+ *
+ * Returns 0 on a single match (with @pf_bdf_out / @vf_id_out set),
+ * -ENOENT if no VF carries @target, or -1 on several matches or a hard
+ * error (e.g. /dev/mlx5_vfmig unreadable).
  */
+#define VFMIG_UUID_MATCHES_LISTED 8
 static int vfmig_resolve_uuid_to_pf_vf(const uint8_t target[16], char *pf_bdf_out, size_t pf_bdf_sz,
 				       uint32_t *vf_id_out)
 {
+	struct {
+		char pf_bdf[NAME_MAX + 1];
+		uint32_t vf_id;
+	} match[VFMIG_UUID_MATCHES_LISTED];
+	unsigned int n_match = 0, i;
+	char uuid_str[VFMIG_UUID_STR_LEN];
 	DIR *d;
 	struct dirent *de;
 
@@ -249,37 +261,48 @@ static int vfmig_resolve_uuid_to_pf_vf(const uint8_t target[16], char *pf_bdf_ou
 		}
 		num_vfs = q.num_vfs;
 
-		if (rc == 0 && !memcmp(q.vf_uuid, target, sizeof(q.vf_uuid))) {
-			snprintf(pf_bdf_out, pf_bdf_sz, "%s", de->d_name);
-			*vf_id_out = 0;
-			close(fd);
-			closedir(d);
-			return 0;
-		}
-
-		for (vf = 1; vf < num_vfs; vf++) {
-			struct mlx5_vfmig_query_vf qq;
-
-			memset(&qq, 0, sizeof(qq));
-			qq.vf_id = vf;
-			if (ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, &qq) != 0) {
-				pr_warn("vfmig: QUERY_VF(%s, vf_id=%u) for UUID resolve: %s\n", path, vf,
-					strerror(errno));
+		for (vf = 0; vf < num_vfs; vf++) {
+			if (vf > 0) {
+				memset(&q, 0, sizeof(q));
+				q.vf_id = vf;
+				if (ioctl(fd, MLX5_VFMIG_IOC_QUERY_VF, &q) != 0) {
+					pr_warn("vfmig: QUERY_VF(%s, vf_id=%u) for UUID resolve: %s\n", path, vf,
+						strerror(errno));
+					continue;
+				}
+			} else if (rc != 0) {
 				continue;
 			}
-			if (!memcmp(qq.vf_uuid, target, sizeof(qq.vf_uuid))) {
-				snprintf(pf_bdf_out, pf_bdf_sz, "%s", de->d_name);
-				*vf_id_out = vf;
-				close(fd);
-				closedir(d);
-				return 0;
+			if (memcmp(q.vf_uuid, target, sizeof(q.vf_uuid)))
+				continue;
+			if (n_match < VFMIG_UUID_MATCHES_LISTED) {
+				snprintf(match[n_match].pf_bdf, sizeof(match[n_match].pf_bdf), "%s", de->d_name);
+				match[n_match].vf_id = vf;
 			}
+			n_match++;
 		}
 		close(fd);
 	}
 
 	closedir(d);
-	return -ENOENT;
+
+	if (n_match == 0)
+		return -ENOENT;
+	if (n_match > 1) {
+		vfmig_uuid_to_str(target, uuid_str);
+		pr_err("vfmig: vf_uuid=%s is stamped on %u VFs on this host; refusing to pick one. The "
+		       "orchestrator must leave it on the destination only (SET_VF_UUID F_CLEAR on the others):\n",
+		       uuid_str, n_match);
+		for (i = 0; i < n_match && i < VFMIG_UUID_MATCHES_LISTED; i++)
+			pr_err("vfmig:   pf=%s vf_id=%u\n", match[i].pf_bdf, match[i].vf_id);
+		if (n_match > VFMIG_UUID_MATCHES_LISTED)
+			pr_err("vfmig:   ... and %u more\n", n_match - VFMIG_UUID_MATCHES_LISTED);
+		return -1;
+	}
+
+	snprintf(pf_bdf_out, pf_bdf_sz, "%s", match[0].pf_bdf);
+	*vf_id_out = match[0].vf_id;
+	return 0;
 }
 
 /*
