@@ -483,6 +483,36 @@ static int vfmig_dest_decide(const char *pf_bdf, uint32_t vf_id, const char *vf_
 }
 
 /*
+ * @step failed on a destination VF. Most such failures come from a
+ * destination that was not freshly created or recycled, and the kernel
+ * logs the reason, so print the VF's state and point there.
+ *
+ * @no_ibdev: the VF bound but no ib device appeared. That is how an
+ * image whose firmware state has outgrown a VF fails: each SAVE from a
+ * restored VF carries more state than the image it was loaded from, and
+ * after enough generations the restored probe fails CREATE_EQ.
+ */
+static void vfmig_report_dest_failure(const char *pf_bdf, uint32_t vf_id, const char *vf_bdf, const char *step,
+				      bool no_ibdev)
+{
+	struct mlx5_vfmig_query_vf q;
+
+	if (!vfmig_query_one_vf(pf_bdf, vf_id, &q))
+		pr_err("vfmig: %s failed on dest pf=%s vf_id=%u (vf_bdf=%s): " VFMIG_VF_STATE_FMT "\n", step, pf_bdf,
+		       vf_id, vf_bdf, VFMIG_VF_STATE_ARGS(&q));
+	else
+		pr_err("vfmig: %s failed on dest pf=%s vf_id=%u (vf_bdf=%s)\n", step, pf_bdf, vf_id, vf_bdf);
+	pr_err("vfmig: a destination VF must be freshly created (sriov_numvfs) or recycled (unbind, SET_VF_UUID "
+	       "F_CLEAR, RECYCLE_VF, SET_TRACKED + ENABLE_MIGRATABLE, SET_VF_UUID) before restore; dmesg has the "
+	       "kernel's reason\n");
+	if (no_ibdev)
+		pr_err("vfmig: if dmesg shows 'CREATE_EQ ... syndrome (0x223532)' and 'mlx5_init_one failed with "
+		       "error code -22' for %s, the image was saved after too many restore generations and its "
+		       "firmware state no longer fits a VF\n",
+		       vf_bdf);
+}
+
+/*
  * Drive ENABLE_MIGRATABLE + SET_TRACKED + LOAD_VHCA_STATE +
  * MARK_RESTORED on a single (pf_bdf, vf_id), streaming the firmware
  * blob at @blob_path (relative to the image dir) into the load fd.
@@ -1492,14 +1522,20 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 			goto err;
 
 		if (action == VFMIG_DEST_LOAD) {
-			if (vfmig_load_one_vf(dest_pf_bdf, dest_vf_id, e->blob_path, e->blob_size))
+			if (vfmig_load_one_vf(dest_pf_bdf, dest_vf_id, e->blob_path, e->blob_size)) {
+				vfmig_report_dest_failure(dest_pf_bdf, dest_vf_id, vf_bdf, "LOAD_VHCA_STATE", false);
 				goto err;
-			if (vfmig_driver_override_and_bind(vf_bdf))
+			}
+			if (vfmig_driver_override_and_bind(vf_bdf)) {
+				vfmig_report_dest_failure(dest_pf_bdf, dest_vf_id, vf_bdf, "bind", false);
 				goto err;
+			}
 		}
 
-		if (vfmig_wait_for_dest_ibdev(vf_bdf, dest_ibdev, sizeof(dest_ibdev)))
+		if (vfmig_wait_for_dest_ibdev(vf_bdf, dest_ibdev, sizeof(dest_ibdev))) {
+			vfmig_report_dest_failure(dest_pf_bdf, dest_vf_id, vf_bdf, "waiting for the ib device", true);
 			goto err;
+		}
 		if (vfmig_resolve_dest_cdev_path(dest_ibdev, dest_cdev_path, sizeof(dest_cdev_path)))
 			goto err;
 
