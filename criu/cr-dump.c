@@ -2258,6 +2258,14 @@ int cr_dump_tasks(pid_t pid)
 		he.allow_uprobes = true;
 	}
 
+	/*
+	 * Last, so the RDMA devices stay suspended no longer than they must,
+	 * but before the inventory: an image without a device's state is
+	 * not one, and cr_dump_finish() may resume the devices.
+	 */
+	if (rdma_save_held_ibdevs())
+		goto err;
+
 	exit_code = write_img_inventory(&he, parent_ie);
 err:
 	if (parent_ie)

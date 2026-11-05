@@ -151,6 +151,13 @@ int rdma_suspend_captured_ibdevs(void);
 void rdma_release_exported_dmabufs(void);
 
 /*
+ * Have each fenced or suspended ibdev's plugin write the device's state
+ * into the image, once per device, at the end of the dump proper. No-op
+ * for trees with no RDMA. See CR_PLUGIN_HOOK__RDMA_SAVE_IBDEV.
+ */
+int rdma_save_held_ibdevs(void);
+
+/*
  * End of dump, called by cr_plugin_fini() between the device plugins' exit
  * hooks and the RDMA plugins'. On an aborted dump, undo what the dump did
  * to its ibdevs in the one order that is safe: resume the parked ones,
@@ -218,6 +225,7 @@ int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe);
  */
 int rdma_dispatch_suspend_ibdev(uint32_t criu_driver, const char *ibdev, bool resume);
 int rdma_dispatch_fence_ibdev(uint32_t criu_driver, const char *ibdev, bool lift);
+int rdma_dispatch_save_ibdev(uint32_t criu_driver, const char *ibdev);
 int rdma_dispatch_resume_ibdev(const UverbsFileEntry *uvfe);
 
 /*

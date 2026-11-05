@@ -492,6 +492,27 @@ enum {
 	 */
 	CR_PLUGIN_HOOK__RDMA_FENCE_IBDEV = 30,
 
+	/*
+	 * Write an ibdev's device state into the image. Dispatched once per
+	 * ibdev the dump fenced or suspended, routed by
+	 * CR_PLUGIN_RDMA_PROVIDED_DRIVER, at the end of the dump proper:
+	 * after every other image is written, before the inventory and
+	 * before cr_dump_finish().
+	 *
+	 * Before cr_dump_finish() because what follows assumes a complete
+	 * image: post-dump scripts may copy it away, and an aborted or
+	 * --leave-running dump resumes the device, rebinds its MRs and lifts
+	 * its fence there, after which the device no longer holds the
+	 * state that went with the memory snapshot. As late as possible
+	 * because the device stays suspended until then.
+	 *
+	 * Return: 0 on success, -ENOTSUP if the plugin does not own @ibdev
+	 * or has nothing to save, < 0 errno on failure. A failure aborts
+	 * the dump, which then undoes the suspend and fence as for any
+	 * other failure.
+	 */
+	CR_PLUGIN_HOOK__RDMA_SAVE_IBDEV = 31,
+
 	CR_PLUGIN_HOOK__MAX
 };
 
@@ -583,6 +604,7 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESTORE_UOBJ_QP_NEEDS_PIE, void);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_SUSPEND_IBDEV, const char *ibdev, bool resume);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_RESUME_IBDEV, const UverbsFileEntry *uvfe);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_FENCE_IBDEV, const char *ibdev, bool lift);
+DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_SAVE_IBDEV, const char *ibdev);
 
 /*
  * RDMA sharing policy.

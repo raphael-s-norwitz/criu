@@ -950,6 +950,54 @@ int rdma_dispatch_fence_ibdev(uint32_t criu_driver, const char *ibdev, bool lift
 }
 
 /*
+ * Route an ibdev's device-state save the same way. A matched plugin that
+ * does not register the hook has no device state of its own to save.
+ */
+int rdma_dispatch_save_ibdev(uint32_t criu_driver, const char *ibdev)
+{
+	plugin_desc_t *this;
+	plugin_desc_t *winner = NULL;
+	const char *winner_name = NULL;
+	CR_PLUGIN_HOOK__RDMA_SAVE_IBDEV_t *fn;
+
+	list_for_each_entry(this, &cr_plugin_ctl.head, list) {
+		const int *p;
+
+		if (!this->d || !this->dlhandle)
+			continue;
+		p = (const int *)dlsym(this->dlhandle, CR_PLUGIN_RDMA_PROVIDED_DRIVER_SYM);
+		if (!p)
+			continue;
+		if ((uint32_t)*p != criu_driver)
+			continue;
+
+		if (winner) {
+			pr_err("ibdev save: multiple plugins declare cr_rdma_provided_driver=%u "
+			       "('%s' and '%s'); operator's plugin set is inconsistent.\n",
+			       criu_driver, winner_name, this->d->name);
+			return -EEXIST;
+		}
+		winner = this;
+		winner_name = this->d->name;
+	}
+
+	if (!winner) {
+		pr_err("ibdev save: no loaded RDMA plugin exports cr_rdma_provided_driver=%u for ibdev=%s\n",
+		       criu_driver, ibdev);
+		return -ENOENT;
+	}
+
+	fn = winner->d->hooks[CR_PLUGIN_HOOK__RDMA_SAVE_IBDEV];
+	if (!fn) {
+		pr_debug("ibdev save: plugin '%s' exposes no RDMA_SAVE_IBDEV; nothing to save for %s\n",
+			 winner_name, ibdev);
+		return -ENOTSUP;
+	}
+
+	return fn(ibdev);
+}
+
+/*
  * Restore-side twin of rdma_dispatch_suspend_ibdev(). Same keying; a
  * matched plugin that does not register the hook has nothing to do once
  * its ibdev can serve traffic again.

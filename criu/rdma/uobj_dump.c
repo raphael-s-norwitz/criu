@@ -1570,6 +1570,34 @@ void rdma_release_exported_dmabufs(void)
 }
 
 /*
+ * Save the device state of every ibdev the dump fenced or suspended,
+ * once each. A plugin that does not own a given ibdev, or has nothing to
+ * save for it, answers -ENOTSUP and is skipped; any other failure aborts
+ * the dump, since an image without a device's state cannot be restored.
+ */
+int rdma_save_held_ibdevs(void)
+{
+	struct rdma_held_ibdev *h;
+	int saved = 0, ret;
+
+	for (h = rdma_held_ibdevs; h; h = h->next) {
+		ret = rdma_dispatch_save_ibdev(h->criu_driver, h->ibdev);
+		if (ret == -ENOTSUP)
+			continue;
+		if (ret < 0) {
+			pr_err("uobj DAG: saving the state of ibdev=%s (criu_driver=%u) failed: %d\n", h->ibdev,
+			       h->criu_driver, ret);
+			return -1;
+		}
+		saved++;
+	}
+
+	if (saved)
+		pr_info("uobj DAG: saved the device state of %d ibdev(s)\n", saved);
+	return 0;
+}
+
+/*
  * The fd on line @index of dmabuf_fds, or -1. A device plugin that
  * recreated the buffers during its rollback has rewritten the lines with
  * the fds they came back as, in this process's table.
