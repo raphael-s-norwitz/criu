@@ -159,13 +159,13 @@ int rdma_save_held_ibdevs(void);
 
 /*
  * End of dump, called by cr_plugin_fini() between the device plugins' exit
- * hooks and the RDMA plugins'. On an aborted dump, undo what the dump did
- * to its ibdevs in the one order that is safe: resume the parked ones,
+ * hooks and the RDMA plugins'. When the tasks keep running (@tasks_resume),
+ * undo what the dump did to its ibdevs in the one order that is safe: resume the parked ones,
  * rebind the unbound MRs -- to the buffers the device plugins' rollback
  * recreated, where it did -- then lift the fences, except on an ibdev left
  * with an unbacked MR.
  */
-void rdma_finish_dump(bool aborted);
+void rdma_finish_dump(bool tasks_resume);
 
 /*
  * Bring those ibdevs back online after rdma_bind_dmabuf_mrs_late() has

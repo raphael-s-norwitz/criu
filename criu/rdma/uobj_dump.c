@@ -330,8 +330,8 @@ static int dmabuf_fds_append(int fd, uint32_t *index_out)
  * -EOPNOTSUPP, same as a kernel too old to know the method at all.
  */
 /*
- * Every ibdev this dump has parked or fenced, so an aborted dump can undo
- * both, in order, while the plugins are still loaded. @unbacked marks an
+ * Every ibdev this dump has parked or fenced, so a dump whose tasks keep
+ * running can undo both, in order, while the plugins are still loaded. @unbacked marks an
  * ibdev with an MR the rollback could not rebind, or whose buffers were
  * already released: its fence must stay up.
  */
@@ -382,16 +382,16 @@ static struct rdma_held_ibdev *rdma_hold_ibdev(uint32_t criu_driver, const char 
  *
  * The unbind is the one step of the dump that changes the dumpee: its MR
  * stops describing anything. Every other device-side change we make is
- * undone if the dump aborts -- vfmig un-parks the VF, the cuda plugin
- * unwinds its checkpoint -- so this follows the same convention rather
- * than leaving a resumed process holding dead lkeys.
+ * undone when the tasks keep running -- vfmig un-parks the VF, the cuda
+ * plugin unwinds its checkpoint -- so this follows the same convention
+ * rather than leaving a resumed process holding dead lkeys.
  *
- * What an aborted dump rebinds to depends on how far it got. Before a
- * device plugin checkpointed the buffer, the exported fd still names the
- * memory the process uses. After, the plugin's rollback recreates the
- * buffer and rewrites the MR's line of dmabuf_fds with the fd it came back
- * as, and that is the one to bind -- the exported fd names memory the
- * process no longer has. So the record outlives the release of the
+ * What to rebind to depends on how far the dump got. Before a device
+ * plugin checkpointed the buffer, the exported fd still names the memory
+ * the process uses. After, the plugin's rollback recreates the buffer and
+ * rewrites the MR's line of dmabuf_fds with the fd it came back as, and
+ * that is the one to bind -- the exported fd names memory the process no
+ * longer has. So the record outlives the release of the
  * exported fd (@dmabuf_fd becomes -1 then), and is dropped only when the
  * dump finishes.
  */
@@ -1628,8 +1628,8 @@ static int dmabuf_fds_line(uint32_t index)
 }
 
 /*
- * Rebind every MR this dump unbound, for an aborted dump whose process is
- * about to run again.
+ * Rebind every MR this dump unbound, for a process that is about to run
+ * again: the dump failed, or the tasks were asked to keep running.
  *
  * To the buffer a device plugin recreated, if its line of dmabuf_fds now
  * names a different fd than the one exported -- the plugin had
@@ -1638,8 +1638,8 @@ static int dmabuf_fds_line(uint32_t index)
  * process's memory. With neither, the MR stays unbacked and its ibdev keeps
  * its fence.
  *
- * A rebind failure is reported and the walk continues: the dump has
- * already failed, and abandoning the remaining MRs would make that worse.
+ * A rebind failure is reported and the walk continues: abandoning the
+ * remaining MRs would leave the running process worse off.
  */
 static void rdma_rebind_unbound_mrs(void)
 {
@@ -1679,7 +1679,7 @@ static void rdma_rebind_unbound_mrs(void)
 	}
 
 	if (rebound || failed)
-		pr_warn("uobj DAG: dump aborted: rebound %d MR(s), %d left unbacked (%d to a recreated buffer)\n",
+		pr_warn("uobj DAG: tasks resume: rebound %d MR(s), %d left unbacked (%d to a recreated buffer)\n",
 			rebound, failed, recreated);
 }
 
@@ -1706,7 +1706,9 @@ static void rdma_forget_unbound_mrs(void)
  * Finish the dump's RDMA side, from cr_plugin_fini(): after the device
  * plugins' exit hooks, before the RDMA plugins'.
  *
- * On an aborted dump, put the ibdevs back as the process left them:
+ * When the tasks keep running -- a failed dump, a post-dump script that
+ * asked for it, or --leave-running -- put the ibdevs back as the process
+ * left them:
  * resume, rebind, lift -- each step needs the one before it. A rebind
  * issues device commands a parked device cannot complete, and a fence
  * lifted before the rebind lets peers' writes land on MRs that are still
@@ -1714,18 +1716,18 @@ static void rdma_forget_unbound_mrs(void)
  * is what recreates a checkpointed buffer; and the resume and lift need
  * the RDMA plugins, which is why they are torn down last.
  */
-void rdma_finish_dump(bool aborted)
+void rdma_finish_dump(bool tasks_resume)
 {
 	struct rdma_held_ibdev *h, *n;
 	int r;
 
-	if (aborted) {
+	if (tasks_resume) {
 		for (h = rdma_held_ibdevs; h; h = h->next) {
 			if (!h->suspended)
 				continue;
 			r = rdma_dispatch_suspend_ibdev(h->criu_driver, h->ibdev, true);
 			if (r < 0)
-				pr_err("uobj DAG: dump aborted: resume of ibdev=%s failed: %d\n", h->ibdev, r);
+				pr_err("uobj DAG: tasks resume: resume of ibdev=%s failed: %d\n", h->ibdev, r);
 		}
 
 		rdma_rebind_unbound_mrs();
@@ -1734,13 +1736,13 @@ void rdma_finish_dump(bool aborted)
 			if (!h->fenced)
 				continue;
 			if (h->unbacked) {
-				pr_err("uobj DAG: dump aborted: ibdev=%s has an unbacked MR; leaving it fenced\n",
+				pr_err("uobj DAG: tasks resume: ibdev=%s has an unbacked MR; leaving it fenced\n",
 				       h->ibdev);
 				continue;
 			}
 			r = rdma_dispatch_fence_ibdev(h->criu_driver, h->ibdev, true);
 			if (r < 0)
-				pr_err("uobj DAG: dump aborted: lifting the fence on ibdev=%s failed: %d\n", h->ibdev,
+				pr_err("uobj DAG: tasks resume: lifting the fence on ibdev=%s failed: %d\n", h->ibdev,
 				       r);
 		}
 	}

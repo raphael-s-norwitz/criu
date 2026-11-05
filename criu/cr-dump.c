@@ -1899,6 +1899,7 @@ static int cr_lazy_mem_dump(void)
 static int cr_dump_finish(int ret)
 {
 	int post_dump_ret = 0;
+	bool tasks_resume;
 
 	if (disconnect_from_page_server())
 		ret = -1;
@@ -1949,14 +1950,18 @@ static int cr_dump_finish(int ret)
 	 *    consistency of the FS and other resources, we simply
 	 *    start rollback procedure and cleanup everything.
 	 */
-	if (ret || post_dump_ret || opts.final_state == TASK_ALIVE) {
+	tasks_resume = ret || post_dump_ret || opts.final_state == TASK_ALIVE;
+	if (tasks_resume) {
 		unsuspend_lsm();
 		network_unlock();
 		delete_link_remaps();
 	}
 
-	if (!ret && opts.lazy_pages)
+	if (!ret && opts.lazy_pages) {
 		ret = cr_lazy_mem_dump();
+		if (ret)
+			tasks_resume = true;
+	}
 
 	if (arch_set_thread_regs(root_item, true) < 0)
 		return -1;
@@ -1964,11 +1969,11 @@ static int cr_dump_finish(int ret)
 	/*
 	 * Also finishes the RDMA side of the dump, between the device
 	 * plugins' exit hooks and the RDMA plugins' -- see rdma_finish_dump()
-	 * for what an aborted dump puts back, and in which order.
+	 * for what tasks that keep running get back, and in which order.
 	 */
-	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
+	cr_plugin_fini_dump(ret, tasks_resume);
 
-	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
+	pstree_switch_state(root_item, tasks_resume ? TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
 	free_pstree(root_item);
 	seccomp_free_entries();

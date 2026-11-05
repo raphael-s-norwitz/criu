@@ -10,6 +10,12 @@
 #endif
 
 void cr_plugin_fini(int stage, int err);
+/*
+ * cr_plugin_fini(DUMP) for the end of a dump that got that far:
+ * @tasks_resume says whether the dumpee keeps running, which is not the
+ * same as the dump having failed -- see cr_dump_finish().
+ */
+void cr_plugin_fini_dump(int ret, bool tasks_resume);
 int cr_plugin_init(int stage);
 
 typedef struct {

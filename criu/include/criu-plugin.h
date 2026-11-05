@@ -413,11 +413,12 @@ enum {
 	 *
 	 * @ibdev is the core's name for the device; a plugin maps it to
 	 * whatever its hardware actually quiesces (for mlx5 SR-IOV
-	 * migration, the VF behind it). Resuming is the plugin's own
-	 * business on a completed dump -- it already owns a fini(DUMP) drain
-	 * that un-parks exactly what it parked.
+	 * migration, the VF behind it). When the tasks do not keep running,
+	 * resuming is the plugin's own business -- it already owns a
+	 * fini(DUMP) pass that un-parks exactly what it parked.
 	 *
-	 * On an aborted dump core calls the hook again with @resume set,
+	 * When they do -- the dump failed, a post-dump script asked for it,
+	 * or --leave-running -- core calls the hook again with @resume set,
 	 * before it rebinds the DMA-BUF MRs the walk unbound: the rebind
 	 * issues device commands, which a parked device cannot complete. That
 	 * happens inside cr_plugin_fini(DUMP), after the exit hooks of the
@@ -475,12 +476,12 @@ enum {
 	 * Dispatched once per captured ibdev, after its QPs are walked and
 	 * before its MRs, routed by CR_PLUGIN_RDMA_PROVIDED_DRIVER like
 	 * RDMA_SUSPEND_IBDEV. After the QPs because a fence drops the ACKs
-	 * their outstanding sends still wait for. After a completed dump,
-	 * undoing it is the plugin's business: on the source it must outlive
-	 * the dumpee, and a device state that is saved with it carries it to
-	 * the destination.
+	 * their outstanding sends still wait for. When the tasks do not keep
+	 * running, undoing it is the plugin's business: on the source it must
+	 * outlive the dumpee, and a device state that is saved with it carries
+	 * it to the destination.
 	 *
-	 * On an aborted dump core calls the hook again with @lift set, once
+	 * When they do, core calls the hook again with @lift set, once
 	 * it has rebound the ibdev's DMA-BUF MRs: lifted any earlier, the
 	 * peers' writes land on MRs that are still unbound. An ibdev with an
 	 * MR that could not be rebound is left fenced. Like the resume, this

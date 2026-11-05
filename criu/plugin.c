@@ -220,7 +220,7 @@ static bool cr_plugin_is_rdma(plugin_desc_t *this)
  * point at the recreated buffers. It also needs the RDMA plugins, to
  * resume the ibdevs and lift their fences, so they go last.
  */
-void cr_plugin_fini(int stage, int ret)
+static void __cr_plugin_fini(int stage, int ret, bool tasks_resume)
 {
 	plugin_desc_t *this, *tmp;
 
@@ -229,10 +229,20 @@ void cr_plugin_fini(int stage, int ret)
 			cr_plugin_teardown(this, stage, ret);
 
 	if (stage == CR_PLUGIN_STAGE__DUMP)
-		rdma_finish_dump(ret != 0);
+		rdma_finish_dump(tasks_resume);
 
 	list_for_each_entry_safe(this, tmp, &cr_plugin_ctl.head, list)
 		cr_plugin_teardown(this, stage, ret);
+}
+
+void cr_plugin_fini(int stage, int ret)
+{
+	__cr_plugin_fini(stage, ret, ret != 0);
+}
+
+void cr_plugin_fini_dump(int ret, bool tasks_resume)
+{
+	__cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret, tasks_resume);
 }
 
 int cr_plugin_init(int stage)
