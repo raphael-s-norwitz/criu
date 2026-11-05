@@ -214,8 +214,8 @@ HOLDER_PID=""
 note "criu dump completed"
 
 [[ -s "$IMG/mlx5_vfmig.img" ]] || die "dump produced no mlx5_vfmig.img"
-grep -qaE 'fini-DUMP drain: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
-	|| { grep -aE 'fini-DUMP drain|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE drain did not write >=1 record"; }
+grep -qaE 'vfmig SAVE: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
+	|| { grep -aE 'vfmig SAVE|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE did not write >=1 record"; }
 # The CQ dump hook must have QUERY_CQ'd the source cqn / cqe_size into the
 # entry's plugin_blob (plus comp_vector/flags).
 grep -qaE 'vfmig: dump-cq: ibdev=[^ ]+ handle=[0-9]+ cqn=[0-9]+ cqe_size=(64|128)' "$IMG/dump.log" \

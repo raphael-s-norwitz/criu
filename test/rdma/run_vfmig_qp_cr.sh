@@ -248,8 +248,8 @@ HOLDER_PID=""
 note "criu dump completed"
 
 [[ -s "$IMG/mlx5_vfmig.img" ]] || die "dump produced no mlx5_vfmig.img"
-grep -qaE 'fini-DUMP drain: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
-	|| { grep -aE 'fini-DUMP drain|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE drain did not write >=1 record"; }
+grep -qaE 'vfmig SAVE: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
+	|| { grep -aE 'vfmig SAVE|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE did not write >=1 record"; }
 # The QP dump hook must have QUERY_QP'd the source qpn / WQ sizing into the
 # entry's plugin_blob (plus the create user_handle).
 grep -qaE 'vfmig: dump-qp: ibdev=[^ ]+ handle=[0-9]+ qpn=[0-9]+ sq_wqe=[0-9]+ rq_wqe=[0-9]+' "$IMG/dump.log" \

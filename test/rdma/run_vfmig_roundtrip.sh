@@ -221,8 +221,8 @@ note "criu dump completed"
 [[ -s "$IMG/mlx5_vfmig.img" ]] || die "dump produced no mlx5_vfmig.img"
 BLOB="$IMG/mlx5_vfmig-pf$PF-vf0.blob"
 [[ -s "$BLOB" ]] || { ls -la "$IMG" >&2; die "dump produced no non-empty firmware blob ($BLOB)"; }
-grep -qaE 'fini-DUMP drain: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
-	|| { grep -aE 'fini-DUMP drain|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE drain did not write >=1 record"; }
+grep -qaE 'vfmig SAVE: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
+	|| { grep -aE 'vfmig SAVE|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE did not write >=1 record"; }
 note "image dir has mlx5_vfmig.img + $(basename "$BLOB") ($(stat -c%s "$BLOB") bytes)"
 
 # CHECKPOINT_DEVICES parked the VF datapath at the freeze point, and

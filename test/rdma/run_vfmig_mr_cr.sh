@@ -214,8 +214,8 @@ HOLDER_PID=""
 note "criu dump completed"
 
 [[ -s "$IMG/mlx5_vfmig.img" ]] || die "dump produced no mlx5_vfmig.img"
-grep -qaE 'fini-DUMP drain: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
-	|| { grep -aE 'fini-DUMP drain|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE drain did not write >=1 record"; }
+grep -qaE 'vfmig SAVE: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
+	|| { grep -aE 'vfmig SAVE|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE did not write >=1 record"; }
 # The PD dump hook must have QUERY_PD'd the source pdn into the entry (the
 # MR's parent PD). uid is dump-side diagnostic only, so match any uid.
 grep -qaE 'vfmig: dump-pd: ibdev=[^ ]+ handle=[0-9]+ pdn=[0-9]+ uid=[0-9]+' "$IMG/dump.log" \

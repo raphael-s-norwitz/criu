@@ -230,8 +230,8 @@ HOLDER_PID=""
 note "criu dump completed"
 
 [[ -s "$IMG/mlx5_vfmig.img" ]] || die "dump produced no mlx5_vfmig.img"
-grep -qaE 'fini-DUMP drain: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
-	|| { grep -aE 'fini-DUMP drain|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE drain did not write >=1 record"; }
+grep -qaE 'vfmig SAVE: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
+	|| { grep -aE 'vfmig SAVE|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE did not write >=1 record"; }
 # The PD dump hook must have QUERY_PD'd the source pdn into the entry. The
 # source uid is auto-DEVX (uid != 0) for a default libmlx5 ucontext and 0
 # only for a rare non-DEVX one; either is fine (uid is dump-side diagnostic

@@ -261,8 +261,8 @@ grep -qaE "vfmig: barrier: loaded .*/$HEX\.desc: session=$SESSION .* peers=1" "$
 grep -qaE "vfmig: barrier\[D1\] session=$SESSION: all 1 peer\(s\) ready" "$IMG/dump.log" \
 	|| { grep -aE 'vfmig: barrier\[D1\]' "$IMG/dump.log" >&2 || true; die "D1 rendezvous did not reach 'all peers ready'"; }
 # The dump still captured a firmware record (SAVE drain ran after the barrier).
-grep -qaE 'fini-DUMP drain: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
-	|| { grep -aE 'fini-DUMP drain|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE drain did not write >=1 record"; }
+grep -qaE 'vfmig SAVE: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
+	|| { grep -aE 'vfmig SAVE|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE did not write >=1 record"; }
 note "D1 descriptor loaded + rendezvous reached 'all peers ready' + SAVE drain wrote a record"
 
 echo

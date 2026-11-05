@@ -186,8 +186,8 @@ dump_into() {
 	"$CRIU" dump -t "$pid" -D "$img" -v4 -o dump.log --shell-job -L "$SANDBOX" >/dev/null 2>&1 \
 		|| { tail -80 "$img/dump.log" >&2 2>/dev/null || true; die "criu dump failed (see $img/dump.log)"; }
 	[[ -s "$img/mlx5_vfmig.img" ]] || die "dump into $img produced no mlx5_vfmig.img"
-	grep -qaE 'fini-DUMP drain: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$img/dump.log" \
-		|| { grep -aE 'fini-DUMP drain|vfmig: captured' "$img/dump.log" >&2 || true; die "SAVE drain did not write >=1 record into $img"; }
+	grep -qaE 'vfmig SAVE: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$img/dump.log" \
+		|| { grep -aE 'vfmig SAVE|vfmig: captured' "$img/dump.log" >&2 || true; die "SAVE did not write >=1 record into $img"; }
 	note "criu dump of pid=$pid into $(basename "$img") completed"
 }
 
