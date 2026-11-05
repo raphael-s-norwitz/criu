@@ -60,7 +60,7 @@ extern bool vfmig_active;
  * each context's (pf_bdf, vf_id) and confirms QUERY_VF.tracked=1;
  * vfmig_claimed_add() records each VF we win the claim for so the
  * dump-side hooks added in later commits (CHECKPOINT_DEVICES suspend,
- * fini(DUMP) SAVE drain) can act on exactly that set without re-walking
+ * RDMA_SAVE_IBDEV SAVE) can act on exactly that set without re-walking
  * /proc/<pid>/fd or re-querying sysfs. Deduplicated by (pf_bdf, vf_id)
  * since a VF can back several contexts. Reset by init()/fini() via
  * vfmig_claimed_clear().
@@ -73,7 +73,7 @@ void vfmig_claimed_clear(void);
  * is the RDMA_DUMP_UVERBS_CONTEXT hook: core RDMA dump hands it a
  * drained cdev fd sharing the source ucontext's IDR, and it snapshots
  * that ucontext (QUERY_UCONTEXT, falling back to QUERY_DYN_UARS) onto
- * the matching claimed-VF entry so the fini(DUMP) SAVE drain can write
+ * the matching claimed-VF entry so the RDMA_SAVE_IBDEV hook can write
  * it into mlx5_vfmig.img. See the claimed-set note above for why the
  * snapshot rides on the claimed entry rather than a separate queue.
  */
@@ -257,13 +257,16 @@ int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift);
 void vfmig_suspended_clear(void);
 
 /*
- * Dump-side SAVE drain. Called from fini(DUMP) on a successful dump:
- * walks the claimed-VF set, runs SAVE_VHCA_STATE per VF, drains each
- * blob to the image dir, and appends one Mlx5VfmigStateEntry per VF to
- * mlx5_vfmig.img. Deferred to fini so the invasive SAVE runs only after
- * the rest of the dump has succeeded.
+ * RDMA_SAVE_IBDEV: run SAVE_VHCA_STATE for the claimed VF behind
+ * @ibdev, drain the blob to the image dir, and append its
+ * Mlx5VfmigStateEntry to mlx5_vfmig.img. Core calls it per held ibdev
+ * after the rest of the image is written and before the dump finishes,
+ * so a failed SAVE fails the dump. vfmig_report_saves(), from
+ * fini(DUMP) on a good dump, logs the totals and names any claimed VF
+ * SAVE never ran for.
  */
-void vfmig_drain_claimed_in_fini(void);
+int rdma_mlx5_vfmig_plugin_save_ibdev(const char *ibdev);
+void vfmig_report_saves(void);
 
 /*
  * vf_image.c -- on-disk image format helpers. Take primitives + raw

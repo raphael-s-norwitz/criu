@@ -1,8 +1,8 @@
 /*
  * mlx5_sriov_vfmig restore-side path.
  *
- * The VF firmware layer here is the LOAD counterpart to the fini(DUMP)
- * SAVE drain in vfmig_dump.c: it matches each image entry's vf_uuid to
+ * The VF firmware layer here is the LOAD counterpart to the dump-side
+ * SAVE (RDMA_SAVE_IBDEV hook) in vfmig_dump.c: it matches each image entry's vf_uuid to
  * a destination VF, and -- unless the VF already came up from a LOAD -- drives
  * ENABLE_MIGRATABLE + SET_TRACKED + LOAD_VHCA_STATE (streaming the
  * firmware blob off the image dir) + MARK_RESTORED and binds it to

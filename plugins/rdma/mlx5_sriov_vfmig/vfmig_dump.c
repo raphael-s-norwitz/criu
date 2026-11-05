@@ -17,8 +17,9 @@
  *     self-DMA lands in a pinned MR page mid-snapshot. fini(DUMP)
  *     resumes the set (RESUME_VHCA) once the snapshot is done.
  *
- *   - the fini(DUMP) SAVE drain. Runs SAVE_VHCA_STATE per claimed VF and
- *     writes one blob + one Mlx5VfmigStateEntry per VF into the image.
+ *   - the SAVE. The RDMA_SAVE_IBDEV hook runs SAVE_VHCA_STATE on each
+ *     claimed VF at the end of the dump proper and writes one blob +
+ *     one Mlx5VfmigStateEntry per VF into the image.
  *
  * Both sets are deduplicated by (pf_bdf, vf_id): a single VF can back
  * several uverbs contexts (e.g. one per worker thread, or across
@@ -61,10 +62,13 @@ struct vfmig_claimed_vf {
 	bool fenced;
 	struct vfmig_rx_fence_handles fence;
 
+	/* The RDMA_SAVE_IBDEV hook wrote this VF's image record. */
+	bool saved;
+
 	/*
 	 * ucontext snapshot, attached by the RDMA_DUMP_UVERBS_CONTEXT
 	 * hook (rdma_mlx5_vfmig_plugin_dump_uverbs_context) and consumed
-	 * by the fini(DUMP) drain. v0 carries a single snapshot per VF:
+	 * by the RDMA_SAVE_IBDEV hook. v0 carries a single snapshot per VF:
 	 * a VF backs one seed context on the bare-context critical path.
 	 * uctx_is_dyn selects which of the two shapes below is live.
 	 */
@@ -130,8 +134,8 @@ void vfmig_claimed_clear(void)
  * uverbs context it walked, handing us @lfd -- a drained cdev fd that
  * shares the source ucontext's object IDR -- so we can snapshot the
  * ucontext's UAR state via the MLX5_IB_OBJECT_VFMIG QUERY verbs. The
- * snapshot is attached to the matching claimed-VF entry; the fini(DUMP)
- * SAVE drain folds it into that VF's image record.
+ * snapshot is attached to the matching claimed-VF entry; the
+ * RDMA_SAVE_IBDEV hook folds it into that VF's image record.
  *
  * The claim hook runs immediately before this one over the same
  * context (both inside core's dump_uverbsfile), so the claimed entry is
@@ -780,7 +784,7 @@ int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift)
 
 /*
  * Resume every VF this dump parked at CHECKPOINT_DEVICES. Called from
- * fini(DUMP) after the SAVE drain, on both the success and failure
+ * fini(DUMP), after SAVE has run in RDMA_SAVE_IBDEV, on both the success and failure
  * paths: the snapshot is complete (or lost) either way, and a VF left in
  * STOP would make the orchestrator's sriov_numvfs=0 teardown walk a dead
  * command ring. RESUME_VHCA is idempotent, so a VF the kernel already
@@ -808,7 +812,7 @@ void vfmig_resume_suspended_vfs(void)
 
 /*
  * Per-VF capture result, produced by vfmig_capture_one_vf() and consumed
- * by vfmig_drain_claimed_in_fini() to build one image record.
+ * by vfmig_save_claimed_vf() to build one image record.
  */
 struct vfmig_saved_vf {
 	uint32_t vhca_id;
@@ -831,7 +835,7 @@ struct vfmig_saved_vf {
  *
  * flags=0 is correct in both cases the plugin produces. When the VF was
  * already parked to STOP by CHECKPOINT_DEVICES (the normal path -- that
- * hook runs at freeze, before this drain), SAVE captures it as-is and
+ * hook runs at freeze, before SAVE), SAVE captures it as-is and
  * leaves the resume to our fini RESUME_VHCA; KEEP_SUSPENDED would be a
  * no-op for a caller-parked VF. When the VF was not pre-parked, SAVE
  * transiently self-suspends and resumes it on close, leaving the source
@@ -905,86 +909,115 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id, struct vfmig
 }
 
 /*
- * Dump-side SAVE drain, called from fini(DUMP) on a successful dump.
- *
- * Walks the claimed-VF set (already deduplicated by (pf_bdf, vf_id) at
- * claim time), captures each VF's firmware blob, and appends one
- * Mlx5VfmigStateEntry per VF to mlx5_vfmig.img. SAVE_VHCA_STATE is the
- * most invasive thing the plugin does to the host, so it is deferred to
- * here -- after the rest of the dump has succeeded -- rather than run
- * inline at claim time.
- *
- * Best-effort per VF: a capture/append failure for one VF is logged and
- * skipped so the other VFs still land in the image. fini's return value
- * is dropped by criu, so the pr_err lines are the operator's surface for
- * "which VF didn't make it into the image".
+ * Capture @c's firmware blob and append its Mlx5VfmigStateEntry to
+ * mlx5_vfmig.img. Returns 0, or -1 (logged) with no record written.
  */
-void vfmig_drain_claimed_in_fini(void)
+static int vfmig_save_claimed_vf(struct vfmig_claimed_vf *c)
+{
+	struct vfmig_saved_vf sv;
+	struct vfmig_uctx_image_blob uctx_blob;
+	struct vfmig_uctx_image_blob *uctx = NULL;
+	char cdev_path[PATH_MAX];
+	const char *cdev_for_record;
+	uint32_t ctxn = 0;
+
+	memset(&sv, 0, sizeof(sv));
+	if (vfmig_capture_one_vf(c->pf_bdf, c->vf_id, &sv)) {
+		pr_err("vfmig: capture failed for pf=%s vf_id=%u; no image record written\n", c->pf_bdf, c->vf_id);
+		return -1;
+	}
+
+	/*
+	 * source_cdev_path + ctxn come from the ucontext snapshot when one
+	 * was captured (the readlink'd cdev the context was opened
+	 * against). For a firmware-only VF (no seed context) fall back to
+	 * re-resolving the cdev from the ibdev; a miss there is not fatal,
+	 * so use an empty string.
+	 */
+	if (c->uctx_captured && c->source_cdev_path[0]) {
+		cdev_for_record = c->source_cdev_path;
+		ctxn = c->ctxn;
+	} else {
+		if (find_uverbs_cdev_for_ibdev(c->ibdev, cdev_path, sizeof(cdev_path)))
+			cdev_path[0] = '\0';
+		cdev_for_record = cdev_path;
+	}
+
+	if (c->uctx_captured) {
+		memset(&uctx_blob, 0, sizeof(uctx_blob));
+		if (c->uctx_is_dyn) {
+			uctx_blob.dyn_uar_records = c->uctx_dyn_records;
+			uctx_blob.dyn_uar_records_len = c->uctx_dyn_n * sizeof(*c->uctx_dyn_records);
+		} else {
+			uctx_blob.meta = &c->uctx_meta;
+			uctx_blob.meta_len = sizeof(c->uctx_meta);
+			uctx_blob.uar_table = c->uctx_uar_table;
+			uctx_blob.uar_table_len = c->uctx_uar_n * sizeof(*c->uctx_uar_table);
+			uctx_blob.bfreg_count = c->uctx_bfreg_count;
+			uctx_blob.bfreg_count_len = c->uctx_bfreg_n * sizeof(*c->uctx_bfreg_count);
+		}
+		uctx_blob.source_devx_uid = c->source_devx_uid;
+		uctx_blob.has_source_devx_uid = true;
+		uctx = &uctx_blob;
+	}
+
+	if (vfmig_append_state_entry(ctxn, c->ibdev, cdev_for_record, c->pf_bdf, c->vf_id, sv.vhca_id, sv.vf_uuid,
+				     sv.blob_path, sv.blob_size, uctx, c->fenced ? &c->fence : NULL)) {
+		pr_err("vfmig: failed to append state entry for pf=%s vf_id=%u\n", c->pf_bdf, c->vf_id);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Save the VF behind @ibdev into the image.
+ *
+ * Core dispatches this once per ibdev it fenced or suspended, at the end
+ * of the dump proper, so the VF is still parked from the suspend hook and
+ * SAVE captures it as the memory snapshot left it. A failure fails the
+ * dump: an image missing one of the VFs its contexts ran on cannot be
+ * restored, and failing lets core put every VF back as it was.
+ */
+int rdma_mlx5_vfmig_plugin_save_ibdev(const char *ibdev)
 {
 	struct vfmig_claimed_vf *c;
-	int total = 0, written = 0, failed = 0;
+
+	if (!vfmig_active)
+		return -ENOTSUP;
+
+	for (c = vfmig_claimed_head; c; c = c->next)
+		if (!strcmp(c->ibdev, ibdev))
+			break;
+	if (!c)
+		return -ENOTSUP;
+	if (c->saved)
+		return 0;
+
+	if (vfmig_save_claimed_vf(c))
+		return -1;
+	c->saved = true;
+	return 0;
+}
+
+/*
+ * After a successful dump, check that every claimed VF reached the
+ * image. One whose ibdev core never dispatched for is an image that
+ * cannot be fully restored, and the only place left to say so.
+ */
+void vfmig_report_saves(void)
+{
+	struct vfmig_claimed_vf *c;
+	int total = 0, written = 0;
 
 	for (c = vfmig_claimed_head; c; c = c->next) {
-		struct vfmig_saved_vf sv;
-		struct vfmig_uctx_image_blob uctx_blob;
-		struct vfmig_uctx_image_blob *uctx = NULL;
-		char cdev_path[PATH_MAX];
-		const char *cdev_for_record;
-		uint32_t ctxn = 0;
-
 		total++;
-		memset(&sv, 0, sizeof(sv));
-		if (vfmig_capture_one_vf(c->pf_bdf, c->vf_id, &sv)) {
-			pr_err("vfmig: capture failed for pf=%s vf_id=%u; no image record written\n", c->pf_bdf,
-			       c->vf_id);
-			failed++;
-			continue;
-		}
-
-		/*
-		 * source_cdev_path + ctxn come from the ucontext snapshot
-		 * when one was captured (the readlink'd cdev the context
-		 * was opened against). For a firmware-only VF (no seed
-		 * context) fall back to re-resolving the cdev from the
-		 * ibdev; a miss there is not fatal, so use an empty string.
-		 */
-		if (c->uctx_captured && c->source_cdev_path[0]) {
-			cdev_for_record = c->source_cdev_path;
-			ctxn = c->ctxn;
-		} else {
-			if (find_uverbs_cdev_for_ibdev(c->ibdev, cdev_path, sizeof(cdev_path)))
-				cdev_path[0] = '\0';
-			cdev_for_record = cdev_path;
-		}
-
-		if (c->uctx_captured) {
-			memset(&uctx_blob, 0, sizeof(uctx_blob));
-			if (c->uctx_is_dyn) {
-				uctx_blob.dyn_uar_records = c->uctx_dyn_records;
-				uctx_blob.dyn_uar_records_len = c->uctx_dyn_n * sizeof(*c->uctx_dyn_records);
-			} else {
-				uctx_blob.meta = &c->uctx_meta;
-				uctx_blob.meta_len = sizeof(c->uctx_meta);
-				uctx_blob.uar_table = c->uctx_uar_table;
-				uctx_blob.uar_table_len = c->uctx_uar_n * sizeof(*c->uctx_uar_table);
-				uctx_blob.bfreg_count = c->uctx_bfreg_count;
-				uctx_blob.bfreg_count_len = c->uctx_bfreg_n * sizeof(*c->uctx_bfreg_count);
-			}
-			uctx_blob.source_devx_uid = c->source_devx_uid;
-			uctx_blob.has_source_devx_uid = true;
-			uctx = &uctx_blob;
-		}
-
-		if (vfmig_append_state_entry(ctxn, c->ibdev, cdev_for_record, c->pf_bdf, c->vf_id, sv.vhca_id,
-					     sv.vf_uuid, sv.blob_path, sv.blob_size, uctx,
-					     c->fenced ? &c->fence : NULL)) {
-			pr_err("vfmig: failed to append state entry for pf=%s vf_id=%u\n", c->pf_bdf, c->vf_id);
-			failed++;
-			continue;
-		}
-		written++;
+		if (c->saved)
+			written++;
+		else
+			pr_err("vfmig: pf=%s vf_id=%u (%s) was claimed but never saved; the image lacks it\n",
+			       c->pf_bdf, c->vf_id, c->ibdev);
 	}
 
 	if (total)
-		pr_info("fini-DUMP drain: claimed_vfs=%d records_written=%d failed=%d\n", total, written, failed);
+		pr_info("vfmig SAVE: claimed_vfs=%d records_written=%d failed=%d\n", total, written, total - written);
 }

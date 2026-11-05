@@ -20,11 +20,11 @@
  *     The matching provided-driver + sharing declarations let dump-time
  *     arbitration route this driver's contexts to this plugin.
  *   - the claimed-VF cache (vfmig_dump.c). A successful claim records
- *     (ibdev, pf_bdf, vf_id) into a dedup'd set so the dump-side drain
+ *     (ibdev, pf_bdf, vf_id) into a dedup'd set so the dump-side hooks
  *     can act on exactly the VFs backing the snapshot tree without
  *     re-walking sysfs.
- *   - SAVE on dump. fini(DUMP) drains the claimed set, runs
- *     SAVE_VHCA_STATE per VF, writes one firmware blob per VF plus one
+ *   - SAVE on dump. The RDMA_SAVE_IBDEV hook, which core runs per
+ *     held ibdev before the dump finishes, runs SAVE_VHCA_STATE per VF, writes one firmware blob per VF plus one
  *     Mlx5VfmigStateEntry per VF into the image dir.
  *   - the restore-side entry point (vfmig_restore.c). The exported
  *     mlx5_vfmig_plugin_restore_vf_only() symbol, driven by the
@@ -47,7 +47,7 @@
  *     claims it. The HANDLE_DEVICE_VMA hook claims exactly the
  *     uverbs-cdev mappings of our tracked VFs (metadata only), which is
  *     what lets a plain criu dump of a process holding a VF context run
- *     far enough for the claim + fini(DUMP) SAVE drain to fire.
+ *     far enough for the claim + RDMA_SAVE_IBDEV SAVE to fire.
  *   - this commit: snapshot-ordering datapath suspend. The
  *     CHECKPOINT_DEVICES hook parks every claimed VF to STOP
  *     (SUSPEND_VHCA) at CRIU's freeze point, before task memory is
@@ -172,19 +172,12 @@ static int rdma_mlx5_vfmig_plugin_init(int stage)
 static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 {
 	/*
-	 * Drain the SAVE queue at the very end of dump, and only when the
-	 * rest of CRIU's dump pipeline succeeded (ret == 0). SAVE_VHCA_STATE
-	 * is the most invasive thing this plugin does to the host; firing it
-	 * for a dump that has already been declared lost would suspend VFs
-	 * and produce blobs that can never be paired with a restorable
-	 * image. On the RESTORE stage the claimed set is empty, so the drain
-	 * is a no-op there too.
+	 * SAVE already ran in RDMA_SAVE_IBDEV, before the dump finished;
+	 * on a good dump just report what it wrote.
 	 *
 	 * Then resume anything CHECKPOINT_DEVICES parked -- on both the
 	 * success and failure paths, so a failed dump never strands a VF in
-	 * STOP. The resume must follow the drain: SAVE captures the parked
-	 * VF as-is, so quiescing it until after the blob is read keeps the
-	 * capture consistent. On a failed dump core has normally resumed
+	 * STOP. On a failed dump core has normally resumed
 	 * them already, before rebinding the MRs, and lifted the fences
 	 * after; this is the backstop for a resume that did not happen. The
 	 * fences are core's alone to lift: one left up guards an MR core
@@ -192,7 +185,7 @@ static void rdma_mlx5_vfmig_plugin_fini(int stage, int ret)
 	 */
 	if (stage == CR_PLUGIN_STAGE__DUMP) {
 		if (ret == 0)
-			vfmig_drain_claimed_in_fini();
+			vfmig_report_saves();
 		vfmig_resume_suspended_vfs();
 	}
 
@@ -307,8 +300,8 @@ static int rdma_mlx5_vfmig_plugin_claim_uverbs_context(const char *ibdev, uint32
 
 	/*
 	 * Record the VF we just won the claim for. The dump-side hooks
-	 * added in later commits (CHECKPOINT_DEVICES suspend, fini(DUMP)
-	 * SAVE drain) consume this set; the cache dedups by (pf_bdf,
+	 * added in later commits (CHECKPOINT_DEVICES suspend, RDMA_SAVE_IBDEV
+	 * SAVE) consume this set; the cache dedups by (pf_bdf,
 	 * vf_id) so multiple contexts on the same VF record once.
 	 */
 	vfmig_claimed_add(ibdev, pf_bdf, (uint32_t)vf_id);
@@ -323,7 +316,7 @@ static int rdma_mlx5_vfmig_plugin_claim_uverbs_context(const char *ibdev, uint32
  * plugin claims it. Claim exactly the uverbs-cdev mappings that belong
  * to one of our tracked VFs: criu then records the mapping as metadata
  * only (it never reads the write-only page), and the VF's real device
- * state is captured separately by the fini(DUMP) SAVE drain. Decline
+ * state is captured separately by the RDMA_SAVE_IBDEV hook. Decline
  * everything else with -ENOTSUP so the mapping falls through to any
  * other plugin or to the core's default handling.
  */
@@ -406,6 +399,7 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, rdma_mlx5_vfmig_p
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, rdma_mlx5_vfmig_plugin_update_vma_map)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_RESUME_IBDEV, rdma_mlx5_vfmig_plugin_resume_ibdev)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_FENCE_IBDEV, rdma_mlx5_vfmig_plugin_fence_ibdev)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_SAVE_IBDEV, rdma_mlx5_vfmig_plugin_save_ibdev)
 
 /*
  * RDMA sharing policy: EXCLUSIVE.
