@@ -1,2 +1,3 @@
 uverbs_ctx_holder
 vfmig_barrier_peer
+qp_gid_holder
