@@ -58,8 +58,13 @@ struct vfmig_claimed_vf {
 	char pf_bdf[64];
 	uint32_t vf_id;
 
-	/* RoCE RX fence raised by the RDMA_FENCE_IBDEV hook, if any. */
+	/*
+	 * RoCE RX fence raised by the RDMA_FENCE_IBDEV hook, if any, and
+	 * whether that raise also suspended the VF's mlx5e. Only the handles
+	 * go into the image: the destination binds a fresh mlx5e.
+	 */
 	bool fenced;
+	bool eth_suspended;
 	struct vfmig_rx_fence_handles fence;
 
 	/* The RDMA_SAVE_IBDEV hook wrote this VF's image record. */
@@ -710,6 +715,37 @@ int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev, bool resume)
 	return 0;
 }
 
+#define VFMIG_PORT_ACTIVE_TIMEOUT_S 10
+
+/*
+ * Wait for port 1 of @ibdev to come back ACTIVE after mlx5e resumed, so
+ * the tasks we hand back can pass traffic straight away. Only warns: the
+ * link may come up later, and the tasks run either way.
+ */
+static void vfmig_wait_port_active(const char *ibdev)
+{
+	double deadline = vfmig_now() + VFMIG_PORT_ACTIVE_TIMEOUT_S;
+	char path[PATH_MAX], state[64] = "";
+	FILE *f;
+
+	snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/1/state", ibdev);
+	do {
+		f = fopen(path, "r");
+		if (f) {
+			if (!fgets(state, sizeof(state), f))
+				state[0] = '\0';
+			fclose(f);
+			if (strstr(state, "ACTIVE"))
+				return;
+		}
+		usleep(100 * 1000);
+	} while (vfmig_now() < deadline);
+
+	state[strcspn(state, "\n")] = '\0';
+	pr_warn("vfmig: %s port 1 not ACTIVE %ds after mlx5e resumed (state '%s')\n", ibdev,
+		VFMIG_PORT_ACTIVE_TIMEOUT_S, state);
+}
+
 /*
  * Fence the VF behind @ibdev: from here on no RoCE packet reaches its QPs.
  * Core calls this after the uobject walk has waited for the VF's QPs to
@@ -723,21 +759,30 @@ int rdma_mlx5_vfmig_plugin_suspend_ibdev(const char *ibdev, bool resume)
  * descriptor: an unreadable uuid is treated as legacy (the capture path
  * refuses an unstamped VF anyway) and a malformed descriptor fails closed.
  *
- * The fence is never lifted on a good dump. The source runs again after
- * fini(DUMP) resumes it, until the dumpee is killed, and anything it took
- * in then would move its QPs past the saved state. SAVE carries the fence
- * to the destination, which lifts it with the handles kept here and
- * written into the VF's image record.
+ * The raise also suspends the VF's mlx5e (F_ETH_SUSPEND), so the firmware
+ * objects it owns are gone before SAVE and are not carried to the
+ * destination. Its netdev stays registered, keeping the addresses and RoCE
+ * GIDs the dumpee's QPs use. CRIU_VFMIG_NO_ETH_SUSPEND=1 leaves mlx5e up;
+ * a kernel without the flag gets the fence alone, with a warning.
  *
- * With @lift, the dump was aborted and core has rebound the VF's MRs: the
- * dumpee carries on, so let its traffic back in.
+ * The fence is lifted only when the tasks keep running. Otherwise the
+ * source runs again after fini(DUMP) resumes it, until the dumpee is
+ * killed, and anything it took in then would move its QPs past the saved
+ * state. SAVE carries the fence to the destination, which lifts it with
+ * the handles kept here and written into the VF's image record.
+ *
+ * With @lift, the tasks keep running -- the dump failed, a post-dump
+ * script asked for it, or --leave-running -- and core has resumed the VF
+ * and rebound its MRs: resume mlx5e and let the dumpee's traffic back in.
  */
 int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift)
 {
 	struct vfmig_claimed_vf *c;
 	struct vfmig_rendezvous rz;
+	const char *env, *eth = NULL;
 	uint8_t vf_uuid[16];
-	int mode;
+	uint32_t flags;
+	int mode, r;
 
 	if (!vfmig_active)
 		return -ENOTSUP;
@@ -751,11 +796,16 @@ int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift)
 	if (lift) {
 		if (!c->fenced)
 			return 0;
-		if (vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_LIFT, 0, &c->fence))
+		flags = c->eth_suspended ? MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND : 0;
+		if (vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_LIFT, &flags, &c->fence))
 			return -1;
 		c->fenced = false;
-		pr_info("vfmig: lifted RoCE RX fence pf=%s vf_id=%u (%s) after an aborted dump\n", c->pf_bdf,
-			c->vf_id, ibdev);
+		pr_info("vfmig: lifted RoCE RX fence pf=%s vf_id=%u (%s)%s; the tasks keep running\n", c->pf_bdf,
+			c->vf_id, ibdev, c->eth_suspended ? ", mlx5e resumed" : "");
+		if (c->eth_suspended) {
+			c->eth_suspended = false;
+			vfmig_wait_port_active(ibdev);
+		}
 		return 0;
 	}
 
@@ -774,11 +824,32 @@ int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift)
 		return -1;
 	}
 
-	if (vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_RAISE, 0, &c->fence))
+	env = getenv("CRIU_VFMIG_NO_ETH_SUSPEND");
+	if (env && !strcmp(env, "1")) {
+		flags = 0;
+		eth = ", mlx5e left up (CRIU_VFMIG_NO_ETH_SUSPEND=1)";
+	} else {
+		flags = MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND;
+	}
+	r = vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_RAISE, &flags, &c->fence);
+	if (r == -EINVAL && flags) {
+		pr_warn("vfmig: pf=%s vf_id=%u (%s): kernel does not take RX_FENCE_F_ETH_SUSPEND; fencing without "
+			"it, so SAVE carries mlx5e's firmware objects\n",
+			c->pf_bdf, c->vf_id, ibdev);
+		flags = 0;
+		eth = ", mlx5e left up (kernel lacks F_ETH_SUSPEND)";
+		r = vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_RAISE, &flags, &c->fence);
+	}
+	if (r)
 		return -1;
 	c->fenced = true;
-	pr_info("vfmig: fenced RoCE RX pf=%s vf_id=%u (%s): table 0x%x group 0x%x\n", c->pf_bdf, c->vf_id, ibdev,
-		c->fence.table_id, c->fence.group_id);
+	c->eth_suspended = flags & MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND;
+	if (c->eth_suspended)
+		eth = ", mlx5e suspended";
+	else if (!eth)
+		eth = ", mlx5e not bound";
+	pr_info("vfmig: fenced RoCE RX pf=%s vf_id=%u (%s): table 0x%x group 0x%x%s\n", c->pf_bdf, c->vf_id, ibdev,
+		c->fence.table_id, c->fence.group_id, eth);
 	return 0;
 }
 

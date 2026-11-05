@@ -1429,8 +1429,9 @@ int rdma_mlx5_vfmig_plugin_resume_ibdev(const UverbsFileEntry *uvfe)
 	}
 
 	if (!v->fence_lifted) {
-		if (vfmig_dp_rx_fence(v->pf_bdf, v->vf_id, MLX5_VFMIG_RX_FENCE_LIFT,
-				      v->fenced ? 0 : MLX5_VFMIG_RX_FENCE_F_NO_TABLE, &v->fence))
+		uint32_t flags = v->fenced ? 0 : MLX5_VFMIG_RX_FENCE_F_NO_TABLE;
+
+		if (vfmig_dp_rx_fence(v->pf_bdf, v->vf_id, MLX5_VFMIG_RX_FENCE_LIFT, &flags, &v->fence))
 			return -1;
 		v->fence_lifted = true;
 		pr_info("vfmig: lifted RoCE RX fence pf=%s vf_id=%u (%s)%s\n", v->pf_bdf, v->vf_id, v->dest_ibdev,

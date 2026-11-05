@@ -72,11 +72,11 @@ int vfmig_dp_suspend(const char *pf_bdf, uint32_t vf_id, uint32_t dir_flags)
 	return 0;
 }
 
-int vfmig_dp_rx_fence(const char *pf_bdf, uint32_t vf_id, uint32_t op, uint32_t flags,
+int vfmig_dp_rx_fence(const char *pf_bdf, uint32_t vf_id, uint32_t op, uint32_t *flags,
 		      struct vfmig_rx_fence_handles *h)
 {
 	struct mlx5_vfmig_rx_fence rf;
-	int fd, rc;
+	int fd, rc, err;
 
 	fd = vfmig_dp_open_cdev(pf_bdf);
 	if (fd < 0)
@@ -87,15 +87,22 @@ int vfmig_dp_rx_fence(const char *pf_bdf, uint32_t vf_id, uint32_t op, uint32_t 
 	rf.op = op;
 	rf.table_id = h->table_id;
 	rf.group_id = h->group_id;
-	rf.flags = flags;
+	rf.flags = *flags;
 	rc = ioctl(fd, MLX5_VFMIG_IOC_RX_FENCE, &rf);
+	err = errno;
 	close(fd);
 	if (rc) {
-		pr_perror("vfmig: RX_FENCE(pf=%s vf_id=%u op=%u flags=0x%x)", pf_bdf, vf_id, op, flags);
-		return -1;
+		/* A kernel without F_ETH_SUSPEND says EINVAL; the caller retries without it. */
+		if (!(err == EINVAL && op == MLX5_VFMIG_RX_FENCE_RAISE && (*flags & MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND))) {
+			errno = err;
+			pr_perror("vfmig: RX_FENCE(pf=%s vf_id=%u op=%u flags=0x%x)", pf_bdf, vf_id, op, *flags);
+		}
+		return -err;
 	}
 	h->table_id = rf.table_id;
 	h->group_id = rf.group_id;
+	if (op == MLX5_VFMIG_RX_FENCE_RAISE)
+		*flags = rf.flags;
 	return 0;
 }
 

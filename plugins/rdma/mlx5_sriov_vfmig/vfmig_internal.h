@@ -184,9 +184,13 @@ struct vfmig_rx_fence_handles {
 
 /*
  * MLX5_VFMIG_IOC_RX_FENCE: @op RAISE fills @h, LIFT takes it, or ignores it
- * with MLX5_VFMIG_RX_FENCE_F_NO_TABLE in @flags. Returns 0 or -1 (logged).
+ * with MLX5_VFMIG_RX_FENCE_F_NO_TABLE in @flags. RAISE writes back the
+ * flags the kernel acted on: F_ETH_SUSPEND is cleared when mlx5e was not
+ * bound. Returns 0, -1 if the cdev would not open, or -errno, logged
+ * except for the EINVAL of a RAISE with F_ETH_SUSPEND that the kernel
+ * does not know.
  */
-int vfmig_dp_rx_fence(const char *pf_bdf, uint32_t vf_id, uint32_t op, uint32_t flags,
+int vfmig_dp_rx_fence(const char *pf_bdf, uint32_t vf_id, uint32_t op, uint32_t *flags,
 		      struct vfmig_rx_fence_handles *h);
 
 /*
