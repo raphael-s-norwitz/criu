@@ -100,6 +100,22 @@ need_hw() {
 	skip_hw "$*"
 }
 
+# SET_TRACKED needs the VF in a managed DMA-IOMMU domain. On a host booted
+# with iommu=pt a fresh VF lands in an identity domain and SET_TRACKED
+# fails with EOPNOTSUPP; switch the VF's group to DMA while it is still
+# unbound (the kernel only allows the change with no driver attached).
+ensure_dma_domain() {
+	local bdf="$1" type_f="/sys/bus/pci/devices/$1/iommu_group/type" t
+	[[ -e "$type_f" ]] || die "VF $bdf has no iommu_group (IOMMU disabled?)"
+	t="$(cat "$type_f")"
+	case "$t" in
+	DMA|DMA-FQ) return 0 ;;
+	esac
+	echo DMA >"$type_f" 2>/dev/null \
+		|| die "VF $bdf iommu_group type is '$t' and could not be set to DMA (boot without iommu=pt)"
+	note "VF $bdf iommu_group type $t -> $(cat "$type_f")"
+}
+
 resolve_vf_ibdev() {
 	local vf_bdf="$1" ib target
 	for ib in /sys/class/infiniband/*; do
@@ -150,6 +166,7 @@ SRIOV_TOUCHED=1
 echo 0 >"$SRIOV_NUMVFS"
 echo 0 >"$PF_DEV/sriov_drivers_autoprobe"
 echo 1 >"$SRIOV_NUMVFS"
+ensure_dma_domain "$(readlink "$PF_DEV/virtfn0" | xargs basename)"
 "$VFMIG_TOOL" "$PF" set_tracked 0 1
 "$VFMIG_TOOL" "$PF" enable_migratable 0
 # The plugin's dump-side capture refuses an all-zeros vf_uuid and the
