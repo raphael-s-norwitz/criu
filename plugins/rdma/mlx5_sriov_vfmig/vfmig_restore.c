@@ -146,8 +146,12 @@ struct vfmig_restored_ctx {
 	int dest_cdev_fd;
 
 	bool is_dyn;
-	/* Static (lib_uar_dyn=false) snapshot, valid iff !is_dyn. */
+	/*
+	 * The source meta. For a dyn ucontext only its TD fields are set,
+	 * and only if the image carried them; otherwise all zero.
+	 */
 	struct mlx5_ib_vfmig_ucontext_meta_local meta;
+	/* Static (lib_uar_dyn=false) snapshot, valid iff !is_dyn. */
 	uint32_t *uar_table;
 	size_t uar_n;
 	uint32_t *bfreg_count;
@@ -827,8 +831,65 @@ static void vfmig_explain_get_context_einval(const struct vfmig_restored_ctx *c,
 	       c->dest_cdev_path, c->source_ctxn);
 }
 
+/*
+ * GET_CONTEXT(VFMIG_RESTORE), adopting the source's transport domain
+ * when the image names one. A kernel that predates ADOPT_TD rejects it
+ * with -EOPNOTSUPP; the ucontext then gets a fresh TD, and the source's
+ * stays allocated in the VF's later SAVEs. *@adopted says which.
+ */
+static int vfmig_get_restore_context(const struct vfmig_restored_ctx *c, int fd, uint64_t lib_caps,
+				     uint32_t total_bfregs, uint32_t ll_bfregs, uint8_t max_cqe_version,
+				     bool *adopted)
+{
+	const struct mlx5_ib_vfmig_ucontext_meta_local *td = NULL;
+	int rc;
+
+	if (c->meta.flags & MLX5_IB_VFMIG_UCTX_META_F_TDN)
+		td = &c->meta;
+
+	rc = vfmig_send_get_context_v2(fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE, lib_caps, total_bfregs, ll_bfregs,
+				       max_cqe_version, td);
+	if (rc == -EOPNOTSUPP && td) {
+		pr_warn("vfmig: %s ctxn=%u: the kernel cannot adopt the source's transport domain 0x%x; "
+			"allocating a fresh one, so the source's stays in this VF's later SAVEs\n",
+			c->dest_cdev_path, c->source_ctxn, td->tdn);
+		td = NULL;
+		rc = vfmig_send_get_context_v2(fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE, lib_caps, total_bfregs,
+					       ll_bfregs, max_cqe_version, NULL);
+	}
+	*adopted = td != NULL;
+	return rc;
+}
+
+static void vfmig_meta_clear_td(struct mlx5_ib_vfmig_ucontext_meta_local *m)
+{
+	m->tdn = 0;
+	m->td_uid = 0;
+	m->flags &= ~MLX5_IB_VFMIG_UCTX_META_F_TDN;
+}
+
+/* An adopted TD must read back as the source's. */
+static bool vfmig_td_matches(const struct vfmig_restored_ctx *c, const struct mlx5_ib_vfmig_ucontext_meta_local *got)
+{
+	return (got->flags & MLX5_IB_VFMIG_UCTX_META_F_TDN) && got->tdn == c->meta.tdn &&
+	       got->td_uid == c->meta.td_uid;
+}
+
+static void vfmig_log_td(const struct vfmig_restored_ctx *c, bool adopted)
+{
+	if (adopted)
+		pr_info("vfmig: ctxn=%u: td adopted (tdn=0x%x td_uid=%u)\n", c->source_ctxn, c->meta.tdn,
+			c->meta.td_uid);
+	else if (c->meta.flags & MLX5_IB_VFMIG_UCTX_META_F_TDN)
+		pr_info("vfmig: ctxn=%u: td fresh (kernel lacks ADOPT_TD; source tdn=0x%x left allocated)\n",
+			c->source_ctxn, c->meta.tdn);
+	else
+		pr_info("vfmig: ctxn=%u: td fresh (image names no source td)\n", c->source_ctxn);
+}
+
 static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 {
+	bool adopted;
 	int fd, rc;
 
 	if (c->dest_cdev_fd >= 0)
@@ -842,12 +903,12 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 
 	if (!c->is_dyn) {
 		const struct mlx5_ib_vfmig_ucontext_meta_local *m = &c->meta;
-		struct mlx5_ib_vfmig_ucontext_meta_local meta_b = {};
+		struct mlx5_ib_vfmig_ucontext_meta_local meta_a, meta_b = {};
 		uint32_t *uar_b = NULL, *cnt_b = NULL;
 		size_t uar_bn = 0, cnt_bn = 0;
 
-		rc = vfmig_send_get_context_v2(fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE, m->lib_caps, m->total_num_bfregs,
-					       m->num_low_latency_bfregs, m->cqe_version, /* adopt_devx_uid */ 0);
+		rc = vfmig_get_restore_context(c, fd, m->lib_caps, m->total_num_bfregs, m->num_low_latency_bfregs,
+					       m->cqe_version, &adopted);
 		if (rc) {
 			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE, static) on %s ctxn=%u failed: %d (%s) "
 			       "[source_devx_uid=%u (image-only, not consumed at restore)]\n",
@@ -872,10 +933,18 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 			close(fd);
 			return -1;
 		}
-		if (memcmp(&meta_b, m, sizeof(*m)) != 0 || uar_bn != c->uar_n ||
+		meta_a = *m;
+		if (!adopted) {
+			/* A fresh TD legitimately differs from the source's. */
+			vfmig_meta_clear_td(&meta_a);
+			vfmig_meta_clear_td(&meta_b);
+		}
+		if (memcmp(&meta_b, &meta_a, sizeof(meta_a)) != 0 || uar_bn != c->uar_n ||
 		    memcmp(uar_b, c->uar_table, c->uar_n * sizeof(*uar_b)) != 0) {
-			pr_err("vfmig: post-restore re-QUERY on %s ctxn=%u diverged from snapshot\n",
-			       c->dest_cdev_path, c->source_ctxn);
+			pr_err("vfmig: post-restore re-QUERY on %s ctxn=%u diverged from snapshot%s\n",
+			       c->dest_cdev_path, c->source_ctxn,
+			       adopted && !vfmig_td_matches(c, &meta_b) ? " (adopted transport domain not reported)" :
+									  "");
 			free(uar_b);
 			free(cnt_b);
 			close(fd);
@@ -885,15 +954,16 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 		free(cnt_b);
 		pr_info("vfmig: post-restore re-QUERY ctxn=%u (static): bitwise match (num_sys_pages=%zu)\n",
 			c->source_ctxn, c->uar_n);
+		vfmig_log_td(c, adopted);
 	} else {
 		struct mlx5_ib_vfmig_dyn_uar_record_local *recs_b = NULL;
+		struct mlx5_ib_vfmig_ucontext_meta_local meta_b;
 		size_t recs_bn = 0, i_a;
 		bool ok = true;
 
-		rc = vfmig_send_get_context_v2(fd, MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE,
-					       MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR, /* total_num_bfregs */ 8,
-					       /* num_low_latency_bfregs */ 0, /* max_cqe_version */ 1,
-					       /* adopt_devx_uid */ 0);
+		rc = vfmig_get_restore_context(c, fd, MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR,
+					       /* total_num_bfregs */ 8, /* num_low_latency_bfregs */ 0,
+					       /* max_cqe_version */ 1, &adopted);
 		if (rc) {
 			pr_err("vfmig: GET_CONTEXT(VFMIG_RESTORE|DYN_UAR) on %s ctxn=%u failed: %d (%s) "
 			       "[source_devx_uid=%u (image-only, not consumed at restore)]\n",
@@ -911,7 +981,7 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 			return -1;
 		}
 
-		rc = vfmig_snapshot_dyn_uars(fd, &recs_b, &recs_bn);
+		rc = vfmig_snapshot_dyn_uars(fd, &recs_b, &recs_bn, &meta_b);
 		if (rc) {
 			pr_err("vfmig: post-restore QUERY_DYN_UARS on %s ctxn=%u failed: %d (%s)\n",
 			       c->dest_cdev_path, c->source_ctxn, rc, strerror(-rc));
@@ -945,12 +1015,20 @@ static int vfmig_ensure_cdev_open(struct vfmig_restored_ctx *c)
 			}
 		}
 		free(recs_b);
+		if (ok && adopted && !vfmig_td_matches(c, &meta_b)) {
+			pr_err("vfmig: post-restore QUERY_DYN_UARS on %s ctxn=%u: adopted transport domain 0x%x "
+			       "uid %u reads back as 0x%x uid %u (flags 0x%x)\n",
+			       c->dest_cdev_path, c->source_ctxn, c->meta.tdn, c->meta.td_uid, meta_b.tdn,
+			       meta_b.td_uid, meta_b.flags);
+			ok = false;
+		}
 		if (!ok) {
 			close(fd);
 			return -1;
 		}
 		pr_info("vfmig: post-restore re-QUERY ctxn=%u (dyn): bitwise match (records=%zu)\n", c->source_ctxn,
 			c->dyn_n);
+		vfmig_log_td(c, adopted);
 	}
 
 	fd = vfmig_park_fd_high(fd);
@@ -1641,9 +1719,10 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 			       e->ctxn);
 			goto err;
 		}
-		if (has_static && e->uctx_meta.len != sizeof(struct mlx5_ib_vfmig_ucontext_meta_local)) {
-			pr_err("vfmig: image entry ctxn=%u static uctx_meta length=%zu != %zu\n", e->ctxn,
-			       e->uctx_meta.len, sizeof(struct mlx5_ib_vfmig_ucontext_meta_local));
+		if (e->has_uctx_meta && e->uctx_meta.len != sizeof(struct mlx5_ib_vfmig_ucontext_meta_local)) {
+			pr_err("vfmig: image entry ctxn=%u %s uctx_meta length=%zu != %zu\n", e->ctxn,
+			       has_static ? "static" : "dyn", e->uctx_meta.len,
+			       sizeof(struct mlx5_ib_vfmig_ucontext_meta_local));
 			goto err;
 		}
 		if (has_dyn && e->uctx_dyn_uar_records.len % sizeof(struct mlx5_ib_vfmig_dyn_uar_record_local)) {
@@ -1715,6 +1794,8 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 				}
 				memcpy(c->dyn_records, e->uctx_dyn_uar_records.data, e->uctx_dyn_uar_records.len);
 			}
+			if (e->has_uctx_meta)
+				c->meta = *(const struct mlx5_ib_vfmig_ucontext_meta_local *)e->uctx_meta.data;
 		}
 
 		c->next = vfmig_restored_ctxs;

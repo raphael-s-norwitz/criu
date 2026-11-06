@@ -144,7 +144,9 @@ message mlx5_vfmig_state_entry {
 	 *     RESTORE_UCONTEXT time -- wire byte-identity is exactly what
 	 *     the handler needs, and treating it as opaque keeps the
 	 *     image oblivious to fields future minor kernel revisions may
-	 *     add.
+	 *     add. With MLX5_IB_VFMIG_UCTX_META_F_TDN set it also names the
+	 *     source's transport domain, which the restore side adopts
+	 *     (MLX5_IB_ALLOC_UCTX_VFMIG_ADOPT_TD) instead of allocating one.
 	 *
 	 * uctx_uar_table: snapshot of sys_pages[], length equals
 	 *     meta.num_sys_pages. Each entry is an opaque 32-bit firmware
@@ -164,7 +166,9 @@ message mlx5_vfmig_state_entry {
 	 *
 	 * EXACTLY ONE of {uctx_meta + uctx_uar_table (+ uctx_bfreg_count)}
 	 * vs uctx_dyn_uar_records is populated per entry, depending on
-	 * which mode the source ucontext ran in.
+	 * which mode the source ucontext ran in. A dyn entry may also carry
+	 * uctx_meta (from QUERY_DYN_UARS' META), only when it names a
+	 * transport domain; restore reads nothing else from it.
 	 */
 	optional bytes		uctx_meta		= 10;
 	optional bytes		uctx_uar_table		= 11;

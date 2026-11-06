@@ -83,8 +83,13 @@ struct vfmig_claimed_vf {
 	uint32_t source_devx_uid;
 	char source_cdev_path[PATH_MAX];
 
-	/* static-UAR shape (uctx_is_dyn == false) */
+	/*
+	 * Both shapes: QUERY_UCONTEXT's meta, or QUERY_DYN_UARS' optional
+	 * meta (only its TD fields are meaningful for a dyn ucontext).
+	 */
 	struct mlx5_ib_vfmig_ucontext_meta_local uctx_meta;
+
+	/* static-UAR shape (uctx_is_dyn == false) */
 	uint32_t *uctx_uar_table;
 	size_t uctx_uar_n;
 	uint32_t *uctx_bfreg_count;
@@ -205,13 +210,14 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
 	 */
 	rc = vfmig_snapshot_uctx(lfd, &meta, &uar, &uar_n, &cnt, &cnt_n);
 	if (rc == -EOPNOTSUPP) {
-		rc = vfmig_snapshot_dyn_uars(lfd, &dyn, &dyn_n);
+		rc = vfmig_snapshot_dyn_uars(lfd, &dyn, &dyn_n, &meta);
 		if (rc) {
 			pr_err("vfmig: dump-uctx: QUERY_DYN_UARS(ibdev=%s ctxn=%u) failed: %s\n", ibdev, ctxn,
 			       strerror(-rc));
 			return -1;
 		}
 		c->uctx_is_dyn = true;
+		c->uctx_meta = meta;
 		c->uctx_dyn_records = dyn;
 		c->uctx_dyn_n = dyn_n;
 		c->source_devx_uid = 0; /* dyn QUERY carries no meta.devx_uid */
@@ -232,8 +238,13 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
 	c->ctxn = ctxn;
 	c->uctx_captured = true;
 
-	pr_info("vfmig: dump-uctx: captured %s ucontext for ibdev=%s ctxn=%u devx_uid=%u\n",
-		c->uctx_is_dyn ? "dyn-UAR" : "static-UAR", ibdev, ctxn, c->source_devx_uid);
+	if (c->uctx_meta.flags & MLX5_IB_VFMIG_UCTX_META_F_TDN)
+		pr_info("vfmig: dump-uctx: captured %s ucontext for ibdev=%s ctxn=%u devx_uid=%u td=0x%x td_uid=%u\n",
+			c->uctx_is_dyn ? "dyn-UAR" : "static-UAR", ibdev, ctxn, c->source_devx_uid,
+			c->uctx_meta.tdn, c->uctx_meta.td_uid);
+	else
+		pr_info("vfmig: dump-uctx: captured %s ucontext for ibdev=%s ctxn=%u devx_uid=%u (no td reported)\n",
+			c->uctx_is_dyn ? "dyn-UAR" : "static-UAR", ibdev, ctxn, c->source_devx_uid);
 	return 0;
 }
 
@@ -1019,6 +1030,11 @@ static int vfmig_save_claimed_vf(struct vfmig_claimed_vf *c)
 		if (c->uctx_is_dyn) {
 			uctx_blob.dyn_uar_records = c->uctx_dyn_records;
 			uctx_blob.dyn_uar_records_len = c->uctx_dyn_n * sizeof(*c->uctx_dyn_records);
+			/* Restore takes only the transport domain from a dyn meta. */
+			if (c->uctx_meta.flags & MLX5_IB_VFMIG_UCTX_META_F_TDN) {
+				uctx_blob.meta = &c->uctx_meta;
+				uctx_blob.meta_len = sizeof(c->uctx_meta);
+			}
 		} else {
 			uctx_blob.meta = &c->uctx_meta;
 			uctx_blob.meta_len = sizeof(c->uctx_meta);

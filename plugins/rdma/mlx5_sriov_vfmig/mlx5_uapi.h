@@ -80,6 +80,9 @@
 	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
 #define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT_LOCAL \
 	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+/* Optional: older kernels ignore it and leave the meta zeroed. */
+#define MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_META_LOCAL \
+	((1u << UVERBS_ID_NS_SHIFT_LOCAL) + 2)
 #define MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS_LOCAL \
 	(1u << UVERBS_ID_NS_SHIFT_LOCAL)
 
@@ -263,19 +266,30 @@ struct mlx5_ib_restore_cq_req_local {
  * that doesn't emit it reads zero.) Consumed by the dump path only as
  * image-only metadata (mlx5_vfmig_state_entry.source_devx_uid); it is
  * never enforced -- RESTORE_UCONTEXT tolerates a mismatch.
+ *
+ * With MLX5_IB_VFMIG_UCTX_META_F_TDN in @flags, @tdn / @td_uid name the
+ * ucontext's transport domain and its firmware owner; the restore side
+ * passes them back with MLX5_IB_ALLOC_UCTX_VFMIG_ADOPT_TD. The flag is
+ * clear on devices without transport domains and from older kernels.
+ * RESTORE_UCONTEXT does not compare the three.
  */
+enum {
+	MLX5_IB_VFMIG_UCTX_META_F_TDN = 1 << 0,
+};
+
 struct mlx5_ib_vfmig_ucontext_meta_local {
 	uint32_t num_static_sys_pages;
 	uint32_t num_sys_pages;
 	uint32_t num_dyn_bfregs;
 	uint32_t num_low_latency_bfregs;
 	uint32_t total_num_bfregs;
-	uint32_t reserved0;
+	uint32_t tdn;
 	uint64_t lib_caps;
 	uint8_t lib_uar_4k;
 	uint8_t lib_uar_dyn;
 	uint8_t cqe_version;
-	uint8_t reserved1[3];
+	uint8_t flags;
+	uint16_t td_uid;
 	uint16_t devx_uid;
 } __attribute__((aligned(8)));
 
@@ -315,10 +329,18 @@ enum {
  * snapshot. DEVX is defined only to document that bit 0 is taken; the
  * restore path always opens the destination without DEVX (the source's
  * devx_uid, commonly non-zero, is diagnostic-only and never adopted).
+ *
+ * VFMIG_ADOPT_TD (only with VFMIG_RESTORE) makes the ucontext take over
+ * the source's transport domain, named by the request's vfmig_tdn /
+ * vfmig_td_uid, instead of allocating one. Without it the TD that
+ * LOAD_VHCA_STATE brought back stays allocated with no owner, and every
+ * later SAVE of the VF carries it. Kernels that predate it reject the
+ * flag with -EOPNOTSUPP.
  */
 enum {
 	MLX5_IB_ALLOC_UCTX_DEVX = 1 << 0,
 	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE = 1 << 1,
+	MLX5_IB_ALLOC_UCTX_VFMIG_ADOPT_TD = 1 << 2,
 };
 
 /*
@@ -341,8 +363,9 @@ struct mlx5_ib_alloc_ucontext_req_v2_local {
 	uint16_t reserved1;
 	uint32_t reserved2;
 	uint64_t lib_caps;
-	uint32_t adopt_devx_uid;
-	uint32_t reserved3;
+	uint32_t vfmig_tdn;
+	uint16_t vfmig_td_uid;
+	uint16_t reserved3;
 } __attribute__((aligned(8)));
 
 struct mlx5_ib_alloc_ucontext_resp_local {

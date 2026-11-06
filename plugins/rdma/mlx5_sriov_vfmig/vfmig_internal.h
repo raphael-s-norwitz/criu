@@ -122,7 +122,10 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_drive
  *                              arrays (static-UAR mode). Returns
  *                              -EOPNOTSUPP for a dyn-UAR ucontext.
  *   vfmig_snapshot_dyn_uars()  two-pass QUERY_DYN_UARS: allocates the
- *                              dyn-UAR record array (dyn-UAR mode).
+ *                              dyn-UAR record array (dyn-UAR mode) and,
+ *                              if @meta_out is set, fills it from the
+ *                              optional META (all zero, F_TDN clear, on
+ *                              kernels without it).
  *   vfmig_query_pd()           QUERY_PD: fills @blob_out (source FW pdn,
  *                              the verbatim RESTORE_PD UHW) and @uid_out
  *                              (source PD's mpd->uid) for the PD the
@@ -134,7 +137,8 @@ int rdma_mlx5_vfmig_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_drive
  */
 int vfmig_snapshot_uctx(int fd, struct mlx5_ib_vfmig_ucontext_meta_local *meta_out, uint32_t **uar_out,
 			size_t *uar_n_out, uint32_t **cnt_out, size_t *cnt_n_out);
-int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **records_out, size_t *n_out);
+int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **records_out, size_t *n_out,
+			    struct mlx5_ib_vfmig_ucontext_meta_local *meta_out);
 int vfmig_query_pd(int fd, uint32_t pd_handle, struct mlx5_ib_restore_pd_req_local *blob_out, uint32_t *uid_out);
 int vfmig_query_cq(int fd, uint32_t cq_handle, struct mlx5_ib_restore_cq_req_local *blob_out, uint32_t *cqe_out,
 		   uint32_t *comp_vector_out, uint32_t *flags_out);
@@ -149,7 +153,9 @@ int vfmig_query_qp_sq_psn(int fd, uint32_t qp_handle, struct mlx5_ib_vfmig_qp_sq
  *   vfmig_send_get_context_v2()  legacy IB_USER_VERBS_CMD_GET_CONTEXT
  *                                alloc with the mlx5 driver payload;
  *                                @flags carries VFMIG_RESTORE so the
- *                                kernel arms the restore-pending gate.
+ *                                kernel arms the restore-pending gate;
+ *                                a non-NULL @adopt_td adds
+ *                                VFMIG_ADOPT_TD with its tdn / td_uid.
  *   vfmig_restore_uctx()         MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT:
  *                                replays the captured uar_table +
  *                                bfreg_count + meta into the ucontext.
@@ -160,7 +166,7 @@ int vfmig_query_qp_sq_psn(int fd, uint32_t qp_handle, struct mlx5_ib_vfmig_qp_sq
  * All are pure marshaling; the caller owns the fd and the arrays.
  */
 int vfmig_send_get_context_v2(int fd, uint32_t flags, uint64_t lib_caps, uint32_t total_bfregs, uint32_t ll_bfregs,
-			      uint8_t max_cqe_version, uint32_t adopt_devx_uid);
+			      uint8_t max_cqe_version, const struct mlx5_ib_vfmig_ucontext_meta_local *adopt_td);
 int vfmig_restore_uctx(int fd, const uint32_t *uar_table, size_t uar_n, const uint32_t *bfreg_count, size_t bfreg_n,
 		       const struct mlx5_ib_vfmig_ucontext_meta_local *meta);
 int vfmig_restore_dyn_uars(int fd, const struct mlx5_ib_vfmig_dyn_uar_record_local *records, size_t n_records);

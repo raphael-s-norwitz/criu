@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -154,11 +155,11 @@ int vfmig_snapshot_uctx(int fd, struct mlx5_ib_vfmig_ucontext_meta_local *meta_o
  * Returns 0 on success, -errno on failure.
  */
 static int vfmig_query_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local *records, size_t n_records,
-				uint32_t *count_out)
+				uint32_t *count_out, struct mlx5_ib_vfmig_ucontext_meta_local *meta)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;
-		struct ib_uverbs_attr attrs[2];
+		struct ib_uverbs_attr attrs[3];
 	} cmd = {};
 	unsigned int n = 0;
 
@@ -178,6 +179,12 @@ static int vfmig_query_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_loca
 	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data = (uintptr_t)count_out;
 	n++;
+	if (meta) {
+		cmd.attrs[n].attr_id = MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_META_LOCAL;
+		cmd.attrs[n].len = sizeof(*meta);
+		cmd.attrs[n].data = (uintptr_t)meta;
+		n++;
+	}
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
@@ -198,7 +205,8 @@ static int vfmig_query_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_loca
  *
  * Returns 0 on success, -errno on failure.
  */
-int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **records_out, size_t *n_out)
+int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **records_out, size_t *n_out,
+			    struct mlx5_ib_vfmig_ucontext_meta_local *meta_out)
 {
 	struct mlx5_ib_vfmig_dyn_uar_record_local *recs = NULL;
 	uint32_t count = 0, count2 = 0;
@@ -206,8 +214,10 @@ int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **
 
 	*records_out = NULL;
 	*n_out = 0;
+	if (meta_out)
+		memset(meta_out, 0, sizeof(*meta_out));
 
-	rc = vfmig_query_dyn_uars(fd, NULL, 0, &count);
+	rc = vfmig_query_dyn_uars(fd, NULL, 0, &count, meta_out);
 	if (rc)
 		return rc;
 
@@ -218,7 +228,7 @@ int vfmig_snapshot_dyn_uars(int fd, struct mlx5_ib_vfmig_dyn_uar_record_local **
 	if (!recs)
 		return -ENOMEM;
 
-	rc = vfmig_query_dyn_uars(fd, recs, count, &count2);
+	rc = vfmig_query_dyn_uars(fd, recs, count, &count2, NULL);
 	if (rc) {
 		free(recs);
 		return rc;
@@ -471,14 +481,18 @@ int vfmig_query_qp_sq_psn(int fd, uint32_t qp_handle, struct mlx5_ib_vfmig_qp_sq
  * UAR-shape fields (devx_uid is excluded -- a mismatch there is
  * tolerated, log-and-continue).
  *
- * @adopt_devx_uid is always 0: the destination ucontext is opened
- * without DEVX and the source devx_uid is not adopted (diagnostic
- * only).
+ * The destination ucontext is opened without DEVX and the source
+ * devx_uid is not adopted (diagnostic only).
+ *
+ * A non-NULL @adopt_td is the source meta carrying F_TDN: the request
+ * adds VFMIG_ADOPT_TD and its tdn / td_uid, so the ucontext takes over
+ * the TD that LOAD_VHCA_STATE brought back. A kernel without the flag
+ * returns -EOPNOTSUPP.
  *
  * Returns 0 on success, -errno on failure.
  */
 int vfmig_send_get_context_v2(int fd, uint32_t flags, uint64_t lib_caps, uint32_t total_bfregs, uint32_t ll_bfregs,
-			      uint8_t max_cqe_version, uint32_t adopt_devx_uid)
+			      uint8_t max_cqe_version, const struct mlx5_ib_vfmig_ucontext_meta_local *adopt_td)
 {
 	struct {
 		struct ib_uverbs_cmd_hdr hdr;
@@ -500,7 +514,11 @@ int vfmig_send_get_context_v2(int fd, uint32_t flags, uint64_t lib_caps, uint32_
 	cmd.req.flags = flags;
 	cmd.req.max_cqe_version = max_cqe_version;
 	cmd.req.lib_caps = lib_caps;
-	cmd.req.adopt_devx_uid = adopt_devx_uid;
+	if (adopt_td) {
+		cmd.req.flags |= MLX5_IB_ALLOC_UCTX_VFMIG_ADOPT_TD;
+		cmd.req.vfmig_tdn = adopt_td->tdn;
+		cmd.req.vfmig_td_uid = adopt_td->td_uid;
+	}
 
 	n = write(fd, &cmd, sizeof(cmd));
 	if (n < 0)
