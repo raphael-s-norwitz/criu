@@ -92,8 +92,12 @@ int vfmig_dp_rx_fence(const char *pf_bdf, uint32_t vf_id, uint32_t op, uint32_t 
 	err = errno;
 	close(fd);
 	if (rc) {
-		/* A kernel without F_ETH_SUSPEND says EINVAL; the caller retries without it. */
-		if (!(err == EINVAL && op == MLX5_VFMIG_RX_FENCE_RAISE && (*flags & MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND))) {
+		/*
+		 * A kernel without F_ETH_SUSPEND or F_IB_RELEASE says EINVAL;
+		 * the caller retries without them.
+		 */
+		if (!(err == EINVAL && op == MLX5_VFMIG_RX_FENCE_RAISE &&
+		      (*flags & (MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND | MLX5_VFMIG_RX_FENCE_F_IB_RELEASE)))) {
 			errno = err;
 			pr_perror("vfmig: RX_FENCE(pf=%s vf_id=%u op=%u flags=0x%x)", pf_bdf, vf_id, op, *flags);
 		}

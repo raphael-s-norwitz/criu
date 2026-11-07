@@ -776,6 +776,12 @@ static void vfmig_wait_port_active(const char *ibdev)
  * GIDs the dumpee's QPs use. CRIU_VFMIG_NO_ETH_SUSPEND=1 leaves mlx5e up;
  * a kernel without the flag gets the fence alone, with a warning.
  *
+ * It also has mlx5_ib release its cached mkeys and UMR QP and CQ
+ * (F_IB_RELEASE), which the first MR registration creates and which the
+ * destination's mlx5_ib would otherwise create again next to the loaded
+ * ones. mlx5_ib recreates them on its next MR operation, so the lift does
+ * not undo it. A kernel without the flag is warned about once per dump.
+ *
  * The fence is lifted only when the tasks keep running. Otherwise the
  * source runs again after fini(DUMP) resumes it, until the dumpee is
  * killed, and anything it took in then would move its QPs past the saved
@@ -786,11 +792,13 @@ static void vfmig_wait_port_active(const char *ibdev)
  * script asked for it, or --leave-running -- and core has resumed the VF
  * and rebound its MRs: resume mlx5e and let the dumpee's traffic back in.
  */
+static bool vfmig_ib_release_unsupported;
+
 int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift)
 {
 	struct vfmig_claimed_vf *c;
 	struct vfmig_rendezvous rz;
-	const char *env, *eth = NULL;
+	const char *env, *eth = NULL, *ib = NULL;
 	uint8_t vf_uuid[16];
 	uint32_t flags;
 	int mode, r;
@@ -842,7 +850,20 @@ int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift)
 	} else {
 		flags = MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND;
 	}
+	if (vfmig_ib_release_unsupported) {
+		ib = ", mlx5_ib kept (kernel lacks F_IB_RELEASE)";
+	} else {
+		flags |= MLX5_VFMIG_RX_FENCE_F_IB_RELEASE;
+	}
 	r = vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_RAISE, &flags, &c->fence);
+	if (r == -EINVAL && (flags & MLX5_VFMIG_RX_FENCE_F_IB_RELEASE)) {
+		pr_warn("vfmig: kernel does not take RX_FENCE_F_IB_RELEASE; fencing without it, so SAVE carries "
+			"mlx5_ib's UMR QP and CQ once an MR has been registered\n");
+		vfmig_ib_release_unsupported = true;
+		flags &= ~MLX5_VFMIG_RX_FENCE_F_IB_RELEASE;
+		ib = ", mlx5_ib kept (kernel lacks F_IB_RELEASE)";
+		r = vfmig_dp_rx_fence(c->pf_bdf, c->vf_id, MLX5_VFMIG_RX_FENCE_RAISE, &flags, &c->fence);
+	}
 	if (r == -EINVAL && flags) {
 		pr_warn("vfmig: pf=%s vf_id=%u (%s): kernel does not take RX_FENCE_F_ETH_SUSPEND; fencing without "
 			"it, so SAVE carries mlx5e's firmware objects\n",
@@ -859,8 +880,12 @@ int rdma_mlx5_vfmig_plugin_fence_ibdev(const char *ibdev, bool lift)
 		eth = ", mlx5e suspended";
 	else if (!eth)
 		eth = ", mlx5e not bound";
-	pr_info("vfmig: fenced RoCE RX pf=%s vf_id=%u (%s): table 0x%x group 0x%x%s\n", c->pf_bdf, c->vf_id, ibdev,
-		c->fence.table_id, c->fence.group_id, eth);
+	if (flags & MLX5_VFMIG_RX_FENCE_F_IB_RELEASE)
+		ib = ", mlx5_ib released";
+	else if (!ib)
+		ib = ", mlx5_ib kept (not bound, or it holds an ODP or dma-buf MR)";
+	pr_info("vfmig: fenced RoCE RX pf=%s vf_id=%u (%s): table 0x%x group 0x%x%s%s\n", c->pf_bdf, c->vf_id,
+		ibdev, c->fence.table_id, c->fence.group_id, eth, ib);
 	return 0;
 }
 
