@@ -38,7 +38,8 @@
  * mode, functionally exercises the post-restore state:
  *   - PD mode: register + deregister a small MR against the PD (reg_mr
  *     resolves the PD by its ufile handle, so success proves the kernel
- *     PD survived at the same handle).
+ *     PD survived at the same handle). HOLDER_PD_MR_PROBES=N repeats
+ *     the pair N times (default 1; 0 only re-queries the device).
  *   - MR mode: verify the registered buffer's content survived, then
  *     deregister the persistent MR -- dereg resolves the MR by its
  *     ufile handle, so success proves RESTORE_MR reinstalled the
@@ -74,6 +75,7 @@ static struct ibv_pd *g_pd;
 static struct ibv_mr *g_mr;
 static struct ibv_cq *g_cq;
 static struct ibv_qp *g_qp;
+static int pd_mr_probes = 1;
 static uint32_t g_mr_lkey, g_mr_rkey;
 static const char *g_status_path;
 static volatile sig_atomic_t g_terminate;
@@ -397,6 +399,9 @@ int main(int argc, char **argv)
 			return 2;
 	}
 
+	if (getenv("HOLDER_PD_MR_PROBES"))
+		pd_mr_probes = atoi(getenv("HOLDER_PD_MR_PROBES"));
+
 	signal(SIGTERM, on_sigterm);
 	signal(SIGINT, on_sigterm);
 	signal(SIGUSR1, on_sigusr1);
@@ -431,7 +436,7 @@ int main(int argc, char **argv)
 					rc = verify_mr(msg, sizeof(msg));
 				if (rc == 0 && g_cq)
 					rc = verify_cq(msg, sizeof(msg));
-				if (rc == 0 && pd_only)
+				for (int i = 0; rc == 0 && pd_only && i < pd_mr_probes; i++)
 					rc = verify_pd(msg, sizeof(msg));
 				write_status(rc ? msg : "OK");
 			}

@@ -33,7 +33,7 @@
 # HOLDER_KIND picks the workload, to split image growth by what the restore
 # recreates: qp (default; qp_gid_holder, self-SEND each hop), ctx (bare
 # ucontext; uverbs_ctx_holder, ibv_query_device each hop) or pd (ucontext +
-# PD; reg/dereg of an MR each hop).
+# PD; HOLDER_PD_MR_PROBES reg/dereg pairs of an MR each hop, default 1).
 #
 # One row per hop goes to stdout and $WORKDIR/hops.tsv.
 #
@@ -282,7 +282,7 @@ PF_NET="$(ls "$PF_DEV/net" 2>/dev/null | head -1)"
 [[ "$HOPS" =~ ^[1-9][0-9]*$ ]] || die "HOPS must be a positive integer"
 
 [[ -r "$FW_PAGES" ]] || note "no $FW_PAGES (debugfs not mounted?); skipping the firmware page check"
-note "PF=$PF ($PF_NET) VF_A=$VF_A VF_B=$VF_B hops=$HOPS leave_every=$LEAVE_EVERY holder=$HOLDER_KIND"
+note "PF=$PF ($PF_NET) VF_A=$VF_A VF_B=$VF_B hops=$HOPS leave_every=$LEAVE_EVERY holder=$HOLDER_KIND${HOLDER_PD_MR_PROBES:+ pd_mr_probes=$HOLDER_PD_MR_PROBES}"
 note "growth_tol=${GROWTH_TOL}B fw_pages_tol=$FW_PAGES_TOL strict_dmesg=$STRICT_DMESG; work dir $WORKDIR"
 
 SANDBOX="$WORKDIR/plugins"
@@ -324,7 +324,8 @@ IDX="$(find_gid_index "$CUR_IB")" || die "no RoCEv2 GID for $IP"
 case "$HOLDER_KIND" in
 qp)  HOLDER_ARGS="$CUR_IB $STATUS $IDX"; HOLDER_ENV="" ;;
 ctx) HOLDER_ARGS="$CUR_IB $STATUS"; HOLDER_ENV="" ;;
-pd)  HOLDER_ARGS="$CUR_IB $STATUS"; HOLDER_ENV="export HOLDER_ALLOC_PD=1;" ;;
+pd)  HOLDER_ARGS="$CUR_IB $STATUS"
+     HOLDER_ENV="export HOLDER_ALLOC_PD=1 HOLDER_PD_MR_PROBES=${HOLDER_PD_MR_PROBES:-1};" ;;
 esac
 systemd-run --scope --quiet --unit="vfmig-qploop-$$" \
 	bash -c "exec </dev/null >'$WORKDIR/holder.log' 2>&1; $HOLDER_ENV exec '$HOLDER' $HOLDER_ARGS" &
