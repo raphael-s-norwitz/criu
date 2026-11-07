@@ -10,7 +10,8 @@
 # same one), restores it and requires the QP to pass traffic. From hop 2
 # on, every dump is of a restored process on a restored VF.
 #
-# Per hop it checks: the fence suspended mlx5e, SAVE wrote the record, the
+# Per hop it checks: the fence suspended mlx5e and had mlx5_ib release its
+# UMR QP and CQ, SAVE wrote the record, the
 # IP's GID came back at the same index, the destination replayed
 # frag_buf=0, and the restored QP passed a self-SEND. Every LEAVE_EVERY
 # hops it first does a --leave-running dump of the restored process and
@@ -34,6 +35,10 @@
 # recreates: qp (default; qp_gid_holder, self-SEND each hop), ctx (bare
 # ucontext; uverbs_ctx_holder, ibv_query_device each hop) or pd (ucontext +
 # PD; HOLDER_PD_MR_PROBES reg/dereg pairs of an MR each hop, default 1).
+#
+# KRES_LOG=1 adds a kres column: the CQs mlx5_ib itself owns on the restored
+# VF after the holder's check (its UMR CQ, cqe 255, once an MR was
+# registered), from rdma res.
 #
 # One row per hop goes to stdout and $WORKDIR/hops.tsv.
 #
@@ -79,6 +84,7 @@ LEAVE_EVERY="${LEAVE_EVERY:-5}"
 GROWTH_TOL="${GROWTH_TOL:-131072}"
 FW_PAGES_TOL="${FW_PAGES_TOL:-256}"
 STRICT_DMESG="${STRICT_DMESG:-0}"
+KRES_LOG="${KRES_LOG:-0}"
 IP="${IP:-192.168.250.10}"
 MAC="${MAC:-02:00:00:fa:00:10}"
 WANT_HW="${VFMIG_CR_HW:-auto}"
@@ -343,9 +349,9 @@ note "$HOLDER_KIND holder pid=$HOLDER_PID on vf $CUR_VF ($CUR_IB, $CUR_NET), gid
 # Hops
 # ---------------------------------------------------------------------------
 sect "Hops"
-printf 'hop\tfrom\tto\tblob_bytes\tfw_pages_idle\tfw_pages_bound\tunexpected_kmsgs\tdump_s\tload_s\trestore_s\tleave_running\ttd\treplays\n' >"$TSV"
-printf '  %4s %4s %4s %10s %8s %8s %5s %7s %7s %9s %5s %7s %s\n' hop from to blob fw_idle fw_bound kmsg dump_s load_s restore_s leave td \
-	"replays cmd/fw/eq/frag/db/dma=total"
+printf 'hop\tfrom\tto\tblob_bytes\tfw_pages_idle\tfw_pages_bound\tunexpected_kmsgs\tdump_s\tload_s\trestore_s\tleave_running\ttd\treplays\tkres\n' >"$TSV"
+printf '  %4s %4s %4s %10s %8s %8s %5s %7s %7s %9s %5s %7s %-26s %s\n' hop from to blob fw_idle fw_bound kmsg dump_s load_s restore_s leave td \
+	"replays cmd/fw/eq/frag/db/dma=total" kres
 BLOB_REF=""
 PREV_IMG=""
 
@@ -366,6 +372,8 @@ for hop in $(seq 1 "$HOPS"); do
 		"$CRIU" dump -t "$HOLDER_PID" -D "$LRIMG" -v4 -o dump.log --shell-job -L "$SANDBOX" --leave-running \
 			>/dev/null 2>&1 || { tail -60 "$LRIMG/dump.log" >&2; die "hop $hop: --leave-running dump failed"; }
 		grep -qa ", mlx5e suspended" "$LRIMG/dump.log" || die "hop $hop: --leave-running: mlx5e was not suspended"
+		grep -qa ", mlx5_ib released" "$LRIMG/dump.log" \
+			|| { grep -a 'fenced RoCE RX' "$LRIMG/dump.log" >&2; die "hop $hop: --leave-running: mlx5_ib not released"; }
 		grep -qa "mlx5e resumed; the tasks keep running" "$LRIMG/dump.log" \
 			|| die "hop $hop: --leave-running: fence not lifted with mlx5e resumed"
 		wait_active "$CUR_IB" || die "hop $hop: port not ACTIVE after --leave-running"
@@ -385,6 +393,8 @@ for hop in $(seq 1 "$HOPS"); do
 	t1="$(now)"
 	grep -qaE "vfmig: fenced RoCE RX pf=$PF vf_id=$CUR_VF .*, mlx5e suspended" "$IMG/dump.log" \
 		|| { grep -a 'fenced RoCE RX' "$IMG/dump.log" >&2; die "hop $hop: mlx5e not suspended on vf $CUR_VF"; }
+	grep -qaE "vfmig: fenced RoCE RX pf=$PF vf_id=$CUR_VF .*, mlx5_ib released" "$IMG/dump.log" \
+		|| { grep -a 'fenced RoCE RX' "$IMG/dump.log" >&2; die "hop $hop: mlx5_ib did not release its UMR QP and CQ on vf $CUR_VF"; }
 	grep -qaE 'vfmig SAVE: claimed_vfs=1 records_written=1 failed=0' "$IMG/dump.log" \
 		|| die "hop $hop: SAVE did not write the record"
 	BLOB="$(grep -aoE "vfmig: captured pf=$PF vf_id=$CUR_VF .* size=[0-9]+" "$IMG/dump.log" | tail -1 | sed -E 's/.*size=//')"
@@ -434,11 +444,13 @@ for hop in $(seq 1 "$HOPS"); do
 	unexpected_kmsgs <"$IMG/dmesg.txt" >"$IMG/unexpected_kmsgs.txt"
 	NK="$(wc -l <"$IMG/unexpected_kmsgs.txt")"
 	FW="$(fw_pages)"
+	KRES=-
+	[[ "$KRES_LOG" == 1 ]] && KRES="$(rdma res show cq dev "$DST_IB" 2>/dev/null | grep '\[mlx5_ib\]' | grep -oE 'cqe [0-9]+' | tr ' ' = | paste -sd, -)" && KRES="${KRES:-none}"
 
-	printf '%d\t%d\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n' "$hop" "$CUR_VF" "$DST_VF" "$BLOB" "$FW_IDLE" "$FW" \
-		"$NK" "$(secs "$t0" "$t1")" "$(secs "$t2" "$t3")" "$(secs "$t4" "$t5")" "$LR" "$TD" "$REPLAYS" >>"$TSV"
-	printf '  %4d %4d %4d %10s %8s %8s %5d %7s %7s %9s %5s %7s %s\n' "$hop" "$CUR_VF" "$DST_VF" "$BLOB" "$FW_IDLE" "$FW" \
-		"$NK" "$(secs "$t0" "$t1")" "$(secs "$t2" "$t3")" "$(secs "$t4" "$t5")" "$LR" "$TD" "$REPLAYS"
+	printf '%d\t%d\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$hop" "$CUR_VF" "$DST_VF" "$BLOB" "$FW_IDLE" "$FW" \
+		"$NK" "$(secs "$t0" "$t1")" "$(secs "$t2" "$t3")" "$(secs "$t4" "$t5")" "$LR" "$TD" "$REPLAYS" "$KRES" >>"$TSV"
+	printf '  %4d %4d %4d %10s %8s %8s %5d %7s %7s %9s %5s %7s %-26s %s\n' "$hop" "$CUR_VF" "$DST_VF" "$BLOB" "$FW_IDLE" "$FW" \
+		"$NK" "$(secs "$t0" "$t1")" "$(secs "$t2" "$t3")" "$(secs "$t4" "$t5")" "$LR" "$TD" "$REPLAYS" "$KRES"
 
 	if [[ "$NK" -gt 0 ]]; then
 		sed 's/^/        /' "$IMG/unexpected_kmsgs.txt" | head -5
