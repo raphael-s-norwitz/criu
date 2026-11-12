@@ -11,8 +11,9 @@
 #
 # Usage: vfmig_pasid_preflight.sh [--vf BDF] [--src KERNEL_SRC] [--out DIR] [--verbose]
 #   --vf   VF to qualify (default: every ConnectX VF found)
-#   --src  kernel source tree matching the running kernel (default: none,
-#          source checks skipped)
+#   --src  optional kernel source tree matching the running kernel, for
+#          extra checks (uapi, domain ops wiring); the running kernel's
+#          symbol table is used without it
 #   --out  directory for raw captures (default: ./pasid-preflight-<host>-<ts>)
 #   --verbose  print the full report, not just the summary (the full report
 #          is always written to <out>/report.txt)
@@ -448,9 +449,31 @@ done
 verdict "restorable_vf_pfs" "${CANDIDATES[*]:-none}" "PFs that pass the vfmig tracking prerequisites; PASID is separate"
 
 # ---------------------------------------------------------------------------
-section "Kernel PASID attach support (source)"
+section "Kernel PASID attach support"
+# The running kernel's symbol table answers this without a source tree;
+# symbol names are listed to unprivileged users too. --src, if given, checks
+# the domain ops wiring and uapi and overrides this.
 SRC_ATTACH=UNKNOWN
-SRC_WHY="no --src given"
+SRC_WHY="/proc/kallsyms unreadable"
+ksym() { grep -qE "^[0-9a-f]+ [tT] $1\$" /proc/kallsyms 2>/dev/null && echo yes || echo no; }
+if [ -r /proc/kallsyms ]; then
+	core=$(ksym iommu_attach_device_pasid)
+	say "  running kernel: iommu_attach_device_pasid $core"
+	case "$IOMMU_KIND" in
+	intel) p=$(ksym intel_iommu_set_dev_pasid); drvsym="intel_iommu_set_dev_pasid (paging domains)" ;;
+	smmuv3) p=$(ksym arm_smmu_s1_set_dev_pasid); drvsym="arm_smmu_s1_set_dev_pasid (stage-1 domains)" ;;
+	amd) p=unknown; drvsym="AMD paging-domain PASID attach (not visible in kallsyms; upstream AMD takes a PASID only on SVA and blocked domains)" ;;
+	virtio) p=no; drvsym="virtio-iommu set_dev_pasid (not implemented)" ;;
+	*) p=unknown; drvsym="no recognised IOMMU" ;;
+	esac
+	say "  running kernel: $drvsym $p"
+	if [ "$core" = no ] || [ "$p" = no ]; then
+		SRC_ATTACH=NO
+	elif [ "$p" = yes ]; then
+		SRC_ATTACH=YES
+	fi
+	SRC_WHY="running kernel: iommu_attach_device_pasid $core; $drvsym $p"
+fi
 if [ -n "$SRC" ] && [ -d "$SRC/drivers/iommu" ]; then
 	sv=$(make -s -C "$SRC" kernelversion 2>/dev/null)
 	say "  source: $SRC ($sv; running $(uname -r))"
