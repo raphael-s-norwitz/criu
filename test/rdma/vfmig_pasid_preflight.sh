@@ -9,11 +9,13 @@
 # for the full picture: PCI extended capabilities (PASID/ATS/PRI), dmesg and
 # IOMMU debugfs are not readable otherwise; those checks report UNKNOWN.
 #
-# Usage: vfmig_pasid_preflight.sh [--vf BDF] [--src KERNEL_SRC] [--out DIR]
+# Usage: vfmig_pasid_preflight.sh [--vf BDF] [--src KERNEL_SRC] [--out DIR] [--verbose]
 #   --vf   VF to qualify (default: every ConnectX VF found)
 #   --src  kernel source tree matching the running kernel (default: none,
 #          source checks skipped)
 #   --out  directory for raw captures (default: ./pasid-preflight-<host>-<ts>)
+#   --verbose  print the full report, not just the summary (the full report
+#          is always written to <out>/report.txt)
 #
 # It also lists the PFs on which restorable (vfmig-trackable) VFs could be
 # created. The firmware migration caps are confirmed from the kernel log: a
@@ -28,12 +30,14 @@ export LC_ALL=C
 VFS=()
 SRC=""
 OUT=""
+VERBOSE=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--vf) VFS+=("$2"); shift 2 ;;
 	--src) SRC="$2"; shift 2 ;;
 	--out) OUT="$2"; shift 2 ;;
-	-h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+	-v|--verbose) VERBOSE=1; shift ;;
+	-h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -50,8 +54,11 @@ KLOG=""
 declare -A VERDICT
 VERDICT_ORDER=()
 
-say() { echo "$*" | tee -a "$REPORT"; }
-sayin() { tee -a "$REPORT"; }
+# The full report always goes to $REPORT; the console gets it only with
+# --verbose, and otherwise just the short summary at the end (show).
+say() { if [ "$VERBOSE" = 1 ]; then echo "$*" | tee -a "$REPORT"; else echo "$*" >> "$REPORT"; fi; }
+sayin() { if [ "$VERBOSE" = 1 ]; then tee -a "$REPORT"; else cat >> "$REPORT"; fi; }
+show() { echo "$*" | tee -a "$REPORT"; }
 section() { say ""; say "== $* =="; }
 verdict() {	# key value reason
 	[ -n "${VERDICT[$1]+x}" ] || VERDICT_ORDER+=("$1")
@@ -81,7 +88,9 @@ kconfig() {
 section "Host"
 say "kernel:   $(uname -r)"
 say "cmdline:  $(cat /proc/cmdline)"
-VIRT=$(systemd-detect-virt 2>/dev/null || echo unknown)
+# systemd-detect-virt prints "none" and exits 1 on bare metal.
+VIRT=$(systemd-detect-virt 2>/dev/null)
+VIRT=${VIRT:-unknown}
 say "virt:     $VIRT"
 say "dmi:      $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) / $(cat /sys/class/dmi/id/product_name 2>/dev/null)"
 say "cpu:      $(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo)"
@@ -121,6 +130,7 @@ IOMMU_KIND=none
 HW_PASID=UNKNOWN
 HW_PASID_WHY="no IOMMU capability registers readable"
 HW_PASID_BITS=0
+IOMMU_UNITS=()
 
 for d in /sys/class/iommu/*; do
 	[ -e "$d" ] || continue
@@ -134,6 +144,10 @@ for d in /sys/class/iommu/*; do
 		say "    caching_mode=$(bit $cap 7) (1 = emulated/virtual IOMMU)"
 		say "    ecap: SMTS(scalable mode)=$(bit $ecap 43) PASID=$(bit $ecap 40) PSS=$(field $ecap 35 31)$([ "$(bit $ecap 40)" = 1 ] && echo " (width $(( $(field $ecap 35 31) + 1 )) bits)")"
 		say "          FLTS(first stage)=$(bit $ecap 47) SLTS(second stage)=$(bit $ecap 46) NEST=$(bit $ecap 26) PRS=$(bit $ecap 29) DT(ATS)=$(bit $ecap 2) PT=$(bit $ecap 6)"
+		u="Intel VT-d $ver, scalable mode $([ "$(bit $ecap 43)" = 1 ] && echo on || echo off)"
+		[ "$(bit $ecap 40)" = 1 ] && u="$u, PASID $(( $(field $ecap 35 31) + 1 ))-bit" || u="$u, no PASID"
+		[ "$(bit $cap 7)" = 1 ] && u="$u, virtual (caching mode)"
+		IOMMU_UNITS+=("$u")
 		if [ "$(bit $ecap 43)" = 1 ] && [ "$(bit $ecap 40)" = 1 ]; then
 			HW_PASID=YES
 			HW_PASID_BITS=$(( $(field $ecap 35 31) + 1 ))
@@ -149,6 +163,7 @@ for d in /sys/class/iommu/*; do
 		efr=$((16#${f%%:*}))
 		say "  $n: AMD-Vi efr:efr2=$f"
 		say "    PPRSup=$(bit $efr 1) GTSup=$(bit $efr 4) PASmax=$(field $efr 32 31) GIOSup=$(bit $efr 48)"
+		IOMMU_UNITS+=("AMD-Vi, GTSup=$(bit $efr 4) PASmax=$(field $efr 32 31)")
 		if [ "$(bit $efr 4)" = 1 ] && [ "$(field $efr 32 31)" -gt 0 ]; then
 			HW_PASID=YES
 			HW_PASID_BITS=$(( $(field $efr 32 31) + 1 ))
@@ -197,6 +212,9 @@ PFS=()
 ALL_VFS=()
 for dev in /sys/bus/pci/devices/*; do
 	[ "$(cat "$dev/vendor")" = 0x15b3 ] || continue
+	# Network (0x0200) and InfiniBand (0x0207) functions only; this skips
+	# the ConnectX-7 and BlueField PCIe switch ports.
+	case "$(cat "$dev/class")" in 0x02*) ;; *) continue ;; esac
 	bdf=$(basename "$dev")
 	if [ -e "$dev/physfn" ]; then
 		ALL_VFS+=("$bdf")
@@ -214,11 +232,22 @@ fn_info() {	# bdf
 	fw=""
 	[ -n "$ib" ] && fw=$(cat "/sys/class/infiniband/$ib/fw_ver" 2>/dev/null)
 	net=$(ls "$dev/net" 2>/dev/null | tr '\n' ' ')
-	say "  $1 [$(lspci -s "$1" -mm 2>/dev/null | awk -F'"' '{print $6}')] driver=${drv:-none} iommu_group=${grp:-none} ib=${ib:-none} fw=${fw:-?} net=${net:-none}"
+	FN_NAME=$(lspci -s "$1" -mm 2>/dev/null | awk -F'"' '{print $6}')
+	FN_FW=${fw:-?}
+	say "  $1 [$FN_NAME] driver=${drv:-none} iommu_group=${grp:-none} ib=${ib:-none} fw=$FN_FW net=${net:-none}"
 }
 
+declare -A PF_MODEL PF_FW PF_VFS PF_VERDICT
 for pf in "${PFS[@]}"; do
 	fn_info "$pf"
+	# "MT2910 Family [ConnectX-7]" -> ConnectX-7,
+	# "MT43244 BlueField-3 integrated ConnectX-7 ..." -> BlueField-3
+	case "$FN_NAME" in
+	*\[*\]*) m=${FN_NAME##*\[}; m=${m%%\]*} ;;
+	*) m=$(echo "$FN_NAME" | sed -E 's/^MT[0-9]+ //; s/ integrated.*//') ;;
+	esac
+	PF_MODEL[$pf]=${m:-?}
+	PF_FW[$pf]=$FN_FW
 	dev=/sys/bus/pci/devices/$pf
 	say "    sriov_numvfs=$(cat "$dev/sriov_numvfs" 2>/dev/null || echo n/a) sriov_totalvfs=$(cat "$dev/sriov_totalvfs" 2>/dev/null || echo n/a)"
 	if command -v devlink >/dev/null; then
@@ -239,7 +268,7 @@ section "PCIe PASID / ATS / PRI capabilities"
 DEV_PASID=UNKNOWN
 DEV_PASID_WHY="needs root to read PCI extended capabilities"
 DEV_PASID_EN=UNKNOWN
-declare -A PF_PASID PF_ACS
+declare -A PF_PASID PF_ATS PF_ACS
 pcicaps() {	# bdf
 	local f="$OUT/lspci_vvv_$1.txt"
 	lspci -vvv -s "$1" > "$f" 2>&1
@@ -260,6 +289,7 @@ if [ "$ROOT" = 1 ]; then
 		f="$OUT/lspci_vvv_$pf.txt"
 		PF_PASID[$pf]=NO
 		grep -q 'Access Control Services' "$f" && PF_ACS[$pf]=YES || PF_ACS[$pf]=NO
+		grep -q 'Address Translation Service' "$f" && PF_ATS[$pf]=YES || PF_ATS[$pf]=NO
 		if grep -q 'Process Address Space ID' "$f"; then
 			PF_PASID[$pf]=YES
 			w=$(grep -A1 'Process Address Space ID' "$f" | grep -oE 'Max PASID Width: [0-9a-f]+' | awk '{print $4}')
@@ -273,7 +303,9 @@ if [ "$ROOT" = 1 ]; then
 		say "  VF $vf (a VF has no PASID capability of its own; it uses the PF's):"
 		pcicaps "$vf" | sayin
 	done
-	if [ "$DEV_PASID" = NO ] && [ "$VIRT" != none ]; then
+	if [ "$DEV_PASID" = NO ] && [ "$VIRT" = none ]; then
+		DEV_PASID_WHY="$DEV_PASID_WHY; whether the device exposes PASID may depend on its firmware configuration"
+	elif [ "$DEV_PASID" = NO ]; then
 		DEV_PASID_WHY="$DEV_PASID_WHY to this guest; the hypervisor may hide it (QEMU vfio hides PASID unless the vIOMMU supports it)"
 		grep -q 'Address Translation Service' "$OUT/lspci_vvv_${PFS[0]}.txt" 2>/dev/null ||
 			DEV_PASID_WHY="$DEV_PASID_WHY; ATS is hidden too, so the physical device is unknown: run this on the hypervisor"
@@ -305,26 +337,29 @@ say "  device, SR-IOV room, legacy eswitch, firmware 'migration' and"
 say "  'vhca_resource_manager' caps, and its own IOMMU group on a managed DMA"
 say "  domain. The PASID column is extra: what a PASID design would need on top."
 CANDIDATES=()
+# Each reason has a long form for the report and a short one for the summary.
+nope() { no+=("$1"); sno+=("$2"); }
+maybe() { unk+=("$1"); sunk+=("$2"); }
 for pf in "${PFS[@]}"; do
 	dev=/sys/bus/pci/devices/$pf
-	no=(); unk=()
+	no=(); unk=(); sno=(); sunk=()
 	say "  PF $pf:"
 
 	drv=$(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)
 	say "    driver:          ${drv:-none}"
-	[ "$drv" = mlx5_core ] || no+=("not bound to mlx5_core")
+	[ "$drv" = mlx5_core ] || nope "not bound to mlx5_core" "driver ${drv:-none}"
 
 	if [ -e "/dev/mlx5_vfmig/$pf" ]; then
 		say "    vfmig device:    /dev/mlx5_vfmig/$pf"
 	else
 		say "    vfmig device:    absent"
-		no+=("no /dev/mlx5_vfmig/$pf (CONFIG_MLX5_VFMIG or PF init)")
+		nope "no /dev/mlx5_vfmig/$pf (CONFIG_MLX5_VFMIG or PF init)" "no vfmig device"
 	fi
 
 	tot=$(cat "$dev/sriov_totalvfs" 2>/dev/null || echo 0)
 	num=$(cat "$dev/sriov_numvfs" 2>/dev/null || echo 0)
 	say "    sr-iov:          $num of $tot VFs enabled"
-	[ "$tot" -gt 0 ] || no+=("no SR-IOV (sriov_totalvfs=0)")
+	[ "$tot" -gt 0 ] || nope "no SR-IOV (sriov_totalvfs=0)" "no SR-IOV"
 	[ "$num" -gt 0 ] && say "    (sriov_numvfs can only change via 0; existing VFs are recycled, not re-created)"
 
 	mode=$(devlink dev eswitch show "pci/$pf" 2>/dev/null |
@@ -332,8 +367,8 @@ for pf in "${PFS[@]}"; do
 	say "    eswitch mode:    ${mode:-unknown}"
 	case "$mode" in
 	legacy) ;;
-	"") unk+=("eswitch mode unreadable") ;;
-	*) unk+=("eswitch mode $mode is untested; the vfmig tests use legacy") ;;
+	"") maybe "eswitch mode unreadable" "eswitch mode unreadable" ;;
+	*) maybe "eswitch mode $mode is untested; the vfmig tests use legacy" "eswitch $mode untested" ;;
 	esac
 
 	# The kernel's own view comes first: vfmig refuses to make a VF
@@ -344,7 +379,7 @@ for pf in "${PFS[@]}"; do
 		if grep -qE "mlx5_core $pf: vfmig: PF firmware does not advertise" "$KLOG"; then
 			kev=NO
 			say "    kernel log:      $(grep -m1 -oE "vfmig: PF firmware does not advertise.*" "$KLOG")"
-			no+=("kernel reports missing firmware migration caps")
+			nope "kernel reports missing firmware migration caps" "firmware lacks migration caps"
 		elif grep -qE "mlx5_core $pf: vfmig: vf [0-9]+ tracked=1" "$KLOG"; then
 			kev=YES
 			say "    kernel log:      a VF was tracked on this PF this boot (firmware migration caps present)"
@@ -356,20 +391,21 @@ for pf in "${PFS[@]}"; do
 	if [ "$kev" = UNKNOWN ]; then
 		why="no VF tracked on this PF this boot"
 		[ -n "$KLOG" ] || why="kernel log needs root"
-		unk+=("firmware migration caps unconfirmed ($why)")
+		maybe "firmware migration caps unconfirmed ($why)" "firmware caps unconfirmed"
 	fi
 
 	grp=$(basename "$(readlink "$dev/iommu_group" 2>/dev/null)" 2>/dev/null)
 	if [ -z "$grp" ]; then
 		say "    iommu:           no group"
-		no+=("no IOMMU translation (migratable VFs need a managed DMA domain)")
+		nope "no IOMMU translation (migratable VFs need a managed DMA domain)" "no IOMMU group"
 	else
 		gtype=$(cat /sys/kernel/iommu_groups/$grp/type 2>/dev/null)
 		say "    iommu:           PF group $grp type $gtype; ACS ${PF_ACS[$pf]:-UNKNOWN}"
 		case "$gtype" in
 		identity) say "    (VFs default to identity too; set each VF group's type to DMA before SET_TRACKED, as the test loop does)" ;;
 		esac
-		[ "${PF_ACS[$pf]:-UNKNOWN}" = NO ] && unk+=("no ACS on the PF: VFs may share an IOMMU group, and tracking needs one group per VF")
+		[ "${PF_ACS[$pf]:-UNKNOWN}" = NO ] &&
+			say "    (no ACS capability on the PF; checked below on the VFs' own groups)"
 	fi
 
 	for vf in "${ALL_VFS[@]}"; do
@@ -389,6 +425,7 @@ for pf in "${PFS[@]}"; do
 				line="$line (tracked this boot)"
 		fi
 		say "$line"
+		[ "$vfn" -gt 1 ] && maybe "VF $vf shares IOMMU group $vfg with $((vfn - 1)) other device(s); tracking needs one group per VF" "VF IOMMU group shared"
 	done
 
 	pasid=${PF_PASID[$pf]:-UNKNOWN}
@@ -396,13 +433,17 @@ for pf in "${PFS[@]}"; do
 
 	if [ ${#no[@]} -gt 0 ]; then
 		say "    => NOT A CANDIDATE: $(join "${no[@]}")"
+		PF_VERDICT[$pf]="no: $(join "${sno[@]}")"
 	elif [ ${#unk[@]} -gt 0 ]; then
 		say "    => POSSIBLE, unconfirmed: $(join "${unk[@]}")"
 		CANDIDATES+=("$pf(unconfirmed)")
+		PF_VERDICT[$pf]="possible: $(join "${sunk[@]}")"
 	else
 		say "    => CANDIDATE: up to $tot restorable VFs ($num enabled now)"
 		CANDIDATES+=("$pf")
+		PF_VERDICT[$pf]="yes"
 	fi
+	PF_VFS[$pf]="$num/$tot"
 done
 verdict "restorable_vf_pfs" "${CANDIDATES[*]:-none}" "PFs that pass the vfmig tracking prerequisites; PASID is separate"
 
@@ -457,8 +498,29 @@ verdict "tagged_dma_demonstrated" "NOT_TESTED" "no documented mlx5 interface fou
 
 # ---------------------------------------------------------------------------
 section "Summary"
+show ""
+show "host:    $(hostname -s), kernel $(uname -r), $([ "$VIRT" = none ] && echo "bare metal" || echo "virt $VIRT")$([ "$ROOT" = 1 ] || echo ", not root (PCI caps and kernel log UNKNOWN)")"
+if [ ${#IOMMU_UNITS[@]} -gt 0 ]; then
+	printf '%s\n' "${IOMMU_UNITS[@]}" | sort | uniq -c |
+		while read -r n u; do show "iommu:   $n x $u"; done
+else
+	show "iommu:   $IOMMU_KIND"
+fi
+show ""
+if [ ${#PFS[@]} -gt 0 ]; then
+	fmt='  %-13s %-12s %-11s %-6s %-6s %-8s %s'
+	show "$(printf "$fmt" "PF" "model" "firmware" "PASID" "ATS" "VFs" "restorable VFs")"
+	for pf in "${PFS[@]}"; do
+		show "$(printf "$fmt" "$pf" "${PF_MODEL[$pf]}" "${PF_FW[$pf]}" \
+			"${PF_PASID[$pf]:-?}" "${PF_ATS[$pf]:-?}" "${PF_VFS[$pf]:-?}" "${PF_VERDICT[$pf]:-?}")"
+	done
+else
+	show "  no ConnectX network/InfiniBand functions found"
+fi
+show ""
 for k in "${VERDICT_ORDER[@]}"; do
-	say "  $(printf '%-28s' "$k") ${VERDICT[$k]}"
+	[ "$k" = restorable_vf_pfs ] && continue
+	show "  $(printf '%-28s' "$k") ${VERDICT[$k]}"
 done
-say ""
-say "raw captures in $OUT"
+show ""
+show "full report: $REPORT (or rerun with --verbose)"
