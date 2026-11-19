@@ -81,6 +81,15 @@ enough for a proper zdtm test.
       the out-of-band `mlx5_vfmig` orchestrator CLI (`VFMIG_TOOL=...`,
       used to stamp the per-VF UUID criu never sets); skips gracefully
       when any precondition is missing.
+- `run_vfmig_iova_bits_sweep.sh` -- runs a vfmig C/R gate (default
+  `run_vfmig_xvf_cr.sh`) once per IOVA window size in `BITS` (default
+  `39 36 34`; sizes the PF's sysfs `iova_bits` leaves out are skipped),
+  then once with the destination tracked with the wrong window, which
+  restore must refuse before LOAD, and once with it untracked, which the
+  plugin must track with the image's window. Every vfmig gate takes
+  `IOVA_BITS` for its `set_tracked` calls; `run_vfmig_xvf_cr.sh` also
+  takes `MISMATCH_BITS` and `DST_TRACK` and checks the dump recorded the
+  window.
 
 ## Run
 

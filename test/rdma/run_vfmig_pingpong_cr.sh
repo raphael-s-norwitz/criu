@@ -63,6 +63,8 @@ fi
 
 PF="${PF:-0000:08:00.0}"
 VFMIG_TOOL="${VFMIG_TOOL:-mlx5_vfmig}"
+# SET_TRACKED iova_bits for every VF tracked here; 0 is the kernel default
+IOVA_BITS="${IOVA_BITS:-0}"
 DEV_DIR="/dev/mlx5_vfmig"
 VF_A="${VF_A:-0}"
 VF_B="${VF_B:-1}"
@@ -155,7 +157,7 @@ recycle_slot() {
 # No bind, no enable_migratable: the restore tool's LOAD path does both.
 stamp_dest() {
 	ensure_dma_domain "$(vf_bdf "$1")"
-	"$VFMIG_TOOL" "$PF" set_tracked "$1" 1
+	"$VFMIG_TOOL" "$PF" set_tracked "$1" 1 "$IOVA_BITS"
 	"$VFMIG_TOOL" "$PF" set_vf_uuid "$1" "$2"
 }
 
@@ -278,7 +280,7 @@ STATUS="$WORKDIR/holder.status"
 sect "gen0: hold a context on vf_id=$VF_A and dump it"
 A_BDF="$(vf_bdf "$VF_A")"
 ensure_dma_domain "$A_BDF"
-"$VFMIG_TOOL" "$PF" set_tracked "$VF_A" 1
+"$VFMIG_TOOL" "$PF" set_tracked "$VF_A" 1 "$IOVA_BITS"
 "$VFMIG_TOOL" "$PF" enable_migratable "$VF_A"
 "$VFMIG_TOOL" "$PF" set_vf_uuid "$VF_A" "$VF_UUID"
 echo mlx5_core >"/sys/bus/pci/devices/$A_BDF/driver_override"

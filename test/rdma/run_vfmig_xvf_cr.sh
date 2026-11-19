@@ -42,6 +42,14 @@
 # DST_VF collapses to the same-slot case and is a useful regression check
 # through this same code path (mirrors the kernel harness's SRC==DST).
 #
+# IOVA_BITS=N tracks both VFs with an N-bit IOVA window (default 0, the
+# kernel's 39); the dump must record it. MISMATCH_BITS=M first tracks the
+# destination with an M-bit window instead: the restore tool must refuse
+# the image before LOAD, then the destination is re-tracked with N and
+# the restore proceeds. DST_TRACK=0 leaves the destination untracked, as
+# an orchestrator that only stamps the UUID would: the plugin must track
+# it with the image's window.
+#
 # This gate is hardware-only and needs >= max(SRC_VF,DST_VF)+1 VFs. It
 # self-skips to PASS when any precondition is missing, so it is safe to
 # run anywhere. Set VFMIG_CR_HW=1 to turn a skip into a hard failure.
@@ -74,6 +82,11 @@ fi
 
 PF="${PF:-0000:08:00.0}"
 VFMIG_TOOL="${VFMIG_TOOL:-mlx5_vfmig}"
+# SET_TRACKED iova_bits for every VF tracked here; 0 is the kernel default
+IOVA_BITS="${IOVA_BITS:-0}"
+EXPECT_BITS=$(( IOVA_BITS ? IOVA_BITS : 39 ))
+MISMATCH_BITS="${MISMATCH_BITS:-}"
+DST_TRACK="${DST_TRACK:-1}"
 DEV_DIR="/dev/mlx5_vfmig"
 SRC_VF="${SRC_VF:-0}"
 DST_VF="${DST_VF:-1}"
@@ -177,10 +190,20 @@ PF_DEV="/sys/bus/pci/devices/$PF"
 [[ "$(cat "$PF_DEV/sriov_totalvfs" 2>/dev/null || echo 0)" -ge "$NUMVFS" ]] \
 	|| need_hw "PF $PF has sriov_totalvfs < $NUMVFS (need slots SRC_VF=$SRC_VF, DST_VF=$DST_VF)"
 [[ -d "$DEV_DIR" ]] || need_hw "$DEV_DIR missing (mlx5_vfmig kernel support not loaded)"
+WINDOWS_F="/sys/class/mlx5_vfmig/mlx5_vfmig!$PF/iova_bits"
+[[ -r "$WINDOWS_F" ]] || need_hw "$WINDOWS_F missing (kernel predates IOVA window selection)"
+WINDOWS="$(cat "$WINDOWS_F")"
+if [[ -n "$MISMATCH_BITS" ]]; then
+	[[ "$MISMATCH_BITS" != "$EXPECT_BITS" ]] || die "MISMATCH_BITS=$MISMATCH_BITS is the window under test"
+fi
+for b in "$EXPECT_BITS" $MISMATCH_BITS; do
+	[[ " $WINDOWS " == *" $b "* ]] || need_hw "PF $PF lists no $b-bit IOVA window (iova_bits: $WINDOWS)"
+done
 
 SRIOV_NUMVFS="$PF_DEV/sriov_numvfs"
 VF_UUID="$(cat /proc/sys/kernel/random/uuid)"
 note "PF=$PF SRC_VF=$SRC_VF DST_VF=$DST_VF numvfs=$NUMVFS vf_uuid=$VF_UUID"
+note "iova_bits=$EXPECT_BITS${MISMATCH_BITS:+ mismatch=$MISMATCH_BITS} dst_track=$DST_TRACK (PF windows: $WINDOWS)"
 [[ "$SRC_VF" == "$DST_VF" ]] && note "SRC_VF == DST_VF: same-slot regression run"
 
 # criu has no --disable-plugin; -L overrides the whole plugin dir. Point it
@@ -200,7 +223,7 @@ echo 0 >"$PF_DEV/sriov_drivers_autoprobe"
 echo "$NUMVFS" >"$SRIOV_NUMVFS"
 SRC_BDF="$(readlink "$PF_DEV/virtfn$SRC_VF" | xargs basename)"
 ensure_dma_domain "$SRC_BDF"
-"$VFMIG_TOOL" "$PF" set_tracked "$SRC_VF" 1
+"$VFMIG_TOOL" "$PF" set_tracked "$SRC_VF" 1 "$IOVA_BITS"
 "$VFMIG_TOOL" "$PF" enable_migratable "$SRC_VF"
 # Orchestrator stamps the source identity. Only SRC_VF carries it for now.
 "$VFMIG_TOOL" "$PF" set_vf_uuid "$SRC_VF" "$VF_UUID"
@@ -248,7 +271,9 @@ note "criu dump completed"
 [[ -s "$IMG/mlx5_vfmig.img" ]] || die "dump produced no mlx5_vfmig.img"
 grep -qaE 'vfmig SAVE: claimed_vfs=[0-9]+ records_written=[1-9][0-9]* failed=0' "$IMG/dump.log" \
 	|| { grep -aE 'vfmig SAVE|vfmig: captured' "$IMG/dump.log" >&2 || true; die "SAVE did not write >=1 record"; }
-note "image dir has mlx5_vfmig.img + firmware blob + ucontext snapshot"
+grep -qaE "vfmig: captured pf=$PF vf_id=$SRC_VF vhca_id=[0-9]+ iova_bits=$EXPECT_BITS " "$IMG/dump.log" \
+	|| { grep -aE 'vfmig: captured' "$IMG/dump.log" >&2 || true; die "dump did not record iova_bits=$EXPECT_BITS"; }
+note "image dir has mlx5_vfmig.img + firmware blob + ucontext snapshot (iova_bits=$EXPECT_BITS)"
 
 # ---------------------------------------------------------------------------
 # Reprovision; stamp the UUID on the DESTINATION VF only (DST_VF)
@@ -262,10 +287,34 @@ recycle_slot "$SRC_VF"
 note "source VF vf_id=$SRC_VF recycled: $(vf_query "$SRC_VF")"
 DEST_BDF="$(vf_bdf "$DST_VF")"
 ensure_dma_domain "$DEST_BDF"
-# Tracked so QUERY_VF surfaces the stamped vf_uuid; stamp only on DST_VF.
-# Deliberately do NOT bind or enable_migratable -- the restore tool's LOAD
-# path drives both.
-"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 1
+
+if [[ -n "$MISMATCH_BITS" ]]; then
+	sect "Destination tracked with the wrong window ($MISMATCH_BITS bits): restore must refuse"
+	"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 1 "$MISMATCH_BITS"
+	"$VFMIG_TOOL" "$PF" set_vf_uuid "$DST_VF" "$VF_UUID"
+	MLOG="$WORKDIR/fw_restore_mismatch.log"
+	if "$RESTORE_TOOL" -D "$IMG" -p "$MLX5_SO" >"$MLOG" 2>&1; then
+		cat "$MLOG" >&2 || true
+		die "restore tool accepted an image saved with iova_bits=$EXPECT_BITS on a $MISMATCH_BITS-bit destination"
+	fi
+	grep -qaE "vfmig: pf=$PF vf_id=$DST_VF is tracked with iova_bits=$MISMATCH_BITS but the image was saved with iova_bits=$EXPECT_BITS" "$MLOG" \
+		|| { cat "$MLOG" >&2; die "restore tool failed without naming the window mismatch"; }
+	! grep -qaE "vfmig: loaded pf=$PF vf_id=$DST_VF " "$MLOG" \
+		|| { cat "$MLOG" >&2; die "restore tool ran LOAD_VHCA_STATE despite the window mismatch"; }
+	[[ ! -e "/sys/bus/pci/devices/$DEST_BDF/driver" ]] \
+		|| die "destination VF $DEST_BDF was bound despite the window mismatch"
+	note "refused before LOAD: $(grep -aE 'is tracked with iova_bits=' "$MLOG" | head -1)"
+	"$VFMIG_TOOL" "$PF" clear_vf_uuid "$DST_VF" "$VF_UUID"
+	"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 0
+	note "destination untracked and UUID cleared; re-tracking with $EXPECT_BITS bits"
+fi
+
+# Stamp only on DST_VF. Deliberately do NOT bind or enable_migratable --
+# the restore tool's LOAD path drives both. With DST_TRACK=0 it is not
+# tracked either, and the plugin must track it with the image's window.
+if [[ "$DST_TRACK" == 1 ]]; then
+	"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 1 "$IOVA_BITS"
+fi
 "$VFMIG_TOOL" "$PF" set_vf_uuid "$DST_VF" "$VF_UUID"
 [[ ! -e "/sys/bus/pci/devices/$DEST_BDF/driver" ]] \
 	|| die "destination VF $DEST_BDF is already bound before prerestore (expected unbound)"
@@ -287,6 +336,17 @@ grep -qaE "vfmig: dest vf_id=$DST_VF \(vf_bdf=$DEST_BDF\) vf_state=0x0 .*: unbou
 	|| { cat "$FLOG" >&2; die "restore did not decide to LOAD the unbound destination"; }
 grep -qaE "vfmig: restored VF: vf_uuid=$VF_UUID .*source\(pf=$PF vf_id=$SRC_VF\) -> dest\(pf=$PF vf_id=$DST_VF .* dest_ibdev=[^ ]+ dest_cdev=[^ ]+" "$FLOG" \
 	|| { cat "$FLOG" >&2; die "prerestore tool did not complete a cross-slot VF restore"; }
+TRACKED_LINE="vfmig: pf=$PF vf_id=$DST_VF was not tracked; tracked it with the image's iova_bits=$EXPECT_BITS"
+if [[ "$DST_TRACK" == 1 ]]; then
+	! grep -qaF "$TRACKED_LINE" "$FLOG" \
+		|| { cat "$FLOG" >&2; die "plugin re-tracked a destination the orchestrator had tracked"; }
+else
+	grep -qaF "$TRACKED_LINE" "$FLOG" \
+		|| { cat "$FLOG" >&2; die "plugin did not track the untracked destination with iova_bits=$EXPECT_BITS"; }
+	[[ "$(vf_query "$DST_VF")" == *" tracked=1 "*" iova_bits=$EXPECT_BITS"* ]] \
+		|| die "destination not tracked with iova_bits=$EXPECT_BITS after prerestore: $(vf_query "$DST_VF")"
+	note "plugin tracked the untracked destination with the image's iova_bits=$EXPECT_BITS"
+fi
 [[ -e "/sys/bus/pci/devices/$DEST_BDF/driver" ]] \
 	|| die "destination VF $DEST_BDF not bound after firmware prerestore"
 DEST_IBDEV=""

@@ -64,6 +64,8 @@ fi
 
 PF="${PF:-0000:08:00.0}"
 VFMIG_TOOL="${VFMIG_TOOL:-mlx5_vfmig}"
+# SET_TRACKED iova_bits for every VF tracked here; 0 is the kernel default
+IOVA_BITS="${IOVA_BITS:-0}"
 DEV_DIR="/dev/mlx5_vfmig"
 SRC_VF="${SRC_VF:-0}"
 DST_VF="${DST_VF:-1}"
@@ -273,7 +275,7 @@ start_source() {
 	SRC_BDF="$(vf_bdf "$SRC_VF")"
 	ensure_dma_domain "$SRC_BDF"
 	ip link set "$PF_NET" vf "$SRC_VF" mac "$MAC" || fail "set source VF admin MAC"
-	"$VFMIG_TOOL" "$PF" set_tracked "$SRC_VF" 1 >/dev/null || fail "set_tracked $SRC_VF"
+	"$VFMIG_TOOL" "$PF" set_tracked "$SRC_VF" 1 "$IOVA_BITS" >/dev/null || fail "set_tracked $SRC_VF"
 	"$VFMIG_TOOL" "$PF" enable_migratable "$SRC_VF" >/dev/null || fail "enable_migratable $SRC_VF"
 	"$VFMIG_TOOL" "$PF" set_vf_uuid "$SRC_VF" "$UUID" >/dev/null || fail "set_vf_uuid $SRC_VF"
 	echo mlx5_core >"/sys/bus/pci/devices/$SRC_BDF/driver_override"
@@ -442,7 +444,7 @@ migrate_to_dest() {
 	dbdf="$(vf_bdf "$DST_VF")"
 	ensure_dma_domain "$dbdf"
 	ip link set "$PF_NET" vf "$DST_VF" mac "$MAC" || fail "set dest VF admin MAC"
-	"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 1 >/dev/null || fail "dest set_tracked"
+	"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 1 "$IOVA_BITS" >/dev/null || fail "dest set_tracked"
 	"$VFMIG_TOOL" "$PF" set_vf_uuid "$DST_VF" "$UUID" >/dev/null || fail "dest set_vf_uuid"
 
 	kmark "$MODE prerestore"

@@ -71,6 +71,8 @@ fi
 
 PF="${PF:-0000:08:00.0}"
 VFMIG_TOOL="${VFMIG_TOOL:-mlx5_vfmig}"
+# SET_TRACKED iova_bits for every VF tracked here; 0 is the kernel default
+IOVA_BITS="${IOVA_BITS:-0}"
 DEV_DIR="/dev/mlx5_vfmig"
 SRC_VF="${SRC_VF:-0}"
 DST_VF="${DST_VF:-0}"
@@ -174,7 +176,7 @@ echo 0 >"$PF_DEV/sriov_drivers_autoprobe"
 echo "$NUMVFS" >"$SRIOV_NUMVFS"
 SRC_BDF="$(readlink "$PF_DEV/virtfn$SRC_VF" | xargs basename)"
 ensure_dma_domain "$SRC_BDF"
-"$VFMIG_TOOL" "$PF" set_tracked "$SRC_VF" 1
+"$VFMIG_TOOL" "$PF" set_tracked "$SRC_VF" 1 "$IOVA_BITS"
 "$VFMIG_TOOL" "$PF" enable_migratable "$SRC_VF"
 # The plugin's dump-side capture refuses an all-zeros vf_uuid and the
 # restore-side match keys off vf_uuid, so the harness plays orchestrator
@@ -257,7 +259,7 @@ ensure_dma_domain "$DEST_BDF"
 # Tracked so QUERY_VF surfaces the stamped vf_uuid; stamp the same UUID.
 # Deliberately do NOT bind or enable_migratable -- the restore tool's LOAD
 # path drives both.
-"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 1
+"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 1 "$IOVA_BITS"
 "$VFMIG_TOOL" "$PF" set_vf_uuid "$DST_VF" "$VF_UUID"
 [[ ! -e "/sys/bus/pci/devices/$DEST_BDF/driver" ]] \
 	|| die "destination VF $DEST_BDF is already bound before prerestore (expected unbound)"

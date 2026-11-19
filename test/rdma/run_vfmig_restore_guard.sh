@@ -58,6 +58,8 @@ fi
 
 PF="${PF:-0000:08:00.0}"
 VFMIG_TOOL="${VFMIG_TOOL:-mlx5_vfmig}"
+# SET_TRACKED iova_bits for every VF tracked here; 0 is the kernel default
+IOVA_BITS="${IOVA_BITS:-0}"
 DEV_DIR="/dev/mlx5_vfmig"
 SRC_VF="${SRC_VF:-0}"
 DST_VF="${DST_VF:-1}"
@@ -133,7 +135,7 @@ recycle_slot() {
 bootstrap_slot() {
 	local vf="$1"
 	ensure_dma_domain "$(vf_bdf "$vf")"
-	"$VFMIG_TOOL" "$PF" set_tracked "$vf" 1
+	"$VFMIG_TOOL" "$PF" set_tracked "$vf" 1 "$IOVA_BITS"
 	"$VFMIG_TOOL" "$PF" enable_migratable "$vf"
 	"$VFMIG_TOOL" "$PF" set_vf_uuid "$vf" "$VF_UUID"
 }

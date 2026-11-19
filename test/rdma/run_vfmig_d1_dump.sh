@@ -59,6 +59,8 @@ fi
 
 PF="${PF:-0000:08:00.0}"
 VFMIG_TOOL="${VFMIG_TOOL:-mlx5_vfmig}"
+# SET_TRACKED iova_bits for every VF tracked here; 0 is the kernel default
+IOVA_BITS="${IOVA_BITS:-0}"
 DEV_DIR="/dev/mlx5_vfmig"
 VFMIG_RZ_DIR="${VFMIG_RZ_DIR:-/run/criu-vfmig/rendezvous}"
 BARRIER_TIMEOUT_MS="${BARRIER_TIMEOUT_MS:-15000}"
@@ -149,7 +151,7 @@ SRIOV_TOUCHED=1
 echo 0 >"$SRIOV_NUMVFS"
 echo 0 >"$PF_DEV/sriov_drivers_autoprobe"
 echo 1 >"$SRIOV_NUMVFS"
-"$VFMIG_TOOL" "$PF" set_tracked 0 1
+"$VFMIG_TOOL" "$PF" set_tracked 0 1 "$IOVA_BITS"
 "$VFMIG_TOOL" "$PF" enable_migratable 0
 # The dump-side capture refuses an all-zeros vf_uuid, and barrier mode is keyed
 # off vf_uuid -> descriptor, so the harness plays orchestrator and stamps a

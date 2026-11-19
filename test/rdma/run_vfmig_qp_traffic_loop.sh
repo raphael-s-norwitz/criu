@@ -76,6 +76,8 @@ fi
 
 PF="${PF:-0000:08:00.0}"
 VFMIG_TOOL="${VFMIG_TOOL:-mlx5_vfmig}"
+# SET_TRACKED iova_bits for every VF tracked here; 0 is the kernel default
+IOVA_BITS="${IOVA_BITS:-0}"
 DEV_DIR="/dev/mlx5_vfmig"
 VF_A="${VF_A:-0}"
 VF_B="${VF_B:-1}"
@@ -316,7 +318,7 @@ CUR_VF="$VF_A"
 CUR_BDF="$(vf_bdf "$CUR_VF")"
 ensure_dma_domain "$CUR_BDF"
 ip link set "$PF_NET" vf "$CUR_VF" mac "$MAC" || die "set vf $CUR_VF admin MAC"
-"$VFMIG_TOOL" "$PF" set_tracked "$CUR_VF" 1 >/dev/null || die "set_tracked $CUR_VF"
+"$VFMIG_TOOL" "$PF" set_tracked "$CUR_VF" 1 "$IOVA_BITS" >/dev/null || die "set_tracked $CUR_VF"
 "$VFMIG_TOOL" "$PF" enable_migratable "$CUR_VF" >/dev/null || die "enable_migratable $CUR_VF"
 "$VFMIG_TOOL" "$PF" set_vf_uuid "$CUR_VF" "$UUID" >/dev/null || die "set_vf_uuid $CUR_VF"
 echo mlx5_core >"/sys/bus/pci/devices/$CUR_BDF/driver_override"
@@ -412,7 +414,7 @@ for hop in $(seq 1 "$HOPS"); do
 	DST_BDF="$(vf_bdf "$DST_VF")"
 	ensure_dma_domain "$DST_BDF"
 	ip link set "$PF_NET" vf "$DST_VF" mac "$MAC" || die "hop $hop: set vf $DST_VF admin MAC"
-	"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 1 >/dev/null || die "hop $hop: set_tracked $DST_VF"
+	"$VFMIG_TOOL" "$PF" set_tracked "$DST_VF" 1 "$IOVA_BITS" >/dev/null || die "hop $hop: set_tracked $DST_VF"
 	"$VFMIG_TOOL" "$PF" set_vf_uuid "$DST_VF" "$UUID" >/dev/null || die "hop $hop: set_vf_uuid $DST_VF"
 
 	t2="$(now)"
