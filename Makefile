@@ -484,6 +484,7 @@ ruff:
 		scripts/uninstall_module.py \
 		coredump/ coredump/coredump \
 		scripts/github-indent-warnings.py \
+		plugins/rdma/mlx5_sriov_vfmig/mlx5_vfmig_iova_check.py \
 		contrib/criu-service-client/test/*.py \
 		contrib/compression-benchmark/ \
 		test/others/compression/ \

@@ -9,6 +9,14 @@ PLUGIN_SOBJ := rdma_mlx5_vfmig_plugin.so
 RESTORE_BIN  := mlx5_vfmig_restore_vf
 RESTORE_SRCS := mlx5_vfmig_restore_vf.c
 
+#
+# Standalone, read-only check of which SET_TRACKED iova_bits this host's
+# VFs can reserve. Python 3 standard library only; installed without the
+# .py suffix.
+#
+IOVA_CHECK_SCRIPT := mlx5_vfmig_iova_check.py
+IOVA_CHECK_BIN    := mlx5_vfmig_iova_check
+
 DEPS_RDMA_MLX5_VFMIG := $(PLUGIN_SOBJ) $(RESTORE_BIN)
 
 #
@@ -115,6 +123,8 @@ install:
 	$(Q) mkdir -p $(DESTDIR)$(SBINDIR)
 	$(E) "  INSTALL " $(RESTORE_BIN)
 	$(Q) install -m 755 $(RESTORE_BIN) $(DESTDIR)$(SBINDIR)
+	$(E) "  INSTALL " $(IOVA_CHECK_BIN)
+	$(Q) install -m 755 $(IOVA_CHECK_SCRIPT) $(DESTDIR)$(SBINDIR)/$(IOVA_CHECK_BIN)
 .PHONY: install
 
 uninstall:
@@ -122,4 +132,6 @@ uninstall:
 	$(Q) $(RM) $(DESTDIR)$(PLUGINDIR)/$(PLUGIN_SOBJ)
 	$(E) " UNINSTALL" $(RESTORE_BIN)
 	$(Q) $(RM) $(DESTDIR)$(SBINDIR)/$(RESTORE_BIN)
+	$(E) " UNINSTALL" $(IOVA_CHECK_BIN)
+	$(Q) $(RM) $(DESTDIR)$(SBINDIR)/$(IOVA_CHECK_BIN)
 .PHONY: uninstall
