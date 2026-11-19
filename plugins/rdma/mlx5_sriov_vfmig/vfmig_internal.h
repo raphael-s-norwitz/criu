@@ -318,7 +318,7 @@ struct vfmig_uctx_image_blob {
 int vfmig_drain_save_fd_to_blob(int save_fd, const char *blob_path, uint64_t *out_size);
 int vfmig_append_state_entry(uint32_t ctxn, const char *ibdev, const char *source_cdev_path, const char *pf_bdf,
 			     uint32_t vf_id, uint32_t vhca_id, const uint8_t vf_uuid[16], const char *blob_path,
-			     uint64_t blob_size, const struct vfmig_uctx_image_blob *uctx,
+			     uint64_t blob_size, uint32_t iova_bits, const struct vfmig_uctx_image_blob *uctx,
 			     const struct vfmig_rx_fence_handles *fence);
 int vfmig_read_image(Mlx5VfmigStateEntry ***out_arr, size_t *out_n);
 

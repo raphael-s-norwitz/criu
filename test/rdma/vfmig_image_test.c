@@ -116,10 +116,10 @@ int main(void)
 
 	/* 2. Append two entries, read them back, compare every field. */
 	rc = vfmig_append_state_entry(7, "mlx5_2", "/dev/infiniband/uverbs2", "0000:08:00.0", 3, 0x123, uuid_a,
-				      "mlx5_vfmig-pf0000:08:00.0-vf3.blob", 65536, NULL, NULL);
+				      "mlx5_vfmig-pf0000:08:00.0-vf3.blob", 65536, 39, NULL, NULL);
 	CHECK(rc == 0, "append entry A");
 	rc = vfmig_append_state_entry(9, "mlx5_5", "/dev/infiniband/uverbs5", "0000:08:00.1", 1, 0x456, uuid_b,
-				      "mlx5_vfmig-pf0000:08:00.1-vf1.blob", 131072, NULL, NULL);
+				      "mlx5_vfmig-pf0000:08:00.1-vf1.blob", 131072, 34, NULL, NULL);
 	CHECK(rc == 0, "append entry B");
 
 	rc = vfmig_read_image(&arr, &n);
@@ -132,13 +132,15 @@ int main(void)
 			      a->vf_id == 3 && a->vhca_id == 0x123 &&
 			      !strcmp(a->source_cdev_path, "/dev/infiniband/uverbs2") &&
 			      !strcmp(a->blob_path, "mlx5_vfmig-pf0000:08:00.0-vf3.blob") && a->blob_size == 65536 &&
-			      a->vf_uuid.len == 16 && !memcmp(a->vf_uuid.data, uuid_a, 16),
+			      a->vf_uuid.len == 16 && !memcmp(a->vf_uuid.data, uuid_a, 16) && a->has_iova_bits &&
+			      a->iova_bits == 39,
 		      "entry A round-trips all fields");
 		CHECK(b->ctxn == 9 && !strcmp(b->ibdev, "mlx5_5") && !strcmp(b->pf_bdf, "0000:08:00.1") &&
 			      b->vf_id == 1 && b->vhca_id == 0x456 &&
 			      !strcmp(b->source_cdev_path, "/dev/infiniband/uverbs5") &&
 			      !strcmp(b->blob_path, "mlx5_vfmig-pf0000:08:00.1-vf1.blob") && b->blob_size == 131072 &&
-			      b->vf_uuid.len == 16 && !memcmp(b->vf_uuid.data, uuid_b, 16),
+			      b->vf_uuid.len == 16 && !memcmp(b->vf_uuid.data, uuid_b, 16) && b->has_iova_bits &&
+			      b->iova_bits == 34,
 		      "entry B round-trips all fields");
 	}
 	free_entries(arr, n);
@@ -147,7 +149,7 @@ int main(void)
 
 	/* 3. All-zero vf_uuid is refused. */
 	rc = vfmig_append_state_entry(1, "mlx5_2", "/dev/infiniband/uverbs2", "0000:08:00.0", 0, 0, uuid_zero,
-				      "x.blob", 0, NULL, NULL);
+				      "x.blob", 0, 39, NULL, NULL);
 	CHECK(rc == -1, "append with all-zero vf_uuid is refused");
 
 	/* 4. drain_save_fd_to_blob: fd -> blob file with right size + bytes. */

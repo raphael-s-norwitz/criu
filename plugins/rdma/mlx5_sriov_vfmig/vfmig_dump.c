@@ -926,6 +926,7 @@ struct vfmig_saved_vf {
 	uint8_t vf_uuid[16];
 	char blob_path[128];
 	uint64_t blob_size;
+	uint32_t iova_bits;
 };
 
 /*
@@ -991,6 +992,14 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id, struct vfmig
 		return -1;
 	}
 	memcpy(out->vf_uuid, qv.vf_uuid, sizeof(out->vf_uuid));
+	if (!qv.tracked || !qv.iova_bits) {
+		pr_err("vfmig: refusing to dump pf=%s vf_id=%u: QUERY_VF reports no IOVA window (tracked=%u "
+		       "iova_bits=%u); the VF must be tracked (SET_TRACKED) by a kernel that reports its window\n",
+		       pf_bdf, vf_id, qv.tracked, qv.iova_bits);
+		close(cdev_fd);
+		return -1;
+	}
+	out->iova_bits = qv.iova_bits;
 
 	memset(&ss, 0, sizeof(ss));
 	ss.vf_id = vf_id;
@@ -1010,8 +1019,8 @@ static int vfmig_capture_one_vf(const char *pf_bdf, uint32_t vf_id, struct vfmig
 	close(ss.save_fd);
 	close(cdev_fd);
 
-	pr_info("vfmig: captured pf=%s vf_id=%u vhca_id=%u blob='%s' size=%llu\n", pf_bdf, vf_id, out->vhca_id,
-		out->blob_path, (unsigned long long)out->blob_size);
+	pr_info("vfmig: captured pf=%s vf_id=%u vhca_id=%u iova_bits=%u blob='%s' size=%llu\n", pf_bdf, vf_id,
+		out->vhca_id, out->iova_bits, out->blob_path, (unsigned long long)out->blob_size);
 	return 0;
 }
 
@@ -1074,7 +1083,7 @@ static int vfmig_save_claimed_vf(struct vfmig_claimed_vf *c)
 	}
 
 	if (vfmig_append_state_entry(ctxn, c->ibdev, cdev_for_record, c->pf_bdf, c->vf_id, sv.vhca_id, sv.vf_uuid,
-				     sv.blob_path, sv.blob_size, uctx, c->fenced ? &c->fence : NULL)) {
+				     sv.blob_path, sv.blob_size, sv.iova_bits, uctx, c->fenced ? &c->fence : NULL)) {
 		pr_err("vfmig: failed to append state entry for pf=%s vf_id=%u\n", c->pf_bdf, c->vf_id);
 		return -1;
 	}

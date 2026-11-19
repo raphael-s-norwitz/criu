@@ -528,19 +528,26 @@ static void vfmig_report_dest_failure(const char *pf_bdf, uint32_t vf_id, const 
  * MARK_RESTORED on a single (pf_bdf, vf_id), streaming the firmware
  * blob at @blob_path (relative to the image dir) into the load fd.
  *
- * ENABLE_MIGRATABLE and SET_TRACKED are idempotent per the kernel UAPI:
- * the orchestrator may already have run them on the destination VF, in
- * which case the kernel returns 0 with no firmware traffic. Re-issuing
- * them lets the plugin tolerate a minimal orchestrator that only does
- * sriov_numvfs + SET_VF_UUID.
+ * ENABLE_MIGRATABLE is idempotent per the kernel UAPI: the orchestrator
+ * may already have run it on the destination VF, in which case the
+ * kernel returns 0 with no firmware traffic.
+ *
+ * The blob replays only onto a VF tracked with the source's IOVA window
+ * (@iova_bits, from the image). An untracked VF is tracked with it here,
+ * so a minimal orchestrator that only does sriov_numvfs + SET_VF_UUID
+ * still works. A VF the orchestrator already tracked with another
+ * window is refused before anything is sent to it: re-windowing means
+ * untracking it, which is the orchestrator's call, not the plugin's.
  */
-static int vfmig_load_one_vf(const char *pf_bdf, uint32_t vf_id, const char *blob_path, uint64_t blob_size)
+static int vfmig_load_one_vf(const char *pf_bdf, uint32_t vf_id, const char *blob_path, uint64_t blob_size,
+			     uint32_t iova_bits)
 {
 	char cdev_path[PATH_MAX];
 	char buf[65536];
 	int cdev_fd, blob_fd, img_dir, load_fd;
 	struct mlx5_vfmig_enable_migratable em;
 	struct mlx5_vfmig_set_tracked sttr;
+	struct mlx5_vfmig_query_vf qv;
 	struct mlx5_vfmig_load_state ls;
 	struct mlx5_vfmig_mark_restored mr;
 	uint64_t total_written = 0;
@@ -557,6 +564,21 @@ static int vfmig_load_one_vf(const char *pf_bdf, uint32_t vf_id, const char *blo
 		return -1;
 	}
 
+	memset(&qv, 0, sizeof(qv));
+	qv.vf_id = vf_id;
+	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_QUERY_VF, &qv)) {
+		pr_perror("vfmig: QUERY_VF pf=%s vf_id=%u", pf_bdf, vf_id);
+		close(cdev_fd);
+		return -1;
+	}
+	if (qv.tracked && qv.iova_bits != iova_bits) {
+		pr_err("vfmig: pf=%s vf_id=%u is tracked with iova_bits=%u but the image was saved with iova_bits=%u; "
+		       "untrack the VF and SET_TRACKED it with iova_bits=%u before restore\n",
+		       pf_bdf, vf_id, qv.iova_bits, iova_bits, iova_bits);
+		close(cdev_fd);
+		return -1;
+	}
+
 	em.vf_id = vf_id;
 	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_ENABLE_MIGRATABLE, &em)) {
 		pr_perror("vfmig: ENABLE_MIGRATABLE pf=%s vf_id=%u", pf_bdf, vf_id);
@@ -564,12 +586,17 @@ static int vfmig_load_one_vf(const char *pf_bdf, uint32_t vf_id, const char *blo
 		return -1;
 	}
 
-	sttr.vf_id = vf_id;
-	sttr.enable = 1;
-	if (ioctl(cdev_fd, MLX5_VFMIG_IOC_SET_TRACKED, &sttr)) {
-		pr_perror("vfmig: SET_TRACKED pf=%s vf_id=%u", pf_bdf, vf_id);
-		close(cdev_fd);
-		return -1;
+	if (!qv.tracked) {
+		sttr.vf_id = vf_id;
+		sttr.enable = 1;
+		sttr.iova_bits = iova_bits;
+		if (ioctl(cdev_fd, MLX5_VFMIG_IOC_SET_TRACKED, &sttr)) {
+			pr_perror("vfmig: SET_TRACKED pf=%s vf_id=%u iova_bits=%u", pf_bdf, vf_id, iova_bits);
+			close(cdev_fd);
+			return -1;
+		}
+		pr_info("vfmig: pf=%s vf_id=%u was not tracked; tracked it with the image's iova_bits=%u\n", pf_bdf,
+			vf_id, iova_bits);
 	}
 
 	ls.vf_id = vf_id;
@@ -1588,6 +1615,13 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 
 		vfmig_uuid_to_str(e->vf_uuid.data, uuid_str);
 
+		if (!e->has_iova_bits || !e->iova_bits) {
+			pr_err("vfmig: ctxn=%u source(pf=%s vf_id=%u vf_uuid=%s): image record has no iova_bits; it "
+			       "was written by a plugin that predates IOVA window selection and cannot be restored\n",
+			       e->ctxn, e->pf_bdf, e->vf_id, uuid_str);
+			goto err;
+		}
+
 		rc = vfmig_resolve_uuid_to_pf_vf(e->vf_uuid.data, dest_pf_bdf, sizeof(dest_pf_bdf), &dest_vf_id);
 		if (rc == -ENOENT) {
 			pr_err("vfmig: ctxn=%u source(pf=%s vf_id=%u): no VF on this host has vf_uuid=%s. The "
@@ -1620,7 +1654,7 @@ static int vfmig_restore_init_all_vfs_internal(bool run_phase_b)
 			goto err;
 
 		if (action == VFMIG_DEST_LOAD) {
-			if (vfmig_load_one_vf(dest_pf_bdf, dest_vf_id, e->blob_path, e->blob_size)) {
+			if (vfmig_load_one_vf(dest_pf_bdf, dest_vf_id, e->blob_path, e->blob_size, e->iova_bits)) {
 				vfmig_report_dest_failure(dest_pf_bdf, dest_vf_id, vf_bdf, "LOAD_VHCA_STATE");
 				goto err;
 			}

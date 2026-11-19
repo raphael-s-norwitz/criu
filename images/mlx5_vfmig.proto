@@ -220,4 +220,13 @@ message mlx5_vfmig_state_entry {
 	 */
 	optional uint32		fence_table_id		= 15;
 	optional uint32		fence_group_id		= 16;
+
+	/*
+	 * SET_TRACKED iova_bits of the source VF's IOVA window, from
+	 * MLX5_VFMIG_IOC_QUERY_VF at dump time. The blob replays only onto
+	 * a VF tracked with the same window: restore tracks an untracked
+	 * destination VF with it and refuses one tracked with another.
+	 * Always written; restore refuses a record without it.
+	 */
+	optional uint32		iova_bits		= 17;
 }
