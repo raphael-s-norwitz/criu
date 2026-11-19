@@ -77,7 +77,7 @@ struct mlx5_vfmig_get_vhca_id {
  *   Userspace iterates @vf_id 0..num_vfs-1 to enumerate. Returns 0 on
  *   success, or -ERANGE if @vf_id >= num_vfs (with @num_vfs still filled
  *   in so callers can size their iteration; @vhca_id / @restored /
- *   @tracked / @vf_uuid are zeroed).
+ *   @tracked / @vf_uuid / @iova_bits are zeroed).
  *
  *   Output fields:
  *     vhca_id:   live VHCA identifier.
@@ -108,6 +108,11 @@ struct mlx5_vfmig_get_vhca_id {
  *                A kernel without this field reports 0 for a bound VF, so
  *                check BOUND against sysfs before trusting a clear
  *                FROM_LOAD.
+ *     iova_bits: with @tracked, the DMA mask bits the VF's IOVA window
+ *                was reserved under (SET_TRACKED's @iova_bits after
+ *                defaulting); 0 if untracked. A kernel without this
+ *                field reports 0 for a tracked VF; its window is then
+ *                MLX5_VFMIG_IOVA_BITS_DEFAULT.
  *
  *   ABI note: this struct grew to add @vf_uuid + @reserved_out. The
  *   encoded ioctl number changes with the struct size (sizeof in the
@@ -124,7 +129,8 @@ struct mlx5_vfmig_query_vf {
 				 *      all-zeros if unset
 				 */
 	__u8  vf_state;		/* out: MLX5_VFMIG_VF_STATE_* */
-	__u8  reserved_out[7];	/* out: zeroed */
+	__u8  iova_bits;	/* out: tracked window bits, 0 if untracked */
+	__u8  reserved_out[6];	/* out: zeroed */
 };
 
 #define MLX5_VFMIG_VF_STATE_BOUND	(1u << 0)
@@ -181,16 +187,38 @@ struct mlx5_vfmig_enable_migratable {
  *
  *   @iova_bits selects the VF's IOVA window on enable: the VF's DMA mask
  *   is set to @iova_bits bits and the window is the top half of what
- *   that mask reaches, [2^(iova_bits-1), 2^iova_bits). 0 selects
- *   MLX5_VFMIG_IOVA_BITS_DEFAULT (39: [256 GiB, 512 GiB)); otherwise it
- *   must be in [MLX5_VFMIG_IOVA_BITS_MIN, MLX5_VFMIG_IOVA_BITS_DEFAULT]
- *   (34: [8 GiB, 16 GiB) is the smallest window the kernel's fixed slots
- *   fit in). Ignored on disable. A SAVE replays only onto a VF tracked
- *   with the same @iova_bits.
+ *   that mask reaches, [2^(iova_bits-1), 2^iova_bits). A non-zero
+ *   value must be in [MLX5_VFMIG_IOVA_BITS_MIN,
+ *   MLX5_VFMIG_IOVA_BITS_DEFAULT] (34: [8 GiB, 16 GiB) is the smallest
+ *   window the kernel's fixed slots fit in). 0 asks for no particular
+ *   window: MLX5_VFMIG_IOVA_BITS_DEFAULT (39: [256 GiB, 512 GiB)) on an
+ *   untracked VF, the window it already has on a tracked one. Ignored
+ *   on disable. QUERY_VF reports the window in @iova_bits. A SAVE
+ *   replays only onto a VF tracked with the same @iova_bits.
+ *
+ *   /sys/class/mlx5_vfmig/mlx5_vfmig!<PF BDF>/iova_bits lists, space
+ *   separated, the values whose window that PF's VFs can take once in
+ *   a DMA domain: the IOMMU aperture and bus DMA limit reach the window
+ *   and no PCI host-bridge window or IOMMU reserved region of the PF
+ *   overlaps it. It is worked out when the PF is probed, so it can be
+ *   read before SR-IOV is enabled. A VF whose IOMMU group defaults to
+ *   identity (iommu=pt) needs its group type set to DMA or DMA-FQ
+ *   first. Not visible from the PF: reserved regions firmware scopes
+ *   to a VF alone (an RMRR or IORT entry naming it, rare for VFs), and
+ *   IOVAs still mapped in a VF's DMA domain, which an unbound VF has
+ *   only if a driver leaked them. SET_TRACKED is the final word.
+ *
+ *   IOVAs a driver unmapped do not count: they are dropped from the
+ *   VF domain's IOVA caches when the window needs their space. In a
+ *   DMA-FQ (lazy) domain they first wait in the IOMMU flush queue, up
+ *   to a second when the IOMMU shadows its page tables, as a virtual
+ *   IOMMU in caching mode does; an enable whose window is blocked
+ *   there waits for the queue to drain and tries once more, so it can
+ *   take a second or so longer.
  *
  *   Idempotent: a toggle to the state the VF is already in is a no-op
- *   (returns 0, no iommu traffic), as long as an enable asks for the
- *   window the VF already has.
+ *   (returns 0, no iommu traffic), as long as an enable with a non-zero
+ *   @iova_bits asks for the window the VF already has.
  *
  *   Errors:
  *     -EFAULT     copy_from_user.
@@ -198,7 +226,8 @@ struct mlx5_vfmig_enable_migratable {
  *                 @iova_bits out of range.
  *     -ENODEV     the VF pci_dev could not be found.
  *     -EBUSY      the VF is bound to a driver (must be unbound first), or
- *                 is already tracked with a different @iova_bits.
+ *                 is already tracked with a different non-zero
+ *                 @iova_bits (untrack it first).
  *     -EOPNOTSUPP the VF is not in a managed DMA-IOMMU domain or is not
  *                 DMA-coherent, or its IOMMU aperture or bus DMA limit
  *                 does not reach the top of the window.
@@ -216,7 +245,7 @@ struct mlx5_vfmig_set_tracked {
 	__u32 vf_id;		/* in  */
 	__u32 enable;		/* in: 0 = untrack, 1 = track */
 	__u32 flags;		/* in: reserved, must be 0 */
-	__u32 iova_bits;	/* in: window DMA mask bits, 0 = default */
+	__u32 iova_bits;	/* in: window DMA mask bits, 0 = any */
 };
 
 #define MLX5_VFMIG_IOC_SET_TRACKED \
@@ -435,8 +464,10 @@ struct mlx5_vfmig_save_state {
  *   of range or @flags / @reserved are non-zero; -EOPNOTSUPP if the VF is
  *   not migration-enabled; -EBUSY if a save or load session already exists
  *   for this vf_id; -ENODEV if the PF is gone. write() errors surface
- *   -EPROTO/-EINVAL for a malformed stream. Any firmware error from the
- *   deferred LOAD_VHCA_STATE surfaces in the VF probe (dmesg), not here.
+ *   -EPROTO/-EINVAL for a malformed stream, and -ERANGE for a stream
+ *   saved from a VF tracked with a different SET_TRACKED @iova_bits
+ *   than this one. Any firmware error from the deferred LOAD_VHCA_STATE
+ *   surfaces in the VF probe (dmesg), not here.
  */
 struct mlx5_vfmig_load_state {
 	__u32 vf_id;	/* in  */
